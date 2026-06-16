@@ -1,0 +1,41 @@
+use crate::tensor::Tensor1D;
+use crate::jacobian::Jacobian;
+use crate::model_plan::param_store::ParamSlice;
+use crate::neuron::types::softmax::Softmax;
+use crate::neuron::base::Neuron;
+use super::{Layer, LayerInfo};
+
+pub struct SoftmaxLayer;
+
+impl SoftmaxLayer {
+    pub fn new() -> Self { Self }
+}
+
+impl Layer for SoftmaxLayer {
+    fn forward(
+        &self,
+        input: &Tensor1D,
+        j_input: &Jacobian,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> (Tensor1D, Jacobian) {
+        Softmax.forward(input, j_input)
+    }
+
+    fn param_len(&self) -> usize { 0 }
+
+    fn layer_info(&self) -> LayerInfo {
+        LayerInfo {
+            layer_type: "Softmax".to_string(),
+            input_dim: 0,
+            output_dim: 0,
+            param_count: 0,
+            param_start_index: None,
+        }
+    }
+}
+
+
+
+
+

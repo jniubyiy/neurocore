@@ -1,5 +1,4 @@
 use crate::tensor::Tensor1D;
-use crate::jacobian::Jacobian;
 use crate::neuron::base::Neuron;
 
 pub struct Linear {
@@ -11,31 +10,27 @@ impl Linear {
     pub fn new(weights: Vec<f32>, bias: f32) -> Self {
         Linear { weights, bias }
     }
+
+    /// Статический метод для расчёта одного нейрона без владения данными.
+    pub fn forward_slice(weights: &[f32], bias: f32, input: &[f32]) -> f32 {
+        assert_eq!(weights.len(), input.len(), "Linear forward_slice: weight/input length mismatch");
+        let mut sum = bias;
+        for i in 0..weights.len() {
+            sum += weights[i] * input[i];
+        }
+        sum
+    }
 }
 
 impl Neuron for Linear {
-    fn forward(&self, input: &Tensor1D, j_input: &Jacobian) -> (Tensor1D, Jacobian) {
-        let n = input.len();
-        assert_eq!(n, self.weights.len(), "Linear: input length must match weights length");
-        let p = j_input.num_params;          // <-- исправлено
+    fn apply(&self, _x: f32) -> f32 {
+        panic!("Linear neuron does not support element‑wise apply; use forward()");
+    }
 
-        let mut out_val = self.bias;
-        for i in 0..n {
-            out_val += self.weights[i] * input.data[i];
-        }
-
-        let mut out_jac = vec![0.0_f32; p];
-        for i in 0..n {
-            for j in 0..p {
-                out_jac[j] += self.weights[i] * j_input.data[i][j];
-            }
-        }
-
-        (Tensor1D::from_scalar(out_val), Jacobian {
-            out_features: 1,
-            num_params: p,
-            data: vec![out_jac],
-        })
+    fn forward(&self, input: &Tensor1D) -> Tensor1D {
+        assert_eq!(input.len(), self.weights.len(), "Linear: input length must match weights length");
+        let sum = self.bias + self.weights.iter().zip(&input.data).map(|(w, x)| w * x).sum::<f32>();
+        Tensor1D::from_scalar(sum)
     }
 }
 

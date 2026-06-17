@@ -1,56 +1,61 @@
-use crate::tensor::Tensor3D;
-use crate::jacobian::Jacobian3D;
+use crate::tensor::{Tensor3D, Tensor1D};
 use crate::model_plan::param_store::ParamSlice;
-use super::Layer3D;
+use crate::neuron::Softmax;
+use crate::neuron::base::Neuron;
+use super::{Layer3D, LayerContext3D};
 
-pub struct Softmax3D;
+pub struct Softmax3D {
+    neuron: Softmax,
+    inner_size: usize,
+}
 
 impl Softmax3D {
-    pub fn new() -> Self { Self }
+    pub fn new(size: usize) -> Self {
+        Self { neuron: Softmax, inner_size: size }
+    }
 }
 
 impl Layer3D for Softmax3D {
-    fn forward_3d(
-        &self,
-        input: &Tensor3D,
-        j_input: &Jacobian3D,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) -> (Tensor3D, Jacobian3D) {
-        let depth = input.depth;
-        let rows = input.rows;
-        let cols = input.cols;
-        let params = j_input.num_params;
-        let mut out = vec![vec![vec![0.0; cols]; rows]; depth];
-        let mut j_out = Jacobian3D::new(depth, rows, cols, params);
-        for d in 0..depth {
-            for r in 0..rows {
-                let row = &input.data[d][r];
-                let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut exps = vec![0.0; cols];
-                let mut sum = 0.0;
-                for c in 0..cols {
-                    exps[c] = (row[c] - max_val).exp();
-                    sum += exps[c];
-                }
-                for c in 0..cols {
-                    let softmax_val = exps[c] / sum;
-                    out[d][r][c] = softmax_val;
-                    for p in 0..params {
-                        let mut deriv = 0.0;
-                        for k in 0..cols {
-                            let delta = if c == k { 1.0 } else { 0.0 };
-                            deriv += softmax_val * (delta - exps[k] / sum) * j_input.data[d][r][k][p];
-                        }
-                        j_out.data[d][r][c][p] = deriv;
-                    }
+    fn forward_into(&self, input: &Tensor3D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<f32>>>) -> LayerContext3D {
+        let mut output = vec![vec![vec![0.0; input.cols]; input.rows]; input.depth];
+        for d in 0..input.depth {
+            for r in 0..input.rows {
+                let row_in = Tensor1D::new(input.data[d][r].clone());
+                let row_out = self.neuron.forward(&row_in);
+                for c in 0..input.cols {
+                    let val = row_out.data[c];
+                    out_buf[d][r][c] = val;
+                    output[d][r][c] = val;
                 }
             }
         }
-        (Tensor3D::new(out), j_out)
+        LayerContext3D::Softmax3D { output: Tensor3D::new(output) }
+    }
+
+    fn backward(&self, ctx: &LayerContext3D, delta: &Tensor3D, params: &[f32], slice: &ParamSlice) -> (Tensor3D, Vec<f32>) {
+        let sm = match ctx { LayerContext3D::Softmax3D { output } => output, _ => panic!() };
+        let depth = sm.depth;
+        let rows = sm.rows;
+        let cols = sm.cols;
+        let mut d_prev = vec![vec![vec![0.0; cols]; rows]; depth];
+        for d in 0..depth {
+            for r in 0..rows {
+                for i in 0..cols {
+                    let mut sum = 0.0;
+                    for j in 0..cols {
+                        let kron = if i == j { 1.0 } else { 0.0 };
+                        sum += delta.data[d][r][j] * sm.data[d][r][j] * (kron - sm.data[d][r][i]);
+                    }
+                    d_prev[d][r][i] = sum;
+                }
+            }
+        }
+        (Tensor3D::new(d_prev), vec![])
     }
 
     fn param_len(&self) -> usize { 0 }
+    fn in_features(&self) -> usize { self.inner_size }
+    fn out_features(&self) -> usize { self.inner_size }
 }
 
 

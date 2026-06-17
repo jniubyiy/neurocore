@@ -1,3 +1,6 @@
+// ============================================================
+// Файл: src/layers/mod.rs
+// ============================================================
 pub mod layers1d;
 pub mod layers2d;
 pub mod layers3d;
@@ -15,32 +18,32 @@ pub use layers1d::{
 
 // 2D
 pub use layers2d::{
-    Layer2D,
-    Linear2D, ReLU2D, Sigmoid2D, Softmax2D, Tanh2D, Memory2D,
+    Layer2D, LayerContext,
+    Linear2D, ReLU2D, Sigmoid2D, Softmax2D, Tanh2D,
+    Sequential2D, Memory2D,
 };
 
 // 3D
 pub use layers3d::{
-    Layer3D,
+    Layer3D, LayerContext3D,
     Linear3D, ReLU3D, Sigmoid3D, Softmax3D, Tanh3D, Memory3D,
 };
 
 // 4D
 pub use layers4d::{
-    Layer4D,
+    Layer4D, LayerContext4D,
     Linear4D, ReLU4D, Sigmoid4D, Softmax4D, Tanh4D, Memory4D,
 };
 
 // 5D
 pub use layers5d::{
-    Layer5D,
+    Layer5D, LayerContext5D,
     Linear5D, ReLU5D, Sigmoid5D, Softmax5D, Tanh5D, Memory5D,
 };
 
-// Специальные
+// Специальные слои
 pub use layers_special::{
     DimReduce, DimExpand,
     ReduceMean, Unsqueeze,
 };
-
 

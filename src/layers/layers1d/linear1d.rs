@@ -1,83 +1,94 @@
+// ============================================================
+// Файл: src/layers/layers1d/linear1d.rs
+// ============================================================
 use crate::tensor::Tensor1D;
-use crate::jacobian::Jacobian;
-use crate::model_plan::param_store::ParamSlice;
+use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::model_plan::blueprint::assert_power_of_two;
+use crate::neuron::Linear;
 use super::{Layer, LayerInfo};
 
 pub struct LinearLayer {
     input_dim: usize,
     output_dim: usize,
-    slice: ParamSlice,
+    last_input: Option<Tensor1D>,
+    grad_W: Vec<f32>,
+    grad_b: Vec<f32>,
 }
 
 impl LinearLayer {
-    pub fn new(input_dim: usize, output_dim: usize, slice: ParamSlice) -> Self {
+    pub fn new(input_dim: usize, output_dim: usize) -> Self {
         assert_power_of_two(input_dim);
         assert_power_of_two(output_dim);
-        assert_eq!(
-            slice.len,
-            input_dim * output_dim + output_dim,
-            "LinearLayer: slice len must be in_dim*out_dim + out_dim"
-        );
-        Self { input_dim, output_dim, slice }
+        Self {
+            input_dim,
+            output_dim,
+            last_input: None,
+            grad_W: vec![0.0; input_dim * output_dim],
+            grad_b: vec![0.0; output_dim],
+        }
     }
 
-    fn weight_index(&self, out_idx: usize, in_idx: usize) -> usize {
-        self.slice.start + out_idx * self.input_dim + in_idx
+    fn weight_index(&self, out_idx: usize, in_idx: usize, slice: &ParamSlice) -> usize {
+        slice.start + out_idx * self.input_dim + in_idx
     }
 
-    fn bias_index(&self, out_idx: usize) -> usize {
-        self.slice.start + self.input_dim * self.output_dim + out_idx
+    fn bias_index(&self, out_idx: usize, slice: &ParamSlice) -> usize {
+        slice.start + self.input_dim * self.output_dim + out_idx
     }
 }
 
 impl Layer for LinearLayer {
-    fn forward(
-        &self,
-        input: &Tensor1D,
-        j_input: &Jacobian,
-        params: &[f32],
-        _slice: &ParamSlice,
-    ) -> (Tensor1D, Jacobian) {
-        let out_features = self.output_dim;
-        let total_params = j_input.num_params;
-        let mut out_data = vec![0.0; out_features];
-        let mut j_out = Jacobian::new(out_features, total_params);
+    fn forward_into(&mut self, input: &Tensor1D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<f32>) {
+        assert_eq!(input.len(), self.input_dim);
+        assert_eq!(out_buf.len(), self.output_dim);
+        self.last_input = Some(input.clone());
 
-        for out_i in 0..out_features {
-            let mut sum = 0.0;
-            for in_i in 0..self.input_dim {
-                let w = params[self.weight_index(out_i, in_i)];
-                sum += w * input.data[in_i];
+        for o in 0..self.output_dim {
+            let w_start = self.weight_index(o, 0, slice);
+            let w_end = w_start + self.input_dim;
+            let weights = &params[w_start..w_end];
+            let bias = params[self.bias_index(o, slice)];
+            out_buf[o] = Linear::forward_slice(weights, bias, &input.data);
+        }
+    }
 
-                let global_idx = self.weight_index(out_i, in_i);
-                if global_idx < total_params {
-                    j_out.data[out_i][global_idx] += input.data[in_i];
-                }
-            }
-            let b = params[self.bias_index(out_i)];
-            sum += b;
-            let global_idx = self.bias_index(out_i);
-            if global_idx < total_params {
-                j_out.data[out_i][global_idx] += 1.0;
-            }
-            out_data[out_i] = sum;
+    fn backward(&mut self, delta: &Tensor1D, params: &[f32], slice: &ParamSlice) -> Tensor1D {
+        let input = self.last_input.take()
+            .expect("backward called without forward or input already consumed");
+        assert_eq!(delta.len(), self.output_dim);
 
-            for p in 0..total_params {
-                let mut deriv = 0.0;
-                for in_i in 0..self.input_dim {
-                    let w = params[self.weight_index(out_i, in_i)];
-                    deriv += w * j_input.data[in_i][p];
-                }
-                j_out.data[out_i][p] += deriv;
+        for o in 0..self.output_dim {
+            let d = delta.data[o];
+            for i in 0..self.input_dim {
+                self.grad_W[o * self.input_dim + i] += d * input.data[i];
             }
+            self.grad_b[o] += d;
         }
 
-        (Tensor1D::new(out_data), j_out)
+        let mut delta_prev = vec![0.0; self.input_dim];
+        for i in 0..self.input_dim {
+            let mut sum = 0.0;
+            for o in 0..self.output_dim {
+                sum += params[self.weight_index(o, i, slice)] * delta.data[o];
+            }
+            delta_prev[i] = sum;
+        }
+        Tensor1D::new(delta_prev)
+    }
+
+    fn apply_gradients(&mut self, store: &mut ParamStore, lr: f32, slice: &ParamSlice) {
+        for (idx, g) in self.grad_W.iter().enumerate() {
+            store.add_to_param(slice.start + idx, -lr * g);
+        }
+        for (idx, g) in self.grad_b.iter().enumerate() {
+            store.add_to_param(slice.start + self.input_dim * self.output_dim + idx, -lr * g);
+        }
+        self.grad_W.fill(0.0);
+        self.grad_b.fill(0.0);
     }
 
     fn param_len(&self) -> usize {
-        self.slice.len
+        self.input_dim * self.output_dim + self.output_dim
     }
 
     fn layer_info(&self) -> LayerInfo {
@@ -85,12 +96,11 @@ impl Layer for LinearLayer {
             layer_type: "Linear".to_string(),
             input_dim: self.input_dim,
             output_dim: self.output_dim,
-            param_count: self.slice.len,
-            param_start_index: Some(self.slice.start),
+            param_count: self.param_len(),
+            param_start_index: None,
         }
     }
 }
-
 
 
 

@@ -4,22 +4,15 @@ pub mod expand_dim;
 pub use reduce_dim::ReduceMean;
 pub use expand_dim::Unsqueeze;
 
-pub trait DimReduce<InputTensor, InputJacobian, OutputTensor, OutputJacobian> {
-    fn reduce(&self, input: &InputTensor, j_input: &InputJacobian) -> (OutputTensor, OutputJacobian);
-    fn param_count(&self) -> usize;
-    fn update_params(&mut self, lr: f32, grad: &[f32]);
-    fn get_params(&self) -> Vec<f32>;
-    fn set_params(&mut self, values: &[f32]);
+/// Трейт для уменьшения размерности (без якобианов, без параметров).
+pub trait DimReduce<InputTensor, OutputTensor> {
+    fn reduce(&self, input: &InputTensor) -> OutputTensor;
 }
 
-pub trait DimExpand<InputTensor, InputJacobian, OutputTensor, OutputJacobian> {
-    fn expand(&self, input: &InputTensor, j_input: &InputJacobian) -> (OutputTensor, OutputJacobian);
-    fn param_count(&self) -> usize;
-    fn update_params(&mut self, lr: f32, grad: &[f32]);
-    fn get_params(&self) -> Vec<f32>;
-    fn set_params(&mut self, values: &[f32]);
+/// Трейт для увеличения размерности (без якобианов, без параметров).
+pub trait DimExpand<InputTensor, OutputTensor> {
+    fn expand(&self, input: &InputTensor) -> OutputTensor;
 }
-
 
 
 

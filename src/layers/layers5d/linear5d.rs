@@ -1,52 +1,43 @@
-use crate::layers::Linear4D;
-use crate::layers::Layer4D;
 use crate::tensor::Tensor5D;
-use crate::jacobian::Jacobian5D;
 use crate::model_plan::param_store::ParamSlice;
-use crate::model_plan::blueprint::assert_power_of_two;
-use super::Layer5D;
+use super::{Layer5D, LayerContext5D};
+use crate::layers::layers4d::{Linear4D, Layer4D};
 
-pub struct Linear5D {
-    pub inner_4d: Linear4D,
-}
+pub struct Linear5D { inner: Linear4D }
 
 impl Linear5D {
-    pub fn new(in_features: usize, out_features: usize, slice: ParamSlice) -> Self {
-        assert_power_of_two(in_features);
-        assert_power_of_two(out_features);
-        let inner_4d = Linear4D::new(in_features, out_features, slice);
-        Self { inner_4d }
-    }
+    pub fn new(in_features: usize, out_features: usize) -> Self { Self { inner: Linear4D::new(in_features, out_features) } }
 }
 
 impl Layer5D for Linear5D {
-    fn forward_5d(
-        &self,
-        input: &Tensor5D,
-        j_input: &Jacobian5D,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Tensor5D, Jacobian5D) {
+    fn forward_into(&self, input: &Tensor5D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<Vec<Vec<f32>>>>>) -> LayerContext5D {
         let outer = input.outer;
-        let dim1 = input.dim1;
-        let depth = input.depth;
-        let rows = input.rows;
-        let total_params = j_input.num_params;
-        let out_features = self.inner_4d.inner_3d.inner_2d.output_dim;
-        let mut out_data = Vec::with_capacity(outer);
-        let mut j_out = Jacobian5D::new(outer, dim1, depth, rows, out_features, total_params);
-
+        let mut contexts = Vec::with_capacity(outer);
         for o in 0..outer {
             let slice_4d = input.slice_4d(o);
-            let j_slice_4d = j_input.slice_jacobian(o);
-            let (out_slice, j_out_slice) = self.inner_4d.forward_4d(&slice_4d, &j_slice_4d, params, slice);
-            out_data.push(out_slice.data);
-            j_out.set_slice_jacobian(o, &j_out_slice);
+            let ctx = self.inner.forward_into(&slice_4d, params, slice, &mut out_buf[o]);
+            contexts.push(ctx);
         }
-        (Tensor5D::new(out_data), j_out)
+        LayerContext5D::Linear5D { contexts }
     }
 
-    fn param_len(&self) -> usize { self.inner_4d.param_len() }
+    fn backward(&self, ctx: &LayerContext5D, delta: &Tensor5D, params: &[f32], slice: &ParamSlice) -> (Tensor5D, Vec<f32>) {
+        let contexts = match ctx { LayerContext5D::Linear5D { contexts } => contexts, _ => panic!() };
+        let outer = delta.outer;
+        let mut d_prev_data = Vec::with_capacity(outer);
+        let mut total_grad = vec![0.0; self.param_len()];
+        for o in 0..outer {
+            let delta_4d = crate::tensor::Tensor4D::new(delta.data[o].clone());
+            let (d_prev_4d, grads) = self.inner.backward(&contexts[o], &delta_4d, params, slice);
+            d_prev_data.push(d_prev_4d.data);
+            for (i, g) in grads.iter().enumerate() { total_grad[i] += g; }
+        }
+        (Tensor5D::new(d_prev_data), total_grad)
+    }
+
+    fn param_len(&self) -> usize { self.inner.param_len() }
+    fn in_features(&self) -> usize { self.inner.in_features() }
+    fn out_features(&self) -> usize { self.inner.out_features() }
 }
 
 

@@ -1,29 +1,47 @@
 use crate::tensor::Tensor1D;
-use crate::jacobian::Jacobian;
-use crate::model_plan::param_store::ParamSlice;
-use crate::neuron::types::softmax::Softmax;
+use crate::model_plan::param_store::{ParamSlice, ParamStore};
+use crate::neuron::Softmax;
 use crate::neuron::base::Neuron;
 use super::{Layer, LayerInfo};
 
-pub struct SoftmaxLayer;
+pub struct SoftmaxLayer {
+    neuron: Softmax,
+    last_output: Option<Tensor1D>,
+}
 
 impl SoftmaxLayer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self {
+            neuron: Softmax,
+            last_output: None,
+        }
+    }
 }
 
 impl Layer for SoftmaxLayer {
-    fn forward(
-        &self,
-        input: &Tensor1D,
-        j_input: &Jacobian,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) -> (Tensor1D, Jacobian) {
-        Softmax.forward(input, j_input)
+    fn forward_into(&mut self, input: &Tensor1D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<f32>) {
+        let out = self.neuron.forward(input);
+        self.last_output = Some(out.clone());
+        out_buf.copy_from_slice(&out.data);
     }
 
-    fn param_len(&self) -> usize { 0 }
+    fn backward(&mut self, delta: &Tensor1D, _params: &[f32], _slice: &ParamSlice) -> Tensor1D {
+        let sm = self.last_output.take().expect("Softmax backward without forward");
+        let n = sm.len();
+        let mut delta_prev = vec![0.0; n];
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                let kron = if i == j { 1.0 } else { 0.0 };
+                sum += delta.data[j] * sm.data[j] * (kron - sm.data[i]);
+            }
+            delta_prev[i] = sum;
+        }
+        Tensor1D::new(delta_prev)
+    }
 
+    fn apply_gradients(&mut self, _store: &mut ParamStore, _lr: f32, _slice: &ParamSlice) {}
+    fn param_len(&self) -> usize { 0 }
     fn layer_info(&self) -> LayerInfo {
         LayerInfo {
             layer_type: "Softmax".to_string(),
@@ -34,7 +52,6 @@ impl Layer for SoftmaxLayer {
         }
     }
 }
-
 
 
 

@@ -1,65 +1,48 @@
 use crate::tensor::Tensor2D;
-use crate::jacobian::Jacobian2D;
 use crate::model_plan::param_store::ParamSlice;
-use crate::model_plan::blueprint::assert_power_of_two;
-use super::Layer2D;
+use crate::neuron::Tanh;
+use crate::neuron::base::Neuron;
+use super::{Layer2D, LayerContext};
 
 pub struct Tanh2D {
-    size: usize,
+    neuron: Tanh,
+    pub size: usize,
 }
 
 impl Tanh2D {
     pub fn new(size: usize) -> Self {
-        assert_power_of_two(size);
-        Self { size }
+        Self { neuron: Tanh, size }
     }
 }
 
 impl Layer2D for Tanh2D {
-    fn forward_2d(
-        &self,
-        input: &Tensor2D,
-        j_input: &Jacobian2D,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) -> (Tensor2D, Jacobian2D) {
-        let rows = input.rows;
-        let cols = input.cols;
-        let params = j_input.num_params;
-        let mut out = vec![vec![0.0; cols]; rows];
-        let mut j_out = Jacobian2D::new(rows, cols, params);
-        for r in 0..rows {
-            for c in 0..cols {
-                let x = input.data[r][c];
-                let t = x.tanh();
-                out[r][c] = t;
-                let grad = 1.0 - t * t;
-                for p in 0..params {
-                    j_out.data[r][c][p] = j_input.data[r][c][p] * grad;
-                }
+    fn forward_into(&self, input: &Tensor2D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<Vec<f32>>) -> LayerContext {
+        let mut out = vec![vec![0.0; input.cols]; input.rows];
+        for r in 0..input.rows {
+            for c in 0..input.cols {
+                let val = self.neuron.apply(input.data[r][c]);
+                out[r][c] = val;
+                out_buf[r][c] = val;
             }
         }
-        (Tensor2D::new(out), j_out)
+        LayerContext::Tanh2D { output: Tensor2D::new(out) }
+    }
+
+    fn backward(&self, ctx: &LayerContext, delta: &Tensor2D, _params: &[f32], _slice: &ParamSlice) -> (Tensor2D, Vec<f32>) {
+        let output = match ctx { LayerContext::Tanh2D { output } => output, _ => panic!() };
+        let rows = output.rows;
+        let cols = output.cols;
+        let mut dprev = vec![vec![0.0; cols]; rows];
+        for r in 0..rows {
+            for c in 0..cols {
+                let t = output.data[r][c];
+                dprev[r][c] = delta.data[r][c] * (1.0 - t * t);
+            }
+        }
+        (Tensor2D::new(dprev), vec![])
     }
 
     fn param_len(&self) -> usize { 0 }
     fn in_features(&self) -> usize { self.size }
     fn out_features(&self) -> usize { self.size }
-
-    fn execute_range(
-        &self,
-        _input: &Tensor2D,
-        _j_input: &Jacobian2D,
-        _out: &mut [f32],
-        _j_out: &mut [f32],
-        _row_start: usize,
-        _row_end: usize,
-        _col_start: usize,
-        _col_end: usize,
-        _total_params: usize,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) {
-        unimplemented!()
-    }
 }

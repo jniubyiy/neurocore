@@ -1,3 +1,6 @@
+// ============================================================
+// Файл: src/layers/layers1d/builder1d.rs
+// ============================================================
 use super::Layer;
 use super::linear1d::LinearLayer;
 use super::relu1d::ReLULayer;
@@ -24,8 +27,8 @@ impl LinearLayerBuilder {
 }
 
 impl LayerBuilder for LinearLayerBuilder {
-    fn build(&self, slice: ParamSlice) -> Box<dyn Layer> {
-        Box::new(LinearLayer::new(self.in_features, self.out_features, slice))
+    fn build(&self, _slice: ParamSlice) -> Box<dyn Layer> {
+        Box::new(LinearLayer::new(self.in_features, self.out_features))
     }
     fn input_dim(&self) -> usize { self.in_features }
     fn output_dim(&self) -> usize { self.out_features }

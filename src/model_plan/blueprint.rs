@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use crate::model_plan::dim::Dim;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 
@@ -7,12 +6,22 @@ use crate::layers::{
     Layer as Layer1D,
 };
 use crate::layers::{
-    Linear2D, ReLU2D, Sigmoid2D, Softmax2D, Tanh2D, Memory2D,
+    Linear2D, ReLU2D, Sigmoid2D, Softmax2D, Tanh2D,
     Layer2D,
 };
+use crate::layers::{
+    Linear3D, ReLU3D, Sigmoid3D, Softmax3D, Tanh3D,
+    Layer3D,
+};
+use crate::layers::{
+    Linear4D, ReLU4D, Sigmoid4D, Softmax4D, Tanh4D,
+    Layer4D,
+};
+use crate::layers::{
+    Linear5D, ReLU5D, Sigmoid5D, Softmax5D, Tanh5D,
+    Layer5D,
+};
 
-/// Проверяет, является ли число степенью двойки (1,2,4,8,…).
-/// Если нет – паникует с понятным сообщением.
 pub fn assert_power_of_two(x: usize) {
     assert!(
         x > 0 && (x & (x - 1)) == 0,
@@ -78,41 +87,82 @@ impl LayerBlueprint {
         }
     }
 
-    pub fn build_layer_1d(&self, store: &mut ParamStore) -> (Arc<dyn Layer1D + Send + Sync>, ParamSlice) {
+    pub fn build_layer_1d(&self, store: &mut ParamStore) -> (Box<dyn Layer1D + Send + Sync>, ParamSlice) {
         match self.kind {
             LayerKind::Linear => {
                 let len = self.param_len();
                 let slice = store.allocate(len);
-                (Arc::new(LinearLayer::new(self.in_features, self.out_features, slice)), slice)
+                (Box::new(LinearLayer::new(self.in_features, self.out_features)), slice)
             }
-            LayerKind::ReLU => (Arc::new(ReLULayer::new()), ParamSlice::new(0, 0)),
-            LayerKind::Sigmoid => (Arc::new(SigmoidLayer::new()), ParamSlice::new(0, 0)),
-            LayerKind::Softmax => (Arc::new(SoftmaxLayer::new()), ParamSlice::new(0, 0)),
-            LayerKind::Tanh => (Arc::new(TanhLayer::new()), ParamSlice::new(0, 0)),
+            LayerKind::ReLU => (Box::new(ReLULayer::new()), ParamSlice::new(0, 0)),
+            LayerKind::Sigmoid => (Box::new(SigmoidLayer::new()), ParamSlice::new(0, 0)),
+            LayerKind::Softmax => (Box::new(SoftmaxLayer::new()), ParamSlice::new(0, 0)),
+            LayerKind::Tanh => (Box::new(TanhLayer::new()), ParamSlice::new(0, 0)),
             LayerKind::Memory => {
                 let len = self.param_len();
                 let slice = store.allocate(len);
-                (Arc::new(MemoryLayer::new(self.in_features, self.out_features, slice)), slice)
+                (Box::new(MemoryLayer::new(self.in_features, self.out_features)), slice)
             }
         }
     }
 
-    pub fn build_layer_2d(&self, store: &mut ParamStore) -> (Arc<dyn Layer2D + Send + Sync>, ParamSlice) {
+    pub fn build_layer_2d(&self, store: &mut ParamStore) -> (Box<dyn Layer2D + Send + Sync>, ParamSlice) {
         match self.kind {
             LayerKind::Linear => {
                 let len = self.param_len();
                 let slice = store.allocate(len);
-                (Arc::new(Linear2D::new(self.in_features, self.out_features, slice)), slice)
+                (Box::new(Linear2D::new(self.in_features, self.out_features)), slice)
             }
-            LayerKind::ReLU => (Arc::new(ReLU2D::new(self.in_features)), ParamSlice::new(0, 0)),
-            LayerKind::Sigmoid => (Arc::new(Sigmoid2D::new(self.in_features)), ParamSlice::new(0, 0)),
-            LayerKind::Softmax => (Arc::new(Softmax2D::new(self.in_features)), ParamSlice::new(0, 0)),
-            LayerKind::Tanh => (Arc::new(Tanh2D::new(self.in_features)), ParamSlice::new(0, 0)),
-            LayerKind::Memory => {
+            LayerKind::ReLU => (Box::new(ReLU2D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Sigmoid => (Box::new(Sigmoid2D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Softmax => (Box::new(Softmax2D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Tanh => (Box::new(Tanh2D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Memory => panic!("Memory2D временно отключён"),
+        }
+    }
+
+    pub fn build_layer_3d(&self, store: &mut ParamStore) -> (Box<dyn Layer3D + Send + Sync>, ParamSlice) {
+        match self.kind {
+            LayerKind::Linear => {
                 let len = self.param_len();
                 let slice = store.allocate(len);
-                (Arc::new(Memory2D::new(self.in_features, self.out_features, slice)), slice)
+                (Box::new(Linear3D::new(self.in_features, self.out_features)), slice)
             }
+            LayerKind::ReLU => (Box::new(ReLU3D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Sigmoid => (Box::new(Sigmoid3D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Softmax => (Box::new(Softmax3D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Tanh => (Box::new(Tanh3D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Memory => panic!("Memory3D временно отключён"),
+        }
+    }
+
+    pub fn build_layer_4d(&self, store: &mut ParamStore) -> (Box<dyn Layer4D + Send + Sync>, ParamSlice) {
+        match self.kind {
+            LayerKind::Linear => {
+                let len = self.param_len();
+                let slice = store.allocate(len);
+                (Box::new(Linear4D::new(self.in_features, self.out_features)), slice)
+            }
+            LayerKind::ReLU => (Box::new(ReLU4D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Sigmoid => (Box::new(Sigmoid4D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Softmax => (Box::new(Softmax4D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Tanh => (Box::new(Tanh4D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Memory => panic!("Memory4D временно отключён"),
+        }
+    }
+
+    pub fn build_layer_5d(&self, store: &mut ParamStore) -> (Box<dyn Layer5D + Send + Sync>, ParamSlice) {
+        match self.kind {
+            LayerKind::Linear => {
+                let len = self.param_len();
+                let slice = store.allocate(len);
+                (Box::new(Linear5D::new(self.in_features, self.out_features)), slice)
+            }
+            LayerKind::ReLU => (Box::new(ReLU5D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Sigmoid => (Box::new(Sigmoid5D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Softmax => (Box::new(Softmax5D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Tanh => (Box::new(Tanh5D::new(self.in_features)), ParamSlice::new(0, 0)),
+            LayerKind::Memory => panic!("Memory5D временно отключён"),
         }
     }
 }

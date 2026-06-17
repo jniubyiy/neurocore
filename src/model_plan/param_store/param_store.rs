@@ -1,3 +1,7 @@
+// ============================================================
+// Файл: src/model_plan/param_store/param_store.rs
+// ============================================================
+
 /// Дескриптор непрерывного участка в общем массиве параметров.
 #[derive(Debug, Clone, Copy)]
 pub struct ParamSlice {
@@ -68,5 +72,10 @@ impl ParamStore {
     pub fn set_slice(&mut self, slice: ParamSlice, values: &[f32]) {
         assert_eq!(values.len(), slice.len);
         self.data[slice.start..slice.start + slice.len].copy_from_slice(values);
+    }
+
+    /// Добавить delta к параметру с индексом `index`. (новый метод)
+    pub fn add_to_param(&mut self, index: usize, delta: f32) {
+        self.data[index] += delta;
     }
 }

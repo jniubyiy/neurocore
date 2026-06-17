@@ -1,29 +1,42 @@
 use crate::tensor::Tensor1D;
-use crate::jacobian::Jacobian;
-use crate::model_plan::param_store::ParamSlice;
-use crate::neuron::types::tanh::Tanh;
+use crate::model_plan::param_store::{ParamSlice, ParamStore};
+use crate::neuron::Tanh;
 use crate::neuron::base::Neuron;
 use super::{Layer, LayerInfo};
 
-pub struct TanhLayer;
+pub struct TanhLayer {
+    neuron: Tanh,
+    last_output: Option<Tensor1D>,
+}
 
 impl TanhLayer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self {
+            neuron: Tanh,
+            last_output: None,
+        }
+    }
 }
 
 impl Layer for TanhLayer {
-    fn forward(
-        &self,
-        input: &Tensor1D,
-        j_input: &Jacobian,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) -> (Tensor1D, Jacobian) {
-        Tanh.forward(input, j_input)
+    fn forward_into(&mut self, input: &Tensor1D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<f32>) {
+        let out: Vec<f32> = input.data.iter().map(|&x| self.neuron.apply(x)).collect();
+        self.last_output = Some(Tensor1D::new(out.clone()));
+        out_buf.copy_from_slice(&out);
     }
 
-    fn param_len(&self) -> usize { 0 }
+    fn backward(&mut self, delta: &Tensor1D, _params: &[f32], _slice: &ParamSlice) -> Tensor1D {
+        let out = self.last_output.take().expect("Tanh backward without forward");
+        let mut delta_prev = vec![0.0; out.len()];
+        for i in 0..out.len() {
+            let t = out.data[i];
+            delta_prev[i] = delta.data[i] * (1.0 - t * t);
+        }
+        Tensor1D::new(delta_prev)
+    }
 
+    fn apply_gradients(&mut self, _store: &mut ParamStore, _lr: f32, _slice: &ParamSlice) {}
+    fn param_len(&self) -> usize { 0 }
     fn layer_info(&self) -> LayerInfo {
         LayerInfo {
             layer_type: "Tanh".to_string(),

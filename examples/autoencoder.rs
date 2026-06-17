@@ -1,9 +1,11 @@
 use neurocore::model_plan::{Plan, LayerBlueprint, Dim};
-use neurocore::tensor::Tensor1D;
-use neurocore::jacobian::Jacobian;
-use neurocore::loss_plan::{LossBlueprint, LossPlan};
+use neurocore::dispatchers::single::SingleModel1D;
+use neurocore::dispatchers::auto::AutoModel1D;
+use neurocore::dispatchers::trained::TrainedModel1D;
 use neurocore::dispatchers::single::loss::dim1d::SingleLoss1D;
 use neurocore::dispatchers::common::model_trait::{Model1D, LossDispatch};
+use neurocore::loss_plan::{LossBlueprint, LossPlan};
+use neurocore::tensor::Tensor1D;
 
 fn main() {
     let plan = Plan::new(vec![
@@ -12,29 +14,58 @@ fn main() {
         LayerBlueprint::linear(Dim::Dim1, 2, 4),
     ]).expect("Ошибка архитектуры");
 
-    let mut built = plan.build_1d();
-    let total_params = built.store.len();
-    for i in 0..total_params {
-        built.store.set_param(i, 0.3);
-    }
-
-    let mut model = built.into_single_model();
-
-    let x = Tensor1D::new(vec![1.0, 2.0, 3.0, 4.0]);
-    let j0 = Jacobian::new(4, total_params);
-
     let loss_plan = LossPlan::new(LossBlueprint::mse()).unwrap();
     let built_loss = loss_plan.build(4, 4).unwrap();
     let loss_dispatch = SingleLoss1D::new();
+    let x = Tensor1D::new(vec![1.0, 2.0, 3.0, 4.0]);
+    let target = x.clone();
     let lr = 0.1;
 
+    // --- SingleModel1D ---
+    println!("=== SingleModel1D ===");
+    let mut built = plan.build_1d();
+    let total = built.store.len();
+    for i in 0..total { built.store.set_param(i, 0.3); }
+    let mut model = built.into_single_model();
+
     for e in 0..500 {
-        let (pred, j_pred) = model.forward(&x, &j0);
-        let (loss, grad) = loss_dispatch.compute_loss(&pred, &x, &j_pred, &built_loss);
-        model.update_params(lr, &grad);
-        if e % 100 == 0 { println!("Epoch {}: loss={:.6}", e, loss); }
+        let pred = model.forward(&x);
+        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
+        model.backward(&delta);
+        model.update_params(lr);
+        if e % 100 == 0 { println!("  Epoch {}: loss={:.6}", e, loss); }
     }
-    println!("Done");
+    println!("  Done.");
+
+    // --- AutoModel1D ---
+    println!("\n=== AutoModel1D (потоков: 1) ===");
+    let mut built2 = plan.build_1d();
+    for i in 0..total { built2.store.set_param(i, 0.3); }
+    let mut model2 = built2.into_auto_model(1);
+
+    for e in 0..500 {
+        let pred = model2.forward(&x);
+        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
+        model2.backward(&delta);
+        model2.update_params(lr);
+        if e % 100 == 0 { println!("  Epoch {}: loss={:.6}", e, loss); }
+    }
+    println!("  Done.");
+
+    // --- TrainedModel1D ---
+    println!("\n=== TrainedModel1D (потоков: 1) ===");
+    let mut built3 = plan.build_1d();
+    for i in 0..total { built3.store.set_param(i, 0.3); }
+    let mut model3 = built3.into_trained_model(1);
+
+    for e in 0..500 {
+        let pred = model3.forward(&x);
+        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
+        model3.backward(&delta);
+        model3.update_params(lr);
+        if e % 100 == 0 { println!("  Epoch {}: loss={:.6}", e, loss); }
+    }
+    println!("  Done.");
 }
 
 

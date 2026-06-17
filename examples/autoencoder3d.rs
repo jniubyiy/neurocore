@@ -1,51 +1,71 @@
-use neurocore::tensor::Tensor3D;
-use neurocore::jacobian::Jacobian3D;
-use neurocore::layers::{Layer3D, Linear3D, Sigmoid3D};
-use neurocore::loss_plan::{LossBlueprint, LossPlan};
+use neurocore::model_plan::{Plan, LayerBlueprint, Dim};
+use neurocore::dispatchers::single::SingleModel3D;
+use neurocore::dispatchers::auto::AutoModel3D;
+use neurocore::dispatchers::trained::TrainedModel3D;
 use neurocore::dispatchers::single::loss::dim3d::SingleLoss3D;
-use neurocore::dispatchers::common::model_trait::{Model3D, LossDispatch};
-use neurocore::model_plan::param_store::{ParamStore, ParamSlice};
+use neurocore::dispatchers::common::model_trait::{Model3D, LossDispatch3D};
+use neurocore::loss_plan::{LossBlueprint, LossPlan};
+use neurocore::tensor::Tensor3D;
 
 fn main() {
-    let in_features = 4; let hidden = 2; let out_features = 4;
-    let p_enc = in_features * hidden + hidden;       // 10
-    let p_dec = hidden * out_features + out_features; // 12
-
-    let mut store = ParamStore::new();
-    let enc_slice = store.allocate_with(&vec![0.3; p_enc]);
-    let dec_slice = store.allocate_with(&vec![0.3; p_dec]);
-
-    let encoder = Linear3D::new(in_features, hidden, enc_slice);
-    let sigmoid = Sigmoid3D::new();
-    let decoder = Linear3D::new(hidden, out_features, dec_slice);
-
-    let input = Tensor3D::new(vec![
-        vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]],
-    ]);
-    let target = input.clone();
-    let total_params = store.len();
-    let j0 = Jacobian3D::new(input.depth, input.rows, in_features, total_params);
+    let plan = Plan::new(vec![
+        LayerBlueprint::linear(Dim::Dim3, 4, 2),
+        LayerBlueprint::sigmoid(Dim::Dim3, 2),
+        LayerBlueprint::linear(Dim::Dim3, 2, 4),
+    ]).expect("Ошибка архитектуры");
 
     let loss_plan = LossPlan::new(LossBlueprint::mse()).unwrap();
-    let built_loss = loss_plan.build(out_features, out_features).unwrap();
+    let built_loss = loss_plan.build_3d(4, 4).unwrap();
     let loss_dispatch = SingleLoss3D::new();
+    let input = Tensor3D::new(vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]);
+    let target = input.clone();
     let lr = 0.1;
 
-    let layers: Vec<std::sync::Arc<dyn Layer3D + Send + Sync>> = vec![
-        std::sync::Arc::new(encoder),
-        std::sync::Arc::new(sigmoid),
-        std::sync::Arc::new(decoder),
-    ];
-    let slices = vec![enc_slice, ParamSlice::new(0, 0), dec_slice];
-    let mut model = neurocore::dispatchers::auto::AutoModel3D::new(layers, slices, store, 1);
+    // --- SingleModel3D ---
+    println!("=== SingleModel3D ===");
+    let mut built = plan.build_3d();
+    let total = built.store.len();
+    for i in 0..total { built.store.set_param(i, 0.3); }
+    let mut model = built.into_single_model();
 
-    for epoch in 0..500 {
-        let (dec_out, j_dec) = model.forward(&input, &j0);
-        let (loss, grad) = loss_dispatch.compute_loss(&dec_out, &target, &j_dec, &built_loss);
-        model.update_params(lr, &grad);
-        if epoch % 100 == 0 { println!("Epoch {}: loss={:.6}", epoch, loss); }
+    for e in 0..500 {
+        let (pred, contexts) = model.forward(&input);
+        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
+        let (_, all_grads) = model.backward(&contexts, &delta);
+        model.update_params(lr, &all_grads);
+        if e % 100 == 0 { println!("  Epoch {}: loss={:.6}", e, loss); }
     }
-    println!("\nОбучение завершено.");
+    println!("  Done.");
+
+    // --- AutoModel3D (4 потока) ---
+    println!("\n=== AutoModel3D (4 потока) ===");
+    let mut built2 = plan.build_3d();
+    for i in 0..total { built2.store.set_param(i, 0.3); }
+    let mut model2 = built2.into_auto_model(4);
+
+    for e in 0..500 {
+        let (pred, contexts) = model2.forward(&input);
+        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
+        let (_, all_grads) = model2.backward(&contexts, &delta);
+        model2.update_params(lr, &all_grads);
+        if e % 100 == 0 { println!("  Epoch {}: loss={:.6}", e, loss); }
+    }
+    println!("  Done.");
+
+    // --- TrainedModel3D (4 потока) ---
+    println!("\n=== TrainedModel3D (4 потока) ===");
+    let mut built3 = plan.build_3d();
+    for i in 0..total { built3.store.set_param(i, 0.3); }
+    let mut model3 = built3.into_trained_model(4);
+
+    for e in 0..500 {
+        let (pred, contexts) = model3.forward(&input);
+        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
+        let (_, all_grads) = model3.backward(&contexts, &delta);
+        model3.update_params(lr, &all_grads);
+        if e % 100 == 0 { println!("  Epoch {}: loss={:.6}", e, loss); }
+    }
+    println!("  Done.");
 }
 
 

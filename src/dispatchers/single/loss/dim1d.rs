@@ -1,4 +1,4 @@
-use crate::loss::ops::{LossInput, LossJacobian};
+use crate::tensor::Tensor1D;
 use crate::loss_plan::BuiltLoss;
 use crate::dispatchers::common::model_trait::LossDispatch;
 
@@ -11,12 +11,11 @@ impl SingleLoss1D {
 impl LossDispatch for SingleLoss1D {
     fn compute_loss(
         &self,
-        pred: &dyn LossInput,
-        target: &dyn LossInput,
-        j_pred: &dyn LossJacobian,
+        pred: &Tensor1D,
+        target: &Tensor1D,
         built_loss: &BuiltLoss,
-    ) -> (f32, Vec<f32>) {
-        (built_loss.forward)(pred, target, j_pred)
+    ) -> (f32, Tensor1D) {
+        (built_loss.forward)(pred, target)
     }
 
     fn num_workers(&self) -> usize { 1 }

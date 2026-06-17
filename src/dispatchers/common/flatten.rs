@@ -1,4 +1,6 @@
-﻿use crate::tensor::Tensor2D;
+﻿// Временно отключаем, т.к. Jacobian2D недоступен
+/*
+use crate::tensor::Tensor2D;
 use crate::jacobian::Jacobian2D;
 
 pub fn flatten_tensor(t: &Tensor2D) -> Vec<f32> {
@@ -35,3 +37,4 @@ pub fn unflatten_jacobian(flat: &[f32], rows: usize, out_features: usize, num_pa
     }
     j
 }
+*/

@@ -1,6 +1,3 @@
-// ============================================================
-// Файл: src/dispatchers/auto/model/dim3d.rs (обновлён для forward_into)
-// ============================================================
 use crate::layers::{Layer3D, LayerContext3D};
 use crate::tensor::Tensor3D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};

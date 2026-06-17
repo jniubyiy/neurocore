@@ -2,27 +2,25 @@ use crate::tensor::Tensor1D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::neuron::Softmax;
 use crate::neuron::base::Neuron;
+use crate::linalg;
+use crate::linalg::faer_to_tensor1d;
 use super::{Layer, LayerInfo};
 
 pub struct SoftmaxLayer {
-    neuron: Softmax,
     last_output: Option<Tensor1D>,
 }
 
 impl SoftmaxLayer {
-    pub fn new() -> Self {
-        Self {
-            neuron: Softmax,
-            last_output: None,
-        }
-    }
+    pub fn new() -> Self { Self { last_output: None } }
 }
 
 impl Layer for SoftmaxLayer {
     fn forward_into(&mut self, input: &Tensor1D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<f32>) {
-        let out = self.neuron.forward(input);
-        self.last_output = Some(out.clone());
-        out_buf.copy_from_slice(&out.data);
+        let m = linalg::tensor1d_to_faer(input);
+        let out = Softmax.forward_mat(&m);
+        let t = faer_to_tensor1d(&out);
+        self.last_output = Some(t.clone());
+        out_buf.copy_from_slice(&t.data);
     }
 
     fn backward(&mut self, delta: &Tensor1D, _params: &[f32], _slice: &ParamSlice) -> Tensor1D {

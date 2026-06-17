@@ -1,38 +1,32 @@
-use crate::tensor::{Tensor3D, Tensor1D};
+use crate::tensor::Tensor3D;
 use crate::model_plan::param_store::ParamSlice;
 use crate::neuron::Softmax;
 use crate::neuron::base::Neuron;
+use crate::linalg;
 use super::{Layer3D, LayerContext3D};
 
 pub struct Softmax3D {
-    neuron: Softmax,
     inner_size: usize,
 }
 
 impl Softmax3D {
-    pub fn new(size: usize) -> Self {
-        Self { neuron: Softmax, inner_size: size }
-    }
+    pub fn new(size: usize) -> Self { Self { inner_size: size } }
 }
 
 impl Layer3D for Softmax3D {
-    fn forward_into(&self, input: &Tensor3D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<f32>>>) -> LayerContext3D {
-        let mut output = vec![vec![vec![0.0; input.cols]; input.rows]; input.depth];
-        for d in 0..input.depth {
-            for r in 0..input.rows {
-                let row_in = Tensor1D::new(input.data[d][r].clone());
-                let row_out = self.neuron.forward(&row_in);
-                for c in 0..input.cols {
-                    let val = row_out.data[c];
-                    out_buf[d][r][c] = val;
-                    output[d][r][c] = val;
-                }
-            }
-        }
-        LayerContext3D::Softmax3D { output: Tensor3D::new(output) }
+    fn forward_into(&self, input: &Tensor3D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<f32>>>) -> LayerContext3D {
+        // Softmax должен применяться к каждой строке отдельно.
+        // Но в 3D тензоре «строкой» считается последняя размерность (cols).
+        // Мы уже преобразовали тензор в матрицу (total_rows × cols), и Softmax.forward_mat
+        // применяет softmax к каждой строке этой матрицы. Это как раз то, что нужно.
+        let mat = linalg::tensor3d_to_faer(input);
+        let out = Softmax.forward_mat(&mat);
+        let t = linalg::faer_to_tensor3d(&out, input.depth, input.rows, input.cols);
+        *out_buf = t.data.clone();
+        LayerContext3D::Softmax3D { output: t }
     }
 
-    fn backward(&self, ctx: &LayerContext3D, delta: &Tensor3D, params: &[f32], slice: &ParamSlice) -> (Tensor3D, Vec<f32>) {
+    fn backward(&self, ctx: &LayerContext3D, delta: &Tensor3D, _params: &[f32], _slice: &ParamSlice) -> (Tensor3D, Vec<f32>) {
         let sm = match ctx { LayerContext3D::Softmax3D { output } => output, _ => panic!() };
         let depth = sm.depth;
         let rows = sm.rows;

@@ -1,6 +1,3 @@
-// ============================================================
-// Файл: src/dispatchers/trained/model/dim2d.rs (обновлён для forward_into)
-// ============================================================
 use crate::layers::{Layer2D, LayerContext};
 use crate::tensor::Tensor2D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};

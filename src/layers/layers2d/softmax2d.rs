@@ -2,31 +2,24 @@ use crate::tensor::Tensor2D;
 use crate::model_plan::param_store::ParamSlice;
 use crate::neuron::Softmax;
 use crate::neuron::base::Neuron;
+use crate::linalg;
 use super::{Layer2D, LayerContext};
 
 pub struct Softmax2D {
-    neuron: Softmax,
     pub size: usize,
 }
 
 impl Softmax2D {
-    pub fn new(size: usize) -> Self {
-        Self { neuron: Softmax, size }
-    }
+    pub fn new(size: usize) -> Self { Self { size } }
 }
 
 impl Layer2D for Softmax2D {
     fn forward_into(&self, input: &Tensor2D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<Vec<f32>>) -> LayerContext {
-        let mut out = vec![vec![0.0; input.cols]; input.rows];
-        for r in 0..input.rows {
-            let row_tensor = crate::tensor::Tensor1D::new(input.data[r].clone());
-            let soft = self.neuron.forward(&row_tensor);
-            for c in 0..input.cols {
-                out[r][c] = soft.data[c];
-                out_buf[r][c] = soft.data[c];
-            }
-        }
-        LayerContext::Softmax2D { output: Tensor2D::new(out) }
+        let mat = linalg::tensor2d_to_faer(input);
+        let out = Softmax.forward_mat(&mat);
+        let out_t = linalg::faer_to_tensor2d(&out);
+        *out_buf = out_t.data.clone();
+        LayerContext::Softmax2D { output: out_t }
     }
 
     fn backward(&self, ctx: &LayerContext, delta: &Tensor2D, _params: &[f32], _slice: &ParamSlice) -> (Tensor2D, Vec<f32>) {

@@ -2,26 +2,23 @@ use crate::tensor::Tensor2D;
 use crate::model_plan::param_store::ParamSlice;
 use crate::neuron::ReLU;
 use crate::neuron::base::Neuron;
+use crate::linalg;
 use super::{Layer2D, LayerContext};
 
 pub struct ReLU2D {
-    neuron: ReLU,
     pub size: usize,
 }
 
 impl ReLU2D {
-    pub fn new(size: usize) -> Self {
-        Self { neuron: ReLU, size }
-    }
+    pub fn new(size: usize) -> Self { Self { size } }
 }
 
 impl Layer2D for ReLU2D {
     fn forward_into(&self, input: &Tensor2D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<Vec<f32>>) -> LayerContext {
-        for r in 0..input.rows {
-            for c in 0..input.cols {
-                out_buf[r][c] = self.neuron.apply(input.data[r][c]);
-            }
-        }
+        let mat = linalg::tensor2d_to_faer(input);
+        let out = ReLU.forward_mat(&mat);
+        let out_t = linalg::faer_to_tensor2d(&out);
+        *out_buf = out_t.data;
         LayerContext::ReLU2D { input: input.clone() }
     }
 

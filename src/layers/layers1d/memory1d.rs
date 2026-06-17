@@ -2,6 +2,7 @@ use crate::tensor::Tensor1D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::neuron::Memory as MemoryNeuron;
 use crate::neuron::base::Neuron;
+use crate::linalg;
 use super::{Layer, LayerInfo};
 
 pub struct MemoryLayer {
@@ -33,6 +34,8 @@ impl Layer for MemoryLayer {
         assert_eq!(out_buf.len(), self.output_dim);
         self.last_input = Some(input.clone());
 
+        let input_mat = linalg::tensor1d_to_faer(input);
+
         for out_i in 0..self.output_dim {
             let offset = slice.start + out_i * (2 * self.input_dim + 1);
             let m0 = params[offset .. offset + self.input_dim].to_vec();
@@ -40,8 +43,8 @@ impl Layer for MemoryLayer {
             let t_val = params[offset + 2 * self.input_dim];
 
             let neuron = MemoryNeuron::new(m0, m1, t_val);
-            let result = neuron.forward(input);
-            out_buf[out_i] = result.data[0];
+            let result_mat = neuron.forward_mat(&input_mat);
+            out_buf[out_i] = result_mat[(0, 0)];
         }
     }
 
@@ -80,21 +83,21 @@ impl Layer for MemoryLayer {
             let dy_dot0 = soft0 + dot0 * ds0_dot0 + dot1 * ds1_dot0;
             let dy_dot1 = soft1 + dot0 * ds0_dot1 + dot1 * ds1_dot1;
 
-            let d = delta.data[out_i];
+            let delta_val = delta.data[out_i];
 
             for i in 0..self.input_dim {
-                self.grad_m0[out_i * self.input_dim + i] += d * (dy_dot0 * input.data[i]);
-                self.grad_m1[out_i * self.input_dim + i] += d * (dy_dot1 * input.data[i]);
+                self.grad_m0[out_i * self.input_dim + i] += delta_val * (dy_dot0 * input.data[i]);
+                self.grad_m1[out_i * self.input_dim + i] += delta_val * (dy_dot1 * input.data[i]);
             }
 
             let avg_dot = soft0 * dot0 + soft1 * dot1;
             let ds0_dt = soft0 * (dot0 - avg_dot) / (t_val * t_val);
             let ds1_dt = soft1 * (dot1 - avg_dot) / (t_val * t_val);
             let dy_dt = dot0 * ds0_dt + dot1 * ds1_dt;
-            self.grad_t[out_i] += d * dy_dt;
+            self.grad_t[out_i] += delta_val * dy_dt;
 
             for i in 0..self.input_dim {
-                delta_prev[i] += d * (dy_dot0 * m0[i] + dy_dot1 * m1[i]);
+                delta_prev[i] += delta_val * (dy_dot0 * m0[i] + dy_dot1 * m1[i]);
             }
         }
 

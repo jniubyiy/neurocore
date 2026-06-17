@@ -1,5 +1,9 @@
 use crate::tensor::Tensor1D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
+use crate::neuron::ReLU;
+use crate::neuron::base::Neuron;
+use crate::linalg;
+use crate::linalg::faer_to_tensor1d;
 use super::{Layer, LayerInfo};
 
 pub struct ReLULayer {
@@ -13,9 +17,9 @@ impl ReLULayer {
 impl Layer for ReLULayer {
     fn forward_into(&mut self, input: &Tensor1D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<f32>) {
         self.last_input = Some(input.clone());
-        for (i, &x) in input.data.iter().enumerate() {
-            out_buf[i] = if x > 0.0 { x } else { 0.0 };
-        }
+        let m = linalg::tensor1d_to_faer(input);
+        let out = ReLU.forward_mat(&m);
+        out_buf.copy_from_slice(&faer_to_tensor1d(&out).data);
     }
 
     fn backward(&mut self, delta: &Tensor1D, _params: &[f32], _slice: &ParamSlice) -> Tensor1D {

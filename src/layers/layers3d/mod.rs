@@ -34,7 +34,7 @@ impl LayerContext3D {
     pub fn depth(&self) -> usize {
         match self {
             LayerContext3D::Linear3D { contexts } => contexts.len(),
-            _ => 0, // для активационных/Memory глубина не хранится списком контекстов
+            _ => 0,
         }
     }
 

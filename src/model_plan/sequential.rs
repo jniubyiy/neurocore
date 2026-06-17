@@ -1,6 +1,6 @@
 use crate::tensor::Tensor1D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
-use super::{Layer, LayerInfo};
+use crate::layers::{Layer, LayerInfo};
 
 pub struct Sequential {
     layers: Vec<Box<dyn Layer>>,
@@ -62,7 +62,3 @@ impl Layer for Sequential {
         }
     }
 }
-
-
-
-

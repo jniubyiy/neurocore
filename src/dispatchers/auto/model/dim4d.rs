@@ -1,6 +1,3 @@
-// ============================================================
-// Файл: src/dispatchers/auto/model/dim4d.rs (обновлён для forward_into)
-// ============================================================
 use crate::layers::{Layer4D, LayerContext4D};
 use crate::tensor::Tensor4D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};

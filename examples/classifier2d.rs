@@ -1,11 +1,9 @@
 use neurocore::model_plan::{Plan, LayerBlueprint, Dim};
-use neurocore::dispatchers::single::SingleModel2D;
-use neurocore::dispatchers::auto::AutoModel2D;
-use neurocore::dispatchers::trained::TrainedModel2D;
 use neurocore::dispatchers::single::loss::dim2d::SingleLoss2D;
 use neurocore::dispatchers::common::model_trait::{Model2D, LossDispatch2D};
 use neurocore::loss_plan::{LossBlueprint, LossPlan};
 use neurocore::tensor::Tensor2D;
+use std::time::Instant;
 
 fn main() {
     let plan = Plan::new(vec![
@@ -22,14 +20,24 @@ fn main() {
     let y2 = Tensor2D::new(vec![vec![1.0]]);
     let lr = 0.5;
 
+    let built_tmp = plan.build_2d();
+    let param_mem = built_tmp.store.len() * std::mem::size_of::<f32>();
+    let buffer_mem = (2 + 2) * std::mem::size_of::<f32>();
+    let total_mem = param_mem + buffer_mem;
+    println!("Estimated peak memory: {} bytes ({:.2} KB)", total_mem, total_mem as f64 / 1024.0);
+
+    let epochs = 200;
+    let mut loss_start = 0.0_f32;
+
     // --- SingleModel2D ---
-    println!("=== SingleModel2D ===");
+    println!("\n=== SingleModel2D ===");
     let mut built = plan.build_2d();
     let total = built.store.len();
     for i in 0..total { built.store.set_param(i, 0.2); }
     let mut model = built.into_single_model();
 
-    for e in 0..200 {
+    let start = Instant::now();
+    for e in 0..epochs {
         for (x, y) in [(&x1, &y1), (&x2, &y2)] {
             let (pred, contexts) = model.forward(x);
             let (_, delta) = loss_dispatch.compute_loss(&pred, y, &built_loss);
@@ -37,12 +45,21 @@ fn main() {
             model.update_params(lr, &all_grads);
         }
         if e % 50 == 0 {
-            let (pred, contexts) = model.forward(&x1);
+            let (pred, _) = model.forward(&x1);
             let (loss, _) = loss_dispatch.compute_loss(&pred, &y1, &built_loss);
+            if e == 0 { loss_start = loss; }
             println!("  Epoch {}: loss={:.6}", e, loss);
         }
     }
-    println!("  Done.");
+    let duration = start.elapsed();
+    let (pred, _) = model.forward(&x1);
+    let (final_loss, _) = loss_dispatch.compute_loss(&pred, &y1, &built_loss);
+    println!("  Done. Time: {:?}", duration);
+    println!("  Final loss: {:.6}", final_loss);
+    if final_loss > 0.0 && loss_start > 0.0 {
+        let rate = (loss_start / final_loss).ln() / epochs as f32;
+        println!("  Convergence rate (avg log improvement per epoch): {:.6}", rate);
+    }
 
     // --- AutoModel2D (4 потока) ---
     println!("\n=== AutoModel2D (4 потока) ===");
@@ -50,7 +67,8 @@ fn main() {
     for i in 0..total { built2.store.set_param(i, 0.2); }
     let mut model2 = built2.into_auto_model(4);
 
-    for e in 0..200 {
+    let start = Instant::now();
+    for e in 0..epochs {
         for (x, y) in [(&x1, &y1), (&x2, &y2)] {
             let (pred, contexts) = model2.forward(x);
             let (_, delta) = loss_dispatch.compute_loss(&pred, y, &built_loss);
@@ -58,12 +76,21 @@ fn main() {
             model2.update_params(lr, &all_grads);
         }
         if e % 50 == 0 {
-            let (pred, contexts) = model2.forward(&x1);
+            let (pred, _) = model2.forward(&x1);
             let (loss, _) = loss_dispatch.compute_loss(&pred, &y1, &built_loss);
+            if e == 0 { loss_start = loss; }
             println!("  Epoch {}: loss={:.6}", e, loss);
         }
     }
-    println!("  Done.");
+    let duration = start.elapsed();
+    let (pred, _) = model2.forward(&x1);
+    let (final_loss, _) = loss_dispatch.compute_loss(&pred, &y1, &built_loss);
+    println!("  Done. Time: {:?}", duration);
+    println!("  Final loss: {:.6}", final_loss);
+    if final_loss > 0.0 && loss_start > 0.0 {
+        let rate = (loss_start / final_loss).ln() / epochs as f32;
+        println!("  Convergence rate (avg log improvement per epoch): {:.6}", rate);
+    }
 
     // --- TrainedModel2D (4 потока) ---
     println!("\n=== TrainedModel2D (4 потока) ===");
@@ -71,7 +98,8 @@ fn main() {
     for i in 0..total { built3.store.set_param(i, 0.2); }
     let mut model3 = built3.into_trained_model(4);
 
-    for e in 0..200 {
+    let start = Instant::now();
+    for e in 0..epochs {
         for (x, y) in [(&x1, &y1), (&x2, &y2)] {
             let (pred, contexts) = model3.forward(x);
             let (_, delta) = loss_dispatch.compute_loss(&pred, y, &built_loss);
@@ -79,12 +107,21 @@ fn main() {
             model3.update_params(lr, &all_grads);
         }
         if e % 50 == 0 {
-            let (pred, contexts) = model3.forward(&x1);
+            let (pred, _) = model3.forward(&x1);
             let (loss, _) = loss_dispatch.compute_loss(&pred, &y1, &built_loss);
+            if e == 0 { loss_start = loss; }
             println!("  Epoch {}: loss={:.6}", e, loss);
         }
     }
-    println!("  Done.");
+    let duration = start.elapsed();
+    let (pred, _) = model3.forward(&x1);
+    let (final_loss, _) = loss_dispatch.compute_loss(&pred, &y1, &built_loss);
+    println!("  Done. Time: {:?}", duration);
+    println!("  Final loss: {:.6}", final_loss);
+    if final_loss > 0.0 && loss_start > 0.0 {
+        let rate = (loss_start / final_loss).ln() / epochs as f32;
+        println!("  Convergence rate (avg log improvement per epoch): {:.6}", rate);
+    }
 }
 
 

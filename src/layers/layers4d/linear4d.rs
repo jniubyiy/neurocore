@@ -6,7 +6,9 @@ use crate::layers::layers3d::{Linear3D, Layer3D};
 pub struct Linear4D { inner: Linear3D }
 
 impl Linear4D {
-    pub fn new(in_features: usize, out_features: usize) -> Self { Self { inner: Linear3D::new(in_features, out_features) } }
+    pub fn new(in_features: usize, out_features: usize) -> Self {
+        Self { inner: Linear3D::new(in_features, out_features) }
+    }
 }
 
 impl Layer4D for Linear4D {

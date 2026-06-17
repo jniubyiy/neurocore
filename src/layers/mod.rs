@@ -12,15 +12,12 @@ pub mod layers_special;
 pub use layers1d::{
     Layer, LayerInfo,
     LinearLayer, ReLULayer, SigmoidLayer, SoftmaxLayer, TanhLayer, MemoryLayer,
-    Sequential,
-    LayerBuilder, LinearLayerBuilder, ReLULayerBuilder, SigmoidLayerBuilder, SoftmaxLayerBuilder,
 };
 
 // 2D
 pub use layers2d::{
     Layer2D, LayerContext,
-    Linear2D, ReLU2D, Sigmoid2D, Softmax2D, Tanh2D,
-    Sequential2D, Memory2D,
+    Linear2D, ReLU2D, Sigmoid2D, Softmax2D, Tanh2D, Memory2D,
 };
 
 // 3D

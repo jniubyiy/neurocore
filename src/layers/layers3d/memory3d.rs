@@ -1,7 +1,8 @@
-use crate::tensor::{Tensor3D, Tensor1D};
+use crate::tensor::Tensor3D;
 use crate::model_plan::param_store::ParamSlice;
 use crate::neuron::Memory as MemoryNeuron;
 use crate::neuron::base::Neuron;
+use crate::linalg;
 use super::{Layer3D, LayerContext3D};
 
 pub struct Memory3D {
@@ -23,20 +24,24 @@ impl Layer3D for Memory3D {
         assert_eq!(out_buf[0].len(), rows);
         assert_eq!(out_buf[0][0].len(), self.output_dim);
 
-        for d in 0..depth {
-            for r in 0..rows {
-                let input_row = Tensor1D::new(input.data[d][r].clone());
-                for out_i in 0..self.output_dim {
-                    let offset = slice.start + out_i * (2 * self.input_dim + 1);
-                    let m0 = params[offset .. offset + self.input_dim].to_vec();
-                    let m1 = params[offset + self.input_dim .. offset + 2 * self.input_dim].to_vec();
-                    let t_val = params[offset + 2 * self.input_dim];
-                    let neuron = MemoryNeuron::new(m0, m1, t_val);
-                    let result = neuron.forward(&input_row);
-                    out_buf[d][r][out_i] = result.data[0];
+        let x = linalg::tensor3d_to_faer(input);
+
+        for out_i in 0..self.output_dim {
+            let offset = slice.start + out_i * (2 * self.input_dim + 1);
+            let m0 = params[offset .. offset + self.input_dim].to_vec();
+            let m1 = params[offset + self.input_dim .. offset + 2 * self.input_dim].to_vec();
+            let t_val = params[offset + 2 * self.input_dim];
+            let neuron = MemoryNeuron::new(m0, m1, t_val);
+            let result_col = neuron.forward_mat(&x);
+
+            for d in 0..depth {
+                for r in 0..rows {
+                    let idx = d * rows + r;
+                    out_buf[d][r][out_i] = result_col[(idx, 0)];
                 }
             }
         }
+
         LayerContext3D::Memory3D { input: input.clone() }
     }
 
@@ -84,21 +89,21 @@ impl Layer3D for Memory3D {
                     let dy_dot0 = soft0 + dot0 * ds0_dot0 + dot1 * ds1_dot0;
                     let dy_dot1 = soft1 + dot0 * ds0_dot1 + dot1 * ds1_dot1;
 
-                    let d_delta = delta.data[d][r][out_i];
+                    let delta_val = delta.data[d][r][out_i];
 
                     let base_idx = out_i * (2 * self.input_dim + 1);
                     for i in 0..self.input_dim {
-                        grad[base_idx + i] += d_delta * dy_dot0 * input.data[d][r][i];
-                        grad[base_idx + self.input_dim + i] += d_delta * dy_dot1 * input.data[d][r][i];
+                        grad[base_idx + i] += delta_val * dy_dot0 * input.data[d][r][i];
+                        grad[base_idx + self.input_dim + i] += delta_val * dy_dot1 * input.data[d][r][i];
                     }
                     let avg_dot = soft0 * dot0 + soft1 * dot1;
                     let ds0_dt = soft0 * (dot0 - avg_dot) / (t_val * t_val);
                     let ds1_dt = soft1 * (dot1 - avg_dot) / (t_val * t_val);
                     let dy_dt = dot0 * ds0_dt + dot1 * ds1_dt;
-                    grad[base_idx + 2 * self.input_dim] += d_delta * dy_dt;
+                    grad[base_idx + 2 * self.input_dim] += delta_val * dy_dt;
 
                     for i in 0..self.input_dim {
-                        d_prev[d][r][i] += d_delta * (dy_dot0 * m0[i] + dy_dot1 * m1[i]);
+                        d_prev[d][r][i] += delta_val * (dy_dot0 * m0[i] + dy_dot1 * m1[i]);
                     }
                 }
             }

@@ -2,27 +2,25 @@ use crate::tensor::Tensor1D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::neuron::Tanh;
 use crate::neuron::base::Neuron;
+use crate::linalg;
+use crate::linalg::faer_to_tensor1d;
 use super::{Layer, LayerInfo};
 
 pub struct TanhLayer {
-    neuron: Tanh,
     last_output: Option<Tensor1D>,
 }
 
 impl TanhLayer {
-    pub fn new() -> Self {
-        Self {
-            neuron: Tanh,
-            last_output: None,
-        }
-    }
+    pub fn new() -> Self { Self { last_output: None } }
 }
 
 impl Layer for TanhLayer {
     fn forward_into(&mut self, input: &Tensor1D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<f32>) {
-        let out: Vec<f32> = input.data.iter().map(|&x| self.neuron.apply(x)).collect();
-        self.last_output = Some(Tensor1D::new(out.clone()));
-        out_buf.copy_from_slice(&out);
+        let m = linalg::tensor1d_to_faer(input);
+        let out = Tanh.forward_mat(&m);
+        let t = faer_to_tensor1d(&out);
+        self.last_output = Some(t.clone());
+        out_buf.copy_from_slice(&t.data);
     }
 
     fn backward(&mut self, delta: &Tensor1D, _params: &[f32], _slice: &ParamSlice) -> Tensor1D {

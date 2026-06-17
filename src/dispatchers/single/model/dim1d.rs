@@ -50,11 +50,11 @@ impl Model1D for SingleModel1D {
 
     fn backward(&mut self, delta: &Tensor1D) -> Tensor1D {
         let params = self.store.all_params();
-        let mut d = delta.clone();
+        let mut delta_tensor = delta.clone();
         for (layer, slice) in self.layers.iter_mut().rev().zip(self.slices.iter().rev()) {
-            d = layer.backward(&d, params, slice);
+            delta_tensor = layer.backward(&delta_tensor, params, slice);
         }
-        d
+        delta_tensor
     }
 
     fn update_params(&mut self, lr: f32) {

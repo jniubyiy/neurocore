@@ -1,17 +1,15 @@
-// ============================================================
-// Файл: src/layers/layers1d/linear1d.rs
-// ============================================================
+use faer::Mat;
 use crate::tensor::Tensor1D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::model_plan::blueprint::assert_power_of_two;
-use crate::neuron::Linear;
+use crate::linalg;
 use super::{Layer, LayerInfo};
 
 pub struct LinearLayer {
     input_dim: usize,
     output_dim: usize,
     last_input: Option<Tensor1D>,
-    grad_W: Vec<f32>,
+    grad_w: Vec<f32>,
     grad_b: Vec<f32>,
 }
 
@@ -23,7 +21,7 @@ impl LinearLayer {
             input_dim,
             output_dim,
             last_input: None,
-            grad_W: vec![0.0; input_dim * output_dim],
+            grad_w: vec![0.0; input_dim * output_dim],
             grad_b: vec![0.0; output_dim],
         }
     }
@@ -43,12 +41,17 @@ impl Layer for LinearLayer {
         assert_eq!(out_buf.len(), self.output_dim);
         self.last_input = Some(input.clone());
 
-        for o in 0..self.output_dim {
-            let w_start = self.weight_index(o, 0, slice);
-            let w_end = w_start + self.input_dim;
-            let weights = &params[w_start..w_end];
-            let bias = params[self.bias_index(o, slice)];
-            out_buf[o] = Linear::forward_slice(weights, bias, &input.data);
+        let x = linalg::tensor1d_to_faer(input);
+
+        let w_start = slice.start;
+        let w_len = self.input_dim * self.output_dim;
+        let b_start = w_start + w_len;
+        let w = Mat::from_fn(self.output_dim, self.input_dim, |r, c| params[w_start + r * self.input_dim + c]);
+        let b = Mat::from_fn(self.output_dim, 1, |r, _| params[b_start + r]);
+
+        let out = &x * &w.transpose();
+        for j in 0..self.output_dim {
+            out_buf[j] = out[(0, j)] + b[(j, 0)];
         }
     }
 
@@ -58,11 +61,11 @@ impl Layer for LinearLayer {
         assert_eq!(delta.len(), self.output_dim);
 
         for o in 0..self.output_dim {
-            let d = delta.data[o];
+            let delta_val = delta.data[o];
             for i in 0..self.input_dim {
-                self.grad_W[o * self.input_dim + i] += d * input.data[i];
+                self.grad_w[o * self.input_dim + i] += delta_val * input.data[i];
             }
-            self.grad_b[o] += d;
+            self.grad_b[o] += delta_val;
         }
 
         let mut delta_prev = vec![0.0; self.input_dim];
@@ -77,13 +80,13 @@ impl Layer for LinearLayer {
     }
 
     fn apply_gradients(&mut self, store: &mut ParamStore, lr: f32, slice: &ParamSlice) {
-        for (idx, g) in self.grad_W.iter().enumerate() {
+        for (idx, g) in self.grad_w.iter().enumerate() {
             store.add_to_param(slice.start + idx, -lr * g);
         }
         for (idx, g) in self.grad_b.iter().enumerate() {
             store.add_to_param(slice.start + self.input_dim * self.output_dim + idx, -lr * g);
         }
-        self.grad_W.fill(0.0);
+        self.grad_w.fill(0.0);
         self.grad_b.fill(0.0);
     }
 

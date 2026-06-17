@@ -35,7 +35,6 @@ impl LayerContext5D {
             _ => 0,
         }
     }
-
     pub fn contexts(&self) -> &Vec<super::layers4d::LayerContext4D> {
         match self {
             LayerContext5D::Linear5D { contexts } => contexts,
@@ -46,20 +45,14 @@ impl LayerContext5D {
 
 pub trait Layer5D: Send + Sync {
     fn forward(&self, input: &Tensor5D, params: &[f32], slice: &ParamSlice) -> (Tensor5D, LayerContext5D) {
-        let outer = input.outer;
-        let dim1 = input.dim1;
-        let depth = input.depth;
-        let rows = input.rows;
+        let outer = input.outer; let dim1 = input.dim1; let depth = input.depth; let rows = input.rows;
         let cols = self.out_features();
         let mut buf = vec![vec![vec![vec![vec![0.0; cols]; rows]; depth]; dim1]; outer];
         let ctx = self.forward_into(input, params, slice, &mut buf);
         (Tensor5D::new(buf), ctx)
     }
-
     fn forward_into(&self, input: &Tensor5D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<Vec<Vec<f32>>>>>) -> LayerContext5D;
-
     fn backward(&self, ctx: &LayerContext5D, delta: &Tensor5D, params: &[f32], slice: &ParamSlice) -> (Tensor5D, Vec<f32>);
-
     fn param_len(&self) -> usize;
     fn in_features(&self) -> usize;
     fn out_features(&self) -> usize;

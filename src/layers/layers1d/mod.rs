@@ -5,8 +5,6 @@ pub mod linear1d;
 pub mod relu1d;
 pub mod sigmoid1d;
 pub mod softmax1d;
-pub mod sequential1d;
-pub mod builder1d;
 pub mod memory1d;
 pub mod tanh1d;
 
@@ -14,10 +12,8 @@ pub use linear1d::LinearLayer;
 pub use relu1d::ReLULayer;
 pub use sigmoid1d::SigmoidLayer;
 pub use softmax1d::SoftmaxLayer;
-pub use sequential1d::Sequential;
 pub use memory1d::MemoryLayer;
 pub use tanh1d::TanhLayer;
-pub use builder1d::{LayerBuilder, LinearLayerBuilder, ReLULayerBuilder, SigmoidLayerBuilder, SoftmaxLayerBuilder};
 
 #[derive(Debug, Clone)]
 pub struct LayerInfo {

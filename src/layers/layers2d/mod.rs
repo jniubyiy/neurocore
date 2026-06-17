@@ -9,7 +9,6 @@ pub mod relu2d;
 pub mod sigmoid2d;
 pub mod softmax2d;
 pub mod tanh2d;
-pub mod sequential2d;
 pub mod memory2d;
 
 pub use linear2d::Linear2D;
@@ -17,7 +16,6 @@ pub use relu2d::ReLU2D;
 pub use sigmoid2d::Sigmoid2D;
 pub use softmax2d::Softmax2D;
 pub use tanh2d::Tanh2D;
-pub use sequential2d::Sequential2D;
 pub use memory2d::Memory2D;
 
 /// Контекст, сохраняемый 2D‑слоем во время прямого прохода.
@@ -41,7 +39,6 @@ impl LayerContext {
             LayerContext::Tanh2D { output } => output.rows,
             LayerContext::Softmax2D { output } => output.rows,
             LayerContext::Sequential2D { contexts } => {
-                // для Sequential2D возвращаем количество строк из первого контекста
                 contexts.first().map(|c| c.rows()).unwrap_or(0)
             }
         }

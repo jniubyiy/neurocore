@@ -1,6 +1,3 @@
-// ============================================================
-// Файл: src/dispatchers/trained/model/dim5d.rs (обновлён для forward_into)
-// ============================================================
 use crate::layers::{Layer5D, LayerContext5D};
 use crate::tensor::Tensor5D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};

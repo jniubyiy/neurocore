@@ -1,6 +1,6 @@
 ﻿use crate::tensor::{Tensor1D, Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 use crate::loss_plan::{BuiltLoss, BuiltLoss2D, BuiltLoss3D, BuiltLoss4D, BuiltLoss5D};
-use crate::layers::layers2d::LayerContext;
+use crate::layers::LayerContext;
 use crate::layers::layers3d::LayerContext3D;
 use crate::layers::layers4d::LayerContext4D;
 use crate::layers::layers5d::LayerContext5D;

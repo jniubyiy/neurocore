@@ -1,14 +1,11 @@
-use crate::tensor::{Tensor5D, Tensor1D};
+use crate::tensor::Tensor5D;
 use crate::model_plan::param_store::ParamSlice;
 use crate::neuron::Memory as MemoryNeuron;
 use crate::neuron::base::Neuron;
+use crate::linalg;
 use super::{Layer5D, LayerContext5D};
 
-pub struct Memory5D {
-    pub input_dim: usize,
-    pub output_dim: usize,
-}
-
+pub struct Memory5D { pub input_dim: usize, pub output_dim: usize }
 impl Memory5D {
     pub fn new(in_features: usize, out_features: usize) -> Self {
         Self { input_dim: in_features, output_dim: out_features }
@@ -17,107 +14,92 @@ impl Memory5D {
 
 impl Layer5D for Memory5D {
     fn forward_into(&self, input: &Tensor5D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<Vec<Vec<f32>>>>>) -> LayerContext5D {
-        let outer = input.outer;
-        let dim1 = input.dim1;
-        let depth = input.depth;
-        let rows = input.rows;
+        let outer = input.outer; let dim1 = input.dim1; let depth = input.depth; let rows = input.rows;
         assert_eq!(out_buf.len(), outer);
         assert_eq!(out_buf[0].len(), dim1);
         assert_eq!(out_buf[0][0].len(), depth);
         assert_eq!(out_buf[0][0][0].len(), rows);
         assert_eq!(out_buf[0][0][0][0].len(), self.output_dim);
 
-        for o in 0..outer {
-            for d1 in 0..dim1 {
-                for d in 0..depth {
-                    for r in 0..rows {
-                        let input_row = Tensor1D::new(input.data[o][d1][d][r].clone());
-                        for out_i in 0..self.output_dim {
-                            let offset = slice.start + out_i * (2 * self.input_dim + 1);
-                            let m0 = params[offset .. offset + self.input_dim].to_vec();
-                            let m1 = params[offset + self.input_dim .. offset + 2 * self.input_dim].to_vec();
-                            let t_val = params[offset + 2 * self.input_dim];
-                            let neuron = MemoryNeuron::new(m0, m1, t_val);
-                            let result = neuron.forward(&input_row);
-                            out_buf[o][d1][d][r][out_i] = result.data[0];
+        let x = linalg::tensor5d_to_faer(input);
+
+        for out_i in 0..self.output_dim {
+            let offset = slice.start + out_i * (2 * self.input_dim + 1);
+            let m0 = params[offset .. offset + self.input_dim].to_vec();
+            let m1 = params[offset + self.input_dim .. offset + 2 * self.input_dim].to_vec();
+            let t_val = params[offset + 2 * self.input_dim];
+            let neuron = MemoryNeuron::new(m0, m1, t_val);
+            let result_col = neuron.forward_mat(&x);
+
+            let mut idx = 0;
+            for o in 0..outer {
+                for d1 in 0..dim1 {
+                    for d in 0..depth {
+                        for r in 0..rows {
+                            out_buf[o][d1][d][r][out_i] = result_col[(idx, 0)];
+                            idx += 1;
                         }
                     }
                 }
             }
         }
+
         LayerContext5D::Memory5D { input: input.clone() }
     }
 
     fn backward(&self, ctx: &LayerContext5D, delta: &Tensor5D, params: &[f32], slice: &ParamSlice) -> (Tensor5D, Vec<f32>) {
-        let input = match ctx {
-            LayerContext5D::Memory5D { input } => input,
-            _ => panic!("Invalid context for Memory5D"),
-        };
-        let outer = delta.outer;
-        let dim1 = delta.dim1;
-        let depth = delta.depth;
-        let rows = delta.rows;
+        let input = match ctx { LayerContext5D::Memory5D { input } => input, _ => panic!() };
+        let outer = delta.outer; let dim1 = delta.dim1; let depth = delta.depth; let rows = delta.rows;
         let cols_out = delta.cols;
         assert_eq!(cols_out, self.output_dim);
 
         let mut d_prev = vec![vec![vec![vec![vec![0.0; self.input_dim]; rows]; depth]; dim1]; outer];
         let mut grad = vec![0.0; self.param_len()];
 
-        for o in 0..outer {
-            for d1 in 0..dim1 {
-                for d in 0..depth {
-                    for r in 0..rows {
-                        for out_i in 0..self.output_dim {
-                            let offset = slice.start + out_i * (2 * self.input_dim + 1);
-                            let m0 = &params[offset .. offset + self.input_dim];
-                            let m1 = &params[offset + self.input_dim .. offset + 2 * self.input_dim];
-                            let t_val = params[offset + 2 * self.input_dim];
+        for o in 0..outer { for d1 in 0..dim1 { for d in 0..depth { for r in 0..rows {
+            for out_i in 0..self.output_dim {
+                let offset = slice.start + out_i * (2 * self.input_dim + 1);
+                let m0 = &params[offset .. offset + self.input_dim];
+                let m1 = &params[offset + self.input_dim .. offset + 2 * self.input_dim];
+                let t_val = params[offset + 2 * self.input_dim];
 
-                            let mut dot0 = 0.0;
-                            let mut dot1 = 0.0;
-                            for i in 0..self.input_dim {
-                                dot0 += input.data[o][d1][d][r][i] * m0[i];
-                                dot1 += input.data[o][d1][d][r][i] * m1[i];
-                            }
-                            let logit0 = dot0 / t_val;
-                            let logit1 = dot1 / t_val;
-                            let max_logit = logit0.max(logit1);
-                            let exp0 = (logit0 - max_logit).exp();
-                            let exp1 = (logit1 - max_logit).exp();
-                            let sum_exp = exp0 + exp1;
-                            let soft0 = exp0 / sum_exp;
-                            let soft1 = exp1 / sum_exp;
+                let mut dot0 = 0.0; let mut dot1 = 0.0;
+                for i in 0..self.input_dim {
+                    dot0 += input.data[o][d1][d][r][i] * m0[i];
+                    dot1 += input.data[o][d1][d][r][i] * m1[i];
+                }
+                let logit0 = dot0 / t_val; let logit1 = dot1 / t_val;
+                let max_logit = logit0.max(logit1);
+                let exp0 = (logit0 - max_logit).exp();
+                let exp1 = (logit1 - max_logit).exp();
+                let sum_exp = exp0 + exp1;
+                let soft0 = exp0 / sum_exp;
+                let soft1 = exp1 / sum_exp;
 
-                            let ds0_dot0 = soft0 * (1.0 - soft0) / t_val;
-                            let ds0_dot1 = -soft0 * soft1 / t_val;
-                            let ds1_dot0 = -soft1 * soft0 / t_val;
-                            let ds1_dot1 = soft1 * (1.0 - soft1) / t_val;
+                let ds0_dot0 = soft0 * (1.0 - soft0) / t_val;
+                let ds0_dot1 = -soft0 * soft1 / t_val;
+                let ds1_dot0 = -soft1 * soft0 / t_val;
+                let ds1_dot1 = soft1 * (1.0 - soft1) / t_val;
+                let dy_dot0 = soft0 + dot0 * ds0_dot0 + dot1 * ds1_dot0;
+                let dy_dot1 = soft1 + dot0 * ds0_dot1 + dot1 * ds1_dot1;
 
-                            let dy_dot0 = soft0 + dot0 * ds0_dot0 + dot1 * ds1_dot0;
-                            let dy_dot1 = soft1 + dot0 * ds0_dot1 + dot1 * ds1_dot1;
+                let delta_val = delta.data[o][d1][d][r][out_i];
+                let base = out_i * (2 * self.input_dim + 1);
+                for i in 0..self.input_dim {
+                    grad[base + i] += delta_val * dy_dot0 * input.data[o][d1][d][r][i];
+                    grad[base + self.input_dim + i] += delta_val * dy_dot1 * input.data[o][d1][d][r][i];
+                }
+                let avg_dot = soft0 * dot0 + soft1 * dot1;
+                let ds0_dt = soft0 * (dot0 - avg_dot) / (t_val * t_val);
+                let ds1_dt = soft1 * (dot1 - avg_dot) / (t_val * t_val);
+                let dy_dt = dot0 * ds0_dt + dot1 * ds1_dt;
+                grad[base + 2 * self.input_dim] += delta_val * dy_dt;
 
-                            let d_delta = delta.data[o][d1][d][r][out_i];
-
-                            let base_idx = out_i * (2 * self.input_dim + 1);
-                            for i in 0..self.input_dim {
-                                grad[base_idx + i] += d_delta * dy_dot0 * input.data[o][d1][d][r][i];
-                                grad[base_idx + self.input_dim + i] += d_delta * dy_dot1 * input.data[o][d1][d][r][i];
-                            }
-                            let avg_dot = soft0 * dot0 + soft1 * dot1;
-                            let ds0_dt = soft0 * (dot0 - avg_dot) / (t_val * t_val);
-                            let ds1_dt = soft1 * (dot1 - avg_dot) / (t_val * t_val);
-                            let dy_dt = dot0 * ds0_dt + dot1 * ds1_dt;
-                            grad[base_idx + 2 * self.input_dim] += d_delta * dy_dt;
-
-                            for i in 0..self.input_dim {
-                                d_prev[o][d1][d][r][i] += d_delta * (dy_dot0 * m0[i] + dy_dot1 * m1[i]);
-                            }
-                        }
-                    }
+                for i in 0..self.input_dim {
+                    d_prev[o][d1][d][r][i] += delta_val * (dy_dot0 * m0[i] + dy_dot1 * m1[i]);
                 }
             }
-        }
-
+        }}}}
         (Tensor5D::new(d_prev), grad)
     }
 

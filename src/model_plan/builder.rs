@@ -1,11 +1,8 @@
-// ============================================================
-// Файл: src/layers/layers1d/builder1d.rs
-// ============================================================
-use super::Layer;
-use super::linear1d::LinearLayer;
-use super::relu1d::ReLULayer;
-use super::sigmoid1d::SigmoidLayer;
-use super::softmax1d::SoftmaxLayer;
+use crate::layers::Layer;
+use crate::layers::layers1d::linear1d::LinearLayer;
+use crate::layers::layers1d::relu1d::ReLULayer;
+use crate::layers::layers1d::sigmoid1d::SigmoidLayer;
+use crate::layers::layers1d::softmax1d::SoftmaxLayer;
 use crate::model_plan::param_store::ParamSlice;
 
 pub trait LayerBuilder {
@@ -67,8 +64,3 @@ impl LayerBuilder for SoftmaxLayerBuilder {
     fn output_dim(&self) -> usize { 0 }
     fn param_len(&self) -> usize { 0 }
 }
-
-
-
-
-

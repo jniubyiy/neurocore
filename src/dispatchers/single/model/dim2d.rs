@@ -1,6 +1,3 @@
-// ============================================================
-// Файл: src/dispatchers/single/model/dim2d.rs
-// ============================================================
 use crate::layers::{Layer2D, LayerContext};
 use crate::tensor::Tensor2D;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
@@ -56,15 +53,15 @@ impl Model2D for SingleModel2D {
 
     fn backward(&self, contexts: &[Vec<LayerContext>], delta: &Tensor2D) -> (Tensor2D, Vec<Vec<f32>>) {
         let params = self.store.all_params();
-        let mut d = delta.clone();
+        let mut delta_tensor = delta.clone();
         let mut all_grads = Vec::new();
         for ((layer, slice), ctxs) in self.layers.iter().rev().zip(self.slices.iter().rev()).zip(contexts.iter().rev()) {
-            let (d_prev, grads) = layer.backward(&ctxs[0], &d, params, slice);
-            d = d_prev;
+            let (d_prev, grads) = layer.backward(&ctxs[0], &delta_tensor, params, slice);
+            delta_tensor = d_prev;
             all_grads.push(grads);
         }
         all_grads.reverse();
-        (d, all_grads)
+        (delta_tensor, all_grads)
     }
 
     fn update_params(&mut self, lr: f32, all_grads: &[Vec<f32>]) {

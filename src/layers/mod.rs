@@ -1,5 +1,5 @@
-// ============================================================
-// Файл: src/layers/mod.rs
+// src/layers/mod.rs
+
 // ============================================================
 pub mod layers1d;
 pub mod layers2d;
@@ -10,8 +10,10 @@ pub mod layers_special;
 
 // 1D
 pub use layers1d::{
-    Layer, LayerInfo,
+    Layer, LayerInfo, LayerContext1D,
     LinearLayer, ReLULayer, SigmoidLayer, SoftmaxLayer, TanhLayer, MemoryLayer,
+    CombinerLayer1D,
+    SplitterLayer1D,
 };
 
 // 2D

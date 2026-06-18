@@ -5,43 +5,61 @@ use crate::neuron::base::Neuron;
 use crate::linalg;
 use super::{Layer3D, LayerContext3D};
 
-pub struct ReLU3D {
-    inner_size: usize,
-}
+pub struct ReLU3D;
 
 impl ReLU3D {
-    pub fn new(size: usize) -> Self { Self { inner_size: size } }
+    pub fn new() -> Self { Self }
 }
 
 impl Layer3D for ReLU3D {
-    fn forward_into(&self, input: &Tensor3D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<f32>>>) -> LayerContext3D {
+    fn input_dims(&self) -> Vec<usize> { vec![0] }
+    fn output_dims(&self) -> Vec<usize> { vec![0] }
+
+    fn forward_into(
+        &self,
+        inputs: &[Tensor3D],
+        _params: &[f32],
+        _slice: &ParamSlice,
+        out_bufs: &mut [Vec<Vec<Vec<f32>>>],
+    ) -> Vec<LayerContext3D> {
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(out_bufs.len(), 1);
+        let input = &inputs[0];
+        let out_buf = &mut out_bufs[0];
         let mat = linalg::tensor3d_to_faer(input);
         let out = ReLU.forward_mat(&mat);
-        let t = linalg::faer_to_tensor3d(&out, input.depth, input.rows, input.cols);
-        *out_buf = t.data;
-        LayerContext3D::ReLU3D { input: input.clone() }
+        let out_t = linalg::faer_to_tensor3d(&out, input.dim1, input.dim2, input.dim3);
+        *out_buf = out_t.data;
+        vec![LayerContext3D::ReLU3D { input: input.clone() }]
     }
 
-    fn backward(&self, ctx: &LayerContext3D, delta: &Tensor3D, _params: &[f32], _slice: &ParamSlice) -> (Tensor3D, Vec<f32>) {
+    fn backward(
+        &self,
+        ctxs: &[LayerContext3D],
+        deltas: &[Tensor3D],
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> (Vec<Tensor3D>, Vec<f32>) {
+        assert_eq!(ctxs.len(), 1);
+        assert_eq!(deltas.len(), 1);
+        let ctx = &ctxs[0];
+        let delta = &deltas[0];
         let input = match ctx { LayerContext3D::ReLU3D { input } => input, _ => panic!() };
-        let depth = input.depth;
-        let rows = input.rows;
-        let cols = input.cols;
-        let mut d_prev = vec![vec![vec![0.0; cols]; rows]; depth];
-        for d in 0..depth {
-            for r in 0..rows {
-                for c in 0..cols {
-                    let grad = if input.data[d][r][c] > 0.0 { 1.0 } else { 0.0 };
-                    d_prev[d][r][c] = delta.data[d][r][c] * grad;
+        let dim1 = input.dim1;
+        let dim2 = input.dim2;
+        let dim3 = input.dim3;
+        let mut dprev = vec![vec![vec![0.0; dim3]; dim2]; dim1];
+        for i in 0..dim1 {
+            for j in 0..dim2 {
+                for k in 0..dim3 {
+                    dprev[i][j][k] = delta.data[i][j][k] * if input.data[i][j][k] > 0.0 { 1.0 } else { 0.0 };
                 }
             }
         }
-        (Tensor3D::new(d_prev), vec![])
+        (vec![Tensor3D::new(dprev)], vec![])
     }
 
     fn param_len(&self) -> usize { 0 }
-    fn in_features(&self) -> usize { self.inner_size }
-    fn out_features(&self) -> usize { self.inner_size }
 }
 
 

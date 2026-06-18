@@ -2,28 +2,25 @@ use crate::tensor::{Tensor1D, Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 
 // ---------- 1D ----------
 pub fn mse_loss(pred: &Tensor1D, target: &Tensor1D) -> (f32, Tensor1D) {
-    let n = pred.len();
-    assert_eq!(n, target.len(), "MSE: pred and target must have same length");
+    let n = pred.dim1() as f32;
+    assert_eq!(pred.dim1(), target.dim1(), "MSE 1D: size mismatch");
     let diff: Vec<f32> = pred.data.iter().zip(target.data.iter()).map(|(p, t)| p - t).collect();
-    let loss = diff.iter().map(|d| d * d).sum::<f32>() / n as f32;
-    let delta: Vec<f32> = diff.iter().map(|d| 2.0 * d / n as f32).collect();
+    let loss = diff.iter().map(|d| d * d).sum::<f32>() / n;
+    let delta: Vec<f32> = diff.iter().map(|d| 2.0 * d / n).collect();
     (loss, Tensor1D::new(delta))
 }
 
 pub fn mae_loss(pred: &Tensor1D, target: &Tensor1D) -> (f32, Tensor1D) {
-    let n = pred.len();
-    assert_eq!(n, target.len(), "MAE: pred and target must have same length");
+    let n = pred.dim1() as f32;
     let diff: Vec<f32> = pred.data.iter().zip(target.data.iter()).map(|(p, t)| p - t).collect();
-    let loss = diff.iter().map(|d| d.abs()).sum::<f32>() / n as f32;
-    let delta: Vec<f32> = diff.iter().map(|d| d.signum() / n as f32).collect();
+    let loss = diff.iter().map(|d| d.abs()).sum::<f32>() / n;
+    let delta: Vec<f32> = diff.iter().map(|d| d.signum() / n).collect();
     (loss, Tensor1D::new(delta))
 }
 
 pub fn cross_entropy_loss(pred: &Tensor1D, target: &Tensor1D) -> (f32, Tensor1D) {
     let class = target.data[0] as usize;
-    let n = pred.len();
-    assert!(class < n, "CrossEntropy: class index out of bounds");
-
+    let n = pred.dim1();
     let max_val = pred.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = pred.data.iter().map(|&x| (x - max_val).exp()).collect();
     let sum = exps.iter().sum::<f32>();
@@ -35,51 +32,51 @@ pub fn cross_entropy_loss(pred: &Tensor1D, target: &Tensor1D) -> (f32, Tensor1D)
 
 // ---------- 2D ----------
 pub fn mse_loss_2d(pred: &Tensor2D, target: &Tensor2D) -> (f32, Tensor2D) {
-    let n = (pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![0.0; pred.cols]; pred.rows];
-    for r in 0..pred.rows {
-        for c in 0..pred.cols {
-            let diff = pred.data[r][c] - target.data[r][c];
+    let mut delta = vec![vec![0.0; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            let diff = pred.data[i][j] - target.data[i][j];
             loss += diff * diff;
-            delta[r][c] = 2.0 * diff / n;
+            delta[i][j] = 2.0 * diff / n;
         }
     }
     (loss / n, Tensor2D::new(delta))
 }
 
 pub fn mae_loss_2d(pred: &Tensor2D, target: &Tensor2D) -> (f32, Tensor2D) {
-    let n = (pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![0.0; pred.cols]; pred.rows];
-    for r in 0..pred.rows {
-        for c in 0..pred.cols {
-            let diff = pred.data[r][c] - target.data[r][c];
+    let mut delta = vec![vec![0.0; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            let diff = pred.data[i][j] - target.data[i][j];
             loss += diff.abs();
-            delta[r][c] = diff.signum() / n;
+            delta[i][j] = diff.signum() / n;
         }
     }
     (loss / n, Tensor2D::new(delta))
 }
 
 pub fn cross_entropy_loss_2d(logits: &Tensor2D, target: &Tensor2D) -> (f32, Tensor2D) {
-    let rows = logits.rows;
-    let cols = logits.cols;
+    let rows = logits.dim1;
+    let cols = logits.dim2;
     let mut loss = 0.0;
     let mut delta = vec![vec![0.0; cols]; rows];
-    for r in 0..rows {
-        let class = target.data[r][0] as usize;
-        let max_val = logits.data[r].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    for i in 0..rows {
+        let class = target.data[i][0] as usize;
+        let max_val = logits.data[i].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut exps = vec![0.0; cols];
         let mut sum = 0.0;
         for c in 0..cols {
-            exps[c] = (logits.data[r][c] - max_val).exp();
+            exps[c] = (logits.data[i][c] - max_val).exp();
             sum += exps[c];
         }
         loss -= (exps[class] / sum).ln();
         for c in 0..cols {
             let sm = exps[c] / sum;
-            delta[r][c] = if c == class { sm - 1.0 } else { sm };
+            delta[i][c] = if c == class { sm - 1.0 } else { sm };
         }
     }
     (loss / rows as f32, Tensor2D::new(delta))
@@ -87,15 +84,15 @@ pub fn cross_entropy_loss_2d(logits: &Tensor2D, target: &Tensor2D) -> (f32, Tens
 
 // ---------- 3D ----------
 pub fn mse_loss_3d(pred: &Tensor3D, target: &Tensor3D) -> (f32, Tensor3D) {
-    let n = (pred.depth * pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2 * pred.dim3) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![0.0; pred.cols]; pred.rows]; pred.depth];
-    for d in 0..pred.depth {
-        for r in 0..pred.rows {
-            for c in 0..pred.cols {
-                let diff = pred.data[d][r][c] - target.data[d][r][c];
+    let mut delta = vec![vec![vec![0.0; pred.dim3]; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            for k in 0..pred.dim3 {
+                let diff = pred.data[i][j][k] - target.data[i][j][k];
                 loss += diff * diff;
-                delta[d][r][c] = 2.0 * diff / n;
+                delta[i][j][k] = 2.0 * diff / n;
             }
         }
     }
@@ -103,15 +100,15 @@ pub fn mse_loss_3d(pred: &Tensor3D, target: &Tensor3D) -> (f32, Tensor3D) {
 }
 
 pub fn mae_loss_3d(pred: &Tensor3D, target: &Tensor3D) -> (f32, Tensor3D) {
-    let n = (pred.depth * pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2 * pred.dim3) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![0.0; pred.cols]; pred.rows]; pred.depth];
-    for d in 0..pred.depth {
-        for r in 0..pred.rows {
-            for c in 0..pred.cols {
-                let diff = pred.data[d][r][c] - target.data[d][r][c];
+    let mut delta = vec![vec![vec![0.0; pred.dim3]; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            for k in 0..pred.dim3 {
+                let diff = pred.data[i][j][k] - target.data[i][j][k];
                 loss += diff.abs();
-                delta[d][r][c] = diff.signum() / n;
+                delta[i][j][k] = diff.signum() / n;
             }
         }
     }
@@ -119,24 +116,24 @@ pub fn mae_loss_3d(pred: &Tensor3D, target: &Tensor3D) -> (f32, Tensor3D) {
 }
 
 pub fn cross_entropy_loss_3d(logits: &Tensor3D, target: &Tensor3D) -> (f32, Tensor3D) {
-    let rows = logits.depth * logits.rows;
-    let cols = logits.cols;
+    let rows = logits.dim1 * logits.dim2;
+    let cols = logits.dim3;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![0.0; cols]; logits.rows]; logits.depth];
-    for d in 0..logits.depth {
-        for r in 0..logits.rows {
-            let class = target.data[d][r][0] as usize;
-            let max_val = logits.data[d][r].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut delta = vec![vec![vec![0.0; cols]; logits.dim2]; logits.dim1];
+    for i in 0..logits.dim1 {
+        for j in 0..logits.dim2 {
+            let class = target.data[i][j][0] as usize;
+            let max_val = logits.data[i][j].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut exps = vec![0.0; cols];
             let mut sum = 0.0;
             for c in 0..cols {
-                exps[c] = (logits.data[d][r][c] - max_val).exp();
+                exps[c] = (logits.data[i][j][c] - max_val).exp();
                 sum += exps[c];
             }
             loss -= (exps[class] / sum).ln();
             for c in 0..cols {
                 let sm = exps[c] / sum;
-                delta[d][r][c] = if c == class { sm - 1.0 } else { sm };
+                delta[i][j][c] = if c == class { sm - 1.0 } else { sm };
             }
         }
     }
@@ -145,16 +142,16 @@ pub fn cross_entropy_loss_3d(logits: &Tensor3D, target: &Tensor3D) -> (f32, Tens
 
 // ---------- 4D ----------
 pub fn mse_loss_4d(pred: &Tensor4D, target: &Tensor4D) -> (f32, Tensor4D) {
-    let n = (pred.dim1 * pred.depth * pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2 * pred.dim3 * pred.dim4) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![vec![0.0; pred.cols]; pred.rows]; pred.depth]; pred.dim1];
-    for d1 in 0..pred.dim1 {
-        for d in 0..pred.depth {
-            for r in 0..pred.rows {
-                for c in 0..pred.cols {
-                    let diff = pred.data[d1][d][r][c] - target.data[d1][d][r][c];
+    let mut delta = vec![vec![vec![vec![0.0; pred.dim4]; pred.dim3]; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            for k in 0..pred.dim3 {
+                for l in 0..pred.dim4 {
+                    let diff = pred.data[i][j][k][l] - target.data[i][j][k][l];
                     loss += diff * diff;
-                    delta[d1][d][r][c] = 2.0 * diff / n;
+                    delta[i][j][k][l] = 2.0 * diff / n;
                 }
             }
         }
@@ -163,16 +160,16 @@ pub fn mse_loss_4d(pred: &Tensor4D, target: &Tensor4D) -> (f32, Tensor4D) {
 }
 
 pub fn mae_loss_4d(pred: &Tensor4D, target: &Tensor4D) -> (f32, Tensor4D) {
-    let n = (pred.dim1 * pred.depth * pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2 * pred.dim3 * pred.dim4) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![vec![0.0; pred.cols]; pred.rows]; pred.depth]; pred.dim1];
-    for d1 in 0..pred.dim1 {
-        for d in 0..pred.depth {
-            for r in 0..pred.rows {
-                for c in 0..pred.cols {
-                    let diff = pred.data[d1][d][r][c] - target.data[d1][d][r][c];
+    let mut delta = vec![vec![vec![vec![0.0; pred.dim4]; pred.dim3]; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            for k in 0..pred.dim3 {
+                for l in 0..pred.dim4 {
+                    let diff = pred.data[i][j][k][l] - target.data[i][j][k][l];
                     loss += diff.abs();
-                    delta[d1][d][r][c] = diff.signum() / n;
+                    delta[i][j][k][l] = diff.signum() / n;
                 }
             }
         }
@@ -181,25 +178,25 @@ pub fn mae_loss_4d(pred: &Tensor4D, target: &Tensor4D) -> (f32, Tensor4D) {
 }
 
 pub fn cross_entropy_loss_4d(logits: &Tensor4D, target: &Tensor4D) -> (f32, Tensor4D) {
-    let rows = logits.dim1 * logits.depth * logits.rows;
-    let cols = logits.cols;
+    let rows = logits.dim1 * logits.dim2 * logits.dim3;
+    let cols = logits.dim4;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![vec![0.0; cols]; logits.rows]; logits.depth]; logits.dim1];
-    for d1 in 0..logits.dim1 {
-        for d in 0..logits.depth {
-            for r in 0..logits.rows {
-                let class = target.data[d1][d][r][0] as usize;
-                let max_val = logits.data[d1][d][r].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut delta = vec![vec![vec![vec![0.0; cols]; logits.dim3]; logits.dim2]; logits.dim1];
+    for i in 0..logits.dim1 {
+        for j in 0..logits.dim2 {
+            for k in 0..logits.dim3 {
+                let class = target.data[i][j][k][0] as usize;
+                let max_val = logits.data[i][j][k].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut exps = vec![0.0; cols];
                 let mut sum = 0.0;
                 for c in 0..cols {
-                    exps[c] = (logits.data[d1][d][r][c] - max_val).exp();
+                    exps[c] = (logits.data[i][j][k][c] - max_val).exp();
                     sum += exps[c];
                 }
                 loss -= (exps[class] / sum).ln();
                 for c in 0..cols {
                     let sm = exps[c] / sum;
-                    delta[d1][d][r][c] = if c == class { sm - 1.0 } else { sm };
+                    delta[i][j][k][c] = if c == class { sm - 1.0 } else { sm };
                 }
             }
         }
@@ -209,17 +206,17 @@ pub fn cross_entropy_loss_4d(logits: &Tensor4D, target: &Tensor4D) -> (f32, Tens
 
 // ---------- 5D ----------
 pub fn mse_loss_5d(pred: &Tensor5D, target: &Tensor5D) -> (f32, Tensor5D) {
-    let n = (pred.outer * pred.dim1 * pred.depth * pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2 * pred.dim3 * pred.dim4 * pred.dim5) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![vec![vec![0.0; pred.cols]; pred.rows]; pred.depth]; pred.dim1]; pred.outer];
-    for o in 0..pred.outer {
-        for d1 in 0..pred.dim1 {
-            for d in 0..pred.depth {
-                for r in 0..pred.rows {
-                    for c in 0..pred.cols {
-                        let diff = pred.data[o][d1][d][r][c] - target.data[o][d1][d][r][c];
+    let mut delta = vec![vec![vec![vec![vec![0.0; pred.dim5]; pred.dim4]; pred.dim3]; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            for k in 0..pred.dim3 {
+                for l in 0..pred.dim4 {
+                    for m in 0..pred.dim5 {
+                        let diff = pred.data[i][j][k][l][m] - target.data[i][j][k][l][m];
                         loss += diff * diff;
-                        delta[o][d1][d][r][c] = 2.0 * diff / n;
+                        delta[i][j][k][l][m] = 2.0 * diff / n;
                     }
                 }
             }
@@ -229,17 +226,17 @@ pub fn mse_loss_5d(pred: &Tensor5D, target: &Tensor5D) -> (f32, Tensor5D) {
 }
 
 pub fn mae_loss_5d(pred: &Tensor5D, target: &Tensor5D) -> (f32, Tensor5D) {
-    let n = (pred.outer * pred.dim1 * pred.depth * pred.rows * pred.cols) as f32;
+    let n = (pred.dim1 * pred.dim2 * pred.dim3 * pred.dim4 * pred.dim5) as f32;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![vec![vec![0.0; pred.cols]; pred.rows]; pred.depth]; pred.dim1]; pred.outer];
-    for o in 0..pred.outer {
-        for d1 in 0..pred.dim1 {
-            for d in 0..pred.depth {
-                for r in 0..pred.rows {
-                    for c in 0..pred.cols {
-                        let diff = pred.data[o][d1][d][r][c] - target.data[o][d1][d][r][c];
+    let mut delta = vec![vec![vec![vec![vec![0.0; pred.dim5]; pred.dim4]; pred.dim3]; pred.dim2]; pred.dim1];
+    for i in 0..pred.dim1 {
+        for j in 0..pred.dim2 {
+            for k in 0..pred.dim3 {
+                for l in 0..pred.dim4 {
+                    for m in 0..pred.dim5 {
+                        let diff = pred.data[i][j][k][l][m] - target.data[i][j][k][l][m];
                         loss += diff.abs();
-                        delta[o][d1][d][r][c] = diff.signum() / n;
+                        delta[i][j][k][l][m] = diff.signum() / n;
                     }
                 }
             }
@@ -249,26 +246,26 @@ pub fn mae_loss_5d(pred: &Tensor5D, target: &Tensor5D) -> (f32, Tensor5D) {
 }
 
 pub fn cross_entropy_loss_5d(logits: &Tensor5D, target: &Tensor5D) -> (f32, Tensor5D) {
-    let rows = logits.outer * logits.dim1 * logits.depth * logits.rows;
-    let cols = logits.cols;
+    let rows = logits.dim1 * logits.dim2 * logits.dim3 * logits.dim4;
+    let cols = logits.dim5;
     let mut loss = 0.0;
-    let mut delta = vec![vec![vec![vec![vec![0.0; cols]; logits.rows]; logits.depth]; logits.dim1]; logits.outer];
-    for o in 0..logits.outer {
-        for d1 in 0..logits.dim1 {
-            for d in 0..logits.depth {
-                for r in 0..logits.rows {
-                    let class = target.data[o][d1][d][r][0] as usize;
-                    let max_val = logits.data[o][d1][d][r].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut delta = vec![vec![vec![vec![vec![0.0; cols]; logits.dim4]; logits.dim3]; logits.dim2]; logits.dim1];
+    for i in 0..logits.dim1 {
+        for j in 0..logits.dim2 {
+            for k in 0..logits.dim3 {
+                for l in 0..logits.dim4 {
+                    let class = target.data[i][j][k][l][0] as usize;
+                    let max_val = logits.data[i][j][k][l].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut exps = vec![0.0; cols];
                     let mut sum = 0.0;
                     for c in 0..cols {
-                        exps[c] = (logits.data[o][d1][d][r][c] - max_val).exp();
+                        exps[c] = (logits.data[i][j][k][l][c] - max_val).exp();
                         sum += exps[c];
                     }
                     loss -= (exps[class] / sum).ln();
                     for c in 0..cols {
                         let sm = exps[c] / sum;
-                        delta[o][d1][d][r][c] = if c == class { sm - 1.0 } else { sm };
+                        delta[i][j][k][l][c] = if c == class { sm - 1.0 } else { sm };
                     }
                 }
             }

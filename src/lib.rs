@@ -1,9 +1,11 @@
+// src/lib.rs
+
 pub mod linalg;
 pub mod tensor;
-pub mod neuron;  
+pub mod neuron;
 pub mod layers;
 pub mod loss;
 pub mod model_plan;
+pub mod loss_plan;
 pub mod dispatchers;
 pub mod logging;
-pub mod loss_plan;

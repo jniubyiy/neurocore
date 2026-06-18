@@ -6,61 +6,89 @@ use crate::linalg;
 use super::{Layer2D, LayerContext};
 
 pub struct Memory2D {
-    pub input_dim: usize,
-    pub output_dim: usize,
+    pub dim2: usize,
+    pub out_dim2: usize,
 }
 
 impl Memory2D {
-    pub fn new(input_dim: usize, output_dim: usize) -> Self {
-        Self { input_dim, output_dim }
+    pub fn new(dim2: usize, out_dim2: usize) -> Self {
+        Self { dim2, out_dim2 }
     }
 }
 
 impl Layer2D for Memory2D {
-    fn forward_into(&self, input: &Tensor2D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<f32>>) -> LayerContext {
-        let rows = input.rows;
-        assert_eq!(input.cols, self.input_dim);
-        assert_eq!(out_buf.len(), rows);
-        assert_eq!(out_buf[0].len(), self.output_dim);
+    fn input_dims(&self) -> Vec<usize> { vec![self.dim2] }
+    fn output_dims(&self) -> Vec<usize> { vec![self.out_dim2] }
+
+    fn forward_into(
+        &self,
+        inputs: &[Tensor2D],
+        params: &[f32],
+        slice: &ParamSlice,
+        out_bufs: &mut [Vec<Vec<f32>>],
+    ) -> Vec<LayerContext> {
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(out_bufs.len(), 1);
+        let input = &inputs[0];
+        let out_buf = &mut out_bufs[0];
+        let dim1 = input.dim1;
+        let dim2 = input.dim2;
+        assert_eq!(dim2, self.dim2);
+        assert_eq!(out_buf.len(), dim1);
+        assert_eq!(out_buf[0].len(), self.out_dim2);
 
         let x = linalg::tensor2d_to_faer(input);
 
-        for out_i in 0..self.output_dim {
-            let offset = slice.start + out_i * (2 * self.input_dim + 1);
-            let m0 = params[offset .. offset + self.input_dim].to_vec();
-            let m1 = params[offset + self.input_dim .. offset + 2 * self.input_dim].to_vec();
-            let t_val = params[offset + 2 * self.input_dim];
+        for out_i in 0..self.out_dim2 {
+            let offset = slice.start + out_i * (2 * self.dim2 + 1);
+            let m0 = params[offset .. offset + self.dim2].to_vec();
+            let m1 = params[offset + self.dim2 .. offset + 2 * self.dim2].to_vec();
+            let t_val = params[offset + 2 * self.dim2];
 
             let neuron = MemoryNeuron::new(m0, m1, t_val);
             let result_col = neuron.forward_mat(&x);
 
-            for r in 0..rows {
+            for r in 0..dim1 {
                 out_buf[r][out_i] = result_col[(r, 0)];
             }
         }
 
-        LayerContext::Linear2D { input: input.clone() }
+        vec![LayerContext::Memory2D { input: input.clone() }]
     }
 
-    fn backward(&self, ctx: &LayerContext, delta: &Tensor2D, params: &[f32], slice: &ParamSlice) -> (Tensor2D, Vec<f32>) {
+    fn backward(
+        &self,
+        ctxs: &[LayerContext],
+        deltas: &[Tensor2D],
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> (Vec<Tensor2D>, Vec<f32>) {
+        assert_eq!(ctxs.len(), 1);
+        assert_eq!(deltas.len(), 1);
+        let ctx = &ctxs[0];
+        let delta = &deltas[0];
+
         let input = match ctx {
-            LayerContext::Linear2D { input } => input,
+            LayerContext::Memory2D { input } => input,
             _ => panic!("Invalid context for Memory2D"),
         };
-        let rows = input.rows;
-        let mut delta_prev = vec![vec![0.0; self.input_dim]; rows];
+        let dim1 = input.dim1;
+        assert_eq!(delta.dim1, dim1);
+        assert_eq!(delta.dim2, self.out_dim2);
+
+        let mut delta_prev = vec![vec![0.0; self.dim2]; dim1];
         let mut grad = vec![0.0; self.param_len()];
 
-        for r in 0..rows {
-            for out_i in 0..self.output_dim {
-                let offset = slice.start + out_i * (2 * self.input_dim + 1);
-                let m0 = &params[offset .. offset + self.input_dim];
-                let m1 = &params[offset + self.input_dim .. offset + 2 * self.input_dim];
-                let t_val = params[offset + 2 * self.input_dim];
+        for r in 0..dim1 {
+            for out_i in 0..self.out_dim2 {
+                let offset = slice.start + out_i * (2 * self.dim2 + 1);
+                let m0 = &params[offset .. offset + self.dim2];
+                let m1 = &params[offset + self.dim2 .. offset + 2 * self.dim2];
+                let t_val = params[offset + 2 * self.dim2];
 
                 let mut dot0 = 0.0;
                 let mut dot1 = 0.0;
-                for i in 0..self.input_dim {
+                for i in 0..self.dim2 {
                     dot0 += input.data[r][i] * m0[i];
                     dot1 += input.data[r][i] * m1[i];
                 }
@@ -83,31 +111,28 @@ impl Layer2D for Memory2D {
 
                 let delta_val = delta.data[r][out_i];
 
-                let base_idx = out_i * (2 * self.input_dim + 1);
-                for i in 0..self.input_dim {
+                let base_idx = out_i * (2 * self.dim2 + 1);
+                for i in 0..self.dim2 {
                     grad[base_idx + i] += delta_val * (dy_dot0 * input.data[r][i]);
-                    grad[base_idx + self.input_dim + i] += delta_val * (dy_dot1 * input.data[r][i]);
+                    grad[base_idx + self.dim2 + i] += delta_val * (dy_dot1 * input.data[r][i]);
                 }
 
                 let avg_dot = soft0 * dot0 + soft1 * dot1;
                 let ds0_dt = soft0 * (dot0 - avg_dot) / (t_val * t_val);
                 let ds1_dt = soft1 * (dot1 - avg_dot) / (t_val * t_val);
                 let dy_dt = dot0 * ds0_dt + dot1 * ds1_dt;
-                grad[base_idx + 2 * self.input_dim] += delta_val * dy_dt;
+                grad[base_idx + 2 * self.dim2] += delta_val * dy_dt;
 
-                for i in 0..self.input_dim {
+                for i in 0..self.dim2 {
                     delta_prev[r][i] += delta_val * (dy_dot0 * m0[i] + dy_dot1 * m1[i]);
                 }
             }
         }
 
-        (Tensor2D::new(delta_prev), grad)
+        (vec![Tensor2D::new(delta_prev)], grad)
     }
 
     fn param_len(&self) -> usize {
-        self.output_dim * (2 * self.input_dim + 1)
+        self.out_dim2 * (2 * self.dim2 + 1)
     }
-
-    fn in_features(&self) -> usize { self.input_dim }
-    fn out_features(&self) -> usize { self.output_dim }
 }

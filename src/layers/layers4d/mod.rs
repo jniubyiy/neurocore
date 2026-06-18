@@ -1,6 +1,5 @@
-// ============================================================
-// Файл: src/layers/layers4d/mod.rs
-// ============================================================
+// src/layers/layers4d/mod.rs
+
 use crate::tensor::Tensor4D;
 use crate::model_plan::param_store::ParamSlice;
 
@@ -20,48 +19,46 @@ pub use memory4d::Memory4D;
 
 #[derive(Clone)]
 pub enum LayerContext4D {
-    Linear4D   { contexts: Vec<super::layers3d::LayerContext3D> },
-    ReLU4D     { input: Tensor4D },
-    Sigmoid4D  { output: Tensor4D },
-    Tanh4D     { output: Tensor4D },
-    Softmax4D  { output: Tensor4D },
-    Memory4D   { input: Tensor4D },
-}
-
-impl LayerContext4D {
-    pub fn dim1(&self) -> usize {
-        match self {
-            LayerContext4D::Linear4D { contexts } => contexts.len(),
-            _ => 0,
-        }
-    }
-
-    pub fn contexts(&self) -> &Vec<super::layers3d::LayerContext3D> {
-        match self {
-            LayerContext4D::Linear4D { contexts } => contexts,
-            _ => panic!("contexts() called on non‑Linear4D variant"),
-        }
-    }
+    Linear4D  { input: Tensor4D },
+    ReLU4D    { input: Tensor4D },
+    Sigmoid4D { output: Tensor4D },
+    Tanh4D    { output: Tensor4D },
+    Softmax4D { output: Tensor4D },
+    Memory4D  { input: Tensor4D },
 }
 
 pub trait Layer4D: Send + Sync {
-    fn forward(&self, input: &Tensor4D, params: &[f32], slice: &ParamSlice) -> (Tensor4D, LayerContext4D) {
-        let dim1 = input.dim1;
-        let depth = input.depth;
-        let rows = input.rows;
-        let cols = self.out_features();
-        let mut buf = vec![vec![vec![vec![0.0; cols]; rows]; depth]; dim1];
-        let ctx = self.forward_into(input, params, slice, &mut buf);
-        (Tensor4D::new(buf), ctx)
+    fn input_dims(&self) -> Vec<usize>;
+    fn output_dims(&self) -> Vec<usize>;
+
+    fn forward(&self, inputs: &[Tensor4D], params: &[f32], slice: &ParamSlice) -> (Vec<Tensor4D>, Vec<LayerContext4D>) {
+        let out_sizes = self.output_dims();
+        let dim1 = inputs.first().map(|t| t.dim1).unwrap_or(0);
+        let dim2 = inputs.first().map(|t| t.dim2).unwrap_or(0);
+        let dim3 = inputs.first().map(|t| t.dim3).unwrap_or(0);
+        let mut out_bufs: Vec<Vec<Vec<Vec<Vec<f32>>>>> = out_sizes.iter().map(|&sz| vec![vec![vec![vec![0.0; sz]; dim3]; dim2]; dim1]).collect();
+        let ctxs = self.forward_into(inputs, params, slice, &mut out_bufs);
+        let tensors = out_bufs.into_iter().map(Tensor4D::new).collect();
+        (tensors, ctxs)
     }
 
-    fn forward_into(&self, input: &Tensor4D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<Vec<f32>>>>) -> LayerContext4D;
+    fn forward_into(
+        &self,
+        inputs: &[Tensor4D],
+        params: &[f32],
+        slice: &ParamSlice,
+        out_bufs: &mut [Vec<Vec<Vec<Vec<f32>>>>],
+    ) -> Vec<LayerContext4D>;
 
-    fn backward(&self, ctx: &LayerContext4D, delta: &Tensor4D, params: &[f32], slice: &ParamSlice) -> (Tensor4D, Vec<f32>);
+    fn backward(
+        &self,
+        ctxs: &[LayerContext4D],
+        deltas: &[Tensor4D],
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> (Vec<Tensor4D>, Vec<f32>);
 
     fn param_len(&self) -> usize;
-    fn in_features(&self) -> usize;
-    fn out_features(&self) -> usize;
 }
 
 

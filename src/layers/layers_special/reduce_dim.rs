@@ -15,49 +15,49 @@ impl ReduceMean {
 impl DimReduce<Tensor2D, Tensor1D> for ReduceMean {
     fn reduce(&self, input: &Tensor2D) -> Tensor1D {
         assert!(self.axis < 2);
-        let (rows, cols) = (input.rows, input.cols);
+        let (dim1, dim2) = (input.dim1, input.dim2);
         if self.axis == 0 {
-            let mut out_data = vec![0.0; cols];
-            for r in 0..rows {
-                for c in 0..cols {
-                    out_data[c] += input.data[r][c];
+            let mut out_data = vec![0.0; dim2];
+            for i in 0..dim1 {
+                for j in 0..dim2 {
+                    out_data[j] += input.data[i][j];
                 }
             }
-            let n = rows as f32;
-            for c in 0..cols { out_data[c] /= n; }
+            let n = dim1 as f32;
+            for c in 0..dim2 { out_data[c] /= n; }
             Tensor1D::new(out_data)
         } else {
-            let mut out_data = vec![0.0; rows];
-            for r in 0..rows {
-                for c in 0..cols {
-                    out_data[r] += input.data[r][c];
+            let mut out_data = vec![0.0; dim1];
+            for i in 0..dim1 {
+                for j in 0..dim2 {
+                    out_data[i] += input.data[i][j];
                 }
             }
-            let n = cols as f32;
-            for r in 0..rows { out_data[r] /= n; }
+            let n = dim2 as f32;
+            for r in 0..dim1 { out_data[r] /= n; }
             Tensor1D::new(out_data)
         }
     }
 }
 
-// 3D -> 2D (усреднение по глубине, axis=0)
+// 3D -> 2D (усреднение по dim1, axis=0)
 impl DimReduce<Tensor3D, Tensor2D> for ReduceMean {
     fn reduce(&self, input: &Tensor3D) -> Tensor2D {
-        assert_eq!(self.axis, 0, "ReduceMean 3D->2D only supports axis=0 (depth)");
-        let depth = input.depth;
-        let rows = input.rows;
-        let cols = input.cols;
-        let mut out_data = vec![vec![0.0; cols]; rows];
-        for d in 0..depth {
-            for r in 0..rows {
-                for c in 0..cols {
-                    out_data[r][c] += input.data[d][r][c];
+        assert_eq!(self.axis, 0, "ReduceMean 3D->2D only supports axis=0 (dim1)");
+        let dim1 = input.dim1;
+        let dim2 = input.dim2;
+        let dim3 = input.dim3;
+        let mut out_data = vec![vec![0.0; dim3]; dim2];
+        for i in 0..dim1 {
+            for j in 0..dim2 {
+                for k in 0..dim3 {
+                    out_data[j][k] += input.data[i][j][k];
                 }
             }
         }
-        let n = depth as f32;
-        for r in 0..rows {
-            for c in 0..cols { out_data[r][c] /= n; }
+        let n = dim1 as f32;
+        for j in 0..dim2 {
+            for k in 0..dim3 { out_data[j][k] /= n; }
         }
         Tensor2D::new(out_data)
     }
@@ -68,55 +68,55 @@ impl DimReduce<Tensor4D, Tensor3D> for ReduceMean {
     fn reduce(&self, input: &Tensor4D) -> Tensor3D {
         assert_eq!(self.axis, 0, "ReduceMean 4D->3D only supports axis=0 (dim1)");
         let dim1 = input.dim1;
-        let depth = input.depth;
-        let rows = input.rows;
-        let cols = input.cols;
-        let mut out = vec![vec![vec![0.0; cols]; rows]; depth];
-        for d1 in 0..dim1 {
-            for d in 0..depth {
-                for r in 0..rows {
-                    for c in 0..cols {
-                        out[d][r][c] += input.data[d1][d][r][c];
+        let dim2 = input.dim2;
+        let dim3 = input.dim3;
+        let dim4 = input.dim4;
+        let mut out = vec![vec![vec![0.0; dim4]; dim3]; dim2];
+        for i in 0..dim1 {
+            for j in 0..dim2 {
+                for k in 0..dim3 {
+                    for l in 0..dim4 {
+                        out[j][k][l] += input.data[i][j][k][l];
                     }
                 }
             }
         }
         let n = dim1 as f32;
-        for d in 0..depth {
-            for r in 0..rows {
-                for c in 0..cols { out[d][r][c] /= n; }
+        for j in 0..dim2 {
+            for k in 0..dim3 {
+                for l in 0..dim4 { out[j][k][l] /= n; }
             }
         }
         Tensor3D::new(out)
     }
 }
 
-// 5D -> 4D (усреднение по outer, axis=0)
+// 5D -> 4D (усреднение по dim1, axis=0)
 impl DimReduce<Tensor5D, Tensor4D> for ReduceMean {
     fn reduce(&self, input: &Tensor5D) -> Tensor4D {
-        assert_eq!(self.axis, 0, "ReduceMean 5D->4D only supports axis=0 (outer)");
-        let outer = input.outer;
+        assert_eq!(self.axis, 0, "ReduceMean 5D->4D only supports axis=0 (dim1)");
         let dim1 = input.dim1;
-        let depth = input.depth;
-        let rows = input.rows;
-        let cols = input.cols;
-        let mut out = vec![vec![vec![vec![0.0; cols]; rows]; depth]; dim1];
-        for o in 0..outer {
-            for d1 in 0..dim1 {
-                for d in 0..depth {
-                    for r in 0..rows {
-                        for c in 0..cols {
-                            out[d1][d][r][c] += input.data[o][d1][d][r][c];
+        let dim2 = input.dim2;
+        let dim3 = input.dim3;
+        let dim4 = input.dim4;
+        let dim5 = input.dim5;
+        let mut out = vec![vec![vec![vec![0.0; dim5]; dim4]; dim3]; dim2];
+        for i in 0..dim1 {
+            for j in 0..dim2 {
+                for k in 0..dim3 {
+                    for l in 0..dim4 {
+                        for m in 0..dim5 {
+                            out[j][k][l][m] += input.data[i][j][k][l][m];
                         }
                     }
                 }
             }
         }
-        let n = outer as f32;
-        for d1 in 0..dim1 {
-            for d in 0..depth {
-                for r in 0..rows {
-                    for c in 0..cols { out[d1][d][r][c] /= n; }
+        let n = dim1 as f32;
+        for j in 0..dim2 {
+            for k in 0..dim3 {
+                for l in 0..dim4 {
+                    for m in 0..dim5 { out[j][k][l][m] /= n; }
                 }
             }
         }

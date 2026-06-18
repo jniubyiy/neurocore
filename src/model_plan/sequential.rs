@@ -1,6 +1,8 @@
+// src/model_plan/sequential.rs
+
 use crate::tensor::Tensor1D;
-use crate::model_plan::param_store::{ParamSlice, ParamStore};
-use crate::layers::{Layer, LayerInfo};
+use crate::model_plan::param_store::ParamSlice;
+use crate::layers::layers1d::{Layer, LayerContext1D, LayerInfo};
 
 pub struct Sequential {
     layers: Vec<Box<dyn Layer>>,
@@ -15,35 +17,49 @@ impl Sequential {
 }
 
 impl Layer for Sequential {
-    fn forward_into(&mut self, input: &Tensor1D, params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<f32>) {
-        let mut current = input.clone();
-        let mut temp_buf = Vec::new();
-        for (layer, slice) in self.layers.iter_mut().zip(&self.slices) {
-            let output_dim = layer.layer_info().output_dim;
-            if output_dim == 0 {
-                temp_buf.resize(current.len(), 0.0);
-            } else {
-                temp_buf.resize(output_dim, 0.0);
+    fn input_dim1s(&self) -> Vec<usize> {
+        self.layers.first().map_or(vec![], |l| l.input_dim1s())
+    }
+    fn output_dim1s(&self) -> Vec<usize> {
+        self.layers.last().map_or(vec![], |l| l.output_dim1s())
+    }
+
+    fn forward_into(
+        &self,
+        inputs: &[Tensor1D],
+        params: &[f32],
+        _slice: &ParamSlice,
+        out_bufs: &mut [Vec<f32>],
+    ) -> Vec<LayerContext1D> {
+        assert_eq!(inputs.len(), 1);
+        let mut current = vec![inputs[0].clone()];
+        let mut all_ctxs = Vec::new();
+
+        for (layer, slice) in self.layers.iter().zip(&self.slices) {
+            let out_sizes = layer.output_dim1s();
+            let mut temp_bufs: Vec<Vec<f32>> = out_sizes.iter().map(|&sz| vec![0.0; sz]).collect();
+            let ctxs = layer.forward_into(&current, params, slice, &mut temp_bufs);
+            current = temp_bufs.into_iter().map(Tensor1D::new).collect();
+            if let Some(ctx) = ctxs.into_iter().next() {
+                all_ctxs.push(ctx);
             }
-            layer.forward_into(&current, params, slice, &mut temp_buf);
-            current = Tensor1D::new(temp_buf.clone());
         }
-        out_buf.clear();
-        out_buf.extend_from_slice(&current.data);
+
+        assert_eq!(out_bufs.len(), current.len());
+        for (out_buf, tensor) in out_bufs.iter_mut().zip(current) {
+            out_buf.copy_from_slice(&tensor.data);
+        }
+        all_ctxs
     }
 
-    fn backward(&mut self, delta: &Tensor1D, params: &[f32], _slice: &ParamSlice) -> Tensor1D {
-        let mut d = delta.clone();
-        for (layer, slice) in self.layers.iter_mut().rev().zip(self.slices.iter().rev()) {
-            d = layer.backward(&d, params, slice);
-        }
-        d
-    }
-
-    fn apply_gradients(&mut self, store: &mut ParamStore, lr: f32, _slice: &ParamSlice) {
-        for (layer, slice) in self.layers.iter_mut().zip(&self.slices) {
-            layer.apply_gradients(store, lr, slice);
-        }
+    fn backward(
+        &self,
+        _ctxs: &[LayerContext1D],
+        _deltas: &[Tensor1D],
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> (Vec<Tensor1D>, Vec<f32>) {
+        (vec![Tensor1D::zeros(0)], vec![])
     }
 
     fn param_len(&self) -> usize {
@@ -51,12 +67,10 @@ impl Layer for Sequential {
     }
 
     fn layer_info(&self) -> LayerInfo {
-        let first = self.layers.first().map(|l| l.layer_info());
-        let last = self.layers.last().map(|l| l.layer_info());
         LayerInfo {
             layer_type: "Sequential".to_string(),
-            input_dim: first.map(|i| i.input_dim).unwrap_or(0),
-            output_dim: last.map(|i| i.output_dim).unwrap_or(0),
+            input_dim1s: self.input_dim1s(),
+            output_dim1s: self.output_dim1s(),
             param_count: self.param_len(),
             param_start_index: None,
         }

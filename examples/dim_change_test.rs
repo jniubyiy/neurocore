@@ -1,3 +1,5 @@
+// examples/dim_change_test.rs
+
 use neurocore::tensor::{Tensor2D, Tensor1D};
 use neurocore::layers::{ReduceMean, Unsqueeze};
 use neurocore::layers::layers_special::{DimReduce, DimExpand};
@@ -12,7 +14,6 @@ fn main() {
     let x2: Tensor2D = expander.expand(&y);
     println!("Expanded back (1D->2D): {:?}", x2.data);
 }
-
 
 
 

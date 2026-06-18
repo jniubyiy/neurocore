@@ -1,106 +1,55 @@
-use neurocore::model_plan::{Plan, LayerBlueprint, Dim};
-use neurocore::dispatchers::single::loss::dim1d::SingleLoss1D;
-use neurocore::dispatchers::common::model_trait::{Model1D, LossDispatch};
+// examples/linear_test.rs
+
+use neurocore::model_plan::{Plan, LayerDesc, LayerKind, Dim};
+use neurocore::dispatchers::auto_model::{MixedModel, DynamicTensor};
 use neurocore::loss_plan::{LossBlueprint, LossPlan};
 use neurocore::tensor::Tensor1D;
 use std::time::Instant;
 
 fn main() {
-    let plan = Plan::new(vec![
-        LayerBlueprint::linear(Dim::Dim1, 4, 2),
-    ]).expect("Ошибка архитектуры");
+    // Один линейный слой 4 -> 2
+    let descs = vec![
+        LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
+            .input(Dim::Dim1, &[4])
+            .output(Dim::Dim1, &[2]),
+    ];
+
+    let plan = Plan::from_descs(descs).expect("Ошибка плана");
+    let mut model = plan.build();
 
     let loss_plan = LossPlan::new(LossBlueprint::mse()).unwrap();
-    let built_loss = loss_plan.build(2, 2).unwrap();
-    let loss_dispatch = SingleLoss1D::new();
+    let built_loss = loss_plan.build().unwrap();
+
     let x = Tensor1D::new(vec![1.0, 2.0, 3.0, 4.0]);
     let target = Tensor1D::new(vec![0.8, 1.5]);
     let lr = 0.01;
-
-    let built_tmp = plan.build_1d();
-    let param_mem = built_tmp.store.len() * std::mem::size_of::<f32>();
-    let buffer_mem = (4 + 2) * std::mem::size_of::<f32>();
-    let total_mem = param_mem + buffer_mem;
-    println!("Estimated peak memory: {} bytes ({:.2} KB)", total_mem, total_mem as f64 / 1024.0);
-
     let epochs = 500;
-    let mut loss_start = 0.0_f32;
-
-    // --- SingleModel1D ---
-    println!("\n=== SingleModel1D ===");
-    let mut built = plan.build_1d();
-    let total = built.store.len();
-    for i in 0..total { built.store.set_param(i, 0.5); }
-    let mut model = built.into_single_model();
 
     let start = Instant::now();
     for epoch in 0..epochs {
-        let pred = model.forward(&x);
-        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
-        model.backward(&delta);
-        model.update_params(lr);
-        if epoch == 0 { loss_start = loss; }
-        if epoch % 100 == 0 { println!("  Epoch {}: loss={:.6}", epoch, loss); }
+        let (pred_dyn, ctxs) = model.forward(DynamicTensor::Dim1(x.clone()));
+        let pred = match pred_dyn {
+            DynamicTensor::Dim1(t) => t,
+            _ => panic!(),
+        };
+        let (loss, delta) = (built_loss.forward)(&pred, &target);
+        let (_, grads) = model.backward(&ctxs, DynamicTensor::Dim1(delta));
+        model.update_params(lr, &grads);
+
+        if epoch == 0 || epoch % 100 == 0 {
+            println!("Epoch {}: loss={:.6}", epoch, loss);
+        }
     }
     let duration = start.elapsed();
-    let final_pred = model.forward(&x);
-    let (final_loss, _) = loss_dispatch.compute_loss(&final_pred, &target, &built_loss);
-    println!("  Done. Time: {:?}", duration);
-    println!("  Final loss: {:.6}", final_loss);
-    if final_loss > 0.0 && loss_start > 0.0 {
-        let rate = (loss_start / final_loss).ln() / epochs as f32;
-        println!("  Convergence rate (avg log improvement per epoch): {:.6}", rate);
-    }
 
-    // --- AutoModel1D ---
-    println!("\n=== AutoModel1D (потоков: 1) ===");
-    let mut built2 = plan.build_1d();
-    for i in 0..total { built2.store.set_param(i, 0.5); }
-    let mut model2 = built2.into_auto_model(1);
-
-    let start = Instant::now();
-    for epoch in 0..epochs {
-        let pred = model2.forward(&x);
-        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
-        model2.backward(&delta);
-        model2.update_params(lr);
-        if epoch == 0 { loss_start = loss; }
-        if epoch % 100 == 0 { println!("  Epoch {}: loss={:.6}", epoch, loss); }
-    }
-    let duration = start.elapsed();
-    let final_pred = model2.forward(&x);
-    let (final_loss, _) = loss_dispatch.compute_loss(&final_pred, &target, &built_loss);
-    println!("  Done. Time: {:?}", duration);
-    println!("  Final loss: {:.6}", final_loss);
-    if final_loss > 0.0 && loss_start > 0.0 {
-        let rate = (loss_start / final_loss).ln() / epochs as f32;
-        println!("  Convergence rate (avg log improvement per epoch): {:.6}", rate);
-    }
-
-    // --- TrainedModel1D ---
-    println!("\n=== TrainedModel1D (потоков: 1) ===");
-    let mut built3 = plan.build_1d();
-    for i in 0..total { built3.store.set_param(i, 0.5); }
-    let mut model3 = built3.into_trained_model(1);
-
-    let start = Instant::now();
-    for epoch in 0..epochs {
-        let pred = model3.forward(&x);
-        let (loss, delta) = loss_dispatch.compute_loss(&pred, &target, &built_loss);
-        model3.backward(&delta);
-        model3.update_params(lr);
-        if epoch == 0 { loss_start = loss; }
-        if epoch % 100 == 0 { println!("  Epoch {}: loss={:.6}", epoch, loss); }
-    }
-    let duration = start.elapsed();
-    let final_pred = model3.forward(&x);
-    let (final_loss, _) = loss_dispatch.compute_loss(&final_pred, &target, &built_loss);
-    println!("  Done. Time: {:?}", duration);
-    println!("  Final loss: {:.6}", final_loss);
-    if final_loss > 0.0 && loss_start > 0.0 {
-        let rate = (loss_start / final_loss).ln() / epochs as f32;
-        println!("  Convergence rate (avg log improvement per epoch): {:.6}", rate);
-    }
+    let (final_pred_dyn, _) = model.forward(DynamicTensor::Dim1(x.clone()));
+    let final_pred = match final_pred_dyn {
+        DynamicTensor::Dim1(t) => t,
+        _ => panic!(),
+    };
+    let (final_loss, _) = (built_loss.forward)(&final_pred, &target);
+    println!("Done. Time: {:?}", duration);
+    println!("Final loss: {:.6}", final_loss);
 }
 
 

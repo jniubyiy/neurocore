@@ -1,93 +1,114 @@
+// src/layers/layers2d/linear2d.rs (удалены assert_power_of_two)
+
 use faer::Mat;
 use crate::tensor::Tensor2D;
 use crate::model_plan::param_store::ParamSlice;
-use crate::model_plan::blueprint::assert_power_of_two;
 use crate::linalg;
 use super::{Layer2D, LayerContext};
 
 pub struct Linear2D {
-    pub input_dim: usize,
-    pub output_dim: usize,
+    pub dim2: usize,
+    pub out_dim2: usize,
 }
 
 impl Linear2D {
-    pub fn new(input_dim: usize, output_dim: usize) -> Self {
-        assert_power_of_two(input_dim);
-        assert_power_of_two(output_dim);
-        Self { input_dim, output_dim }
+    pub fn new(dim2: usize, out_dim2: usize) -> Self {
+        // Проверки степеней двойки удалены
+        Self { dim2, out_dim2 }
     }
 
     fn weight_index(&self, out_idx: usize, in_idx: usize, slice: &ParamSlice) -> usize {
-        slice.start + out_idx * self.input_dim + in_idx
-    }
-
-    fn bias_index(&self, out_idx: usize, slice: &ParamSlice) -> usize {
-        slice.start + self.input_dim * self.output_dim + out_idx
+        slice.start + out_idx * self.dim2 + in_idx
     }
 }
 
 impl Layer2D for Linear2D {
-    fn forward_into(&self, input: &Tensor2D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<f32>>) -> LayerContext {
-        let rows = input.rows;
-        assert_eq!(input.cols, self.input_dim);
-        assert_eq!(out_buf.len(), rows);
-        assert_eq!(out_buf[0].len(), self.output_dim);
+    fn input_dims(&self) -> Vec<usize> { vec![self.dim2] }
+    fn output_dims(&self) -> Vec<usize> { vec![self.out_dim2] }
+
+    fn forward_into(
+        &self,
+        inputs: &[Tensor2D],
+        params: &[f32],
+        slice: &ParamSlice,
+        out_bufs: &mut [Vec<Vec<f32>>],
+    ) -> Vec<LayerContext> {
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(out_bufs.len(), 1);
+        let input = &inputs[0];
+        let out_buf = &mut out_bufs[0];
+        let dim1 = input.dim1;
+        let dim2 = input.dim2;
+        assert_eq!(dim2, self.dim2);
+        assert_eq!(out_buf.len(), dim1);
+        assert_eq!(out_buf[0].len(), self.out_dim2);
 
         let x = linalg::tensor2d_to_faer(input);
 
         let w_start = slice.start;
-        let w_len = self.input_dim * self.output_dim;
-        let b_start = w_start + w_len;
-        let w = Mat::from_fn(self.output_dim, self.input_dim, |r, c| params[w_start + r * self.input_dim + c]);
-        let b = Mat::from_fn(self.output_dim, 1, |r, _| params[b_start + r]);
+        let w = Mat::from_fn(self.out_dim2, self.dim2, |r, c| params[w_start + r * self.dim2 + c]);
+        let b_start = w_start + self.dim2 * self.out_dim2;
+        let b = Mat::from_fn(self.out_dim2, 1, |r, _| params[b_start + r]);
 
-        let out = &x * &w.transpose();
+        let y = &x * &w.transpose();
 
-        for r in 0..rows {
-            for c in 0..self.output_dim {
-                out_buf[r][c] = out[(r, c)] + b[(c, 0)];
+        for r in 0..dim1 {
+            for c in 0..self.out_dim2 {
+                out_buf[r][c] = y[(r, c)] + b[(c, 0)];
             }
         }
 
-        LayerContext::Linear2D { input: input.clone() }
+        vec![LayerContext::Linear2D { input: input.clone() }]
     }
 
-    fn backward(&self, ctx: &LayerContext, delta: &Tensor2D, params: &[f32], slice: &ParamSlice) -> (Tensor2D, Vec<f32>) {
+    fn backward(
+        &self,
+        ctxs: &[LayerContext],
+        deltas: &[Tensor2D],
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> (Vec<Tensor2D>, Vec<f32>) {
+        assert_eq!(ctxs.len(), 1);
+        assert_eq!(deltas.len(), 1);
+        let ctx = &ctxs[0];
+        let delta = &deltas[0];
+
         let input = match ctx {
             LayerContext::Linear2D { input } => input,
             _ => panic!("Invalid context for Linear2D"),
         };
-        let rows = input.rows;
-        let mut delta_prev = vec![vec![0.0; self.input_dim]; rows];
-        let mut grad = vec![0.0; self.param_len()];
+        let dim1 = input.dim1;
+        assert_eq!(delta.dim1, dim1);
+        assert_eq!(delta.dim2, self.out_dim2);
 
-        for r in 0..rows {
-            for o in 0..self.output_dim {
-                let delta_val = delta.data[r][o];
-                for i in 0..self.input_dim {
-                    let idx = o * self.input_dim + i;
-                    grad[idx] += delta_val * input.data[r][i];
+        let mut grad = vec![0.0; self.param_len()];
+        let mut delta_prev = vec![vec![0.0; self.dim2]; dim1];
+
+        for r in 0..dim1 {
+            for o in 0..self.out_dim2 {
+                let d = delta.data[r][o];
+                for i in 0..self.dim2 {
+                    let idx = o * self.dim2 + i;
+                    grad[idx] += d * input.data[r][i];
                 }
-                grad[self.input_dim * self.output_dim + o] += delta_val;
+                grad[self.dim2 * self.out_dim2 + o] += d;
             }
 
-            for i in 0..self.input_dim {
+            for i in 0..self.dim2 {
                 let mut sum = 0.0;
-                for o in 0..self.output_dim {
+                for o in 0..self.out_dim2 {
                     sum += params[self.weight_index(o, i, slice)] * delta.data[r][o];
                 }
                 delta_prev[r][i] = sum;
             }
         }
-        (Tensor2D::new(delta_prev), grad)
+
+        (vec![Tensor2D::new(delta_prev)], grad)
     }
 
     fn param_len(&self) -> usize {
-        self.input_dim * self.output_dim + self.output_dim
+        self.dim2 * self.out_dim2 + self.out_dim2
     }
-
-    fn in_features(&self) -> usize { self.input_dim }
-    fn out_features(&self) -> usize { self.output_dim }
 }
 
 

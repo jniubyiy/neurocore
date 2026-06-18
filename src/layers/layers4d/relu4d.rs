@@ -5,32 +5,64 @@ use crate::neuron::base::Neuron;
 use crate::linalg;
 use super::{Layer4D, LayerContext4D};
 
-pub struct ReLU4D { inner_size: usize }
-impl ReLU4D { pub fn new(size: usize) -> Self { Self { inner_size: size } } }
+pub struct ReLU4D;
+
+impl ReLU4D {
+    pub fn new() -> Self { Self }
+}
 
 impl Layer4D for ReLU4D {
-    fn forward_into(&self, input: &Tensor4D, _params: &[f32], _slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<Vec<f32>>>>) -> LayerContext4D {
+    fn input_dims(&self) -> Vec<usize> { vec![0] }
+    fn output_dims(&self) -> Vec<usize> { vec![0] }
+
+    fn forward_into(
+        &self,
+        inputs: &[Tensor4D],
+        _params: &[f32],
+        _slice: &ParamSlice,
+        out_bufs: &mut [Vec<Vec<Vec<Vec<f32>>>>],
+    ) -> Vec<LayerContext4D> {
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(out_bufs.len(), 1);
+        let input = &inputs[0];
+        let out_buf = &mut out_bufs[0];
         let mat = linalg::tensor4d_to_faer(input);
         let out = ReLU.forward_mat(&mat);
-        let t = linalg::faer_to_tensor4d(&out, input.dim1, input.depth, input.rows, input.cols);
-        *out_buf = t.data;
-        LayerContext4D::ReLU4D { input: input.clone() }
+        let out_t = linalg::faer_to_tensor4d(&out, input.dim1, input.dim2, input.dim3, input.dim4);
+        *out_buf = out_t.data;
+        vec![LayerContext4D::ReLU4D { input: input.clone() }]
     }
 
-    fn backward(&self, ctx: &LayerContext4D, delta: &Tensor4D, _params: &[f32], _slice: &ParamSlice) -> (Tensor4D, Vec<f32>) {
+    fn backward(
+        &self,
+        ctxs: &[LayerContext4D],
+        deltas: &[Tensor4D],
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> (Vec<Tensor4D>, Vec<f32>) {
+        assert_eq!(ctxs.len(), 1);
+        assert_eq!(deltas.len(), 1);
+        let ctx = &ctxs[0];
+        let delta = &deltas[0];
         let input = match ctx { LayerContext4D::ReLU4D { input } => input, _ => panic!() };
-        let (dim1, depth, rows, cols) = (input.dim1, input.depth, input.rows, input.cols);
-        let mut d_prev = vec![vec![vec![vec![0.0; cols]; rows]; depth]; dim1];
-        for d1 in 0..dim1 { for d in 0..depth { for r in 0..rows { for c in 0..cols {
-            let grad = if input.data[d1][d][r][c] > 0.0 { 1.0 } else { 0.0 };
-            d_prev[d1][d][r][c] = delta.data[d1][d][r][c] * grad;
-        }}}}
-        (Tensor4D::new(d_prev), vec![])
+        let dim1 = input.dim1;
+        let dim2 = input.dim2;
+        let dim3 = input.dim3;
+        let dim4 = input.dim4;
+        let mut dprev = vec![vec![vec![vec![0.0; dim4]; dim3]; dim2]; dim1];
+        for i in 0..dim1 {
+            for j in 0..dim2 {
+                for k in 0..dim3 {
+                    for l in 0..dim4 {
+                        dprev[i][j][k][l] = delta.data[i][j][k][l] * if input.data[i][j][k][l] > 0.0 { 1.0 } else { 0.0 };
+                    }
+                }
+            }
+        }
+        (vec![Tensor4D::new(dprev)], vec![])
     }
 
     fn param_len(&self) -> usize { 0 }
-    fn in_features(&self) -> usize { self.inner_size }
-    fn out_features(&self) -> usize { self.inner_size }
 }
 
 

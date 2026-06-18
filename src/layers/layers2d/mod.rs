@@ -1,6 +1,5 @@
-// ============================================================
-// Файл: src/layers/layers2d/mod.rs
-// ============================================================
+// src/layers/layers2d/mod.rs
+
 use crate::tensor::Tensor2D;
 use crate::model_plan::param_store::ParamSlice;
 
@@ -21,48 +20,44 @@ pub use memory2d::Memory2D;
 /// Контекст, сохраняемый 2D‑слоем во время прямого прохода.
 #[derive(Clone)]
 pub enum LayerContext {
-    Linear2D     { input: Tensor2D },
-    ReLU2D       { input: Tensor2D },
-    Sigmoid2D    { output: Tensor2D },
-    Tanh2D       { output: Tensor2D },
-    Softmax2D    { output: Tensor2D },
-    Sequential2D { contexts: Vec<LayerContext> },
-}
-
-impl LayerContext {
-    /// Количество строк в батче для этого контекста.
-    pub fn rows(&self) -> usize {
-        match self {
-            LayerContext::Linear2D { input } => input.rows,
-            LayerContext::ReLU2D { input } => input.rows,
-            LayerContext::Sigmoid2D { output } => output.rows,
-            LayerContext::Tanh2D { output } => output.rows,
-            LayerContext::Softmax2D { output } => output.rows,
-            LayerContext::Sequential2D { contexts } => {
-                contexts.first().map(|c| c.rows()).unwrap_or(0)
-            }
-        }
-    }
+    Linear2D  { input: Tensor2D },
+    ReLU2D    { input: Tensor2D },
+    Sigmoid2D { output: Tensor2D },
+    Tanh2D    { output: Tensor2D },
+    Softmax2D { output: Tensor2D },
+    Memory2D  { input: Tensor2D },
 }
 
 pub trait Layer2D: Send + Sync {
-    /// Обычный прямой проход (создаёт новый тензор) – для совместимости.
-    fn forward(&self, input: &Tensor2D, params: &[f32], slice: &ParamSlice) -> (Tensor2D, LayerContext) {
-        let rows = input.rows;
-        let cols = self.out_features();
-        let mut buf = vec![vec![0.0; cols]; rows];
-        let ctx = self.forward_into(input, params, slice, &mut buf);
-        (Tensor2D::new(buf), ctx)
+    fn input_dims(&self) -> Vec<usize>;
+    fn output_dims(&self) -> Vec<usize>;
+
+    fn forward(&self, inputs: &[Tensor2D], params: &[f32], slice: &ParamSlice) -> (Vec<Tensor2D>, Vec<LayerContext>) {
+        let out_sizes = self.output_dims();
+        let dim1 = if let Some(first) = inputs.first() { first.dim1 } else { 0 };
+        let mut out_bufs: Vec<Vec<Vec<f32>>> = out_sizes.iter().map(|&sz| vec![vec![0.0; sz]; dim1]).collect();
+        let ctxs = self.forward_into(inputs, params, slice, &mut out_bufs);
+        let tensors = out_bufs.into_iter().map(Tensor2D::new).collect();
+        (tensors, ctxs)
     }
 
-    /// Прямой проход с записью результата в предоставленный двумерный буфер.
-    fn forward_into(&self, input: &Tensor2D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<f32>>) -> LayerContext;
+    fn forward_into(
+        &self,
+        inputs: &[Tensor2D],
+        params: &[f32],
+        slice: &ParamSlice,
+        out_bufs: &mut [Vec<Vec<f32>>],
+    ) -> Vec<LayerContext>;
 
-    fn backward(&self, ctx: &LayerContext, delta: &Tensor2D, params: &[f32], slice: &ParamSlice) -> (Tensor2D, Vec<f32>);
+    fn backward(
+        &self,
+        ctxs: &[LayerContext],
+        deltas: &[Tensor2D],
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> (Vec<Tensor2D>, Vec<f32>);
 
     fn param_len(&self) -> usize;
-    fn in_features(&self) -> usize;
-    fn out_features(&self) -> usize;
 }
 
 

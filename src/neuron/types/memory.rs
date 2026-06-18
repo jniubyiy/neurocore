@@ -43,7 +43,7 @@ impl Neuron for Memory {
     fn forward(&self, input: &crate::tensor::Tensor1D) -> crate::tensor::Tensor1D {
         let mut dot0 = 0.0;
         let mut dot1 = 0.0;
-        for i in 0..input.len() {
+        for i in 0..input.dim1() {
             dot0 += input.data[i] * self.memory0[i];
             dot1 += input.data[i] * self.memory1[i];
         }

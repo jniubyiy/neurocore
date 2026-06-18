@@ -1,6 +1,5 @@
-// ============================================================
-// Файл: src/layers/layers5d/mod.rs
-// ============================================================
+// src/layers/layers5d/mod.rs
+
 use crate::tensor::Tensor5D;
 use crate::model_plan::param_store::ParamSlice;
 
@@ -20,44 +19,67 @@ pub use memory5d::Memory5D;
 
 #[derive(Clone)]
 pub enum LayerContext5D {
-    Linear5D   { contexts: Vec<super::layers4d::LayerContext4D> },
-    ReLU5D     { input: Tensor5D },
-    Sigmoid5D  { output: Tensor5D },
-    Tanh5D     { output: Tensor5D },
-    Softmax5D  { output: Tensor5D },
-    Memory5D   { input: Tensor5D },
-}
-
-impl LayerContext5D {
-    pub fn outer(&self) -> usize {
-        match self {
-            LayerContext5D::Linear5D { contexts } => contexts.len(),
-            _ => 0,
-        }
-    }
-    pub fn contexts(&self) -> &Vec<super::layers4d::LayerContext4D> {
-        match self {
-            LayerContext5D::Linear5D { contexts } => contexts,
-            _ => panic!("contexts() called on non‑Linear5D variant"),
-        }
-    }
+    Linear5D  { input: Tensor5D },
+    ReLU5D    { input: Tensor5D },
+    Sigmoid5D { output: Tensor5D },
+    Tanh5D    { output: Tensor5D },
+    Softmax5D { output: Tensor5D },
+    Memory5D  { input: Tensor5D },
 }
 
 pub trait Layer5D: Send + Sync {
-    fn forward(&self, input: &Tensor5D, params: &[f32], slice: &ParamSlice) -> (Tensor5D, LayerContext5D) {
-        let outer = input.outer; let dim1 = input.dim1; let depth = input.depth; let rows = input.rows;
-        let cols = self.out_features();
-        let mut buf = vec![vec![vec![vec![vec![0.0; cols]; rows]; depth]; dim1]; outer];
-        let ctx = self.forward_into(input, params, slice, &mut buf);
-        (Tensor5D::new(buf), ctx)
-    }
-    fn forward_into(&self, input: &Tensor5D, params: &[f32], slice: &ParamSlice, out_buf: &mut Vec<Vec<Vec<Vec<Vec<f32>>>>>) -> LayerContext5D;
-    fn backward(&self, ctx: &LayerContext5D, delta: &Tensor5D, params: &[f32], slice: &ParamSlice) -> (Tensor5D, Vec<f32>);
-    fn param_len(&self) -> usize;
-    fn in_features(&self) -> usize;
-    fn out_features(&self) -> usize;
-}
+    /// Размер пятой оси (последней) входного тензора (для совместимости).
+    fn dim5(&self) -> usize { self.input_dims()[0] }
 
+    /// Размер пятой оси (последней) выходного тензора (для совместимости).
+    fn out_dim5(&self) -> usize { self.output_dims()[0] }
+
+    /// Размерности каждого из входных тензоров (последняя ось).
+    fn input_dims(&self) -> Vec<usize>;
+
+    /// Размерности каждого из выходных тензоров (последняя ось).
+    fn output_dims(&self) -> Vec<usize>;
+
+    /// Прямой проход с созданием нового тензора.
+    fn forward(&self, inputs: &[Tensor5D], params: &[f32], slice: &ParamSlice) -> (Vec<Tensor5D>, Vec<LayerContext5D>) {
+        let out_sizes = self.output_dims();
+        let dim1 = inputs.first().map(|t| t.dim1).unwrap_or(0);
+        let dim2 = inputs.first().map(|t| t.dim2).unwrap_or(0);
+        let dim3 = inputs.first().map(|t| t.dim3).unwrap_or(0);
+        let dim4 = inputs.first().map(|t| t.dim4).unwrap_or(0);
+        let mut out_bufs: Vec<Vec<Vec<Vec<Vec<Vec<f32>>>>>> = out_sizes
+            .iter()
+            .map(|&sz| vec![vec![vec![vec![vec![0.0; sz]; dim4]; dim3]; dim2]; dim1])
+            .collect();
+        let ctxs = self.forward_into(inputs, params, slice, &mut out_bufs);
+        let tensors = out_bufs.into_iter().map(Tensor5D::new).collect();
+        (tensors, ctxs)
+    }
+
+    /// Прямой проход с записью результата в предоставленные пятимерные буферы.
+    fn forward_into(
+        &self,
+        inputs: &[Tensor5D],
+        params: &[f32],
+        slice: &ParamSlice,
+        out_bufs: &mut [Vec<Vec<Vec<Vec<Vec<f32>>>>>],
+    ) -> Vec<LayerContext5D>;
+
+    /// Обратный проход: принимает градиенты по выходам (по одному на каждый выход),
+    /// контексты (по одному на каждый выход) и возвращает:
+    ///   - градиенты по входам (по одному на каждый вход)
+    ///   - градиенты параметров слоя (плоский вектор)
+    fn backward(
+        &self,
+        ctxs: &[LayerContext5D],
+        deltas: &[Tensor5D],
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> (Vec<Tensor5D>, Vec<f32>);
+
+    /// Количество обучаемых параметров слоя.
+    fn param_len(&self) -> usize;
+}
 
 
 

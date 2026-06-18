@@ -18,9 +18,8 @@ impl Neuron for LeakyReLU {
     fn forward_mat(&self, input: &Mat<f32>) -> Mat<f32> {
         let alpha = self.alpha;
         zip!(input.as_ref()).map(|x| {
-            let val = x.0;          // &f32
-            if *val > 0.0 { *val }  // разыменовываем для сравнения и возврата
-            else { alpha * (*val) }
+            let val = x.0;
+            if *val > 0.0 { *val } else { alpha * (*val) }
         })
     }
 }

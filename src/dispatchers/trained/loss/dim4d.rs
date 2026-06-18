@@ -1,1 +1,0 @@
-pub use crate::dispatchers::single::loss::dim4d::SingleLoss4D as TrainedLoss4D;

@@ -32,7 +32,7 @@ impl Neuron for Linear {
     }
 
     fn forward(&self, input: &crate::tensor::Tensor1D) -> crate::tensor::Tensor1D {
-        assert_eq!(input.len(), self.weights.len());
+        assert_eq!(input.dim1(), self.weights.len());
         let sum = self.bias + self.weights.iter().zip(&input.data).map(|(w, x)| w * x).sum::<f32>();
         crate::tensor::Tensor1D::from_scalar(sum)
     }

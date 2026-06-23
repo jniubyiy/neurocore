@@ -4,10 +4,6 @@ use crate::neuron::base::Neuron;
 pub struct Softmax;
 
 impl Neuron for Softmax {
-    fn apply(&self, _x: f32) -> f32 {
-        panic!("Softmax cannot be applied element‑wise; use forward() for a full vector.");
-    }
-
     fn forward_mat(&self, input: &Mat<f32>) -> Mat<f32> {
         let rows = input.nrows();
         let cols = input.ncols();
@@ -31,5 +27,4 @@ impl Neuron for Softmax {
         out
     }
 }
-
 

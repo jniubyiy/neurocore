@@ -1,3 +1,4 @@
+// src/neuron/types/leaky_relu.rs
 use faer::Mat;
 use faer::zip;
 use crate::neuron::base::Neuron;
@@ -11,10 +12,6 @@ impl LeakyReLU {
 }
 
 impl Neuron for LeakyReLU {
-    fn apply(&self, x: f32) -> f32 {
-        if x > 0.0 { x } else { self.alpha * x }
-    }
-
     fn forward_mat(&self, input: &Mat<f32>) -> Mat<f32> {
         let alpha = self.alpha;
         zip!(input.as_ref()).map(|x| {

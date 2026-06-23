@@ -1,48 +1,107 @@
 // src/layers/mod.rs
 
-// ============================================================
-pub mod layers1d;
-pub mod layers2d;
-pub mod layers3d;
-pub mod layers4d;
-pub mod layers5d;
+// ============= Новые модули слоёв =============
+pub mod linear;
+pub mod relu;
+pub mod sigmoid;
+pub mod softmax;
+pub mod tanh;
+pub mod memory;
+pub mod splitter;
+pub mod combiner;
+pub mod splitter_connector;
+pub mod combiner_connector;
+
+// ============= Контексты и трейты =============
+pub mod context1d;
+pub mod context2d;
+pub mod context3d;
+pub mod context4d;
+
+// ============= Специальные слои =============
 pub mod layers_special;
 
-// 1D
-pub use layers1d::{
-    Layer, LayerInfo, LayerContext1D,
-    LinearLayer, ReLULayer, SigmoidLayer, SoftmaxLayer, TanhLayer, MemoryLayer,
-    CombinerLayer1D,
-    SplitterLayer1D,
-};
+// ============= Универсальный трейт слоя =============
+pub trait UniversalLayer: Send + Sync {
+    // --- Традиционные методы (полный прямой/обратный проход) ---
 
-// 2D
-pub use layers2d::{
-    Layer2D, LayerContext,
-    Linear2D, ReLU2D, Sigmoid2D, Softmax2D, Tanh2D, Memory2D,
-};
+    fn forward(
+        &self,
+        input: &crate::compute_manager::dim_change::DynamicTensor,
+        params: &[f32],
+        slice: &crate::model_plan::param_store::ParamSlice,
+    ) -> (
+        crate::compute_manager::dim_change::DynamicTensor,
+        crate::compute_manager::graph::types::DynamicContext,
+    );
 
-// 3D
-pub use layers3d::{
-    Layer3D, LayerContext3D,
-    Linear3D, ReLU3D, Sigmoid3D, Softmax3D, Tanh3D, Memory3D,
-};
+    fn backward(
+        &self,
+        ctx: &crate::compute_manager::graph::types::DynamicContext,
+        delta: &crate::compute_manager::dim_change::DynamicTensor,
+        params: &[f32],
+        slice: &crate::model_plan::param_store::ParamSlice,
+    ) -> (crate::compute_manager::dim_change::DynamicTensor, Vec<f32>);
 
-// 4D
-pub use layers4d::{
-    Layer4D, LayerContext4D,
-    Linear4D, ReLU4D, Sigmoid4D, Softmax4D, Tanh4D, Memory4D,
-};
+    fn param_len(&self) -> usize;
+    fn input_features(&self) -> usize;
+    fn output_features(&self) -> usize;
 
-// 5D
-pub use layers5d::{
-    Layer5D, LayerContext5D,
-    Linear5D, ReLU5D, Sigmoid5D, Softmax5D, Tanh5D, Memory5D,
-};
+    // --- Новые методы для динамических чанков задач ---
 
-// Специальные слои
-pub use layers_special::{
-    DimReduce, DimExpand,
-    ReduceMean, Unsqueeze,
-};
+    /// Общее количество атомарных задач слоя для данного входного тензора.
+    fn total_tasks(
+        &self,
+        input: &crate::compute_manager::dim_change::DynamicTensor,
+    ) -> usize;
+
+    /// Выполняет непрерывный диапазон задач (по плоскому индексу) и записывает
+    /// результат в выходной тензор `output`. Входной тензор `input` предоставляет
+    /// данные всего батча, а `output` уже создан нужной формы (см. `output_tensor_shape`).
+    fn execute_tasks(
+        &self,
+        input: &crate::compute_manager::dim_change::DynamicTensor,
+        output: &mut crate::compute_manager::dim_change::DynamicTensor,
+        task_offset: usize,
+        task_count: usize,
+        params: &[f32],
+        slice: &crate::model_plan::param_store::ParamSlice,
+    );
+
+    /// Создаёт контекст для одного образца после завершения обработки всего батча.
+    fn create_sample_context(
+        &self,
+        input_sample: &crate::compute_manager::dim_change::DynamicTensor,
+        output_sample: &crate::compute_manager::dim_change::DynamicTensor,
+    ) -> crate::compute_manager::graph::types::DynamicContext;
+
+    /// Возвращает нулевой тензор такой же формы, как выход слоя для заданного
+    /// входного тензора `input` (который описывает форму батча). Используется
+    /// для выделения выходных буферов перед параллельным выполнением чанков.
+    fn output_tensor_shape(
+        &self,
+        input: &crate::compute_manager::dim_change::DynamicTensor,
+    ) -> crate::compute_manager::dim_change::DynamicTensor;
+}
+
+// ============= Реэкспорт универсальных слоёв (публичный API) =============
+pub use linear::Linear;
+pub use relu::ReLU;
+pub use sigmoid::Sigmoid;
+pub use softmax::Softmax;
+pub use tanh::Tanh;
+pub use memory::Memory;
+pub use splitter::Splitter;
+pub use combiner::Combiner;
+pub use splitter_connector::SplitterConnector;
+pub use combiner_connector::CombinerConnector;
+
+// ============= Контексты (оставлены для внутреннего использования и обратной совместимости) =============
+pub use context1d::{Layer, LayerContext1D, LayerInfo};
+pub use context2d::{Layer2D, LayerContext as LayerContext2D};
+pub use context3d::{Layer3D, LayerContext3D};
+pub use context4d::{Layer4D, LayerContext4D};
+
+// ============= Специальные слои =============
+pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 

@@ -1,3 +1,4 @@
+// src/neuron/mod.rs
 pub mod base;
 pub mod types;
 
@@ -12,7 +13,8 @@ pub use types::identity::Identity;
 pub use types::soft_sparse_gate::SoftSparseGate;
 pub use types::soft_keep_gate::SoftKeepGate;
 pub use types::memory::Memory;
-
+pub use types::combiner::Combiner;
+pub use types::splitter::Splitter;
 
 
 

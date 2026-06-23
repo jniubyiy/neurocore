@@ -1,4 +1,4 @@
-use super::tensor1d::Tensor1D;
+// src/tensor/tensor2d.rs
 
 #[derive(Debug, Clone)]
 pub struct Tensor2D {
@@ -16,11 +16,13 @@ impl Tensor2D {
     pub fn zeros(dim1: usize, dim2: usize) -> Self {
         Tensor2D { dim1, dim2, data: vec![vec![0.0; dim2]; dim1] }
     }
-    pub fn row(&self, r: usize) -> Tensor1D {
-        Tensor1D::new(self.data[r].clone())
+    pub fn row(&self, r: usize) -> Vec<f32> {
+        self.data[r].clone()
+    }
+    pub fn from_scalar(value: f32) -> Self {
+        Tensor2D { dim1: 1, dim2: 1, data: vec![vec![value]] }
     }
 }
-
 
 
 

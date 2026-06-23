@@ -1,8 +1,8 @@
 // src/model_plan/sequential.rs
 
-use crate::tensor::Tensor1D;
+use crate::tensor::Tensor2D;
 use crate::model_plan::param_store::ParamSlice;
-use crate::layers::layers1d::{Layer, LayerContext1D, LayerInfo};
+use crate::layers::context1d::{Layer, LayerContext1D, LayerInfo};
 
 pub struct Sequential {
     layers: Vec<Box<dyn Layer>>,
@@ -26,7 +26,7 @@ impl Layer for Sequential {
 
     fn forward_into(
         &self,
-        inputs: &[Tensor1D],
+        inputs: &[Tensor2D],
         params: &[f32],
         _slice: &ParamSlice,
         out_bufs: &mut [Vec<f32>],
@@ -39,7 +39,7 @@ impl Layer for Sequential {
             let out_sizes = layer.output_dim1s();
             let mut temp_bufs: Vec<Vec<f32>> = out_sizes.iter().map(|&sz| vec![0.0; sz]).collect();
             let ctxs = layer.forward_into(&current, params, slice, &mut temp_bufs);
-            current = temp_bufs.into_iter().map(Tensor1D::new).collect();
+            current = temp_bufs.into_iter().map(|buf| Tensor2D::new(vec![buf])).collect();
             if let Some(ctx) = ctxs.into_iter().next() {
                 all_ctxs.push(ctx);
             }
@@ -47,7 +47,7 @@ impl Layer for Sequential {
 
         assert_eq!(out_bufs.len(), current.len());
         for (out_buf, tensor) in out_bufs.iter_mut().zip(current) {
-            out_buf.copy_from_slice(&tensor.data);
+            out_buf.copy_from_slice(&tensor.data[0]);
         }
         all_ctxs
     }
@@ -55,11 +55,11 @@ impl Layer for Sequential {
     fn backward(
         &self,
         _ctxs: &[LayerContext1D],
-        _deltas: &[Tensor1D],
+        _deltas: &[Tensor2D],
         _params: &[f32],
         _slice: &ParamSlice,
-    ) -> (Vec<Tensor1D>, Vec<f32>) {
-        (vec![Tensor1D::zeros(0)], vec![])
+    ) -> (Vec<Tensor2D>, Vec<f32>) {
+        (vec![Tensor2D::zeros(1, 0)], vec![])
     }
 
     fn param_len(&self) -> usize {

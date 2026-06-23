@@ -9,9 +9,6 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 SOURCE_DIR = SCRIPT_DIR   # скрипт лежит в корне neurocore
 
-# Если нужно указать жёстко:
-# SOURCE_DIR = r"D:\neurocore"
-
 # ============================================================
 # 2. Папки, которые ПОЛНОСТЬЮ ПРОПУСКАЕМ (не сканируются)
 # ============================================================
@@ -87,7 +84,36 @@ def collect_rust_files(root_dir, exclude_dirs, mentioned_dirs):
     return tomls + sources, found_mentioned
 
 
-def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total_parts=None):
+def count_lines_of_file(full_path):
+    """Безопасно подсчитывает количество строк в файле. Возвращает 0 при ошибке."""
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            return sum(1 for _ in f)
+    except Exception as e:
+        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось прочитать {full_path} для подсчёта строк: {e}")
+        return 0
+
+
+def distribute_files_by_lines(file_infos, num_parts):
+    """
+    Жадно распределяет файлы по num_parts корзинам так, чтобы суммарное число строк
+    в каждой корзине было как можно более равномерным.
+    Возвращает список корзин, каждая корзина — список элементов file_info.
+    """
+    sorted_infos = sorted(file_infos, key=lambda x: x[3], reverse=True)
+
+    parts = [[] for _ in range(num_parts)]
+    sums = [0] * num_parts
+
+    for info in sorted_infos:
+        min_idx = min(range(num_parts), key=lambda i: sums[i])
+        parts[min_idx].append(info)
+        sums[min_idx] += info[3]
+
+    return parts
+
+
+def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total_parts=None, total_lines=None):
     """Записывает содержимое файлов в выходной текстовый файл."""
     processed = 0
     skipped = 0
@@ -98,6 +124,8 @@ def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total
         out.write(f"Корень проекта: {Path(SOURCE_DIR).resolve()}\n")
         if total_parts and total_parts > 1:
             out.write(f"Часть {part_num} из {total_parts}\n")
+        if total_lines is not None:
+            out.write(f"Общее количество строк в этой части: {total_lines}\n")
         out.write(SEPARATOR + "\n")
 
         if mentioned_dirs_found:
@@ -139,10 +167,7 @@ def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total
             print(f"[OK] Добавлен: {rel_path}")
             processed += 1
 
-        out.write(SEPARATOR + "\n")
-        out.write(f"Обработано успешно: {processed}\n")
-        out.write(f"Пропущено / с ошибками: {skipped}\n")
-        out.write(SEPARATOR + "\n")
+        # Статистика больше не пишется в файл
 
     print(f"Часть {part_num}: обработано {processed} файлов, пропущено {skipped} -> {output_path}")
 
@@ -156,10 +181,8 @@ def write_partition_message(file_obj, part_num, total_parts, is_start):
         else:
             msg = f"Это начало части {part_num}."
     else:
-        if part_num == total_parts - 1:
-            msg = f"Это конец первой половины, дождись второй половины."
-        else:
-            msg = f"Это конец части {part_num}, дождись части {part_num + 1}."
+        # Всегда используем универсальное сообщение
+        msg = f"Это конец части {part_num}, дождись части {part_num + 1}."
     file_obj.write("\n" + SEPARATOR + "\n")
     file_obj.write(msg + "\n")
     file_obj.write(SEPARATOR + "\n\n")
@@ -167,12 +190,10 @@ def write_partition_message(file_obj, part_num, total_parts, is_start):
 
 if __name__ == "__main__":
     this_script = Path(__file__).resolve()
-    # Исключим все возможные выходные файлы (если PARTS=2, то два файла)
     EXCLUDE_FILES = {this_script}
     for p in range(1, PARTS + 1):
         output_file = Path(f"{BASE_OUTPUT_NAME}_part{p}.txt").resolve()
         EXCLUDE_FILES.add(output_file)
-    # Добавим и вариант с одной частью на всякий случай
     EXCLUDE_FILES.add(Path(f"{BASE_OUTPUT_NAME}.txt").resolve())
 
     entries, mentioned_found = collect_rust_files(
@@ -185,29 +206,41 @@ if __name__ == "__main__":
         print("Не найдено ни одного Cargo.toml или .rs файла (с учётом исключений).")
         exit(1)
 
-    total_files = len(entries)
+    file_infos = []
+    for ftype, rel_path, full_path in entries:
+        line_cnt = count_lines_of_file(full_path)
+        file_infos.append((ftype, rel_path, full_path, line_cnt))
+        print(f"[INFO] {rel_path}: {line_cnt} строк(и)")
+
+    total_files = len(file_infos)
+
     if PARTS <= 1:
-        # Одна часть – сохраняем как раньше
         output_path = f"{BASE_OUTPUT_NAME}.txt"
-        merge_files(entries, output_path, mentioned_found)
+        total_lines_all = sum(info[3] for info in file_infos)
+        merge_files(
+            [(info[0], info[1], info[2]) for info in file_infos],
+            output_path,
+            mentioned_found,
+            total_lines=total_lines_all
+        )
     else:
-        # Разбиваем на части
-        files_per_part = math.ceil(total_files / PARTS)
-        for part in range(1, PARTS + 1):
-            start_idx = (part - 1) * files_per_part
-            end_idx = min(start_idx + files_per_part, total_files)
-            part_entries = entries[start_idx:end_idx]
-            output_path = f"{BASE_OUTPUT_NAME}_part{part}.txt"
-            merge_files(part_entries, output_path, mentioned_found, part_num=part, total_parts=PARTS)
-            # Добавляем сообщение в конце каждой части, кроме последней
-            if part < PARTS:
+        distributed_parts = distribute_files_by_lines(file_infos, PARTS)
+
+        for part_idx, part_entries in enumerate(distributed_parts, start=1):
+            part_triples = [(info[0], info[1], info[2]) for info in part_entries]
+            part_lines = sum(info[3] for info in part_entries)
+
+            output_path = f"{BASE_OUTPUT_NAME}_part{part_idx}.txt"
+            merge_files(part_triples, output_path, mentioned_found,
+                        part_num=part_idx, total_parts=PARTS,
+                        total_lines=part_lines)
+
+            if part_idx < PARTS:
                 with open(output_path, "a", encoding="utf-8") as f:
-                    write_partition_message(f, part, PARTS, is_start=False)
-            # И сообщение в начале каждой части, кроме первой
-            if part > 1:
-                # Чтобы вставить в начало, прочитаем файл и перезапишем с сообщением в начале
+                    write_partition_message(f, part_idx, PARTS, is_start=False)
+            if part_idx > 1:
                 with open(output_path, "r", encoding="utf-8") as f:
                     content = f.read()
                 with open(output_path, "w", encoding="utf-8") as f:
-                    write_partition_message(f, part, PARTS, is_start=True)
+                    write_partition_message(f, part_idx, PARTS, is_start=True)
                     f.write(content)

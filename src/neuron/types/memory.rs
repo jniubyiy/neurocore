@@ -1,80 +1,48 @@
+// src/neuron/types/memory.rs
+
 use faer::Mat;
 use crate::neuron::base::Neuron;
 
+/// Одиночный нейрон Memory: два обучаемых вектора весов и температура.
+/// Принимает (batch, in_features), возвращает (batch, 1).
 pub struct Memory {
-    pub memory0: Vec<f32>,
-    pub memory1: Vec<f32>,
-    pub temperature: f32,
+    pub weight0: Vec<f32>,   // длина in_features
+    pub weight1: Vec<f32>,   // длина in_features
+    pub temperature: f32,    // > 0
 }
 
 impl Memory {
-    pub fn new(memory0: Vec<f32>, memory1: Vec<f32>, temperature: f32) -> Self {
-        assert_eq!(memory0.len(), memory1.len());
+    pub fn new(weight0: Vec<f32>, weight1: Vec<f32>, temperature: f32) -> Self {
+        assert_eq!(weight0.len(), weight1.len());
         assert!(temperature > 0.0);
-        Memory { memory0, memory1, temperature }
-    }
-
-    pub fn param_count(&self) -> usize { 2 * self.memory0.len() + 1 }
-    pub fn get_params(&self) -> Vec<f32> {
-        let mut v = Vec::with_capacity(self.param_count());
-        v.extend_from_slice(&self.memory0);
-        v.extend_from_slice(&self.memory1);
-        v.push(self.temperature);
-        v
-    }
-    pub fn set_params(&mut self, values: &[f32]) {
-        let n = self.memory0.len();
-        assert_eq!(values.len(), 2 * n + 1);
-        self.memory0.copy_from_slice(&values[..n]);
-        self.memory1.copy_from_slice(&values[n..2 * n]);
-        self.temperature = values[2 * n];
-    }
-
-    fn mem_col(&self, data: &[f32]) -> Mat<f32> {
-        Mat::from_fn(data.len(), 1, |i, _| data[i])
+        Self { weight0, weight1, temperature }
     }
 }
 
 impl Neuron for Memory {
-    fn apply(&self, _x: f32) -> f32 {
-        panic!("Memory does not support element‑wise apply; use forward()");
-    }
-
-    fn forward(&self, input: &crate::tensor::Tensor1D) -> crate::tensor::Tensor1D {
-        let mut dot0 = 0.0;
-        let mut dot1 = 0.0;
-        for i in 0..input.dim1() {
-            dot0 += input.data[i] * self.memory0[i];
-            dot1 += input.data[i] * self.memory1[i];
-        }
-        let logit0 = dot0 / self.temperature;
-        let logit1 = dot1 / self.temperature;
-        let max_logit = logit0.max(logit1);
-        let exp0 = (logit0 - max_logit).exp();
-        let exp1 = (logit1 - max_logit).exp();
-        let sum_exp = exp0 + exp1;
-        let soft0 = exp0 / sum_exp;
-        let soft1 = exp1 / sum_exp;
-        crate::tensor::Tensor1D::from_scalar(soft0 * dot0 + soft1 * dot1)
-    }
-
     fn forward_mat(&self, input: &Mat<f32>) -> Mat<f32> {
         let batch = input.nrows();
-        let m0_col = self.mem_col(&self.memory0);
-        let m1_col = self.mem_col(&self.memory1);
-        let dot0 = input * &m0_col;
-        let dot1 = input * &m1_col;
+        let in_features = input.ncols();
+        assert_eq!(self.weight0.len(), in_features, "Memory neuron: weight length must match input columns");
 
-        let mut result = Mat::zeros(batch, 1);
+        let mut output = Mat::zeros(batch, 1);
         for i in 0..batch {
-            let d0 = dot0[(i, 0)] / self.temperature;
-            let d1 = dot1[(i, 0)] / self.temperature;
-            let max_logit = d0.max(d1);
-            let exp0 = (d0 - max_logit).exp();
-            let exp1 = (d1 - max_logit).exp();
+            let mut dot0 = 0.0;
+            let mut dot1 = 0.0;
+            for j in 0..in_features {
+                dot0 += input[(i, j)] * self.weight0[j];
+                dot1 += input[(i, j)] * self.weight1[j];
+            }
+            let scaled0 = dot0 / self.temperature;
+            let scaled1 = dot1 / self.temperature;
+            let max_logit = scaled0.max(scaled1);
+            let exp0 = (scaled0 - max_logit).exp();
+            let exp1 = (scaled1 - max_logit).exp();
             let sum = exp0 + exp1;
-            result[(i, 0)] = (exp0 / sum) * dot0[(i, 0)] + (exp1 / sum) * dot1[(i, 0)];
+            let soft0 = exp0 / sum;
+            let soft1 = exp1 / sum;
+            output[(i, 0)] = soft0 * dot0 + soft1 * dot1;
         }
-        result
+        output
     }
 }

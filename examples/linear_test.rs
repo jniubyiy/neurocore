@@ -1,53 +1,77 @@
 // examples/linear_test.rs
+// Один линейный слой 4 -> 2, размерность Dim1.
 
-use neurocore::model_plan::{Plan, LayerDesc, LayerKind, Dim};
-use neurocore::dispatchers::auto_model::{MixedModel, DynamicTensor};
-use neurocore::loss_plan::{LossBlueprint, LossPlan};
-use neurocore::tensor::Tensor1D;
 use std::time::Instant;
+use neurocore::compute_manager::DynamicTensor;
+use neurocore::tensor::Tensor2D;
+use neurocore::{create_models, create_losses, create_optimizers};
+
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+
+    pub fn linear_model() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[4])
+                .output(Dim::Dim1, &[2]),
+        ]
+    }
+}
+
+mod losses {
+    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
+
+    pub fn mse() -> LossDesc {
+        let chain = ElementChain::new()
+            .add(Box::new(Sub))
+            .add(Box::new(Square));
+        LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1)
+    }
+}
+
+mod optimizers {
+    use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ApplyUpdate)
+    }
+}
 
 fn main() {
-    // Один линейный слой 4 -> 2
-    let descs = vec![
-        LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
-            .input(Dim::Dim1, &[4])
-            .output(Dim::Dim1, &[2]),
-    ];
+    let (mut model,) = create_models!(models::linear_model);
+    let (loss_expr,) = create_losses!(losses::mse);
+    let (mut opt,) = create_optimizers!((model, optimizers::sgd));
 
-    let plan = Plan::from_descs(descs).expect("Ошибка плана");
-    let mut model = plan.build();
-
-    let loss_plan = LossPlan::new(LossBlueprint::mse()).unwrap();
-    let built_loss = loss_plan.build().unwrap();
-
-    let x = Tensor1D::new(vec![1.0, 2.0, 3.0, 4.0]);
-    let target = Tensor1D::new(vec![0.8, 1.5]);
-    let lr = 0.01;
+    let x = Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0]]);
+    let target = Tensor2D::new(vec![vec![0.8, 1.5]]);
     let epochs = 500;
 
     let start = Instant::now();
     for epoch in 0..epochs {
-        let (pred_dyn, ctxs) = model.forward(DynamicTensor::Dim1(x.clone()));
-        let pred = match pred_dyn {
-            DynamicTensor::Dim1(t) => t,
-            _ => panic!(),
-        };
-        let (loss, delta) = (built_loss.forward)(&pred, &target);
-        let (_, grads) = model.backward(&ctxs, DynamicTensor::Dim1(delta));
-        model.update_params(lr, &grads);
+        let (pred, ctxs) = model.forward(DynamicTensor::Dim1(x.clone()));
+        let (loss, delta) = model.compute_loss_with_expr(
+            loss_expr.clone(),
+            &pred,
+            &DynamicTensor::Dim1(target.clone()),
+        );
+        let (_, grads) = model.backward(&ctxs, delta);
+        model.update_params_with_optimizer(&mut opt, &grads[0]);
 
         if epoch == 0 || epoch % 100 == 0 {
-            println!("Epoch {}: loss={:.6}", epoch, loss);
+            println!("Epoch {}: loss = {:.6}", epoch, loss);
         }
     }
     let duration = start.elapsed();
 
-    let (final_pred_dyn, _) = model.forward(DynamicTensor::Dim1(x.clone()));
-    let final_pred = match final_pred_dyn {
-        DynamicTensor::Dim1(t) => t,
-        _ => panic!(),
-    };
-    let (final_loss, _) = (built_loss.forward)(&final_pred, &target);
+    let (final_pred, _) = model.forward(DynamicTensor::Dim1(x.clone()));
+    let (final_loss, _) = model.compute_loss_with_expr(
+        loss_expr,
+        &final_pred,
+        &DynamicTensor::Dim1(target.clone()),
+    );
+
     println!("Done. Time: {:?}", duration);
     println!("Final loss: {:.6}", final_loss);
 }

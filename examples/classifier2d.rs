@@ -1,66 +1,88 @@
 // examples/classifier2d.rs
+// Классификатор на 2 класса, размерность Dim2.
 
-use neurocore::model_plan::{Plan, LayerDesc, LayerKind, Dim};
-use neurocore::dispatchers::auto_model::{MixedModel, DynamicTensor};
-use neurocore::loss_plan::{LossBlueprint, LossPlan};
-use neurocore::tensor::Tensor2D;
 use std::time::Instant;
+use neurocore::compute_manager::DynamicTensor;
+use neurocore::tensor::Tensor3D;
+use neurocore::{create_models, create_losses, create_optimizers};
+
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+
+    pub fn classifier() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("fc", LayerKind::Linear, Dim::Dim2)
+                .input(Dim::Dim2, &[2])
+                .output(Dim::Dim2, &[2]),
+            LayerDesc::new("softmax", LayerKind::Softmax, Dim::Dim2)
+                .input(Dim::Dim2, &[2])
+                .output(Dim::Dim2, &[2]),
+        ]
+    }
+}
+
+mod losses {
+    use neurocore::loss_plan::{LossDesc, CrossEntropyWithLogits, ElementChain, Aggregation};
+
+    pub fn cross_entropy() -> LossDesc {
+        let chain = ElementChain::new()
+            .add(Box::new(CrossEntropyWithLogits::new(2)));
+        LossDesc::from_chain(chain, Aggregation::Sum, 1, 2, 1)
+    }
+}
+
+mod optimizers {
+    use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.5))
+            .add(OptCubeDesc::ApplyUpdate)
+    }
+}
 
 fn main() {
-    let descs = vec![
-        LayerDesc::new("fc", LayerKind::Linear, Dim::Dim2)
-            .input(Dim::Dim2, &[2])
-            .output(Dim::Dim2, &[2]),
-        LayerDesc::new("softmax", LayerKind::Softmax, Dim::Dim2)
-            .input(Dim::Dim2, &[2])
-            .output(Dim::Dim2, &[2]),
-    ];
+    let (mut model,) = create_models!(models::classifier);
+    let (loss_expr,) = create_losses!(losses::cross_entropy);
+    let (mut opt,) = create_optimizers!((model, optimizers::sgd));
 
-    let plan = Plan::from_descs(descs).expect("Ошибка плана");
-    let mut model = plan.build();
-
-    let loss_plan = LossPlan::new(LossBlueprint::cross_entropy(2)).unwrap();
-    let built_loss = loss_plan.build_2d().unwrap();
-
-    // Входы: один 2D-образец (1 строка x 2 столбца)
-    let x1 = Tensor2D::new(vec![vec![1.0, 2.0]]);
-    let x2 = Tensor2D::new(vec![vec![2.0, 1.0]]);
-    let y1 = Tensor2D::new(vec![vec![0.0]]); // метка класса 0
-    let y2 = Tensor2D::new(vec![vec![1.0]]);
-    let lr = 0.5;
+    let x1 = Tensor3D::new(vec![vec![vec![1.0, 2.0]]]);
+    let x2 = Tensor3D::new(vec![vec![vec![2.0, 1.0]]]);
+    let y1 = Tensor3D::new(vec![vec![vec![0.0]]]); // класс 0
+    let y2 = Tensor3D::new(vec![vec![vec![1.0]]]); // класс 1
     let epochs = 200;
 
     let start = Instant::now();
     for epoch in 0..epochs {
         for (x, y) in &[(&x1, &y1), (&x2, &y2)] {
-            let (pred_dyn, ctxs) = model.forward(DynamicTensor::Dim2((*x).clone()));
-            let pred = match pred_dyn {
-                DynamicTensor::Dim2(t) => t,
-                _ => panic!(),
-            };
-            let (_, delta) = (built_loss.forward)(&pred, y);
-            let (_, grads) = model.backward(&ctxs, DynamicTensor::Dim2(delta));
-            model.update_params(lr, &grads);
+            let (pred, ctxs) = model.forward(DynamicTensor::Dim2((*x).clone()));
+            let (_, delta) = model.compute_loss_with_expr(
+                loss_expr.clone(),
+                &pred,
+                &DynamicTensor::Dim2((*y).clone()),
+            );
+            let (_, grads) = model.backward(&ctxs, delta);
+            model.update_params_with_optimizer(&mut opt, &grads[0]);
         }
 
         if epoch % 50 == 0 {
-            let (pred_dyn, _) = model.forward(DynamicTensor::Dim2(x1.clone()));
-            let pred = match pred_dyn {
-                DynamicTensor::Dim2(t) => t,
-                _ => panic!(),
-            };
-            let (loss, _) = (built_loss.forward)(&pred, &y1);
-            println!("Epoch {}: loss={:.6}", epoch, loss);
+            let (pred, _) = model.forward(DynamicTensor::Dim2(x1.clone()));
+            let (loss, _) = model.compute_loss_with_expr(
+                loss_expr.clone(),
+                &pred,
+                &DynamicTensor::Dim2(y1.clone()),
+            );
+            println!("Epoch {}: loss = {:.6}", epoch, loss);
         }
     }
     let duration = start.elapsed();
 
-    let (pred_dyn, _) = model.forward(DynamicTensor::Dim2(x1.clone()));
-    let pred = match pred_dyn {
-        DynamicTensor::Dim2(t) => t,
-        _ => panic!(),
-    };
-    let (final_loss, _) = (built_loss.forward)(&pred, &y1);
+    let (final_pred, _) = model.forward(DynamicTensor::Dim2(x1.clone()));
+    let (final_loss, _) = model.compute_loss_with_expr(
+        loss_expr,
+        &final_pred,
+        &DynamicTensor::Dim2(y1.clone()),
+    );
     println!("Done. Time: {:?}", duration);
     println!("Final loss: {:.6}", final_loss);
 }

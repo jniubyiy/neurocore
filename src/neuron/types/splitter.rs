@@ -1,25 +1,26 @@
 // src/neuron/types/splitter.rs
 
-/// Нейрон-разделитель: принимает один вектор `x` длины `n` и выдаёт два вектора `a` (длины `p`) и `b` (длины `q`).
-/// Параметры: матрицы весов `W_a` (p×n), `W_b` (q×n) и смещения `bias_a` (p), `bias_b` (q).
-/// Формула: a = activation(W_a * x + bias_a), b = activation(W_b * x + bias_b). По умолчанию ReLU.
+use faer::Mat;
+use crate::neuron::base::Neuron;
+use crate::neuron::ReLU;
+use crate::neuron::Linear as LinearNeuron;
+
+/// Нейрон-разделитель: принимает матрицу x (batch × n) и выдаёт два выхода a (batch × p) и b (batch × q).
+/// Использует p+q независимых линейных нейронов и ReLU.
 pub struct Splitter {
-    pub n: usize,         // размерность входного вектора
-    pub p: usize,         // размерность первого выходного вектора
-    pub q: usize,         // размерность второго выходного вектора
-    pub wa: Vec<f32>,     // веса для a, размер p * n
-    pub wb: Vec<f32>,     // веса для b, размер q * n
-    pub bias_a: Vec<f32>, // смещения для a, длина p
-    pub bias_b: Vec<f32>, // смещения для b, длина q
+    pub n: usize,
+    pub p: usize,
+    pub q: usize,
+    pub wa: Vec<f32>,     // p * n (row-major)
+    pub wb: Vec<f32>,     // q * n
+    pub bias_a: Vec<f32>, // p
+    pub bias_b: Vec<f32>, // q
 }
 
 impl Splitter {
-    /// Создаёт разделитель с заданными размерностями, параметры инициализируются нулями.
     pub fn new(n: usize, p: usize, q: usize) -> Self {
         Self {
-            n,
-            p,
-            q,
+            n, p, q,
             wa: vec![0.0; p * n],
             wb: vec![0.0; q * n],
             bias_a: vec![0.0; p],
@@ -27,12 +28,10 @@ impl Splitter {
         }
     }
 
-    /// Общее количество параметров.
     pub fn param_count(&self) -> usize {
         self.p * self.n + self.q * self.n + self.p + self.q
     }
 
-    /// Сериализация параметров в плоский вектор.
     pub fn get_params(&self) -> Vec<f32> {
         let mut v = Vec::with_capacity(self.param_count());
         v.extend_from_slice(&self.wa);
@@ -42,7 +41,6 @@ impl Splitter {
         v
     }
 
-    /// Установка параметров из плоского вектора.
     pub fn set_params(&mut self, values: &[f32]) {
         let wa_len = self.p * self.n;
         let wb_len = self.q * self.n;
@@ -55,105 +53,106 @@ impl Splitter {
         self.bias_b.copy_from_slice(&values[wa_len + wb_len + ba_len..]);
     }
 
-    /// Прямой проход для одного образца: выдаёт (a, b) и кэш (x, pre_a, pre_b).
-    pub fn forward_sample(&self, x: &[f32], a_out: &mut [f32], b_out: &mut [f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        assert_eq!(x.len(), self.n);
-        assert_eq!(a_out.len(), self.p);
-        assert_eq!(b_out.len(), self.q);
-        let mut pre_a = vec![0.0; self.p];
-        let mut pre_b = vec![0.0; self.q];
-        // Вычисляем a
-        for i in 0..self.p {
-            let mut sum = self.bias_a[i];
-            for j in 0..self.n {
-                sum += self.wa[i * self.n + j] * x[j];
+    /// Прямой проход: возвращает (a, b, pre_a, pre_b)
+    pub fn forward_mat(&self, x: &Mat<f32>) -> (Mat<f32>, Mat<f32>, Mat<f32>, Mat<f32>) {
+        let batch = x.nrows();
+        assert_eq!(x.ncols(), self.n);
+        let relu = ReLU;
+
+        // Ветка a
+        let mut pre_a = Mat::zeros(batch, self.p);
+        for out_idx in 0..self.p {
+            let w_start = out_idx * self.n;
+            let weights: Vec<f32> = self.wa[w_start..w_start + self.n].to_vec();
+            let neuron = LinearNeuron::new(weights, self.bias_a[out_idx]);
+            let col = neuron.forward_mat(x); // (batch, 1)
+            for i in 0..batch {
+                pre_a[(i, out_idx)] = col[(i, 0)];
             }
-            pre_a[i] = sum;
-            a_out[i] = sum.max(0.0); // ReLU
         }
-        // Вычисляем b
-        for i in 0..self.q {
-            let mut sum = self.bias_b[i];
-            for j in 0..self.n {
-                sum += self.wb[i * self.n + j] * x[j];
+        let mut a = Mat::zeros(batch, self.p);
+        for out_idx in 0..self.p {
+            let col = pre_a.submatrix(0, out_idx, batch, 1).to_owned();
+            let act = relu.forward_mat(&col);
+            for i in 0..batch {
+                a[(i, out_idx)] = act[(i, 0)];
             }
-            pre_b[i] = sum;
-            b_out[i] = sum.max(0.0); // ReLU
         }
-        (x.to_vec(), pre_a, pre_b)
+
+        // Ветка b
+        let mut pre_b = Mat::zeros(batch, self.q);
+        for out_idx in 0..self.q {
+            let w_start = out_idx * self.n;
+            let weights: Vec<f32> = self.wb[w_start..w_start + self.n].to_vec();
+            let neuron = LinearNeuron::new(weights, self.bias_b[out_idx]);
+            let col = neuron.forward_mat(x);
+            for i in 0..batch {
+                pre_b[(i, out_idx)] = col[(i, 0)];
+            }
+        }
+        let mut b = Mat::zeros(batch, self.q);
+        for out_idx in 0..self.q {
+            let col = pre_b.submatrix(0, out_idx, batch, 1).to_owned();
+            let act = relu.forward_mat(&col);
+            for i in 0..batch {
+                b[(i, out_idx)] = act[(i, 0)];
+            }
+        }
+
+        (a, b, pre_a, pre_b)
     }
 
-    /// Обратный проход для одного образца: получает градиенты по выходам `da`, `db`, кэш,
-    /// возвращает градиент по входу `dx` и градиенты параметров (плоский вектор).
-    pub fn backward_sample(&self, da: &[f32], db: &[f32], cache: &(Vec<f32>, Vec<f32>, Vec<f32>)) -> (Vec<f32>, Vec<f32>) {
-        let (x, pre_a, pre_b) = cache;
-        let mut dx = vec![0.0; self.n];
-        let mut d_wa = vec![0.0; self.p * self.n];
-        let mut d_wb = vec![0.0; self.q * self.n];
+    /// Обратный проход (матричный, для эффективности)
+    pub fn backward_mat(
+        &self,
+        x: &Mat<f32>,
+        da: &Mat<f32>,
+        db: &Mat<f32>,
+        pre_a: &Mat<f32>,
+        pre_b: &Mat<f32>,
+    ) -> (Mat<f32>, Vec<f32>) {
+        let batch = x.nrows();
+        assert_eq!(x.ncols(), self.n);
+
+        let d_pre_a = relu_backward_mat(pre_a, da);
+        let d_pre_b = relu_backward_mat(pre_b, db);
+
+        let wa_mat = Mat::from_fn(self.p, self.n, |r, c| self.wa[r * self.n + c]);
+        let wb_mat = Mat::from_fn(self.q, self.n, |r, c| self.wb[r * self.n + c]);
+
+        let dx = &d_pre_a * &wa_mat + &d_pre_b * &wb_mat;
+        let d_wa = &d_pre_a.transpose() * x;
+        let d_wb = &d_pre_b.transpose() * x;
+
         let mut d_bias_a = vec![0.0; self.p];
         let mut d_bias_b = vec![0.0; self.q];
-
-        // Градиенты от a
-        for i in 0..self.p {
-            let d_pre = if pre_a[i] > 0.0 { da[i] } else { 0.0 };
-            d_bias_a[i] += d_pre;
-            for j in 0..self.n {
-                dx[j] += d_pre * self.wa[i * self.n + j];
-                d_wa[i * self.n + j] = d_pre * x[j];
-            }
-        }
-        // Градиенты от b
-        for i in 0..self.q {
-            let d_pre = if pre_b[i] > 0.0 { db[i] } else { 0.0 };
-            d_bias_b[i] += d_pre;
-            for j in 0..self.n {
-                dx[j] += d_pre * self.wb[i * self.n + j];
-                d_wb[i * self.n + j] = d_pre * x[j];
-            }
-        }
-
-        let mut d_params = Vec::with_capacity(self.param_count());
-        d_params.extend_from_slice(&d_wa);
-        d_params.extend_from_slice(&d_wb);
-        d_params.extend_from_slice(&d_bias_a);
-        d_params.extend_from_slice(&d_bias_b);
-        (dx, d_params)
-    }
-
-    /// Пакетный прямой проход: на вход матрица X (batch × n), на выходе два набора матриц A и B.
-    pub fn forward_batch(&self, x_batch: &[Vec<f32>]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>) {
-        let batch = x_batch.len();
-        let mut a_batch = Vec::with_capacity(batch);
-        let mut b_batch = Vec::with_capacity(batch);
-        let mut caches = Vec::with_capacity(batch);
         for i in 0..batch {
-            let mut a = vec![0.0; self.p];
-            let mut b = vec![0.0; self.q];
-            let cache = self.forward_sample(&x_batch[i], &mut a, &mut b);
-            a_batch.push(a);
-            b_batch.push(b);
-            caches.push(cache);
+            for j in 0..self.p { d_bias_a[j] += d_pre_a[(i, j)]; }
+            for j in 0..self.q { d_bias_b[j] += d_pre_b[(i, j)]; }
         }
-        (a_batch, b_batch, caches)
-    }
 
-    /// Пакетный обратный проход.
-    pub fn backward_batch(
-        &self,
-        da_batch: &[Vec<f32>],
-        db_batch: &[Vec<f32>],
-        caches: &[(Vec<f32>, Vec<f32>, Vec<f32>)],
-    ) -> (Vec<Vec<f32>>, Vec<f32>) {
-        let batch = da_batch.len();
-        let mut dx_batch = Vec::with_capacity(batch);
-        let mut d_params = vec![0.0; self.param_count()];
-        for i in 0..batch {
-            let (dx, dpar) = self.backward_sample(&da_batch[i], &db_batch[i], &caches[i]);
-            dx_batch.push(dx);
-            for (idx, &val) in dpar.iter().enumerate() {
-                d_params[idx] += val;
+        let mut grad = Vec::with_capacity(self.param_count());
+        for r in 0..self.p {
+            for c in 0..self.n { grad.push(d_wa[(r, c)]); }
+        }
+        for r in 0..self.q {
+            for c in 0..self.n { grad.push(d_wb[(r, c)]); }
+        }
+        grad.extend_from_slice(&d_bias_a);
+        grad.extend_from_slice(&d_bias_b);
+
+        (dx, grad)
+    }
+}
+
+fn relu_backward_mat(pre: &Mat<f32>, dout: &Mat<f32>) -> Mat<f32> {
+    let mut out = Mat::zeros(pre.nrows(), pre.ncols());
+    for i in 0..pre.nrows() {
+        for j in 0..pre.ncols() {
+            if pre[(i, j)] > 0.0 {
+                out[(i, j)] = dout[(i, j)];
             }
         }
-        (dx_batch, d_params)
     }
+    out
 }

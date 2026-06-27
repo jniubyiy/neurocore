@@ -14,4 +14,9 @@ pub enum LayerKind {
     ReduceMean(Vec<usize>),
     SplitterConnector,
     CombinerConnector,
+    LeakyReLU,
+    Identity,
+    SoftSparseGate,
+    SoftKeepGate,
+    DualAnchor,          // <-- добавлено
 }

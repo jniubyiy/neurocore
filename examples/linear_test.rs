@@ -1,37 +1,31 @@
 // examples/linear_test.rs
-// Один линейный слой 4 -> 2, размерность Dim1.
 
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
-use neurocore::compute_manager::DynamicTensor;
+use neurocore::compute_manager::{Device, DynamicTensor};
+use neurocore::model_plan::Plan;
 use neurocore::tensor::Tensor2D;
-use neurocore::{create_models, create_losses, create_optimizers};
 
 mod models {
     use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
-
     pub fn linear_model() -> Vec<LayerDesc> {
-        vec![
-            LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
-                .input(Dim::Dim1, &[4])
-                .output(Dim::Dim1, &[2]),
-        ]
+        vec![LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
+            .input(Dim::Dim1, &[4])
+            .output(Dim::Dim1, &[2])]
     }
 }
 
 mod losses {
     use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
-
     pub fn mse() -> LossDesc {
-        let chain = ElementChain::new()
-            .add(Box::new(Sub))
-            .add(Box::new(Square));
+        let chain = ElementChain::new().add(Box::new(Sub)).add(Box::new(Square));
         LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1)
     }
 }
 
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
-
     pub fn sgd() -> OptimizerDesc {
         OptimizerDesc::new()
             .add(OptCubeDesc::ScaleGradient(0.01))
@@ -39,10 +33,52 @@ mod optimizers {
     }
 }
 
-fn main() {
-    let (mut model,) = create_models!(models::linear_model);
-    let (loss_expr,) = create_losses!(losses::mse);
-    let (mut opt,) = create_optimizers!((model, optimizers::sgd));
+fn run_training(
+    device: Device,
+    label: &str,
+    initial_params: Option<&[f32]>,
+) -> (Vec<f32>, f32) {
+    // Для GPU выполняем всё в отдельном потоке с большим стеком
+    if matches!(device, Device::Gpu { .. }) {
+        let device = device.clone();
+        let label = label.to_string();
+        let initial_params = initial_params.map(|p| p.to_vec());
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(move || {
+                let (params, loss) = run_training_inner(device, &label, initial_params.as_deref());
+                tx.send((params, loss)).ok();
+            })
+            .unwrap();
+        return rx.recv().unwrap();
+    }
+    run_training_inner(device, label, initial_params)
+}
+
+fn run_training_inner(
+    device: Device,
+    label: &str,
+    initial_params: Option<&[f32]>,
+) -> (Vec<f32>, f32) {
+    println!("\n===== {} =====", label);
+    let mut model = match Plan::from_layer_descs(models::linear_model()) {
+        Ok(plan) => plan.build_with_device(device),
+        Err(e) => {
+            println!("[ERROR] Не удалось собрать модель: {}", e);
+            return (vec![], 0.0);
+        }
+    };
+
+    // Установка начальных параметров, если они переданы
+    if let Some(p) = initial_params {
+        model.param_store().lock().unwrap().set_all_params(p);
+    } else {
+        let mut store = model.param_store().lock().unwrap();
+        for i in 0..store.len() {
+            store.set_param(i, rand::random::<f32>() * 0.01);
+        }
+    }
 
     let x = Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0]]);
     let target = Tensor2D::new(vec![vec![0.8, 1.5]]);
@@ -51,13 +87,13 @@ fn main() {
     let start = Instant::now();
     for epoch in 0..epochs {
         let (pred, ctxs) = model.forward(DynamicTensor::Dim1(x.clone()));
-        let (loss, delta) = model.compute_loss_with_expr(
-            loss_expr.clone(),
+        let (loss, delta) = model.compute_loss(
+            losses::mse(),
             &pred,
             &DynamicTensor::Dim1(target.clone()),
         );
         let (_, grads) = model.backward(&ctxs, delta);
-        model.update_params_with_optimizer(&mut opt, &grads[0]);
+        model.update_params(optimizers::sgd(), &grads[0]);
 
         if epoch == 0 || epoch % 100 == 0 {
             println!("Epoch {}: loss = {:.6}", epoch, loss);
@@ -66,15 +102,31 @@ fn main() {
     let duration = start.elapsed();
 
     let (final_pred, _) = model.forward(DynamicTensor::Dim1(x.clone()));
-    let (final_loss, _) = model.compute_loss_with_expr(
-        loss_expr,
+    let (final_loss, _) = model.compute_loss(
+        losses::mse(),
         &final_pred,
         &DynamicTensor::Dim1(target.clone()),
     );
-
     println!("Done. Time: {:?}", duration);
     println!("Final loss: {:.6}", final_loss);
+
+    let params = model.param_store().lock().unwrap().all_params_vec();
+    (params, final_loss)
 }
 
+fn main() {
+    // Стандартные одиночные проходы
+    run_training(Device::Cpu { threads: 1 }, "CPU (1 поток)", None);
+    run_training(Device::Cpu { threads: 4 }, "CPU (4 потока)", None);
+    run_training(Device::Gpu { id: 0 }, "GPU (id 0)", None);
+
+    // CPU → GPU
+    let cpu_params = run_training(Device::Cpu { threads: 1 }, "CPU (1 поток)", None).0;
+    run_training(Device::Gpu { id: 0 }, "GPU после CPU", Some(&cpu_params));
+
+    // GPU → CPU
+    let gpu_params = run_training(Device::Gpu { id: 0 }, "GPU (id 0)", None).0;
+    run_training(Device::Cpu { threads: 1 }, "CPU после GPU", Some(&gpu_params));
+}
 
 

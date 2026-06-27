@@ -14,3 +14,4 @@ pub use cpu::CpuExecutor;
 pub use graph::model::MixedModel;
 pub use graph::types::{DynamicContext, DynamicBatchTensor};
 pub use dim_change::DynamicTensor;
+pub use gpu::GpuExecutor;

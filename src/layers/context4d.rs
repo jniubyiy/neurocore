@@ -12,10 +12,16 @@ pub enum LayerContext4D {
     Tanh4D    { output: Tensor5D },
     Softmax4D { output: Tensor5D },
     Memory4D  { input: Tensor5D },
-    Splitter4D { input: Tensor5D, pre_a: Vec<f32>, pre_b: Vec<f32> },  // <-- изменено
+    Splitter4D { input: Tensor5D, pre_a: Vec<f32>, pre_b: Vec<f32> },
     Combiner4D { input_a: Tensor5D, input_b: Tensor5D, pre_act: Vec<Vec<Vec<Vec<f32>>>> },
     SplitterConnector { input: Tensor5D },
     CombinerConnector { inputs: Vec<Tensor5D> },
+
+    // Новые слои
+    LeakyReLU4D       { input: Tensor5D },
+    SoftSparseGate4D  { input: Tensor5D },
+    SoftKeepGate4D    { input: Tensor5D },
+    DualAnchor4D      { input: Tensor5D },   // <-- добавлено
 }
 
 pub trait Layer4D: Send + Sync {

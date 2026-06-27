@@ -25,6 +25,12 @@ pub enum LayerContext1D {
     Splitter { input: Tensor2D, pre_a: Vec<f32>, pre_b: Vec<f32> },
     SplitterConnector { input: Tensor2D },
     CombinerConnector { inputs: Vec<Tensor2D> },
+
+    // Новые слои
+    LeakyReLU       { input: Tensor2D },
+    SoftSparseGate  { input: Tensor2D },
+    SoftKeepGate    { input: Tensor2D },
+    DualAnchor1D    { input: Tensor2D },   // <-- добавлено
 }
 
 pub trait Layer: Send + Sync {

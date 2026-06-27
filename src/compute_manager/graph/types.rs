@@ -37,13 +37,22 @@ pub(crate) enum Segment {
     Unsqueeze(Vec<usize>),
     ReduceMean(Vec<usize>),
     SplitterConnector {
-        #[allow(dead_code)]
-        input_dim: usize,
-        output_dims: Vec<usize>,
+        dim_a: usize,
+        dim_b: usize,
     },
     CombinerConnector {
         input_dims: Vec<usize>,
         #[allow(dead_code)]
         output_dim: usize,
+    },
+    Splitter {
+        input_dim: usize,
+        output_dims: Vec<usize>,
+        slice: ParamSlice,
+    },
+    Combiner {
+        input_dim: usize,
+        output_dim: usize,
+        slice: ParamSlice,
     },
 }

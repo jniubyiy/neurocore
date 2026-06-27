@@ -1,15 +1,14 @@
 // examples_large/mnist_binary_32x32.rs
 // Классификатор MNIST (32x32 бинарных изображений) с двумя скрытыми слоями.
 // Модель и потери собираются через макросы, оптимизатор – вручную для гибкости.
+// Используются новые удобные методы compute_loss и update_params.
 
 use std::time::Instant;
 use rand::Rng;
 
 use neurocore::compute_manager::DynamicTensor;
-use neurocore::loss_plan::LossDesc;
-use neurocore::optimizer_plan::OptimizerDesc;
 use neurocore::tensor::Tensor2D;
-use neurocore::{create_models, create_losses};
+use neurocore::create_models;
 
 // -----------------------------------------------------------------
 // Описание моделей, потерь и оптимизаторов (всё как отдельные функции)
@@ -94,8 +93,8 @@ fn main() {
         }
     }
 
-    // Создаём SGD‑оптимизатор вручную (макрос create_optimizers! не поддерживает параметры)
-    let mut opt = model.create_optimizer(optimizers::sgd(lr).build_chain());
+    // Создаём описание оптимизатора один раз
+    let sgd_desc = optimizers::sgd(lr);
 
     let start = Instant::now();
     for epoch in 0..epochs {
@@ -112,11 +111,8 @@ fn main() {
             let (pred, contexts) = model.forward(DynamicTensor::Dim1(batch_x.clone()));
 
             // Функция потерь для текущего размера батча
-            let loss_expr = losses::cross_entropy_desc(num_classes, current_batch_size).build();
-
-            // Вычисление потерь и начального градиента
-            let (loss, delta) = model.compute_loss_with_expr(
-                loss_expr,
+            let (loss, delta) = model.compute_loss(
+                losses::cross_entropy_desc(num_classes, current_batch_size),
                 &pred,
                 &DynamicTensor::Dim1(batch_y),
             );
@@ -125,7 +121,7 @@ fn main() {
             // Обратный проход
             let (_, grads) = model.backward(&contexts, delta);
             // Обновление параметров
-            model.update_params_with_optimizer(&mut opt, &grads[0]);
+            model.update_params(sgd_desc.clone(), &grads[0]);
         }
         println!(
             "Epoch {}: avg loss = {:.6}",

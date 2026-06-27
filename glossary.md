@@ -1,125 +1,272 @@
-# Глоссарий проекта neurocore
+```markdown
+# neurocore – руководство пользователя
 
-## Тензор (Tensor1D)
-Одномерный массив чисел (вектор). Не содержит информации о производных.  
-Используется для представления входных данных, выходов нейронов, целевых значений.
+**neurocore** — библиотека глубокого обучения для Rust, которая позволяет с лёгкостью строить, обучать и применять нейронные сети. Благодаря матричным вычислениям на базе `faer` и встроенной многопоточности, она сочетает производительность с простотой использования.
 
-## Тензор2D (Tensor2D)
-Двумерный массив (матрица) значений. Аналогичен Tensor1D, но для 2D.
+## Установка
 
-## Тензор3D (Tensor3D)
-Трёхмерный массив (объём) значений.
+Добавьте в `Cargo.toml` вашего проекта:
 
-## Тензор4D (Tensor4D)
-Четырёхмерный массив значений.
+```toml
+[dependencies]
+neurocore = { path = "../neurocore" }   # путь к папке библиотеки
+```
 
-## Тензор5D (Tensor5D)
-Пятимерный массив значений.
+Все публичные API становятся доступны через `use neurocore::...`.
 
-## Якобиан (Jacobian)
-Матрица частных производных всех элементов одного тензора по всем скалярным параметрам модели.  
-Строки — элементы тензора, столбцы — глобальные индексы параметров.  
-Позволяет получить чувствительность любого промежуточного значения ко всем параметрам одновременно.
+## Быстрый старт: обучение автоэнкодера
 
-## Якобиан2D (Jacobian2D)
-Трёхмерный массив [rows][cols][params] — частные производные элементов двумерного тензора по параметрам.
+```rust
+use neurocore::create_models;
+use neurocore::compute_manager::DynamicTensor;
+use neurocore::tensor::Tensor2D;
 
-## Якобиан3D (Jacobian3D)
-Четырёхмерный массив [depth][rows][cols][params].
+// 1. Описываем модель: вход 4 → скрытый 2 → выход 4
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+    pub fn autoencoder() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::linear(Dim::Dim1, 4, 2),
+            LayerDesc::sigmoid(Dim::Dim1, 2),
+            LayerDesc::linear(Dim::Dim1, 2, 4),
+        ]
+    }
+}
 
-## Якобиан4D (Jacobian4D)
-Пятимерный массив [dim1][depth][rows][cols][params].
+// 2. Описываем функцию потерь (MSE)
+mod losses {
+    use neurocore::loss_plan::*;
+    pub fn mse() -> LossDesc {
+        LossDesc::from_chain(
+            ElementChain::new()
+                .add(Box::new(Sub))
+                .add(Box::new(Square)),
+            Aggregation::Mean,
+            4, 1, 1
+        )
+    }
+}
 
-## Якобиан5D (Jacobian5D)
-Шестимерный массив [outer][dim1][depth][rows][cols][params].
+// 3. Описываем оптимизатор (SGD с lr=0.01)
+mod optimizers {
+    use neurocore::optimizer_plan::*;
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ApplyUpdate)
+    }
+}
 
-## Параметр (Parameter)
-Скалярная величина, подлежащая обучению. Имеет уникальный глобальный индекс.  
-Трейт Parameter предоставляет метод `as_dual(total_params) -> (Tensor1D, Jacobian)`.
+fn main() {
+    let (mut model,) = create_models!(models::autoencoder);
+    let x = Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0]]);
+    let target = x.clone();
 
-## Нейрон (Neuron)
-Вычислительный блок, принимающий один входной тензор и его якобиан, возвращающий выходной тензор и его якобиан.  
-Может обладать внутренними параметрами (реализует Parameter внутри).
+    for epoch in 0..500 {
+        let (pred, ctxs) = model.forward(DynamicTensor::Dim1(x.clone()));
+        let (loss, delta) = model.compute_loss(losses::mse(), &pred,
+                                               &DynamicTensor::Dim1(target.clone()));
+        let (_, grads) = model.backward(&ctxs, delta);
+        model.update_params(optimizers::sgd(), &grads[0]);
+        if epoch % 100 == 0 { println!("{}: loss={:.6}", epoch, loss); }
+    }
+}
+```
 
-### Типы нейронов (подтипы)
-- **Linear** – полносвязный нейрон: `y = sum(x_i * w_i) + b`. Параметры: веса и смещение.
-- **ReLU** – функция активации `max(0, x)`. Без параметров.
-- **Sigmoid** – сигмоида `1 / (1 + e^(-x))`. Без параметров.
-- **Tanh** – гиперболический тангенс. Без параметров.
-- **LeakyReLU** – ReLU с малым наклоном для отрицательных (`alpha * x`).
-- **Softmax** – преобразует вектор в вероятностное распределение (по последней оси).
-- **Identity** – пропускает вход без изменений. Без параметров.
-- **SoftSparseGate** – обучаемый «разреживатель»: пропускает сильные сигналы, подавляет слабые.
-- **SoftKeepGate** – обучаемый «сохранитель»: пропускает сигналы ниже порога, подавляет выбросы.
+## Основные концепции
 
-## Слой (Layer)
-Композиция одного или нескольких нейронов (или других слоёв) для 1D.  
-Имеет методы `forward`, `param_count`, `update_params`, `layer_info`, `initialize_params`, `get_params`, `set_params`.
+### Тензоры
 
-### Типы слоёв (1D)
-- **LinearLayer** – полносвязный слой из нескольких Linear-нейронов.
-- **ReLULayer** – применяет ReLU ко всем элементам.
-- **SigmoidLayer** – применяет Sigmoid.
-- **SoftmaxLayer** – применяет Softmax к 1D вектору.
-- **Sequential** – последовательный контейнер слоёв.
+Библиотека предоставляет тензоры для разных размерностей. Вы всегда работаете с ними как с входными/выходными данными.
 
-## Слой2D (Layer2D)
-Слой для двумерных тензоров, построенный на тех же нейронах, что и 1D-слои.  
-Реализует трейт `Layer2D` (методы `forward_2d`, `param_count`, `update_params`, `get_params`, `set_params`).
+| Тип | Размерность | Что хранит |
+|-----|------------|------------|
+| `Tensor2D` | `(batch, features)` | набор векторов |
+| `Tensor3D` | `(batch, dim2, dim3)` | например, изображения (каналы×строки) |
+| `Tensor4D` | `(batch, dim2, dim3, dim4)` | 3D-данные |
+| `Tensor5D` | `(batch, dim2, dim3, dim4, dim5)` | 4D-данные |
 
-### Типы слоёв (2D)
-- **Linear2D** – применяет LinearLayer к каждой строке матрицы.
-- **ReLU2D** – поэлементный ReLU.
-- **Sigmoid2D** – поэлементная сигмоида.
-- **Softmax2D** – построчный softmax.
+Каждый тензор создаётся конструктором `new(data)`, где `data` — вложенный `Vec` соответствующей глубины, или `zeros(...)` для нулевого заполнения.
 
-## Слой3D (Layer3D)
-Слой для трёхмерных тензоров, реализующий трейт `Layer3D`.  
-Использует 2D-слои (которые внутри состоят из нейронов) для каждого среза.
+### Описание модели (`LayerDesc` и `Plan`)
 
-### Типы слоёв (3D)
-- **Linear3D** – применяет Linear2D ко всем 2D-срезам.
-- **ReLU3D** – поэлементный ReLU по всему объёму.
-- **Sigmoid3D** – поэлементная сигмоида.
-- **Softmax3D** – построчный softmax (по последней оси).
+Модель описывается цепочкой слоёв, каждый из которых задаётся через `LayerDesc`. Основные поля:
+- `kind` – тип слоя (`LayerKind`)
+- `in_features` / `out_features` – размеры входа/выхода
+- `extra` – дополнительные параметры (например, коэффициент наклона у `LeakyReLU`)
 
-## Слой4D (Layer4D) и Слой5D (Layer5D)
-Аналогично расширяют архитектуру на 4 и 5 измерений с теми же принципами.
+Используйте готовые конструкторы:
+- `LayerDesc::linear(Dim::Dim1, in_features, out_features)`
+- `LayerDesc::relu(Dim::Dim1, size)`
+- `LayerDesc::sigmoid(Dim::Dim1, size)`
+- `LayerDesc::softmax(Dim::Dim1, size)`
+- `LayerDesc::tanh(Dim::Dim1, size)`
+- `LayerDesc::leaky_relu(Dim::Dim1, size, alpha)`
+- `LayerDesc::identity(Dim::Dim1, size)`
+- `LayerDesc::soft_sparse_gate(Dim::Dim1, size, temperature)` — обучаемое прореживание
+- `LayerDesc::soft_keep_gate(Dim::Dim1, size, temperature)` — обучаемое удержание
+- `LayerDesc::dual_anchor(Dim::Dim1, size)` — двуханкерное преобразование
 
-## Модель (Model)
-Готовая модель, хранящая слои и план архитектуры.  
-Методы: `forward`, `update_params`, `save`/`load` (сериализация параметров), `print_plan`, `initial_jacobian`.
+Для изменения формы тензора есть `LayerDesc::unsqueeze(input_dim, target_dims)` и `LayerDesc::reduce_mean(input_dim, target_dims)`. Пример: `unsqueeze(Dim::Dim1, vec![2,2])` превращает вектор длины 4 в матрицу 2×2.
 
-## Построитель модели (ModelBuilder)
-Конструирует модель из последовательности `LayerBuilder` (или `Layer2D`/`Layer3D`/... билдеров).  
-Автоматически вычисляет индексы параметров, проверяет стыковку размерностей и создаёт `Model`.
+Список слоёв объединяется в `Plan`:
+```rust
+let plan = Plan::from_layer_descs(vec![...])?;
+```
 
-## Функция потерь (Loss)
-Обёртка над внутренним трейтом `LossImpl`. Создаётся через `LossBuilder`.  
-Метод `forward` возвращает скалярный тензор потерь и его якобиан.
+Макрос `create_models!` делает это автоматически, принимая имена функций, возвращающих `Vec<LayerDesc>`, и создавая готовые `MixedModel`:
+```rust
+let (encoder, decoder) = create_models!(my_encoder, my_decoder);
+```
 
-### Конструктор потерь (LossBuilder)
-Позволяет гибко собирать функцию потерь из примитивов:
-- `mse()`, `mae()`, `cross_entropy()`
-- `add(other)` – сумма потерь
-- `weight(factor)` – масштабирование
-- `custom(name)` – пользовательская потеря, зарегистрированная через `CustomLoss` + `register_custom_loss`.
+### Модель (`MixedModel`)
 
-## Специальные слои (layers_special)
-Слои изменения размерности (количества плоскостей).
+Главный объект, который вы будете использовать — `MixedModel`. Основные методы:
 
-- **DimReduce** – трейт для слоёв, уменьшающих размерность тензора (N → N-1).
-  - `ReduceMean` – усреднение по заданной оси.
-- **DimExpand** – трейт для слоёв, увеличивающих размерность (N → N+1).
-  - `Unsqueeze` – добавление новой оси размера 1.
+- **`forward(input: DynamicTensor) -> (DynamicTensor, Vec<Vec<DynamicContext>>)`**  
+  Прямой проход. Возвращает предсказание и контексты, необходимые для обратного прохода.
 
-## Архитектурный план (Plan)
-Список `LayerInfo` с описанием каждого слоя (тип, размерности входа/выхода, диапазон параметров).  
-Может быть выведен на печать.
+- **`backward(&contexts, delta: DynamicTensor) -> (DynamicTensor, Vec<Vec<f32>>)`**  
+  Обратный проход. Принимает контексты из `forward` и градиент потерь по выходу. Возвращает градиент по входу и градиенты параметров (вектор).
 
-## Проверка архитектуры
-Функции `verify_architecture` и `verify_param_count` проверяют стыковку размерностей и непрерывность индексов параметров.
+- **`compute_loss(desc: LossDesc, pred, target) -> (f32, DynamicTensor)`**  
+  Удобный комбинированный метод: вычисляет потери по описанию, возвращает значение и градиент по `pred`.
 
-## Прямой режим автоматического дифференцирования (Forward-mode AD)
-Метод вычисления производных, при котором чувствительность распространяется от параметров к выходу вместе с прямым проходом, без построения графа вычислений.  
-В neurocore реализован через параллельное вычисление `TensorND` и `JacobianND`.
+- **`update_params(desc: OptimizerDesc, grads: &[f32])`**  
+  Применяет градиенты к параметрам, используя описанный оптимизатор.
+
+- **`param_store()`**  
+  Даёт доступ к хранилищу параметров (нужно для инициализации весов случайными числами перед обучением). Пример:
+  ```rust
+  let mut store = model.param_store().lock().unwrap();
+  for i in 0..store.len() {
+      store.set_param(i, rand::random::<f32>() * 0.01);
+  }
+  ```
+
+### Динамические тензоры (`DynamicTensor`)
+
+Так как модель может менять размерность внутри, вход/выход `forward` и `compute_loss` оборачиваются в `DynamicTensor`. Создать его просто:
+```rust
+let dt = DynamicTensor::Dim1(tensor2d);
+let dt = DynamicTensor::Dim2(tensor3d);
+// ...
+```
+Извлечь обратно можно через сопоставление с образцом.
+
+### Функции потерь
+
+Описываются цепочкой элементарных операций – «кубиков».  
+Создайте описание с помощью `LossDesc::from_chain`:
+
+```rust
+LossDesc::from_chain(chain, aggregation, total_tasks, pred_features, target_features)
+```
+
+- `chain` – `ElementChain`, полученный вызовами `.add(...)`  
+- `aggregation` – `Aggregation::Mean` или `Aggregation::Sum`  
+- `total_tasks` – количество задач в одном батче (произведение батча на количество элементов)  
+- `pred_features` – сколько признаков в предсказании  
+- `target_features` – сколько признаков в цели  
+
+Доступные кубики (все из модуля `neurocore::loss_plan`):
+- `Sub` – разность `pred - target`
+- `Square` – квадрат
+- `Abs` – модуль
+- `Log` – логарифм
+- `Neg` – смена знака
+- `Mul` – произведение двух входов
+- `AddScalar(c)` – прибавление константы
+- `Log1p` – `ln(1 + x)`
+- `AbsDiff` – модуль разности двух чисел (полезно для сглаживающих потерь)
+- `CrossEntropyWithLogits::new(num_classes)` – кросс-энтропия (на вход ожидает вектор логитов + индекс класса в последнем столбце).
+
+Пример MSE:
+```rust
+ElementChain::new().add(Box::new(Sub)).add(Box::new(Square))
+```
+
+Макрос `create_losses!` может собрать несколько функций потерь в кортеж.
+
+### Оптимизаторы
+
+Задаются цепочкой действий. Самые востребованные кубики:
+- `ScaleGradient(f32)` – умножает градиент (learning rate)
+- `Momentum(f32)` – момент
+- `Adam { beta1, beta2, eps }` – преобразование Adam (требует ApplyUpdate)
+- `ApplyUpdate` – финальное вычитание градиента из параметров (должен идти последним).
+
+Используйте `OptimizerDesc` для построения цепочки:
+```rust
+OptimizerDesc::new()
+    .add(OptCubeDesc::ScaleGradient(0.01))
+    .add(OptCubeDesc::ApplyUpdate)
+```
+Метод `update_params()` модели принимает именно `OptimizerDesc`.
+
+## Дополнительные возможности
+
+### Изменение размерности
+
+Слои `Unsqueeze` и `ReduceMean` позволяют менять форму тензора, например, переходить от вектора к матрице и обратно. Задаются целевыми размерами (без батча).
+
+```rust
+// Превращаем вектор длины 4 в 2×2
+LayerDesc::unsqueeze(Dim::Dim1, vec![2, 2])
+// Обратно: ReduceMean с теми же размерами восстановит вектор
+LayerDesc::reduce_mean(Dim::Dim2, vec![2, 2])
+```
+
+### Выбор числа потоков
+
+По умолчанию модель создаётся для одного потока. Для многопоточности используйте `Plan::build_with_threads(n)`, где `n` – желаемое количество рабочих потоков.
+
+### Логирование
+
+Библиотека имеет встроенный логгер. Для включения вызова информационных сообщений (например, при создании модели) установите уровень:
+```rust
+Logger::set_level(1); // info
+```
+Уровни: 0 – молчание, 1 – info, 2 – debug, 3 – trace.
+
+## Полный список слоёв и их параметров
+
+| Слой | Обучаемые параметры | extra |
+|------|---------------------|-------|
+| `Linear` | веса + смещения | нет |
+| `ReLU` | нет | нет |
+| `Sigmoid` | нет | нет |
+| `Softmax` | нет | нет |
+| `Tanh` | нет | нет |
+| `LeakyReLU` | нет | `alpha` |
+| `Identity` | нет | нет |
+| `SoftSparseGate` | пороги (1 на признак) | `temperature` |
+| `SoftKeepGate` | пороги (1 на признак) | `temperature` |
+| `DualAnchor` | min + max + alpha | нет |
+| `Memory` | нет | нет |
+| `Unsqueeze` | нет | target_dims |
+| `ReduceMean` | нет | target_dims |
+
+## Рекомендации
+
+1. Для инициализации параметров всегда заполняйте их малыми случайными значениями после создания модели.
+2. При использовании `CrossEntropyWithLogits` не добавляйте `Softmax` перед ним – кубик уже включает softmax внутри.
+3. `Softmax` в модели должен идти последним слоем (ограничение валидации плана).
+4. Для многомерных данных выбирайте соответствующую размерность `Dim` и используйте тензоры `Tensor3D`, `Tensor4D`, `Tensor5D`.
+
+## Где искать примеры
+
+В папке `examples/` находятся небольшие, готовые к запуску сценарии:
+- `autoencoder.rs` – автоэнкодер (Dim1)
+- `autoencoder2d.rs`, `autoencoder3d.rs`, `autoencoder4d.rs` – то же для старших размерностей
+- `classifier.rs`, `classifier2d.rs`, `classifier3d.rs`, `classifier4d.rs` – классификаторы
+- `linear_test.rs`, `linear2d_test.rs`, … – обучение одного линейного слоя
+- `loss_test.rs`, `loss2d_test.rs`, … – тесты функций потерь
+- `graph_full.rs` – граф с разветвлением
+
+Папка `examples_large/` содержит более масштабный пример `mnist_binary_32x32.rs` (классификатор на синтетических изображениях).
+
+---
+
+Теперь вы готовы использовать **neurocore** для создания и тренировки собственных нейросетей на Rust!
+```

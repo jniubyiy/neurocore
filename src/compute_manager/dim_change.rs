@@ -1,21 +1,17 @@
 // src/compute_manager/dim_change.rs
 
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
-use crate::layers::layers_special::reduce_dim::ReduceMean;
-use crate::layers::layers_special::expand_dim::Unsqueeze;
-use crate::layers::layers_special::DimExpand;
-use crate::layers::layers_special::DimReduce;
+use faer::Mat;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DynamicTensor {
-    Dim1(Tensor2D),   // батч + 1 ось
-    Dim2(Tensor3D),   // батч + 2 оси
-    Dim3(Tensor4D),   // батч + 3 оси
-    Dim4(Tensor5D),   // батч + 4 оси
+    Dim1(Tensor2D),
+    Dim2(Tensor3D),
+    Dim3(Tensor4D),
+    Dim4(Tensor5D),
 }
 
 impl DynamicTensor {
-    /// Размер батча (первая размерность).
     pub fn batch_size(&self) -> usize {
         match self {
             DynamicTensor::Dim1(t) => t.dim1,
@@ -25,26 +21,15 @@ impl DynamicTensor {
         }
     }
 
-    /// Извлекает один образец (получается тензор с батчем 1? Или чистый вектор? Поскольку у нас нет тензоров без батча,
-    /// образец – это тоже тензор с батчем 1 того же типа. Уменьшать размерность не нужно, просто берем строку.
     pub fn sample(&self, idx: usize) -> DynamicTensor {
         match self {
-            DynamicTensor::Dim1(t) => {
-                DynamicTensor::Dim1(Tensor2D::new(vec![t.data[idx].clone()]))
-            }
-            DynamicTensor::Dim2(t) => {
-                DynamicTensor::Dim2(Tensor3D::new(vec![t.data[idx].clone()]))
-            }
-            DynamicTensor::Dim3(t) => {
-                DynamicTensor::Dim3(Tensor4D::new(vec![t.data[idx].clone()]))
-            }
-            DynamicTensor::Dim4(t) => {
-                DynamicTensor::Dim4(Tensor5D::new(vec![t.data[idx].clone()]))
-            }
+            DynamicTensor::Dim1(t) => DynamicTensor::Dim1(Tensor2D::new(vec![t.data[idx].clone()])),
+            DynamicTensor::Dim2(t) => DynamicTensor::Dim2(Tensor3D::new(vec![t.data[idx].clone()])),
+            DynamicTensor::Dim3(t) => DynamicTensor::Dim3(Tensor4D::new(vec![t.data[idx].clone()])),
+            DynamicTensor::Dim4(t) => DynamicTensor::Dim4(Tensor5D::new(vec![t.data[idx].clone()])),
         }
     }
 
-    /// Количество элементов в последней оси (признаки).
     pub fn features(&self) -> usize {
         match self {
             DynamicTensor::Dim1(t) => t.dim2,
@@ -54,7 +39,6 @@ impl DynamicTensor {
         }
     }
 
-    /// Сериализует все элементы тензора в один плоский вектор (batch-major).
     pub fn to_flat(&self) -> Vec<f32> {
         let mut buf = Vec::new();
         self.write_to_flat(&mut buf);
@@ -146,21 +130,58 @@ impl DynamicTensor {
     }
 }
 
-// ------------------ Функции reshape ------------------
+// ------------------ Вспомогательные функции ------------------
+
+fn reshape_matrix(src: &Mat<f32>, new_rows: usize, new_cols: usize) -> Mat<f32> {
+    let total = src.nrows() * src.ncols();
+    assert_eq!(total, new_rows * new_cols,
+        "reshape_matrix: total element count mismatch");
+    let mut dst = Mat::zeros(new_rows, new_cols);
+    let mut idx = 0;
+    for c in 0..src.ncols() {
+        for r in 0..src.nrows() {
+            let dst_r = idx / new_cols;
+            let dst_c = idx % new_cols;
+            dst[(dst_r, dst_c)] = src[(r, c)];
+            idx += 1;
+        }
+    }
+    dst
+}
+
+// ------------------ Тензорные версии ------------------
 
 pub fn unsqueeze_to(tensor: DynamicTensor, target_dims: Vec<usize>) -> DynamicTensor {
     match tensor {
         DynamicTensor::Dim1(t) => {
-            let expander = Unsqueeze::with_target_dims(target_dims);
-            DynamicTensor::Dim2(expander.expand(&t))
+            let x_mat = crate::linalg::tensor2d_to_faer(&t);
+            let batch = t.dim1;
+            assert_eq!(target_dims.len(), 2);
+            let d1 = target_dims[0];
+            let d2 = target_dims[1];
+            assert_eq!(x_mat.ncols(), d1 * d2);
+            DynamicTensor::Dim2(crate::linalg::faer_to_tensor3d(&x_mat, batch, d1, d2))
         }
         DynamicTensor::Dim2(t) => {
-            let expander = Unsqueeze::with_target_dims(target_dims);
-            DynamicTensor::Dim3(expander.expand(&t))
+            let x_mat = crate::linalg::tensor3d_to_faer(&t);
+            let batch = t.dim1;
+            assert_eq!(target_dims.len(), 3);
+            let d1 = target_dims[0];
+            let d2 = target_dims[1];
+            let d3 = target_dims[2];
+            assert_eq!(x_mat.ncols(), d1 * d2 * d3);
+            DynamicTensor::Dim3(crate::linalg::faer_to_tensor4d(&x_mat, batch, d1, d2, d3))
         }
         DynamicTensor::Dim3(t) => {
-            let expander = Unsqueeze::with_target_dims(target_dims);
-            DynamicTensor::Dim4(expander.expand(&t))
+            let x_mat = crate::linalg::tensor4d_to_faer(&t);
+            let batch = t.dim1;
+            assert_eq!(target_dims.len(), 4);
+            let d1 = target_dims[0];
+            let d2 = target_dims[1];
+            let d3 = target_dims[2];
+            let d4 = target_dims[3];
+            assert_eq!(x_mat.ncols(), d1 * d2 * d3 * d4);
+            DynamicTensor::Dim4(crate::linalg::faer_to_tensor5d(&x_mat, batch, d1, d2, d3, d4))
         }
         DynamicTensor::Dim4(_) => panic!("Cannot unsqueeze a 4D tensor (max)"),
     }
@@ -169,17 +190,69 @@ pub fn unsqueeze_to(tensor: DynamicTensor, target_dims: Vec<usize>) -> DynamicTe
 pub fn reduce_to(tensor: DynamicTensor, target_dims: Vec<usize>) -> DynamicTensor {
     match tensor {
         DynamicTensor::Dim2(t) => {
-            let reducer = ReduceMean::with_target_dims(target_dims);
-            DynamicTensor::Dim1(reducer.reduce(&t))
+            let x_mat = crate::linalg::tensor3d_to_faer(&t);
+            let batch = t.dim1;
+            let new_rows = batch;
+            let new_cols = x_mat.nrows() * x_mat.ncols() / new_rows;
+            let y_mat = reshape_matrix(&x_mat, new_rows, new_cols);
+            DynamicTensor::Dim1(crate::linalg::faer_to_tensor2d(&y_mat))
         }
         DynamicTensor::Dim3(t) => {
-            let reducer = ReduceMean::with_target_dims(target_dims);
-            DynamicTensor::Dim2(reducer.reduce(&t))
+            let x_mat = crate::linalg::tensor4d_to_faer(&t);
+            let batch = t.dim1;
+            let new_rows = batch;
+            let new_cols = x_mat.nrows() * x_mat.ncols() / new_rows;
+            let y_mat = reshape_matrix(&x_mat, new_rows, new_cols);
+            assert_eq!(target_dims.len(), 2);
+            let d1 = target_dims[0];
+            let d2 = target_dims[1];
+            DynamicTensor::Dim2(crate::linalg::faer_to_tensor3d(&y_mat, batch, d1, d2))
         }
         DynamicTensor::Dim4(t) => {
-            let reducer = ReduceMean::with_target_dims(target_dims);
-            DynamicTensor::Dim3(reducer.reduce(&t))
+            let x_mat = crate::linalg::tensor5d_to_faer(&t);
+            let batch = t.dim1;
+            let new_rows = batch;
+            let new_cols = x_mat.nrows() * x_mat.ncols() / new_rows;
+            let y_mat = reshape_matrix(&x_mat, new_rows, new_cols);
+            assert_eq!(target_dims.len(), 3);
+            let d1 = target_dims[0];
+            let d2 = target_dims[1];
+            let d3 = target_dims[2];
+            DynamicTensor::Dim3(crate::linalg::faer_to_tensor4d(&y_mat, batch, d1, d2, d3))
         }
         DynamicTensor::Dim1(_) => panic!("Cannot reduce a 1D tensor"),
     }
+}
+
+// ------------------ Матричные версии ------------------
+
+pub fn unsqueeze_mat(
+    mat: &Mat<f32>,
+    target_dims: &[usize],
+) -> Mat<f32> {
+    let batch = mat.nrows();
+    let features = mat.ncols();
+    let total_new = target_dims.iter().product::<usize>();
+    assert_eq!(features, total_new, "unsqueeze_mat: features mismatch");
+
+    let last_dim = target_dims[target_dims.len() - 1];
+    let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
+    let new_rows = batch * remaining_product;
+    let new_cols = last_dim;
+
+    reshape_matrix(mat, new_rows, new_cols)
+}
+
+pub fn reduce_mat(
+    mat: &Mat<f32>,
+    target_dims: &[usize],
+) -> Mat<f32> {
+    let total = mat.nrows() * mat.ncols();
+    let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
+    let batch = mat.nrows() / remaining_product;
+    let new_rows = batch;
+    let new_cols = total / new_rows;
+
+    assert_eq!(total, new_rows * new_cols, "reduce_mat: element count mismatch");
+    reshape_matrix(mat, new_rows, new_cols)
 }

@@ -1,10 +1,11 @@
 // examples/linear2d_test.rs
 // Один линейный слой 4 -> 2, размерность Dim2.
+// Используются новые удобные методы compute_loss и update_params.
 
 use std::time::Instant;
 use neurocore::compute_manager::DynamicTensor;
 use neurocore::tensor::Tensor3D;
-use neurocore::{create_models, create_losses, create_optimizers};
+use neurocore::create_models;
 
 mod models {
     use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
@@ -41,8 +42,6 @@ mod optimizers {
 
 fn main() {
     let (mut model,) = create_models!(models::linear_model);
-    let (loss_expr,) = create_losses!(losses::mse);
-    let (mut opt,) = create_optimizers!((model, optimizers::sgd));
 
     let x = Tensor3D::new(vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]);
     let target = Tensor3D::new(vec![vec![vec![0.8, 1.2]]]);
@@ -51,13 +50,13 @@ fn main() {
     let start = Instant::now();
     for epoch in 0..epochs {
         let (pred, ctxs) = model.forward(DynamicTensor::Dim2(x.clone()));
-        let (loss, delta) = model.compute_loss_with_expr(
-            loss_expr.clone(),
+        let (loss, delta) = model.compute_loss(
+            losses::mse(),
             &pred,
             &DynamicTensor::Dim2(target.clone()),
         );
         let (_, grads) = model.backward(&ctxs, delta);
-        model.update_params_with_optimizer(&mut opt, &grads[0]);
+        model.update_params(optimizers::sgd(), &grads[0]);
 
         if epoch == 0 || epoch % 200 == 0 {
             println!("Epoch {}: loss = {:.6}", epoch, loss);
@@ -66,8 +65,8 @@ fn main() {
     let duration = start.elapsed();
 
     let (final_pred, _) = model.forward(DynamicTensor::Dim2(x.clone()));
-    let (final_loss, _) = model.compute_loss_with_expr(
-        loss_expr,
+    let (final_loss, _) = model.compute_loss(
+        losses::mse(),
         &final_pred,
         &DynamicTensor::Dim2(target.clone()),
     );
@@ -75,7 +74,6 @@ fn main() {
     println!("Done. Time: {:?}", duration);
     println!("Final loss: {:.6}", final_loss);
 }
-
 
 
 

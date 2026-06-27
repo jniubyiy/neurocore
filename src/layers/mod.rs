@@ -1,6 +1,5 @@
 // src/layers/mod.rs
 
-// ============= Новые модули слоёв =============
 pub mod linear;
 pub mod relu;
 pub mod sigmoid;
@@ -11,80 +10,76 @@ pub mod splitter;
 pub mod combiner;
 pub mod splitter_connector;
 pub mod combiner_connector;
+pub mod leaky_relu;
+pub mod identity;
+pub mod soft_sparse_gate;
+pub mod soft_keep_gate;
+pub mod dual_anchor;
 
-// ============= Контексты и трейты =============
 pub mod context1d;
 pub mod context2d;
 pub mod context3d;
 pub mod context4d;
 
-// ============= Специальные слои =============
 pub mod layers_special;
 
-// ============= Универсальный трейт слоя =============
-pub trait UniversalLayer: Send + Sync {
-    // --- Традиционные методы (полный прямой/обратный проход) ---
+use crate::model_plan::param_store::ParamSlice;
+use crate::compute_manager::graph::types::DynamicContext;
+use faer::Mat;
 
-    fn forward(
+pub trait UniversalLayer: Send + Sync + 'static {
+    fn forward_mat(
         &self,
-        input: &crate::compute_manager::dim_change::DynamicTensor,
+        input: &Mat<f32>,
         params: &[f32],
-        slice: &crate::model_plan::param_store::ParamSlice,
-    ) -> (
-        crate::compute_manager::dim_change::DynamicTensor,
-        crate::compute_manager::graph::types::DynamicContext,
-    );
+        slice: &ParamSlice,
+    ) -> (Mat<f32>, DynamicContext);
 
-    fn backward(
+    fn backward_mat(
         &self,
-        ctx: &crate::compute_manager::graph::types::DynamicContext,
-        delta: &crate::compute_manager::dim_change::DynamicTensor,
+        ctx: &DynamicContext,
+        delta: &Mat<f32>,
         params: &[f32],
-        slice: &crate::model_plan::param_store::ParamSlice,
-    ) -> (crate::compute_manager::dim_change::DynamicTensor, Vec<f32>);
+        slice: &ParamSlice,
+    ) -> (Mat<f32>, Vec<f32>);
 
     fn param_len(&self) -> usize;
     fn input_features(&self) -> usize;
     fn output_features(&self) -> usize;
 
-    // --- Новые методы для динамических чанков задач ---
+    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
 
-    /// Общее количество атомарных задач слоя для данного входного тензора.
-    fn total_tasks(
-        &self,
-        input: &crate::compute_manager::dim_change::DynamicTensor,
-    ) -> usize;
-
-    /// Выполняет непрерывный диапазон задач (по плоскому индексу) и записывает
-    /// результат в выходной тензор `output`. Входной тензор `input` предоставляет
-    /// данные всего батча, а `output` уже создан нужной формы (см. `output_tensor_shape`).
     fn execute_tasks(
         &self,
-        input: &crate::compute_manager::dim_change::DynamicTensor,
-        output: &mut crate::compute_manager::dim_change::DynamicTensor,
+        input: &Mat<f32>,
+        output: &mut Mat<f32>,
         task_offset: usize,
         task_count: usize,
         params: &[f32],
-        slice: &crate::model_plan::param_store::ParamSlice,
+        slice: &ParamSlice,
     );
 
-    /// Создаёт контекст для одного образца после завершения обработки всего батча.
     fn create_sample_context(
         &self,
-        input_sample: &crate::compute_manager::dim_change::DynamicTensor,
-        output_sample: &crate::compute_manager::dim_change::DynamicTensor,
-    ) -> crate::compute_manager::graph::types::DynamicContext;
+        input_sample: &Mat<f32>,
+        output_sample: &Mat<f32>,
+    ) -> DynamicContext;
 
-    /// Возвращает нулевой тензор такой же формы, как выход слоя для заданного
-    /// входного тензора `input` (который описывает форму батча). Используется
-    /// для выделения выходных буферов перед параллельным выполнением чанков.
-    fn output_tensor_shape(
-        &self,
-        input: &crate::compute_manager::dim_change::DynamicTensor,
-    ) -> crate::compute_manager::dim_change::DynamicTensor;
+    fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
+        Mat::zeros(batch_size, self.output_features())
+    }
+
+    // ----- Методы для GPU-диспетчеризации (возвращают Some(self), если слой того же типа) -----
+    fn as_linear(&self) -> Option<&Linear> { None }
+    fn as_relu(&self) -> Option<&ReLU> { None }
+    fn as_sigmoid(&self) -> Option<&Sigmoid> { None }
+    fn as_tanh(&self) -> Option<&Tanh> { None }
+    fn as_leaky_relu(&self) -> Option<&LeakyReLU> { None }
+    fn as_identity(&self) -> Option<&Identity> { None }
+    // При необходимости аналогично добавляются as_softmax, as_reduce_mean и т.д.
 }
 
-// ============= Реэкспорт универсальных слоёв (публичный API) =============
+// Реэкспорт слоёв
 pub use linear::Linear;
 pub use relu::ReLU;
 pub use sigmoid::Sigmoid;
@@ -95,13 +90,16 @@ pub use splitter::Splitter;
 pub use combiner::Combiner;
 pub use splitter_connector::SplitterConnector;
 pub use combiner_connector::CombinerConnector;
+pub use leaky_relu::LeakyReLU;
+pub use identity::Identity;
+pub use soft_sparse_gate::SoftSparseGate;
+pub use soft_keep_gate::SoftKeepGate;
+pub use dual_anchor::DualAnchor;
 
-// ============= Контексты (оставлены для внутреннего использования и обратной совместимости) =============
 pub use context1d::{Layer, LayerContext1D, LayerInfo};
 pub use context2d::{Layer2D, LayerContext as LayerContext2D};
 pub use context3d::{Layer3D, LayerContext3D};
 pub use context4d::{Layer4D, LayerContext4D};
 
-// ============= Специальные слои =============
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 

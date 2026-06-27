@@ -1,10 +1,11 @@
 // examples/classifier3d.rs
 // Классификатор на 2 класса, размерность Dim3.
+// Используются новые удобные методы compute_loss и update_params.
 
 use std::time::Instant;
 use neurocore::compute_manager::DynamicTensor;
 use neurocore::tensor::Tensor4D;
-use neurocore::{create_models, create_losses, create_optimizers};
+use neurocore::create_models;
 
 mod models {
     use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
@@ -43,8 +44,6 @@ mod optimizers {
 
 fn main() {
     let (mut model,) = create_models!(models::classifier);
-    let (loss_expr,) = create_losses!(losses::cross_entropy);
-    let (mut opt,) = create_optimizers!((model, optimizers::sgd));
 
     let x1 = Tensor4D::new(vec![vec![vec![vec![1.0, 2.0]]]]);
     let x2 = Tensor4D::new(vec![vec![vec![vec![2.0, 1.0]]]]);
@@ -56,19 +55,19 @@ fn main() {
     for epoch in 0..epochs {
         for (x, y) in &[(&x1, &y1), (&x2, &y2)] {
             let (pred, ctxs) = model.forward(DynamicTensor::Dim3((*x).clone()));
-            let (_, delta) = model.compute_loss_with_expr(
-                loss_expr.clone(),
+            let (_, delta) = model.compute_loss(
+                losses::cross_entropy(),
                 &pred,
                 &DynamicTensor::Dim3((*y).clone()),
             );
             let (_, grads) = model.backward(&ctxs, delta);
-            model.update_params_with_optimizer(&mut opt, &grads[0]);
+            model.update_params(optimizers::sgd(), &grads[0]);
         }
 
         if epoch % 50 == 0 {
             let (pred, _) = model.forward(DynamicTensor::Dim3(x1.clone()));
-            let (loss, _) = model.compute_loss_with_expr(
-                loss_expr.clone(),
+            let (loss, _) = model.compute_loss(
+                losses::cross_entropy(),
                 &pred,
                 &DynamicTensor::Dim3(y1.clone()),
             );
@@ -78,8 +77,8 @@ fn main() {
     let duration = start.elapsed();
 
     let (final_pred, _) = model.forward(DynamicTensor::Dim3(x1.clone()));
-    let (final_loss, _) = model.compute_loss_with_expr(
-        loss_expr,
+    let (final_loss, _) = model.compute_loss(
+        losses::cross_entropy(),
         &final_pred,
         &DynamicTensor::Dim3(y1.clone()),
     );

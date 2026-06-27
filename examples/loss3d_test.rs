@@ -1,6 +1,8 @@
 // examples/loss3d_test.rs
 // Тестирование потерь: MSE, CrossEntropy, difference_loss, diff_smooth_loss.
+// Использует матричный API LossExpr.
 
+use faer::Mat;
 use neurocore::create_losses;
 
 // -------- Область потерь --------
@@ -62,29 +64,27 @@ fn main() {
     let target = vec![1.5, 1.5, 3.5, 4.5];
 
     let in_size = mse.task_input_size(); // = 2
-    let mut flat_input = Vec::with_capacity(total_elements * in_size);
+    let mut full_input = Mat::zeros(total_elements, in_size);
     for i in 0..total_elements {
-        flat_input.push(pred[i]);
-        flat_input.push(target[i]);
+        full_input[(i, 0)] = pred[i];
+        full_input[(i, 1)] = target[i];
     }
-    let mut out_loss = vec![0.0; total_elements];
-    mse.forward_chunk(0, total_elements, &flat_input, &mut out_loss);
-    let loss = mse.aggregate_loss(&out_loss);
+
+    let (loss_vec, intermediates) = mse.forward_chunk(&full_input);
+    let loss = mse.aggregate_loss(&loss_vec);
     println!("MSE loss: {:.6}", loss);
 
-    let mut grad_pred = vec![0.0; total_elements * in_size];
-    let grad_loss = vec![1.0; total_elements];
-    mse.backward_chunk(
-        0,
-        total_elements,
-        &flat_input,
-        &out_loss,
-        &grad_loss,
-        &mut grad_pred,
-    );
-    let grad_flat = mse.aggregate_grad(&grad_pred);
+    let grad_loss = vec![1.0f32; total_elements];
+    let grad_mat = mse.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_flat = Vec::with_capacity(total_elements * in_size);
+    for i in 0..total_elements {
+        for j in 0..in_size {
+            grad_flat.push(grad_mat[(i, j)]);
+        }
+    }
+    let grad_agg = mse.aggregate_grad(&grad_flat);
     let grad: Vec<f32> = (0..total_elements)
-        .map(|i| grad_flat[i * in_size]) // градиент по pred (первый элемент)
+        .map(|i| grad_agg[i * in_size]) // градиент по pred (первый элемент)
         .collect();
     println!("MSE grad: {:?}", grad);
 
@@ -94,28 +94,26 @@ fn main() {
     let class_index = 1.0f32; // целевой класс 1
 
     let in_size = ce.task_input_size(); // num_classes + 1 = 5
-    let mut flat_input = Vec::with_capacity(1 * in_size);
-    flat_input.extend_from_slice(&pred_logits);
-    flat_input.push(class_index);
+    let mut ce_input = Mat::zeros(1, in_size);
+    ce_input[(0, 0)] = pred_logits[0];
+    ce_input[(0, 1)] = pred_logits[1];
+    ce_input[(0, 2)] = pred_logits[2];
+    ce_input[(0, 3)] = pred_logits[3];
+    ce_input[(0, 4)] = class_index;
 
-    let mut out_loss = vec![0.0; 1];
-    ce.forward_chunk(0, 1, &flat_input, &mut out_loss);
-    let ce_loss = ce.aggregate_loss(&out_loss);
+    let (loss_vec, intermediates) = ce.forward_chunk(&ce_input);
+    let ce_loss = ce.aggregate_loss(&loss_vec);
     println!("CE loss: {:.6}", ce_loss);
 
-    let mut grad_input = vec![0.0; 1 * in_size];
-    let grad_loss = vec![1.0; 1];
-    ce.backward_chunk(
-        0,
-        1,
-        &flat_input,
-        &out_loss,
-        &grad_loss,
-        &mut grad_input,
-    );
-    let grad_flat = ce.aggregate_grad(&grad_input);
+    let grad_loss = vec![1.0f32; 1];
+    let grad_mat = ce.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_flat = Vec::with_capacity(in_size);
+    for j in 0..in_size {
+        grad_flat.push(grad_mat[(0, j)]);
+    }
+    let grad_agg = ce.aggregate_grad(&grad_flat);
     // Показываем градиент только по логитам (первые num_classes элементов)
-    println!("CE grad (first {}): {:?}", 4, &grad_flat[..4]);
+    println!("CE grad (first {}): {:?}", 4, &grad_agg[..4]);
 
     // ==================== Difference Loss ====================
     println!("\n--- Difference Loss (3D) ---");
@@ -123,29 +121,27 @@ fn main() {
     let target = vec![1.5, 1.5, 3.5, 4.5];
 
     let in_size = diff_loss.task_input_size(); // = 2
-    let mut flat_input = Vec::with_capacity(total_elements * in_size);
+    let mut full_input = Mat::zeros(total_elements, in_size);
     for i in 0..total_elements {
-        flat_input.push(pred[i]);
-        flat_input.push(target[i]);
+        full_input[(i, 0)] = pred[i];
+        full_input[(i, 1)] = target[i];
     }
-    let mut out_loss = vec![0.0; total_elements];
-    diff_loss.forward_chunk(0, total_elements, &flat_input, &mut out_loss);
-    let loss = diff_loss.aggregate_loss(&out_loss);
+
+    let (loss_vec, intermediates) = diff_loss.forward_chunk(&full_input);
+    let loss = diff_loss.aggregate_loss(&loss_vec);
     println!("Diff loss: {:.6}", loss);
 
-    let mut grad_pred = vec![0.0; total_elements * in_size];
-    let grad_loss = vec![1.0; total_elements];
-    diff_loss.backward_chunk(
-        0,
-        total_elements,
-        &flat_input,
-        &out_loss,
-        &grad_loss,
-        &mut grad_pred,
-    );
-    let grad_flat = diff_loss.aggregate_grad(&grad_pred);
+    let grad_loss = vec![1.0f32; total_elements];
+    let grad_mat = diff_loss.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_flat = Vec::with_capacity(total_elements * in_size);
+    for i in 0..total_elements {
+        for j in 0..in_size {
+            grad_flat.push(grad_mat[(i, j)]);
+        }
+    }
+    let grad_agg = diff_loss.aggregate_grad(&grad_flat);
     let grad: Vec<f32> = (0..total_elements)
-        .map(|i| grad_flat[i * in_size]) // градиент по pred
+        .map(|i| grad_agg[i * in_size]) // градиент по pred
         .collect();
     println!("Diff grad: {:?}", grad);
 
@@ -154,24 +150,25 @@ fn main() {
     // Представим карту ошибок размером 2x2 (4 пикселя)
     let error_map = vec![1.0, 0.5, 0.2, 0.9]; // 2x2 row-major
     // Горизонтальные пары: (e[0], e[1]), (e[2], e[3])
-    let mut horiz_input = Vec::with_capacity(2 * smooth_h.task_input_size()); // 2 пары
-    horiz_input.push(error_map[0]);
-    horiz_input.push(error_map[1]);
-    horiz_input.push(error_map[2]);
-    horiz_input.push(error_map[3]);
-    let mut h_loss = vec![0.0; 2];
-    smooth_h.forward_chunk(0, 2, &horiz_input, &mut h_loss);
-    let h_val = smooth_h.aggregate_loss(&h_loss);
+    let in_size = smooth_h.task_input_size(); // 2
+    let mut horiz_input = Mat::zeros(2, in_size); // 2 пары
+    horiz_input[(0, 0)] = error_map[0];
+    horiz_input[(0, 1)] = error_map[1];
+    horiz_input[(1, 0)] = error_map[2];
+    horiz_input[(1, 1)] = error_map[3];
+
+    let (loss_vec, _intermediates) = smooth_h.forward_chunk(&horiz_input);
+    let h_val = smooth_h.aggregate_loss(&loss_vec);
 
     // Вертикальные пары: (e[0], e[2]), (e[1], e[3])
-    let mut vert_input = Vec::with_capacity(2 * smooth_v.task_input_size());
-    vert_input.push(error_map[0]);
-    vert_input.push(error_map[2]);
-    vert_input.push(error_map[1]);
-    vert_input.push(error_map[3]);
-    let mut v_loss = vec![0.0; 2];
-    smooth_v.forward_chunk(0, 2, &vert_input, &mut v_loss);
-    let v_val = smooth_v.aggregate_loss(&v_loss);
+    let mut vert_input = Mat::zeros(2, in_size);
+    vert_input[(0, 0)] = error_map[0];
+    vert_input[(0, 1)] = error_map[2];
+    vert_input[(1, 0)] = error_map[1];
+    vert_input[(1, 1)] = error_map[3];
+
+    let (loss_vec, intermediates) = smooth_v.forward_chunk(&vert_input);
+    let v_val = smooth_v.aggregate_loss(&loss_vec);
 
     let total_smooth = h_val + v_val;
     println!(
@@ -180,16 +177,28 @@ fn main() {
     );
 
     // Градиенты гладкости (показываем для наглядности)
-    let mut grad_h = vec![0.0; 2 * smooth_h.task_input_size()];
-    let grad_loss = vec![1.0; 2];
-    smooth_h.backward_chunk(0, 2, &horiz_input, &h_loss, &grad_loss, &mut grad_h);
-    let grad_h_flat = smooth_h.aggregate_grad(&grad_h);
-    println!("Smooth H grad: {:?}", grad_h_flat);
+    let grad_loss = vec![1.0f32; 2];
+    let grad_mat_h = smooth_h.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_h_flat = Vec::with_capacity(2 * in_size);
+    for i in 0..2 {
+        for j in 0..in_size {
+            grad_h_flat.push(grad_mat_h[(i, j)]);
+        }
+    }
+    let grad_h_agg = smooth_h.aggregate_grad(&grad_h_flat);
+    println!("Smooth H grad: {:?}", grad_h_agg);
 
-    let mut grad_v = vec![0.0; 2 * smooth_v.task_input_size()];
-    smooth_v.backward_chunk(0, 2, &vert_input, &v_loss, &grad_loss, &mut grad_v);
-    let grad_v_flat = smooth_v.aggregate_grad(&grad_v);
-    println!("Smooth V grad: {:?}", grad_v_flat);
+    // вертикальные градиенты пересчитаем заново
+    let (_, intermediates_v) = smooth_v.forward_chunk(&vert_input);
+    let grad_mat_v = smooth_v.backward_chunk(&intermediates_v, &grad_loss);
+    let mut grad_v_flat = Vec::with_capacity(2 * in_size);
+    for i in 0..2 {
+        for j in 0..in_size {
+            grad_v_flat.push(grad_mat_v[(i, j)]);
+        }
+    }
+    let grad_v_agg = smooth_v.aggregate_grad(&grad_v_flat);
+    println!("Smooth V grad: {:?}", grad_v_agg);
 }
 
 

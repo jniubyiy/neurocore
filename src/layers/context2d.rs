@@ -10,10 +10,16 @@ pub enum LayerContext {
     Tanh2D    { output: Tensor3D },
     Softmax2D { output: Tensor3D },
     Memory2D  { input: Tensor3D },
-    Splitter2D { input: Tensor3D, pre_a: Vec<f32>, pre_b: Vec<f32> },  // <-- изменено
+    Splitter2D { input: Tensor3D, pre_a: Vec<f32>, pre_b: Vec<f32> },
     Combiner2D { input_a: Tensor3D, input_b: Tensor3D, pre_act: Vec<Vec<f32>> },
     SplitterConnector { input: Tensor3D },
     CombinerConnector { inputs: Vec<Tensor3D> },
+
+    // Новые слои
+    LeakyReLU2D       { input: Tensor3D },
+    SoftSparseGate2D  { input: Tensor3D },
+    SoftKeepGate2D    { input: Tensor3D },
+    DualAnchor2D      { input: Tensor3D },   // <-- добавлено
 }
 
 pub trait Layer2D: Send + Sync {

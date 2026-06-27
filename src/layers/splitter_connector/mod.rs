@@ -2,4 +2,4 @@
 
 pub mod splitter_connector;
 
-pub use self::splitter_connector::SplitterConnector;
+pub use splitter_connector::SplitterConnector;

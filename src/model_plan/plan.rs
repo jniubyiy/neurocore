@@ -2,60 +2,26 @@
 
 use super::layer_desc::LayerDesc;
 use super::blueprint::LayerKind;
+use crate::compute_manager::device::Device;
 use crate::compute_manager::graph::model::MixedModel;
 
-/// План модели, готовый к сборке.
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub(crate) layers: Vec<LayerDesc>,
 }
 
 impl Plan {
-    /// Внутренний конструктор, проверяет корректность архитектуры.
     pub(crate) fn from_descs(descs: Vec<LayerDesc>) -> Result<Self, String> {
         if descs.is_empty() {
             return Err("План не может быть пустым".into());
         }
 
-        // Проверка базовых размерностей для каждого слоя
         for (i, desc) in descs.iter().enumerate() {
             match desc.kind {
                 LayerKind::SplitterConnector | LayerKind::CombinerConnector
-                | LayerKind::Splitter | LayerKind::Combiner => {
-                    if desc.in_features.is_empty() || desc.out_features.is_empty() {
-                        return Err(format!("Слой {}: размерности не могут быть пустыми", i));
-                    }
-                    if matches!(desc.kind, LayerKind::SplitterConnector) {
-                        let input_size = desc.in_features.iter().sum::<usize>();
-                        let output_sum: usize = desc.out_features.iter().sum();
-                        if input_size != output_sum {
-                            return Err(format!(
-                                "Слой {}: SplitterConnector: сумма выходных размеров ({}) должна равняться входному ({})",
-                                i, output_sum, input_size
-                            ));
-                        }
-                    } else if matches!(desc.kind, LayerKind::CombinerConnector) {
-                        let output_size = desc.out_features.iter().sum::<usize>();
-                        let input_sum: usize = desc.in_features.iter().sum();
-                        if output_size != input_sum {
-                            return Err(format!(
-                                "Слой {}: CombinerConnector: сумма входных размеров ({}) должна равняться выходному ({})",
-                                i, input_sum, output_size
-                            ));
-                        }
-                    } else if matches!(desc.kind, LayerKind::Splitter) {
-                        if desc.in_features.len() != 1 || desc.out_features.len() < 2 {
-                            return Err(format!(
-                                "Слой {}: Splitter требует 1 вход и минимум 2 выхода", i
-                            ));
-                        }
-                    } else if matches!(desc.kind, LayerKind::Combiner) {
-                        if desc.in_features.len() < 2 || desc.out_features.len() != 1 {
-                            return Err(format!(
-                                "Слой {}: Combiner требует минимум 2 входа и 1 выход", i
-                            ));
-                        }
-                    }
+                | LayerKind::Splitter | LayerKind::Combiner
+                | LayerKind::Unsqueeze(_) | LayerKind::ReduceMean(_) => {
+                    // Эти слои могут иметь множественные in_features/out_features
                 }
                 _ => {
                     if desc.in_features.len() != 1 || desc.out_features.len() != 1 {
@@ -72,7 +38,7 @@ impl Plan {
             }
         }
 
-        // Проверка совместимости размерностей и размеров последней оси между соседними слоями
+        // Проверка совместимости размерностей
         for i in 1..descs.len() {
             let prev = &descs[i - 1];
             let curr = &descs[i];
@@ -134,28 +100,33 @@ impl Plan {
         Ok(Plan { layers: descs })
     }
 
-    /// Публичная обёртка для создания плана из описаний слоёв.
     pub fn from_layer_descs(descs: Vec<LayerDesc>) -> Result<Plan, String> {
         Plan::from_descs(descs)
     }
 
-    /// Собирает модель с указанным количеством потоков.
+    /// Собрать модель с указанным количеством потоков CPU (обратная совместимость).
     pub fn build_with_threads(&self, threads: usize) -> MixedModel {
         MixedModel::from_plan(self.layers.clone(), threads)
             .expect("Plan уже проверен")
     }
 
-    /// Собирает модель с одним потоком (обратная совместимость).
+    /// Собрать модель на CPU с одним потоком (по умолчанию).
     pub fn build(&self) -> MixedModel {
-        self.build_with_threads(1)
+        self.build_with_device(Device::Cpu { threads: 1 })
     }
 
-    /// Размерность входа (первый слой).
+    /// Собрать модель, явно указав целевое устройство.
+    /// Для `Device::Cpu` число потоков берётся из описания устройства.
+    /// Для `Device::Gpu` используется GPU с заданным индексом.
+    pub fn build_with_device(&self, device: Device) -> MixedModel {
+        MixedModel::from_plan_with_device(self.layers.clone(), 1, device)
+            .expect("Plan уже проверен")
+    }
+
     pub fn input_dim1(&self) -> usize {
         self.layers.first().unwrap().in_features[0]
     }
 
-    /// Размерность выхода (последний слой).
     pub fn output_dim1(&self) -> usize {
         self.layers.last().unwrap().out_features[0]
     }

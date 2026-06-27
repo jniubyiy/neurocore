@@ -1,25 +1,11 @@
 // src/compute_manager/executor.rs
 
-/// Тип, описывающий распределение задач по вычислительным единицам.
-/// Внешний вектор – для каждой единицы (ядра/потока), внутренний – список диапазонов (start, size).
 pub type ChunkAssignment = Vec<Vec<(usize, usize)>>;
 
-/// Абстрактный исполнитель задач на вычислительном устройстве (CPU, GPU и т.п.).
-/// Все реализации должны быть `Send + Sync + Clone`, чтобы их можно было разделять между потоками.
-pub trait Executor: Send + Sync + Clone + 'static {
-    /// Поставить задачу в очередь исполнения.
-    fn execute<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static;
-
-    /// Дождаться завершения всех ранее запущенных задач.
+pub trait Executor: Send + Sync + 'static {
+    fn execute_dyn(&self, f: Box<dyn FnOnce() + Send>);
     fn wait_all(&self);
-
-    /// Количество доступных вычислительных единиц (ядер CPU, потоковых мультипроцессоров GPU и т.д.).
     fn num_workers(&self) -> usize;
-
-    /// Разбить общее количество атомарных задач на чанки и распределить их между
-    /// вычислительными единицами. Возвращает для каждой единицы список непрерывных диапазонов.
-    /// Планировщик может быть адаптивным (например, использовать мини‑модель для оптимизации).
     fn plan_chunks_assignment(&self, total_tasks: usize) -> ChunkAssignment;
+    fn clone_executor(&self) -> Box<dyn Executor>;
 }

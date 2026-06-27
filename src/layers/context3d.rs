@@ -10,10 +10,16 @@ pub enum LayerContext3D {
     Tanh3D    { output: Tensor4D },
     Softmax3D { output: Tensor4D },
     Memory3D  { input: Tensor4D },
-    Splitter3D { input: Tensor4D, pre_a: Vec<f32>, pre_b: Vec<f32> },  // <-- изменено
+    Splitter3D { input: Tensor4D, pre_a: Vec<f32>, pre_b: Vec<f32> },
     Combiner3D { input_a: Tensor4D, input_b: Tensor4D, pre_act: Vec<Vec<Vec<f32>>> },
     SplitterConnector { input: Tensor4D },
     CombinerConnector { inputs: Vec<Tensor4D> },
+
+    // Новые слои
+    LeakyReLU3D       { input: Tensor4D },
+    SoftSparseGate3D  { input: Tensor4D },
+    SoftKeepGate3D    { input: Tensor4D },
+    DualAnchor3D      { input: Tensor4D },   // <-- добавлено
 }
 
 pub trait Layer3D: Send + Sync {

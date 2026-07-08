@@ -41,9 +41,10 @@ impl GpuTensor {
         GpuTensor { buffer, rows, cols }
     }
 
-    /// Чтение данных с GPU (заглушка).
+    /// Чтение данных с GPU в матрицу.
     pub fn to_matrix(&self) -> Mat<f32> {
-        Mat::zeros(self.rows, self.cols)
+        let data = self.buffer.read().expect("Не удалось прочитать данные из GPU-буфера");
+        Mat::from_fn(self.rows, self.cols, |r, c| data[r * self.cols + c])
     }
 
     pub fn shape(&self) -> (usize, usize) {

@@ -1,7 +1,8 @@
-// src/optimizer/cubes.rs
+// src/optimizer_plan/cubes.rs
 
-use super::cube::OptimizerCube;
+use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use super::cube::OptimizerCube;
 
 // ----------------------------------------------------------------
 // ScaleGradient
@@ -28,6 +29,8 @@ impl OptimizerCube for ScaleGradient {
             *g *= self.factor;
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ----------------------------------------------------------------
@@ -56,6 +59,8 @@ impl OptimizerCube for AddWeightDecay {
             *g += self.decay * *p;
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ----------------------------------------------------------------
@@ -89,6 +94,8 @@ impl OptimizerCube for GradientClip {
             }
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ----------------------------------------------------------------
@@ -120,13 +127,15 @@ impl OptimizerCube for Momentum {
             grads[i] = v;
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ----------------------------------------------------------------
 // NesterovMomentum
 // ----------------------------------------------------------------
 
-/// Момент Нестерова.
+/// Момент Нестерова (NAG).
 /// Состояние: одно число на параметр — скорость `v`.
 pub struct NesterovMomentum {
     pub beta: f32,
@@ -148,10 +157,14 @@ impl OptimizerCube for NesterovMomentum {
         for i in 0..n {
             let v_old = state[i];
             let v_new = self.beta * v_old + grads[i];
-            grads[i] = self.beta * v_new + grads[i];
+            // Классический NAG: градиент корректируется с учётом предстоящего шага.
+            // При последующем вычитании ApplyUpdate это даёт желаемое обновление.
+            grads[i] += self.beta * v_new;
             state[i] = v_new;
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ----------------------------------------------------------------
@@ -188,7 +201,6 @@ impl OptimizerCube for AdamTransform {
         let n = grads.len();
         let (m_slice, v_slice) = state.split_at_mut(n);
 
-        // Атомарно увеличиваем счётчик шагов и получаем текущий номер шага
         let t = self.step_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         let bias_correction1 = 1.0 - self.beta1.powi(t as i32);
@@ -204,6 +216,8 @@ impl OptimizerCube for AdamTransform {
             grads[i] = m_hat / (v_hat.sqrt() + self.eps);
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ----------------------------------------------------------------
@@ -230,4 +244,6 @@ impl OptimizerCube for ApplyUpdate {
             *p -= *g;
         }
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }

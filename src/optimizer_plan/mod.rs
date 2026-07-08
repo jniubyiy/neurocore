@@ -16,8 +16,18 @@ pub use cubes::*;
 #[derive(Debug, Clone)]
 pub enum OptCubeDesc {
     ScaleGradient(f32),
+    AddWeightDecay(f32),
     Momentum(f32),
-    Adam { beta1: f32, beta2: f32, eps: f32 },
+    NesterovMomentum(f32),
+    GradientClip {
+        min: Option<f32>,
+        max: Option<f32>,
+    },
+    Adam {
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+    },
     ApplyUpdate,
 }
 
@@ -44,16 +54,25 @@ impl OptimizerDesc {
         for cube in &self.cubes {
             match cube {
                 OptCubeDesc::ScaleGradient(lr) => {
-                    chain = chain.add(Box::new(crate::optimizer_plan::cubes::ScaleGradient::new(*lr)));
+                    chain = chain.add(Box::new(ScaleGradient::new(*lr)));
+                }
+                OptCubeDesc::AddWeightDecay(decay) => {
+                    chain = chain.add(Box::new(AddWeightDecay::new(*decay)));
                 }
                 OptCubeDesc::Momentum(beta) => {
-                    chain = chain.add(Box::new(crate::optimizer_plan::cubes::Momentum::new(*beta)));
+                    chain = chain.add(Box::new(Momentum::new(*beta)));
+                }
+                OptCubeDesc::NesterovMomentum(beta) => {
+                    chain = chain.add(Box::new(NesterovMomentum::new(*beta)));
+                }
+                OptCubeDesc::GradientClip { min, max } => {
+                    chain = chain.add(Box::new(GradientClip::new(*min, *max)));
                 }
                 OptCubeDesc::Adam { beta1, beta2, eps } => {
-                    chain = chain.add(Box::new(crate::optimizer_plan::cubes::AdamTransform::new(*beta1, *beta2, *eps)));
+                    chain = chain.add(Box::new(AdamTransform::new(*beta1, *beta2, *eps)));
                 }
                 OptCubeDesc::ApplyUpdate => {
-                    chain = chain.add(Box::new(crate::optimizer_plan::cubes::ApplyUpdate));
+                    chain = chain.add(Box::new(ApplyUpdate));
                 }
             }
         }

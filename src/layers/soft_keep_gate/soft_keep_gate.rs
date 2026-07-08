@@ -1,3 +1,5 @@
+// src/layers/soft_keep_gate/soft_keep_gate.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
@@ -105,6 +107,11 @@ impl UniversalLayer for SoftKeepGate {
 
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
         Mat::zeros(batch_size, self.in_features)
+    }
+
+    // Добавленный метод для GPU-диспетчеризации
+    fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> {
+        Some(self)
     }
 }
 

@@ -1,4 +1,6 @@
-// src/optimizer/cube.rs
+// src/optimizer_plan/cube.rs
+
+use std::any::Any;
 
 /// Атомарный блок оптимизации.
 ///
@@ -14,7 +16,7 @@
 ///     .add(Box::new(Momentum::new(0.9)))
 ///     .add(Box::new(ApplyUpdate));
 /// ```
-pub trait OptimizerCube: Send + Sync {
+pub trait OptimizerCube: Send + Sync + Any {
     /// Размер состояния, выделяемого на каждый оптимизируемый параметр.
     ///
     /// Например:
@@ -33,4 +35,7 @@ pub trait OptimizerCube: Send + Sync {
     /// * `state`  - мутабельный срез состояния кубика.
     ///   Его длина равна `N * state_size_per_param()`, где `N` — число параметров.
     fn apply(&self, params: &mut [f32], grads: &mut [f32], state: &mut [f32]);
+
+    /// Позволяет downcasting к конкретному типу кубика.
+    fn as_any(&self) -> &dyn Any;
 }

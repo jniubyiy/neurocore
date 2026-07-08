@@ -76,7 +76,13 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_tanh(&self) -> Option<&Tanh> { None }
     fn as_leaky_relu(&self) -> Option<&LeakyReLU> { None }
     fn as_identity(&self) -> Option<&Identity> { None }
-    // При необходимости аналогично добавляются as_softmax, as_reduce_mean и т.д.
+    fn as_softmax(&self) -> Option<&Softmax> { None }
+    fn as_dual_anchor(&self) -> Option<&DualAnchor> { None }
+    fn as_soft_sparse_gate(&self) -> Option<&SoftSparseGate> { None }
+    fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> { None }
+    fn as_reduce_mean(&self) -> Option<&ReduceMean> { None }
+    fn as_unsqueeze(&self) -> Option<&Unsqueeze> { None }
+    fn as_memory(&self) -> Option<&Memory> { None }
 }
 
 // Реэкспорт слоёв

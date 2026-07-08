@@ -242,11 +242,8 @@ impl LayerDesc {
                 let q = self.out_features[1];
                 p * n + q * n + p + q
             }
-            LayerKind::Memory => {
-                let in_dim = self.in_features[0];
-                let out_dim = self.out_features[0];
-                out_dim * (2 * in_dim + 1)
-            }
+            // Memory не имеет обучаемых параметров (состояние хранится внутри слоя)
+            LayerKind::Memory => 0,
             LayerKind::SoftSparseGate | LayerKind::SoftKeepGate => {
                 // обучаемые пороги по числу признаков
                 self.in_features[0]

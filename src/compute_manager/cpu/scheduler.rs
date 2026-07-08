@@ -85,7 +85,7 @@ impl Scheduler {
             });
 
         let input_dim = 5 + MAX_CORES_FOR_MODEL;
-        let chunk_model = ForwardTimePredictor::load(&chunk_model_path, input_dim)
+        let chunk_model = ForwardTimePredictor::load(&chunk_model_path, input_dim, 8)
             .unwrap_or_else(|| ForwardTimePredictor::new(input_dim, 8));
 
         Scheduler {

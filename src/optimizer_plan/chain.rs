@@ -1,4 +1,4 @@
-// src/optimizer/chain.rs
+// src/optimizer_plan/chain.rs
 
 use super::cube::OptimizerCube;
 
@@ -20,6 +20,11 @@ impl OptimizerChain {
     pub fn add(mut self, cube: Box<dyn OptimizerCube>) -> Self {
         self.cubes.push(cube);
         self
+    }
+
+    /// Возвращает срез кубиков.
+    pub fn cubes(&self) -> &[Box<dyn OptimizerCube>] {
+        &self.cubes
     }
 
     /// Общий размер состояния на один параметр

@@ -1,5 +1,6 @@
 // src/loss_plan/cubes.rs
 
+use std::any::Any;
 use faer::Mat;
 
 /// Элементарный кубик функции потерь (матричная версия).
@@ -8,7 +9,7 @@ use faer::Mat;
 /// и возвращает матрицу размера `(batch, out_features)`.
 /// Прямой проход вычисляет выход, обратный — градиенты по входам,
 /// используя переданные матрицы.
-pub trait ElemCube: Send + Sync {
+pub trait ElemCube: Any + Send + Sync {
     /// Число столбцов входной матрицы (признаки на одну задачу).
     fn in_features(&self) -> usize;
 
@@ -29,6 +30,9 @@ pub trait ElemCube: Send + Sync {
         output_cache: &Mat<f32>,
         grad_out: &Mat<f32>,
     ) -> Mat<f32>;
+
+    /// Позволяет downcasting к конкретному типу кубика.
+    fn as_any(&self) -> &dyn Any;
 }
 
 // ----------------------------------------------------------------
@@ -59,6 +63,8 @@ impl ElemCube for Sub {
             if j == 0 { g } else { -g }
         })
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Квадрат числа: `x²`.
@@ -82,6 +88,8 @@ impl ElemCube for Square {
             2.0 * input[(i, 0)] * grad_out[(i, 0)]
         })
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Натуральный логарифм: `ln(x)`.
@@ -105,6 +113,8 @@ impl ElemCube for Log {
             grad_out[(i, 0)] / input[(i, 0)]
         })
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Унарный минус: `-x`.
@@ -125,6 +135,8 @@ impl ElemCube for Neg {
     ) -> Mat<f32> {
         -grad_out
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Умножение двух чисел: `input[:,0] * input[:,1]`.
@@ -152,6 +164,8 @@ impl ElemCube for Mul {
             if j == 0 { g * input[(i, 1)] } else { g * input[(i, 0)] }
         })
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Абсолютное значение: `|x|`.
@@ -177,6 +191,8 @@ impl ElemCube for Abs {
             if x > 0.0 { g } else if x < 0.0 { -g } else { 0.0 }
         })
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Прибавление константы: `x + scalar`.
@@ -197,6 +213,8 @@ impl ElemCube for AddScalar {
     ) -> Mat<f32> {
         grad_out.to_owned()
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// `ln(1 + x)`.
@@ -220,6 +238,8 @@ impl ElemCube for Log1p {
             grad_out[(i, 0)] / (1.0 + input[(i, 0)])
         })
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Модуль разности двух чисел: `|a - b|`.
@@ -249,4 +269,6 @@ impl ElemCube for AbsDiff {
             if j == 0 { grad } else { -grad }
         })
     }
+
+    fn as_any(&self) -> &dyn Any { self }
 }

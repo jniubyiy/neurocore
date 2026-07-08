@@ -5,8 +5,9 @@ pub mod init;
 pub mod executor;
 pub mod memory;
 pub mod pipeline;
-pub mod compute;      // новый модуль: реальные GPU-вычисления
-pub mod processor;    // новый модуль: диспетчеризация слоёв на GPU
+pub mod compute;
+pub mod processor;
+pub mod param_store;    // <-- добавлено
 
 // Реэкспорт основных типов для удобства использования
 pub use init::GpuContext;
@@ -14,6 +15,7 @@ pub use executor::GpuExecutor;
 pub use memory::GpuTensor;
 pub use compute::GpuCompute;
 pub use processor::process_forward_gpu;
+pub use param_store::GpuParamStore;   // <-- добавлено
 
 /// Обнаружить доступные GPU с помощью Vulkan.
 /// Возвращает список имён устройств (или None, если Vulkan недоступен).

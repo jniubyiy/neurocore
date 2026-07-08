@@ -9,6 +9,7 @@ use crate::compute_manager::device::Device;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::gpu::GpuCompute;
+use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::layers::UniversalLayer;
 use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::blueprint::LayerKind;
@@ -48,7 +49,7 @@ impl Executor for CpuExecutor {
     }
 }
 
-// ---------- GPU-исполнитель (всегда компилируется) ----------
+// ---------- GPU-исполнитель ----------
 fn create_gpu_executor(device_index: usize) -> Result<Box<dyn Executor>, String> {
     let context = crate::compute_manager::gpu::init::create_gpu_context(device_index)?;
     Ok(Box::new(crate::compute_manager::gpu::executor::GpuExecutor::new(context)))
@@ -229,6 +230,20 @@ impl MixedModel {
 
         let (executor, gpu_compute) = create_executor(device)?;
 
+        // Если используется GPU, создаём GPU-хранилище параметров
+        let gpu_param_store = if gpu_compute.is_some() {
+            let initial_params = store.lock().unwrap().all_params_vec();
+            let gpu_compute = gpu_compute.as_ref().unwrap().lock().unwrap();
+            let store = GpuParamStore::from_cpu(
+                gpu_compute.context.memory_allocator.clone(),
+                &initial_params,
+                0, // состояние оптимизатора пока не требуется, будет расширено позже
+            );
+            Some(Mutex::new(store))
+        } else {
+            None
+        };
+
         Ok(MixedModel {
             segments,
             store,
@@ -236,6 +251,7 @@ impl MixedModel {
             scheduler: Mutex::new(scheduler),
             executor,
             gpu_compute,
+            gpu_param_store,
             layer_infos,
             input_stream_count,
             output_stream_count,

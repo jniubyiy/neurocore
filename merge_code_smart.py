@@ -1,4 +1,4 @@
-# merge_rust_code_smart.py
+# merge_code_smart.py
 import os
 import math
 from pathlib import Path
@@ -7,7 +7,7 @@ from pathlib import Path
 # 1. Корневая директория проекта
 # ============================================================
 SCRIPT_DIR = Path(__file__).resolve().parent
-SOURCE_DIR = SCRIPT_DIR   # скрипт лежит в корне neurocore
+SOURCE_DIR = SCRIPT_DIR   # скрипт лежит в корне проекта
 
 # ============================================================
 # 2. Папки, которые ПОЛНОСТЬЮ ПРОПУСКАЕМ (не сканируются)
@@ -31,10 +31,10 @@ MENTIONED_EXCLUDE_DIRS = [
 # 4. Количество частей, на которые нужно разбить итоговый файл
 #    (если PARTS = 1, разбивка не производится)
 # ============================================================
-PARTS = 3
+PARTS = 5
 
 # Базовое имя выходных файлов (без расширения)
-BASE_OUTPUT_NAME = "merged_neurocore_code"
+BASE_OUTPUT_NAME = "merged_project_code"
 
 # Разделители
 SEPARATOR = "=" * 80
@@ -44,18 +44,23 @@ SUB_SEPARATOR = "-" * 80
 EXCLUDE_FILES = set()
 
 
-def collect_rust_files(root_dir, exclude_dirs, mentioned_dirs):
-    """Собирает Cargo.toml и все .rs файлы."""
+def collect_files(root_dir, exclude_dirs, mentioned_dirs):
+    """
+    Собирает файлы проекта: Cargo.toml, .rs, .html, .js, .css, .comp, .bat.
+    Возвращает список (тип, отн.путь, полный путь) и множество найденных упомянутых каталогов.
+    """
     root = Path(root_dir).resolve()
     collected = []
     found_mentioned = set()
 
     for current_dir, dirs, filenames in os.walk(root):
+        # Исключаем каталоги из списка dirs, чтобы не заходить в них
         dirs[:] = [
             d for d in dirs
             if d not in exclude_dirs and d not in mentioned_dirs
         ]
 
+        # Проверяем наличие упомянутых каталогов (не сканируются, но будут упомянуты)
         for d in os.listdir(current_dir):
             if d in mentioned_dirs and (Path(current_dir) / d).is_dir():
                 found_mentioned.add(d)
@@ -65,12 +70,25 @@ def collect_rust_files(root_dir, exclude_dirs, mentioned_dirs):
             if full_path in EXCLUDE_FILES:
                 continue
 
-            if fname.lower() == "cargo.toml":
+            # Определяем тип файла по расширению
+            fname_lower = fname.lower()
+            if fname_lower == "cargo.toml":
                 ftype = "toml"
-            elif fname.lower().endswith(".rs"):
+            elif fname_lower.endswith(".rs"):
                 ftype = "rs"
+            elif fname_lower.endswith(".html"):
+                ftype = "html"
+            elif fname_lower.endswith(".js"):
+                ftype = "js"
+            elif fname_lower.endswith(".css"):
+                ftype = "css"
+            # +++ Добавлены новые расширения
+            elif fname_lower.endswith(".comp"):
+                ftype = "comp"
+            elif fname_lower.endswith(".bat"):
+                ftype = "bat"
             else:
-                continue
+                continue  # пропускаем остальные
 
             try:
                 rel_path = full_path.relative_to(root)
@@ -79,9 +97,10 @@ def collect_rust_files(root_dir, exclude_dirs, mentioned_dirs):
 
             collected.append((ftype, str(rel_path), full_path))
 
-    tomls = sorted([c for c in collected if c[0] == "toml"], key=lambda x: x[1])
-    sources = sorted([c for c in collected if c[0] == "rs"], key=lambda x: x[1])
-    return tomls + sources, found_mentioned
+    # Сортировка: сначала Cargo.toml, потом .rs, потом .html, .js, .css, .comp, .bat
+    type_order = {"toml": 0, "rs": 1, "html": 2, "js": 3, "css": 4, "comp": 5, "bat": 6}
+    collected.sort(key=lambda x: (type_order.get(x[0], 99), x[1]))
+    return collected, found_mentioned
 
 
 def count_lines_of_file(full_path):
@@ -120,7 +139,7 @@ def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total
 
     with open(output_path, "w", encoding="utf-8") as out:
         out.write(SEPARATOR + "\n")
-        out.write("СБОРКА КОДА ПРОЕКТА neurocore\n")
+        out.write("СБОРКА КОДА ПРОЕКТА\n")
         out.write(f"Корень проекта: {Path(SOURCE_DIR).resolve()}\n")
         if total_parts and total_parts > 1:
             out.write(f"Часть {part_num} из {total_parts}\n")
@@ -167,8 +186,6 @@ def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total
             print(f"[OK] Добавлен: {rel_path}")
             processed += 1
 
-        # Статистика больше не пишется в файл
-
     print(f"Часть {part_num}: обработано {processed} файлов, пропущено {skipped} -> {output_path}")
 
 
@@ -181,7 +198,6 @@ def write_partition_message(file_obj, part_num, total_parts, is_start):
         else:
             msg = f"Это начало части {part_num}."
     else:
-        # Всегда используем универсальное сообщение
         msg = f"Это конец части {part_num}, дождись части {part_num + 1}."
     file_obj.write("\n" + SEPARATOR + "\n")
     file_obj.write(msg + "\n")
@@ -196,14 +212,15 @@ if __name__ == "__main__":
         EXCLUDE_FILES.add(output_file)
     EXCLUDE_FILES.add(Path(f"{BASE_OUTPUT_NAME}.txt").resolve())
 
-    entries, mentioned_found = collect_rust_files(
+    entries, mentioned_found = collect_files(
         SOURCE_DIR,
         EXCLUDE_DIR_NAMES,
         MENTIONED_EXCLUDE_DIRS
     )
 
     if not entries:
-        print("Не найдено ни одного Cargo.toml или .rs файла (с учётом исключений).")
+        # +++ Обновлено сообщение – добавлены .comp и .bat
+        print("Не найдено ни одного подходящего файла (Cargo.toml, .rs, .html, .js, .css, .comp, .bat) с учётом исключений.")
         exit(1)
 
     file_infos = []

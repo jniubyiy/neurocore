@@ -1,5 +1,6 @@
 // src/loss_plan/cross_entropy.rs
 
+use std::any::Any;
 use faer::Mat;
 use super::cubes::ElemCube;
 
@@ -83,5 +84,9 @@ impl ElemCube for CrossEntropyWithLogits {
         }
 
         grad
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

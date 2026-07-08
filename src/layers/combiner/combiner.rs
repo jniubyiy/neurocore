@@ -16,7 +16,8 @@ impl Combiner {
     pub fn input_dim(&self) -> usize { self.input_dim }
     pub fn output_dim(&self) -> usize { self.output_dim }
 
-    fn get_weights_and_bias(&self, params: &[f32], slice: &ParamSlice) -> (Mat<f32>, Mat<f32>, Vec<f32>) {
+    /// Публичный метод для получения матриц весов и смещения из слайса параметров.
+    pub fn get_weights_and_bias(&self, params: &[f32], slice: &ParamSlice) -> (Mat<f32>, Mat<f32>, Vec<f32>) {
         let in_feat = self.input_dim;
         let out_feat = self.output_dim;
         let base = slice.start;

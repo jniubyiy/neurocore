@@ -106,6 +106,11 @@ impl UniversalLayer for SoftSparseGate {
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
         Mat::zeros(batch_size, self.in_features)
     }
+
+    // Метод для GPU-диспетчеризации
+    fn as_soft_sparse_gate(&self) -> Option<&SoftSparseGate> {
+        Some(self)
+    }
 }
 
 fn soft_sparse_gate_backward_mat(

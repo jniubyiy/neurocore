@@ -112,19 +112,18 @@ impl ForwardTimePredictor {
         }
     }
 
-    /// Загружает модель из файла, только если её `input_dim` совпадает с ожидаемым.
-    /// Проверки на `hidden` не делается, но структура должна быть совместима.
-    pub fn load(path: &PathBuf, expected_input_dim: usize) -> Option<Self> {
+    /// Загружает модель из файла, только если её `input_dim` и `hidden` совпадают с ожидаемыми.
+    pub fn load(path: &PathBuf, expected_input_dim: usize, expected_hidden: usize) -> Option<Self> {
         if path.exists() {
             match fs::read_to_string(path) {
                 Ok(data) => match serde_json::from_str::<Self>(&data) {
                     Ok(m) => {
-                        if m.input_dim == expected_input_dim {
+                        if m.input_dim == expected_input_dim && m.hidden == expected_hidden {
                             Some(m)
                         } else {
                             eprintln!(
-                                "[neurocore] Мини-модель имеет несовпадающую размерность (in {} вместо {}), будет создана новая.",
-                                m.input_dim, expected_input_dim
+                                "[neurocore] Мини-модель имеет несовпадающую архитектуру (in: {} vs {}, hidden: {} vs {}), будет создана новая.",
+                                m.input_dim, expected_input_dim, m.hidden, expected_hidden
                             );
                             None
                         }

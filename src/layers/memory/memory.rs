@@ -123,4 +123,8 @@ impl UniversalLayer for Memory {
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
         Mat::zeros(batch_size, self.features)
     }
+
+    fn as_memory(&self) -> Option<&Memory> {
+        Some(self)
+    }
 }

@@ -101,6 +101,11 @@ impl UniversalLayer for ReduceMean {
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {
         Mat::zeros(0, 0)
     }
+
+    // Метод для GPU-диспетчеризации
+    fn as_reduce_mean(&self) -> Option<&ReduceMean> {
+        Some(self)
+    }
 }
 
 

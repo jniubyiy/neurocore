@@ -43,13 +43,28 @@ impl MixedModel {
                     self.process_reduce_mean_backward(&mut streams, target_dims);
                 }
                 Segment::UniversalProcessor(proc, slices, stream_indices) => {
-                    // Обратный проход UniversalProcessor пока всегда на CPU.
-                    // GPU-реализация backward будет добавлена позднее.
-                    let result = self.process_universal_processor_backward_mat(
-                        proc, slices, &streams, contexts, ctx_pos, &params, &mut total_grad, stream_indices,
-                    );
-                    streams = result.0;
-                    ctx_pos = result.1;
+                    if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+                        let gpu_compute = gpu_compute_mutex.lock().unwrap();
+                        let result = self.process_universal_processor_backward_gpu(
+                            &gpu_compute,
+                            proc,
+                            slices,
+                            &streams,
+                            contexts,
+                            ctx_pos,
+                            &params,
+                            &mut total_grad,
+                            stream_indices,
+                        );
+                        streams = result.0;
+                        ctx_pos = result.1;
+                    } else {
+                        let result = self.process_universal_processor_backward_mat(
+                            proc, slices, &streams, contexts, ctx_pos, &params, &mut total_grad, stream_indices,
+                        );
+                        streams = result.0;
+                        ctx_pos = result.1;
+                    }
                 }
                 Segment::SplitterConnector { dim_a, dim_b } => {
                     let result = self.process_splitter_connector_backward_mat(
@@ -92,10 +107,17 @@ impl MixedModel {
                     let q = output_dims[1];
                     let pre_a_mat = flat_to_mat(pre_a_flat, batch, p);
                     let pre_b_mat = flat_to_mat(pre_b_flat, batch, q);
-                    let (wa, wb, _, _) = crate::layers::Splitter::new(*input_dim, output_dims.clone()).get_weights_and_biases(&params, slice);
-                    let (dx_mat, grad) = crate::layers::Splitter::new(*input_dim, output_dims.clone()).backward_mat(
-                        &x_mat, &da_mat, &db_mat, &pre_a_mat, &pre_b_mat, &wa, &wb,
-                    );
+
+                    let (wa, wb, _, _) = crate::layers::Splitter::new(*input_dim, output_dims.clone())
+                        .get_weights_and_biases(&params, slice);
+
+                    let (dx_mat, grad) = if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+                        let gpu = gpu_compute_mutex.lock().unwrap();
+                        gpu.run_splitter_backward(&x_mat, &da_mat, &db_mat, &pre_a_mat, &pre_b_mat, &wa, &wb)
+                    } else {
+                        crate::layers::Splitter::new(*input_dim, output_dims.clone())
+                            .backward_mat(&x_mat, &da_mat, &db_mat, &pre_a_mat, &pre_b_mat, &wa, &wb)
+                    };
 
                     for (idx, &g) in grad.iter().enumerate() {
                         total_grad[slice.start + idx] += g;
@@ -112,10 +134,10 @@ impl MixedModel {
                 Segment::Combiner { input_dim, output_dim, slice } => {
                     assert!(ctx_pos > 0, "Backward: no context for Combiner");
                     let ctx = &contexts[0][ctx_pos - 1];
-                    let (a_tensor, b_tensor) = match ctx {
+                    let (a_tensor, b_tensor, pre_act_flat) = match ctx {
                         DynamicContext::Ctx1D(c) => match c {
-                            crate::layers::context1d::LayerContext1D::Combiner { input_a, input_b, .. } =>
-                                (input_a, input_b),
+                            crate::layers::context1d::LayerContext1D::Combiner { input_a, input_b, pre_act } =>
+                                (input_a, input_b, pre_act.clone()),
                             _ => panic!("Expected Combiner context"),
                         },
                         _ => panic!("Expected Ctx1D"),
@@ -130,7 +152,29 @@ impl MixedModel {
                     let b_mat = linalg::tensor2d_to_faer(b_tensor);
 
                     let combiner = crate::layers::Combiner::new(vec![*input_dim, *input_dim], *output_dim);
-                    let (da_mat, db_mat, grad) = combiner.backward_mat(&a_mat, &b_mat, &dout_mat, &params, slice);
+                    let (wa, wb, bias) = combiner.get_weights_and_bias(&params, slice);
+
+                    let (da_mat, db_mat, grad) = if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+                        let gpu = gpu_compute_mutex.lock().unwrap();
+                        let batch = a_mat.nrows();
+                        let m = *output_dim;
+                        // Восстановим pre из контекста или пересчитаем, если его нет (для обратной совместимости)
+                        let pre_mat = if !pre_act_flat.is_empty() {
+                            flat_to_mat(pre_act_flat, batch, m)
+                        } else {
+                            // запасной вариант для CPU-логики, где pre не сохранялся
+                            let mut pre = &a_mat * wa.transpose() + &b_mat * wb.transpose();
+                            for i in 0..batch {
+                                for j in 0..m {
+                                    pre[(i, j)] += bias[j];
+                                }
+                            }
+                            pre
+                        };
+                        gpu.run_combiner_backward(&a_mat, &b_mat, &dout_mat, &pre_mat, &wa, &wb)
+                    } else {
+                        combiner.backward_mat(&a_mat, &b_mat, &dout_mat, &params, slice)
+                    };
 
                     for (idx, &g) in grad.iter().enumerate() {
                         total_grad[slice.start + idx] += g;
@@ -186,6 +230,57 @@ impl MixedModel {
         (ins.into_iter().next().unwrap(), grads)
     }
 
+    /// GPU‑backward для UniversalProcessor.
+    fn process_universal_processor_backward_gpu(
+        &self,
+        gpu_compute: &crate::compute_manager::gpu::GpuCompute,
+        proc: &std::sync::Arc<Vec<Box<dyn UniversalLayer>>>,
+        slices: &[crate::model_plan::param_store::ParamSlice],
+        streams: &Vec<Vec<DynamicTensor>>,
+        contexts: &[Vec<DynamicContext>],
+        ctx_pos: usize,
+        params: &[f32],
+        total_grad: &mut Vec<f32>,
+        stream_indices: &Option<Vec<usize>>,
+    ) -> (Vec<Vec<DynamicTensor>>, usize) {
+        let num_layers = proc.len();
+        let num_input_streams = streams.len();
+        let active_indices: Vec<usize> = match stream_indices {
+            Some(indices) => indices.clone(),
+            None => (0..num_input_streams).collect(),
+        };
+
+        let mut new_streams: Vec<Option<Vec<DynamicTensor>>> = vec![None; num_input_streams];
+        for &stream_idx in &active_indices {
+            let stream_samples = &streams[stream_idx];
+            let delta_mat = samples_to_mat(stream_samples);
+            let pos_in_sorted = active_indices.iter().position(|&x| x == stream_idx).unwrap();
+            let stream_ctx_start = ctx_pos - (active_indices.len() - pos_in_sorted) * num_layers;
+            let layer_ctxs = &contexts[0][stream_ctx_start..stream_ctx_start + num_layers];
+
+            // Выполняем GPU‑обратный проход, который сразу записывает градиенты в total_grad
+            let in_delta_mat = crate::compute_manager::gpu::processor::process_backward_gpu(
+                gpu_compute,
+                proc,
+                slices,
+                layer_ctxs,
+                params,
+                &delta_mat,
+                total_grad,
+            );
+
+            let new_samples = mat_to_samples(&in_delta_mat);
+            new_streams[stream_idx] = Some(new_samples);
+        }
+        // Заполняем неизменённые потоки
+        for (i, opt) in new_streams.iter_mut().enumerate() {
+            if opt.is_none() { *opt = Some(streams[i].clone()); }
+        }
+        let new_ctx_pos = ctx_pos - num_layers * active_indices.len();
+        (new_streams.into_iter().map(|o| o.unwrap()).collect(), new_ctx_pos)
+    }
+
+    /// CPU‑backward (оригинальная реализация).
     fn process_universal_processor_backward_mat(
         &self,
         proc: &std::sync::Arc<Vec<Box<dyn UniversalLayer>>>,

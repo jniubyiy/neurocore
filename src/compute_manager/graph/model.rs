@@ -10,18 +10,22 @@ use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::gpu::GpuCompute;
+use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::ParamStore;
-use crate::optimizer_plan::{OptimizerExpr, OptimizerChain, OptimizerDesc};
+use crate::optimizer_plan::{
+    OptimizerExpr, OptimizerChain, OptimizerDesc, cubes::*,
+};
 use crate::linalg;
 
 pub struct MixedModel {
     pub(crate) segments: Vec<Segment>,
     pub(crate) store: Arc<Mutex<ParamStore>>,
-    pub(crate) pool: Arc<WorkerPool>,                    // используется для compute_loss_mat (CPU)
-    pub(crate) scheduler: Mutex<Scheduler>,              // используется для compute_loss_mat (CPU)
-    pub(crate) executor: Box<dyn Executor>,              // универсальный исполнитель (CPU/GPU)
-    pub(crate) gpu_compute: Option<Mutex<GpuCompute>>,  // реальные GPU-вычисления (если устройство GPU)
+    pub(crate) pool: Arc<WorkerPool>,
+    pub(crate) scheduler: Mutex<Scheduler>,
+    pub(crate) executor: Box<dyn Executor>,
+    pub(crate) gpu_compute: Option<Mutex<GpuCompute>>,
+    pub(crate) gpu_param_store: Option<Mutex<GpuParamStore>>,
     #[allow(dead_code)]
     pub(crate) layer_infos: Vec<Vec<LayerInfo>>,
     pub(crate) input_stream_count: usize,
@@ -54,6 +58,7 @@ impl MixedModel {
         OptimizerExpr::new(num_params, chain)
     }
 
+    /// CPU‑обновление параметров (для обратной совместимости).
     pub fn update_params(&mut self, desc: OptimizerDesc, grads: &[f32]) {
         let chain = desc.build_chain();
         let mut opt = self.create_optimizer(chain);
@@ -61,6 +66,91 @@ impl MixedModel {
         let mut params = store.all_params_vec();
         opt.step(&mut params, grads);
         store.set_all_params(&params);
+    }
+
+    /// GPU‑обновление параметров.
+    pub fn update_params_gpu(&self, desc: OptimizerDesc, step: usize) {
+        let gpu_store = self.gpu_param_store
+            .as_ref()
+            .expect("GPU param store is not available");
+        let gpu_compute_mutex = self.gpu_compute
+            .as_ref()
+            .expect("GPU compute is not available");
+        let gpu_compute = gpu_compute_mutex.lock().unwrap();
+        let mut store = gpu_store.lock().unwrap();
+
+        let total = store.num_params;
+        let chain = desc.build_chain();
+        let cubes = chain.cubes();
+
+        // 1. При необходимости выделяем буфер состояния
+        let required_state_per_param = chain.total_state_size_per_param();
+        if required_state_per_param > 0 {
+            let total_state_elems = total * required_state_per_param;
+            let need_new = match &store.opt_state {
+                None => true,
+                Some(buf) => buf.len() < (total_state_elems as u64),
+            };
+            if need_new {
+                let new_state = gpu_compute.create_buffer(
+                    total_state_elems,
+                    vulkano::buffer::BufferUsage::STORAGE_BUFFER | vulkano::buffer::BufferUsage::TRANSFER_DST,
+                );
+                store.opt_state = Some(new_state);
+            }
+        }
+
+        // 2. Применяем кубики, передавая каждому его собственный срез состояния
+        let mut state_offset = 0;
+
+        for cube in cubes.iter() {
+            let size_per_param = cube.state_size_per_param();
+
+            // Создаём подбуфер, если кубик требует состояние
+            let state_slice = store.opt_state.as_ref().map(|full_state| {
+                let elem_size = std::mem::size_of::<f32>() as u64;
+                let start_byte = (state_offset * total) as u64 * elem_size;
+                let len_elems = size_per_param * total;
+                let end_byte = start_byte + len_elems as u64 * elem_size;
+                full_state.clone().slice(start_byte..end_byte)
+            });
+
+            if let Some(cube) = cube.as_any().downcast_ref::<ScaleGradient>() {
+                gpu_compute.run_scale_gradient(&store.grads, cube.factor, total);
+            } else if let Some(cube) = cube.as_any().downcast_ref::<AddWeightDecay>() {
+                gpu_compute.run_weight_decay(&store.params, &store.grads, cube.decay, total);
+            } else if let Some(cube) = cube.as_any().downcast_ref::<GradientClip>() {
+                let min_val = cube.min.unwrap_or(f32::NEG_INFINITY);
+                let max_val = cube.max.unwrap_or(f32::INFINITY);
+                gpu_compute.run_gradient_clip(&store.grads, min_val, max_val, total);
+            } else if let Some(cube) = cube.as_any().downcast_ref::<Momentum>() {
+                if let Some(ref state) = state_slice {
+                    gpu_compute.run_momentum(&store.grads, state, cube.beta, total);
+                }
+            } else if let Some(cube) = cube.as_any().downcast_ref::<NesterovMomentum>() {
+                if let Some(ref state) = state_slice {
+                    gpu_compute.run_nesterov_momentum(&store.grads, state, cube.beta, total);
+                }
+            } else if let Some(cube) = cube.as_any().downcast_ref::<AdamTransform>() {
+                if let Some(ref state) = state_slice {
+                    gpu_compute.run_adam(
+                        &store.grads,
+                        state,
+                        cube.beta1,
+                        cube.beta2,
+                        cube.eps,
+                        step,
+                        total,
+                    );
+                }
+            } else if cube.as_any().is::<ApplyUpdate>() {
+                gpu_compute.run_apply_update(&store.params, &store.grads, total);
+            } else {
+                panic!("Unsupported optimizer cube for GPU: {:?}", std::any::type_name_of_val(cube));
+            }
+
+            state_offset += size_per_param;
+        }
     }
 
     // ── Одиночные вход/выход (обратная совместимость) ──
@@ -182,6 +272,10 @@ impl MixedModel {
         pred: &Mat<f32>,
         target: &Mat<f32>,
     ) -> (f32, Mat<f32>) {
+        if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+            let gpu_compute = gpu_compute_mutex.lock().unwrap();
+            return crate::loss_plan::compute_loss_gpu(&gpu_compute, &expr, pred, target);
+        }
         let mut scheduler = self.scheduler.lock().unwrap();
         crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
     }

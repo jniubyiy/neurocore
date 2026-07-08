@@ -82,6 +82,11 @@ impl UniversalLayer for Softmax {
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {
         Mat::zeros(0, 0) // форма определяется входом
     }
+
+    // Метод для GPU-диспетчеризации
+    fn as_softmax(&self) -> Option<&Softmax> {
+        Some(self)
+    }
 }
 
 // Вспомогательные матричные функции

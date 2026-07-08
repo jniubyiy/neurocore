@@ -81,13 +81,13 @@ pub fn compute_loss_mat(
     let loss = expr.aggregate_loss(&all_loss);
     let grad_flat = expr.aggregate_grad(&all_grad);
 
-    // Восстанавливаем градиент по pred в исходной матричной форме
+    // Корректно восстанавливаем градиент по pred в матрицу (total_tasks x pred_feat)
     let mut grad_pred = Mat::zeros(pred.nrows(), pred.ncols());
     for i in 0..total_tasks {
         let start = i * in_features;
-        let row = i / pred_feat;
-        let col = i % pred_feat;
-        grad_pred[(row, col)] = grad_flat[start]; // первый компонент градиента – по pred
+        for j in 0..pred_feat {
+            grad_pred[(i, j)] = grad_flat[start + j];
+        }
     }
 
     (loss, grad_pred)

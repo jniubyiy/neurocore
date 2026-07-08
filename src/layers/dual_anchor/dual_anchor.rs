@@ -1,3 +1,5 @@
+// src/layers/dual_anchor/dual_anchor.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
@@ -5,7 +7,7 @@ use crate::linalg;
 use faer::Mat;
 
 pub struct DualAnchor {
-    features: usize,
+    pub features: usize,   // сделано публичным для доступа из processor.rs
 }
 
 impl DualAnchor {
@@ -121,6 +123,11 @@ impl UniversalLayer for DualAnchor {
 
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
         Mat::zeros(batch_size, self.features)
+    }
+
+    // Метод для GPU-диспетчеризации
+    fn as_dual_anchor(&self) -> Option<&DualAnchor> {
+        Some(self)
     }
 }
 

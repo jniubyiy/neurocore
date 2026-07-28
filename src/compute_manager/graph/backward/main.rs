@@ -43,6 +43,7 @@ impl MixedModel {
                     self.process_reduce_mean_backward(&mut streams, target_dims);
                 }
                 Segment::UniversalProcessor(proc, slices, stream_indices) => {
+                    // Используем GPU‑backward, если доступен GPU
                     if let Some(ref gpu_compute_mutex) = self.gpu_compute {
                         let gpu_compute = gpu_compute_mutex.lock().unwrap();
                         let result = self.process_universal_processor_backward_gpu(
@@ -107,12 +108,9 @@ impl MixedModel {
                     let q = output_dims[1];
                     let pre_a_mat = flat_to_mat(pre_a_flat, batch, p);
                     let pre_b_mat = flat_to_mat(pre_b_flat, batch, q);
-
-                    let (wa, wb, _, _) = crate::layers::Splitter::new(*input_dim, output_dims.clone())
-                        .get_weights_and_biases(&params, slice);
-
-                    let (dx_mat, grad) = if let Some(ref gpu_compute_mutex) = self.gpu_compute {
-                        let gpu = gpu_compute_mutex.lock().unwrap();
+                    let (wa, wb, _, _) = crate::layers::Splitter::new(*input_dim, output_dims.clone()).get_weights_and_biases(&params, slice);
+                    let (dx_mat, grad) = if let Some(ref gpu) = self.gpu_compute {
+                        let gpu = gpu.lock().unwrap();
                         gpu.run_splitter_backward(&x_mat, &da_mat, &db_mat, &pre_a_mat, &pre_b_mat, &wa, &wb)
                     } else {
                         crate::layers::Splitter::new(*input_dim, output_dims.clone())
@@ -134,10 +132,10 @@ impl MixedModel {
                 Segment::Combiner { input_dim, output_dim, slice } => {
                     assert!(ctx_pos > 0, "Backward: no context for Combiner");
                     let ctx = &contexts[0][ctx_pos - 1];
-                    let (a_tensor, b_tensor, pre_act_flat) = match ctx {
+                    let (a_tensor, b_tensor) = match ctx {
                         DynamicContext::Ctx1D(c) => match c {
-                            crate::layers::context1d::LayerContext1D::Combiner { input_a, input_b, pre_act } =>
-                                (input_a, input_b, pre_act.clone()),
+                            crate::layers::context1d::LayerContext1D::Combiner { input_a, input_b, .. } =>
+                                (input_a, input_b),
                             _ => panic!("Expected Combiner context"),
                         },
                         _ => panic!("Expected Ctx1D"),
@@ -152,17 +150,12 @@ impl MixedModel {
                     let b_mat = linalg::tensor2d_to_faer(b_tensor);
 
                     let combiner = crate::layers::Combiner::new(vec![*input_dim, *input_dim], *output_dim);
-                    let (wa, wb, bias) = combiner.get_weights_and_bias(&params, slice);
-
-                    let (da_mat, db_mat, grad) = if let Some(ref gpu_compute_mutex) = self.gpu_compute {
-                        let gpu = gpu_compute_mutex.lock().unwrap();
+                    let (da_mat, db_mat, grad) = if let Some(ref gpu) = self.gpu_compute {
+                        let gpu = gpu.lock().unwrap();
+                        let (wa, wb, bias) = combiner.get_weights_and_bias(&params, slice);
                         let batch = a_mat.nrows();
                         let m = *output_dim;
-                        // Восстановим pre из контекста или пересчитаем, если его нет (для обратной совместимости)
-                        let pre_mat = if !pre_act_flat.is_empty() {
-                            flat_to_mat(pre_act_flat, batch, m)
-                        } else {
-                            // запасной вариант для CPU-логики, где pre не сохранялся
+                        let pre_mat = {
                             let mut pre = &a_mat * wa.transpose() + &b_mat * wb.transpose();
                             for i in 0..batch {
                                 for j in 0..m {
@@ -230,7 +223,6 @@ impl MixedModel {
         (ins.into_iter().next().unwrap(), grads)
     }
 
-    /// GPU‑backward для UniversalProcessor.
     fn process_universal_processor_backward_gpu(
         &self,
         gpu_compute: &crate::compute_manager::gpu::GpuCompute,
@@ -258,7 +250,6 @@ impl MixedModel {
             let stream_ctx_start = ctx_pos - (active_indices.len() - pos_in_sorted) * num_layers;
             let layer_ctxs = &contexts[0][stream_ctx_start..stream_ctx_start + num_layers];
 
-            // Выполняем GPU‑обратный проход, который сразу записывает градиенты в total_grad
             let in_delta_mat = crate::compute_manager::gpu::processor::process_backward_gpu(
                 gpu_compute,
                 proc,
@@ -272,7 +263,6 @@ impl MixedModel {
             let new_samples = mat_to_samples(&in_delta_mat);
             new_streams[stream_idx] = Some(new_samples);
         }
-        // Заполняем неизменённые потоки
         for (i, opt) in new_streams.iter_mut().enumerate() {
             if opt.is_none() { *opt = Some(streams[i].clone()); }
         }
@@ -280,7 +270,6 @@ impl MixedModel {
         (new_streams.into_iter().map(|o| o.unwrap()).collect(), new_ctx_pos)
     }
 
-    /// CPU‑backward (оригинальная реализация).
     fn process_universal_processor_backward_mat(
         &self,
         proc: &std::sync::Arc<Vec<Box<dyn UniversalLayer>>>,

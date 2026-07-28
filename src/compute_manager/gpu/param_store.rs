@@ -1,31 +1,29 @@
 // src/compute_manager/gpu/param_store.rs
 
+use std::io::{self, Write};
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 
 use super::compute::GpuCompute;
 
-/// Хранилище параметров и состояния оптимизатора в GPU-памяти.
 pub struct GpuParamStore {
-    /// Буфер параметров модели (все параметры в одном векторе).
     pub params: Subbuffer<[f32]>,
-    /// Буфер градиентов (накапливаются во время backward).
     pub grads: Subbuffer<[f32]>,
-    /// Буфер состояния оптимизатора (например, для Adam: удвоенная длина).
     pub opt_state: Option<Subbuffer<[f32]>>,
-    /// Общее количество параметров.
     pub num_params: usize,
 }
 
 impl GpuParamStore {
-    /// Создаёт хранилище с начальными параметрами из CPU-вектора.
     pub fn from_cpu(
         allocator: Arc<StandardMemoryAllocator>,
         initial_params: &[f32],
-        state_size_per_param: usize, // 0, если состояние не требуется
+        state_size_per_param: usize,
     ) -> Self {
         let num = initial_params.len();
+        let host_memory = MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE;
+
+        // Параметры создаются через from_iter (host‑visible автоматически)
         let params_buf = Buffer::from_iter(
             allocator.clone(),
             BufferCreateInfo {
@@ -33,43 +31,45 @@ impl GpuParamStore {
                 ..Default::default()
             },
             AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                memory_type_filter: host_memory,
                 ..Default::default()
             },
             initial_params.iter().copied(),
         )
         .expect("GpuParamStore params");
 
+        // Градиенты – выделяем через new_unsized с явным размером в байтах
+        let grads_size = (num * std::mem::size_of::<f32>()) as u64;
         let grads_buf = Buffer::new_unsized(
             allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                size: (num * std::mem::size_of::<f32>()) as u64,
                 ..Default::default()
             },
             AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                memory_type_filter: host_memory,
                 ..Default::default()
             },
-            (num * std::mem::size_of::<f32>()) as u64,
+            grads_size,
         )
         .expect("GpuParamStore grads");
 
+        // Состояние оптимизатора (если нужно)
         let opt_state_buf = if state_size_per_param > 0 {
             let total_state = num * state_size_per_param;
+            let state_size = (total_state * std::mem::size_of::<f32>()) as u64;
             Some(
                 Buffer::new_unsized(
                     allocator,
                     BufferCreateInfo {
                         usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                        size: (total_state * std::mem::size_of::<f32>()) as u64,
                         ..Default::default()
                     },
                     AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                        memory_type_filter: host_memory,
                         ..Default::default()
                     },
-                    (total_state * std::mem::size_of::<f32>()) as u64,
+                    state_size,
                 )
                 .expect("GpuParamStore opt_state"),
             )
@@ -85,11 +85,21 @@ impl GpuParamStore {
         }
     }
 
-    /// Копирует текущие параметры в CPU-вектор (для отладки/сохранения).
-    pub fn to_cpu(&self, gpu_compute: &GpuCompute) -> Vec<f32> {
-        let staging = gpu_compute.create_buffer(self.num_params, BufferUsage::TRANSFER_DST);
-        gpu_compute.copy_buffer_sync(self.params.clone(), staging.clone());
-        let data = staging.read().unwrap();
-        data.to_vec()
+    pub fn to_cpu(&self, _gpu_compute: &GpuCompute) -> Vec<f32> {
+        eprintln!(
+            "[PARAM] to_cpu: reading {} params directly from host‑visible buffer",
+            self.num_params
+        );
+        io::stderr().flush().unwrap();
+
+        let guard = self.params.read().expect("Failed to read params buffer");
+        let data = guard.to_vec();
+        eprintln!(
+            "[PARAM] to_cpu: read {} floats, first: {:?}",
+            data.len(),
+            &data[..data.len().min(4)]
+        );
+        io::stderr().flush().unwrap();
+        data
     }
 }

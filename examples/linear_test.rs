@@ -3,8 +3,7 @@
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
-use neurocore::compute_manager::{Device, DynamicTensor};
-use neurocore::model_plan::Plan;
+use neurocore::compute_manager::{DevicePlan, DynamicTensor, MixedModel};
 use neurocore::tensor::Tensor2D;
 
 mod models {
@@ -34,43 +33,44 @@ mod optimizers {
 }
 
 fn run_training(
-    device: Device,
+    device_plan: DevicePlan,
     label: &str,
     initial_params: Option<&[f32]>,
 ) -> (Vec<f32>, f32) {
-    // Для GPU выполняем всё в отдельном потоке с большим стеком
-    if matches!(device, Device::Gpu { .. }) {
-        let device = device.clone();
+    if device_plan.gpu_id().is_some() {
+        let device_plan = device_plan.clone();
         let label = label.to_string();
         let initial_params = initial_params.map(|p| p.to_vec());
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
             .stack_size(512 * 1024 * 1024)
             .spawn(move || {
-                let (params, loss) = run_training_inner(device, &label, initial_params.as_deref());
+                let (params, loss) = run_training_inner(device_plan, &label, initial_params.as_deref());
                 tx.send((params, loss)).ok();
             })
             .unwrap();
         return rx.recv().unwrap();
     }
-    run_training_inner(device, label, initial_params)
+    run_training_inner(device_plan, label, initial_params)
 }
 
 fn run_training_inner(
-    device: Device,
+    device_plan: DevicePlan,
     label: &str,
     initial_params: Option<&[f32]>,
 ) -> (Vec<f32>, f32) {
     println!("\n===== {} =====", label);
-    let mut model = match Plan::from_layer_descs(models::linear_model()) {
-        Ok(plan) => plan.build_with_device(device),
+    let mut model = match MixedModel::from_plan_with_device_plan(
+        models::linear_model(),
+        device_plan.clone(),
+    ) {
+        Ok(m) => m,
         Err(e) => {
             println!("[ERROR] Не удалось собрать модель: {}", e);
             return (vec![], 0.0);
         }
     };
 
-    // Установка начальных параметров, если они переданы
     if let Some(p) = initial_params {
         model.param_store().lock().unwrap().set_all_params(p);
     } else {
@@ -115,18 +115,48 @@ fn run_training_inner(
 }
 
 fn main() {
-    // Стандартные одиночные проходы
-    run_training(Device::Cpu { threads: 1 }, "CPU (1 поток)", None);
-    run_training(Device::Cpu { threads: 4 }, "CPU (4 потока)", None);
-    run_training(Device::Gpu { id: 0 }, "GPU (id 0)", None);
+    // 1. Однопоток
+    let (cpu1_params, _) = run_training(
+        DevicePlan::new().cpu(1, 8192),
+        "CPU (1 поток)",
+        None,
+    );
 
-    // CPU → GPU
-    let cpu_params = run_training(Device::Cpu { threads: 1 }, "CPU (1 поток)", None).0;
-    run_training(Device::Gpu { id: 0 }, "GPU после CPU", Some(&cpu_params));
+    // 2. Многопоток
+    run_training(
+        DevicePlan::new().cpu(4, 8192),
+        "CPU (4 потока)",
+        None,
+    );
 
-    // GPU → CPU
-    let gpu_params = run_training(Device::Gpu { id: 0 }, "GPU (id 0)", None).0;
-    run_training(Device::Cpu { threads: 1 }, "CPU после GPU", Some(&gpu_params));
+    // 3. GPU
+    let (gpu0_params, _) = run_training(
+        DevicePlan::new().cpu(2, 8192).gpu(0, 4096),
+        "GPU (id 0)",
+        None,
+    );
+
+    // 4. С CPU на GPU
+    run_training(
+        DevicePlan::new().cpu(2, 8192).gpu(0, 4096),
+        "GPU после CPU",
+        Some(&cpu1_params),
+    );
+
+    // 5. С GPU на CPU
+    run_training(
+        DevicePlan::new().cpu(1, 8192),
+        "CPU после GPU",
+        Some(&gpu0_params),
+    );
+
+    // 6. Многопоток с SSD-кэшем
+    run_training(
+        DevicePlan::new()
+            .cpu(4, 8192)
+            .ssd_cache("D:\\neurocore_cache", 5000),
+        "CPU (4 потока, SSD-кэш)",
+        None,
+    );
 }
-
 

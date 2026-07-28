@@ -31,14 +31,14 @@ pub fn process_forward_gpu(
                 crate::layers::context1d::LayerContext1D::ReLU { input: input_tensor },
             ));
         } else if let Some(_) = layer.as_sigmoid() {
-            let output_tensor = crate::linalg::faer_to_tensor2d(&current);
             current = gpu_compute.run_sigmoid_forward(&current);
+            let output_tensor = crate::linalg::faer_to_tensor2d(&current);
             ctxs.push(DynamicContext::Ctx1D(
                 crate::layers::context1d::LayerContext1D::Sigmoid { output: output_tensor },
             ));
         } else if let Some(_) = layer.as_tanh() {
-            let output_tensor = crate::linalg::faer_to_tensor2d(&current);
             current = gpu_compute.run_tanh_forward(&current);
+            let output_tensor = crate::linalg::faer_to_tensor2d(&current);
             ctxs.push(DynamicContext::Ctx1D(
                 crate::layers::context1d::LayerContext1D::Tanh { output: output_tensor },
             ));
@@ -48,48 +48,10 @@ pub fn process_forward_gpu(
             ctxs.push(DynamicContext::Ctx1D(
                 crate::layers::context1d::LayerContext1D::LeakyReLU { input: input_tensor },
             ));
-        } else if let Some(_) = layer.as_identity() {
+        } else if layer.as_identity().is_some() {
             let (out, ctx) = layer.forward_mat(&current, params, slice);
             current = out;
             ctxs.push(ctx);
-        } else if let Some(_) = layer.as_softmax() {
-            let output_tensor = crate::linalg::faer_to_tensor2d(&current);
-            current = gpu_compute.run_softmax_forward(&current);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Softmax { output: output_tensor },
-            ));
-        } else if let Some(memory) = layer.as_memory() {
-            let input_tensor = crate::linalg::faer_to_tensor2d(&current);
-            let state = gpu_compute.memory_state.as_ref()
-                .expect("Memory state not initialized");
-            current = gpu_compute.run_memory_forward(&current, memory.alpha, state);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Memory { input: input_tensor },
-            ));
-        } else if let Some(softsparse) = layer.as_soft_sparse_gate() {
-            let input_tensor = crate::linalg::faer_to_tensor2d(&current);
-            let thresholds = &params[slice.start..slice.start + layer.input_features()];
-            current = gpu_compute.run_softsparse_forward(&current, thresholds, softsparse.temperature);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::SoftSparseGate { input: input_tensor },
-            ));
-        } else if let Some(softkeep) = layer.as_soft_keep_gate() {
-            let input_tensor = crate::linalg::faer_to_tensor2d(&current);
-            let thresholds = &params[slice.start..slice.start + layer.input_features()];
-            current = gpu_compute.run_softkeep_forward(&current, thresholds, softkeep.temperature);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::SoftKeepGate { input: input_tensor },
-            ));
-        } else if let Some(_) = layer.as_dual_anchor() {
-            let input_tensor = crate::linalg::faer_to_tensor2d(&current);
-            let features = layer.input_features();
-            let min_vals = &params[slice.start..slice.start + features];
-            let max_vals = &params[slice.start + features..slice.start + 2 * features];
-            let alpha = params[slice.start + 2 * features];
-            current = gpu_compute.run_dualanchor_forward(&current, min_vals, max_vals, alpha);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::DualAnchor1D { input: input_tensor },
-            ));
         } else {
             let (out, ctx) = layer.forward_mat(&current, params, slice);
             current = out;

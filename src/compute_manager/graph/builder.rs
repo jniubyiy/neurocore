@@ -6,6 +6,8 @@ use crate::compute_manager::cpu::{CostModel, Scheduler, WorkerPool};
 use crate::compute_manager::cpu::hardware::CPU_INFO;
 use crate::compute_manager::cpu::scheduler::LayerInfo;
 use crate::compute_manager::device::Device;
+use crate::compute_manager::device_plan::DevicePlan;
+use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::gpu::GpuCompute;
@@ -49,34 +51,6 @@ impl Executor for CpuExecutor {
     }
 }
 
-// ---------- GPU-исполнитель ----------
-fn create_gpu_executor(device_index: usize) -> Result<Box<dyn Executor>, String> {
-    let context = crate::compute_manager::gpu::init::create_gpu_context(device_index)?;
-    Ok(Box::new(crate::compute_manager::gpu::executor::GpuExecutor::new(context)))
-}
-
-fn create_executor(device: Device) -> Result<(Box<dyn Executor>, Option<Mutex<GpuCompute>>), String> {
-    match device {
-        Device::Cpu { threads } => {
-            let pool = Arc::new(WorkerPool::new(threads.max(1)));
-            let cost = CostModel::calibrate();
-            let mut sched = Scheduler::new(cost, CPU_INFO.clone());
-            sched.set_num_workers(threads.max(1));
-            Ok((Box::new(CpuExecutor::new(pool, Arc::new(Mutex::new(sched)))), None))
-        }
-        Device::Gpu { id } => {
-            let executor = create_gpu_executor(id)?;
-            let context = crate::compute_manager::gpu::init::create_gpu_context(id)
-                .map_err(|e| format!("Failed to create GPU context: {}", e))?;
-            let context = Arc::new(context);
-            let device_arc = context.device.clone();
-            let pipeline_cache = Arc::new(PipelineCache::new(device_arc));
-            let gpu_compute = GpuCompute::new(context, pipeline_cache);
-            Ok((executor, Some(Mutex::new(gpu_compute))))
-        }
-    }
-}
-
 impl MixedModel {
     pub fn from_plan(layers: Vec<LayerDesc>, num_threads: usize) -> Result<Self, String> {
         Self::from_plan_with_device(layers, num_threads, Device::Cpu { threads: num_threads })
@@ -87,7 +61,58 @@ impl MixedModel {
         _num_threads: usize,
         device: Device,
     ) -> Result<Self, String> {
+        let device_plan = match device {
+            Device::Cpu { threads } => DevicePlan::new().cpu(threads, 8192),
+            Device::Gpu { id } => DevicePlan::new().cpu(2, 8192).gpu(id, 4096),
+        };
+        Self::from_plan_with_device_plan(layers, device_plan)
+    }
+
+    pub fn from_plan_with_device_plan(
+        layers: Vec<LayerDesc>,
+        device_plan: DevicePlan,
+    ) -> Result<Self, String> {
+        // -----------------------------------------------------------
+        // 1. Создаём MemoryExecutor и регистрируем устройства согласно плану
+        // -----------------------------------------------------------
+        let (memory_executor, gpu_context) = device_plan.build_memory_executor();
+
+        // -----------------------------------------------------------
+        // 2. Параметры и планировщик CPU
+        // -----------------------------------------------------------
         let store = Arc::new(Mutex::new(ParamStore::new()));
+        let cpu_threads = device_plan.cpu_threads().max(1);
+        let cost = CostModel::calibrate();
+        let mut scheduler = Scheduler::new(cost, CPU_INFO.clone());
+        scheduler.set_num_workers(cpu_threads);
+        let pool = Arc::new(WorkerPool::new(cpu_threads));
+        let cpu_executor: Box<dyn Executor> = Box::new(CpuExecutor::new(pool.clone(), Arc::new(Mutex::new(scheduler.clone()))));
+
+        // -----------------------------------------------------------
+        // 3. Настройка исполнителя (CPU или GPU)
+        // -----------------------------------------------------------
+        let mut gpu_compute: Option<Mutex<GpuCompute>> = None;
+        let mut gpu_param_store: Option<Mutex<GpuParamStore>> = None;
+        let executor: Box<dyn Executor> = if let Some(gpu_ctx) = gpu_context {
+            // GPU доступен – создаём GPU-исполнитель и GpuCompute
+            let gpu_executor = crate::compute_manager::gpu::GpuExecutor::new(gpu_ctx.as_ref().clone());
+            let pipeline_cache = Arc::new(PipelineCache::new(gpu_ctx.device.clone()));
+            let gpu_compute_instance = GpuCompute::new(
+                gpu_ctx,
+                pipeline_cache,
+                memory_executor.clone(),
+                DeviceId(device_plan.gpu_id().unwrap()),
+            );
+            gpu_compute = Some(Mutex::new(gpu_compute_instance));
+            Box::new(gpu_executor)
+        } else {
+            // Только CPU
+            cpu_executor.clone_executor()
+        };
+
+        // -----------------------------------------------------------
+        // 4. Строим сегменты модели
+        // -----------------------------------------------------------
         let mut segments: Vec<Segment> = Vec::new();
         let mut layer_infos: Vec<Vec<LayerInfo>> = Vec::new();
         let mut current_layers: Vec<Box<dyn UniversalLayer>> = Vec::new();
@@ -222,28 +247,23 @@ impl MixedModel {
             _ => 1,
         };
 
-        let num_cpu_threads = if let Device::Cpu { threads } = device { threads.max(1) } else { 2 };
-        let cost = CostModel::calibrate();
-        let mut scheduler = Scheduler::new(cost, CPU_INFO.clone());
-        scheduler.set_num_workers(num_cpu_threads);
-        let pool = Arc::new(WorkerPool::new(num_cpu_threads));
-
-        let (executor, gpu_compute) = create_executor(device)?;
-
-        // Если используется GPU, создаём GPU-хранилище параметров
-        let gpu_param_store = if gpu_compute.is_some() {
+        // -----------------------------------------------------------
+        // 5. Создаём GPU-хранилище параметров, если есть GPU
+        // -----------------------------------------------------------
+        if let Some(ref gpu_compute_mutex) = gpu_compute {
             let initial_params = store.lock().unwrap().all_params_vec();
-            let gpu_compute = gpu_compute.as_ref().unwrap().lock().unwrap();
-            let store = GpuParamStore::from_cpu(
+            let gpu_compute = gpu_compute_mutex.lock().unwrap();
+            let gpu_store = GpuParamStore::from_cpu(
                 gpu_compute.context.memory_allocator.clone(),
                 &initial_params,
-                0, // состояние оптимизатора пока не требуется, будет расширено позже
+                0,
             );
-            Some(Mutex::new(store))
-        } else {
-            None
-        };
+            gpu_param_store = Some(Mutex::new(gpu_store));
+        }
 
+        // -----------------------------------------------------------
+        // 6. Собираем MixedModel
+        // -----------------------------------------------------------
         Ok(MixedModel {
             segments,
             store,
@@ -255,6 +275,7 @@ impl MixedModel {
             layer_infos,
             input_stream_count,
             output_stream_count,
+            memory_executor,
         })
     }
 }

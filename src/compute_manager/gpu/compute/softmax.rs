@@ -14,11 +14,10 @@ impl GpuCompute {
         let cols = input.ncols();
         let total = batch * cols;
 
-        let input_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
+        let (input_buf, input_id) = self.create_storage_buffer_from_slice(
             &(0..batch).flat_map(|r| (0..cols).map(move |c| input[(r, c)])).collect::<Vec<f32>>(),
         );
-        let output_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (output_buf, output_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.softmax_pipeline();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -67,7 +66,9 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        self.read_buffer_to_mat(output_buf, batch, cols)
+        let mat = self.read_buffer_to_mat(output_buf, output_id, batch, cols);
+        self.release_buffer(input_id);
+        mat
     }
 
     pub fn run_softmax_backward(&self, output: &Mat<f32>, grad_output: &Mat<f32>) -> Mat<f32> {
@@ -75,15 +76,13 @@ impl GpuCompute {
         let cols = output.ncols();
         let total = batch * cols;
 
-        let y_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
+        let (y_buf, y_id) = self.create_storage_buffer_from_slice(
             &(0..batch).flat_map(|r| (0..cols).map(move |c| output[(r, c)])).collect::<Vec<f32>>(),
         );
-        let grad_out_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
+        let (grad_out_buf, go_id) = self.create_storage_buffer_from_slice(
             &(0..batch).flat_map(|r| (0..cols).map(move |c| grad_output[(r, c)])).collect::<Vec<f32>>(),
         );
-        let grad_in_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (grad_in_buf, gi_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.softmax_backward_pipeline();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -133,6 +132,9 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        self.read_buffer_to_mat(grad_in_buf, batch, cols)
+        let mat = self.read_buffer_to_mat(grad_in_buf, gi_id, batch, cols);
+        self.release_buffer(y_id);
+        self.release_buffer(go_id);
+        mat
     }
 }

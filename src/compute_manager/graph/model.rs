@@ -11,6 +11,7 @@ use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::gpu::GpuCompute;
 use crate::compute_manager::gpu::param_store::GpuParamStore;
+use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::ParamStore;
 use crate::optimizer_plan::{
@@ -30,6 +31,7 @@ pub struct MixedModel {
     pub(crate) layer_infos: Vec<Vec<LayerInfo>>,
     pub(crate) input_stream_count: usize,
     pub(crate) output_stream_count: usize,
+    pub(crate) memory_executor: Arc<Mutex<MemoryExecutor>>,
 }
 
 impl MixedModel {
@@ -58,7 +60,6 @@ impl MixedModel {
         OptimizerExpr::new(num_params, chain)
     }
 
-    /// CPU‑обновление параметров (для обратной совместимости).
     pub fn update_params(&mut self, desc: OptimizerDesc, grads: &[f32]) {
         let chain = desc.build_chain();
         let mut opt = self.create_optimizer(chain);
@@ -68,7 +69,6 @@ impl MixedModel {
         store.set_all_params(&params);
     }
 
-    /// GPU‑обновление параметров.
     pub fn update_params_gpu(&self, desc: OptimizerDesc, step: usize) {
         let gpu_store = self.gpu_param_store
             .as_ref()
@@ -83,7 +83,6 @@ impl MixedModel {
         let chain = desc.build_chain();
         let cubes = chain.cubes();
 
-        // 1. При необходимости выделяем буфер состояния
         let required_state_per_param = chain.total_state_size_per_param();
         if required_state_per_param > 0 {
             let total_state_elems = total * required_state_per_param;
@@ -92,21 +91,19 @@ impl MixedModel {
                 Some(buf) => buf.len() < (total_state_elems as u64),
             };
             if need_new {
-                let new_state = gpu_compute.create_buffer(
+                let (new_state_buf, _state_id) = gpu_compute.create_buffer(
                     total_state_elems,
                     vulkano::buffer::BufferUsage::STORAGE_BUFFER | vulkano::buffer::BufferUsage::TRANSFER_DST,
                 );
-                store.opt_state = Some(new_state);
+                store.opt_state = Some(new_state_buf);
             }
         }
 
-        // 2. Применяем кубики, передавая каждому его собственный срез состояния
         let mut state_offset = 0;
 
         for cube in cubes.iter() {
             let size_per_param = cube.state_size_per_param();
 
-            // Создаём подбуфер, если кубик требует состояние
             let state_slice = store.opt_state.as_ref().map(|full_state| {
                 let elem_size = std::mem::size_of::<f32>() as u64;
                 let start_byte = (state_offset * total) as u64 * elem_size;
@@ -153,7 +150,6 @@ impl MixedModel {
         }
     }
 
-    // ── Одиночные вход/выход (обратная совместимость) ──
     pub fn forward(
         &self,
         input: DynamicTensor,
@@ -173,7 +169,6 @@ impl MixedModel {
         (ins.into_iter().next().unwrap(), grads)
     }
 
-    // ── Множественные входы/выходы (публичное API) ──
     pub fn forward_multi(
         &self,
         inputs: Vec<DynamicTensor>,
@@ -241,7 +236,6 @@ impl MixedModel {
         (in_tensors, grads)
     }
 
-    // ── Потери ──
     pub fn compute_loss(
         &self,
         desc: LossDesc,
@@ -272,9 +266,12 @@ impl MixedModel {
         pred: &Mat<f32>,
         target: &Mat<f32>,
     ) -> (f32, Mat<f32>) {
+        let use_gpu = self.gpu_compute.is_some() && (expr.num_tasks() == pred.nrows());
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
-            let gpu_compute = gpu_compute_mutex.lock().unwrap();
-            return crate::loss_plan::compute_loss_gpu(&gpu_compute, &expr, pred, target);
+            if use_gpu {
+                let gpu_compute = gpu_compute_mutex.lock().unwrap();
+                return crate::loss_plan::compute_loss_gpu(&gpu_compute, &expr, pred, target);
+            }
         }
         let mut scheduler = self.scheduler.lock().unwrap();
         crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)

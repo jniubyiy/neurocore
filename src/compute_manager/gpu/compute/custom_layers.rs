@@ -15,10 +15,9 @@ impl GpuCompute {
         let mut state = Vec::with_capacity(2 * features);
         state.resize(features, f32::MAX);
         state.resize(2 * features, f32::MIN);
-        let buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &state,
-        );
+        let (buf, _id) = self.create_storage_buffer_from_slice(&state);
+        // Игнорируем id – буфер будет жить, пока хранится в self.memory_state.
+        // Освобождение произойдёт при дропе GpuCompute (или никогда, если не нужно).
         self.memory_state = Some(buf);
     }
 
@@ -31,11 +30,8 @@ impl GpuCompute {
         let batch = input.nrows();
         let features = input.ncols();
         let total = batch * features;
-        let in_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(input),
-        );
-        let out_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(input));
+        let (out_buf, out_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.memory_fwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -53,7 +49,10 @@ impl GpuCompute {
         .expect("memory_fwd descriptor set");
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
-        self.read_buffer_to_mat(out_buf, batch, features)
+
+        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        self.release_buffer(in_id);
+        mat
     }
 
     pub fn run_memory_backward(
@@ -62,11 +61,8 @@ impl GpuCompute {
         alpha: f32,
     ) -> Mat<f32> {
         let total = grad_out.nrows() * grad_out.ncols();
-        let go_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(grad_out),
-        );
-        let gi_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (go_buf, go_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(grad_out));
+        let (gi_buf, gi_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.memory_bwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -83,7 +79,10 @@ impl GpuCompute {
         .expect("memory_bwd descriptor set");
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
-        self.read_buffer_to_mat(gi_buf, grad_out.nrows(), grad_out.ncols())
+
+        let mat = self.read_buffer_to_mat(gi_buf, gi_id, grad_out.nrows(), grad_out.ncols());
+        self.release_buffer(go_id);
+        mat
     }
 
     // ---------- SoftSparseGate ----------
@@ -96,15 +95,9 @@ impl GpuCompute {
         let batch = input.nrows();
         let features = input.ncols();
         let total = batch * features;
-        let in_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(input),
-        );
-        let thresh_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            thresholds,
-        );
-        let out_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(input));
+        let (thresh_buf, th_id) = self.create_storage_buffer_from_slice(thresholds);
+        let (out_buf, out_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.softsparse_fwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -122,7 +115,11 @@ impl GpuCompute {
         .expect("softsparse_fwd descriptor set");
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
-        self.read_buffer_to_mat(out_buf, batch, features)
+
+        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        self.release_buffer(in_id);
+        self.release_buffer(th_id);
+        mat
     }
 
     pub fn run_softsparse_backward(
@@ -135,20 +132,11 @@ impl GpuCompute {
         let batch = input.nrows();
         let features = input.ncols();
         let total = batch * features;
-        let in_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(input),
-        );
-        let go_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(grad_out),
-        );
-        let thresh_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            thresholds,
-        );
-        let gi_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
-        let gthresh_buf = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(input));
+        let (go_buf, go_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(grad_out));
+        let (thresh_buf, th_id) = self.create_storage_buffer_from_slice(thresholds);
+        let (gi_buf, gi_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (gthresh_buf, gth_id) = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.softsparse_bwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -169,10 +157,18 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let gi = self.read_buffer_to_mat(gi_buf, batch, features);
-        let staging = self.create_buffer(features, BufferUsage::TRANSFER_DST);
+        let gi = self.read_buffer_to_mat(gi_buf, gi_id, batch, features);
+        let (staging, staging_id) = self.create_buffer(features, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(gthresh_buf, staging.clone());
-        let gthresh = staging.read().unwrap()[..features].to_vec();
+        let gthresh = {
+            let guard = staging.read().unwrap();
+            guard[..features].to_vec()
+        };
+        self.release_buffer(staging_id);
+        self.release_buffer(in_id);
+        self.release_buffer(go_id);
+        self.release_buffer(th_id);
+        self.release_buffer(gth_id);
         (gi, gthresh)
     }
 
@@ -186,15 +182,9 @@ impl GpuCompute {
         let batch = input.nrows();
         let features = input.ncols();
         let total = batch * features;
-        let in_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(input),
-        );
-        let thresh_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            thresholds,
-        );
-        let out_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(input));
+        let (thresh_buf, th_id) = self.create_storage_buffer_from_slice(thresholds);
+        let (out_buf, out_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.softkeep_fwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -212,7 +202,11 @@ impl GpuCompute {
         .expect("softkeep_fwd descriptor set");
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
-        self.read_buffer_to_mat(out_buf, batch, features)
+
+        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        self.release_buffer(in_id);
+        self.release_buffer(th_id);
+        mat
     }
 
     pub fn run_softkeep_backward(
@@ -225,20 +219,11 @@ impl GpuCompute {
         let batch = input.nrows();
         let features = input.ncols();
         let total = batch * features;
-        let in_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(input),
-        );
-        let go_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(grad_out),
-        );
-        let thresh_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            thresholds,
-        );
-        let gi_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
-        let gthresh_buf = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(input));
+        let (go_buf, go_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(grad_out));
+        let (thresh_buf, th_id) = self.create_storage_buffer_from_slice(thresholds);
+        let (gi_buf, gi_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (gthresh_buf, gth_id) = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.softkeep_bwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -259,10 +244,18 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let gi = self.read_buffer_to_mat(gi_buf, batch, features);
-        let staging = self.create_buffer(features, BufferUsage::TRANSFER_DST);
+        let gi = self.read_buffer_to_mat(gi_buf, gi_id, batch, features);
+        let (staging, staging_id) = self.create_buffer(features, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(gthresh_buf, staging.clone());
-        let gthresh = staging.read().unwrap()[..features].to_vec();
+        let gthresh = {
+            let guard = staging.read().unwrap();
+            guard[..features].to_vec()
+        };
+        self.release_buffer(staging_id);
+        self.release_buffer(in_id);
+        self.release_buffer(go_id);
+        self.release_buffer(th_id);
+        self.release_buffer(gth_id);
         (gi, gthresh)
     }
 
@@ -277,19 +270,10 @@ impl GpuCompute {
         let batch = input.nrows();
         let features = input.ncols();
         let total = batch * features;
-        let in_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(input),
-        );
-        let min_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            min_vals,
-        );
-        let max_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            max_vals,
-        );
-        let out_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(input));
+        let (min_buf, min_id) = self.create_storage_buffer_from_slice(min_vals);
+        let (max_buf, max_id) = self.create_storage_buffer_from_slice(max_vals);
+        let (out_buf, out_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.dualanchor_fwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -308,7 +292,12 @@ impl GpuCompute {
         .expect("dualanchor_fwd descriptor set");
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
-        self.read_buffer_to_mat(out_buf, batch, features)
+
+        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        self.release_buffer(in_id);
+        self.release_buffer(min_id);
+        self.release_buffer(max_id);
+        mat
     }
 
     pub fn run_dualanchor_backward(
@@ -322,26 +311,14 @@ impl GpuCompute {
         let batch = input.nrows();
         let features = input.ncols();
         let total = batch * features;
-        let in_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(input),
-        );
-        let go_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            &Self::mat_to_flat(grad_out),
-        );
-        let min_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            min_vals,
-        );
-        let max_buf = Self::create_storage_buffer_from_slice(
-            &self.context.memory_allocator,
-            max_vals,
-        );
-        let gi_buf = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
-        let gmin_buf = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
-        let gmax_buf = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
-        let galpha_buf = self.create_buffer(1, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(input));
+        let (go_buf, go_id) = self.create_storage_buffer_from_slice(&Self::mat_to_flat(grad_out));
+        let (min_buf, min_id) = self.create_storage_buffer_from_slice(min_vals);
+        let (max_buf, max_id) = self.create_storage_buffer_from_slice(max_vals);
+        let (gi_buf, gi_id) = self.create_buffer(total, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (gmin_buf, gmin_id) = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (gmax_buf, gmax_id) = self.create_buffer(features, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
+        let (galpha_buf, ga_id) = self.create_buffer(1, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
         let pipeline = self.pipeline_cache.dualanchor_bwd.clone();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
@@ -365,23 +342,45 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let gi = self.read_buffer_to_mat(gi_buf, batch, features);
-        let gmin_staging = self.create_buffer(features, BufferUsage::TRANSFER_DST);
+        let gi = self.read_buffer_to_mat(gi_buf, gi_id, batch, features);
+
+        let (gmin_staging, gms_id) = self.create_buffer(features, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(gmin_buf, gmin_staging.clone());
-        let gmin = gmin_staging.read().unwrap()[..features].to_vec();
+        let gmin = {
+            let guard = gmin_staging.read().unwrap();
+            guard[..features].to_vec()
+        };
+        self.release_buffer(gms_id);
 
-        let gmax_staging = self.create_buffer(features, BufferUsage::TRANSFER_DST);
+        let (gmax_staging, gxs_id) = self.create_buffer(features, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(gmax_buf, gmax_staging.clone());
-        let gmax = gmax_staging.read().unwrap()[..features].to_vec();
+        let gmax = {
+            let guard = gmax_staging.read().unwrap();
+            guard[..features].to_vec()
+        };
+        self.release_buffer(gxs_id);
 
-        let galpha_staging = self.create_buffer(1, BufferUsage::TRANSFER_DST);
+        let (galpha_staging, gas_id) = self.create_buffer(1, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(galpha_buf, galpha_staging.clone());
-        let galpha = galpha_staging.read().unwrap()[0];
+        let galpha = {
+            let guard = galpha_staging.read().unwrap();
+            guard[0]
+        };
+        self.release_buffer(gas_id);
 
         let mut grad = Vec::with_capacity(2 * features + 1);
         grad.extend_from_slice(&gmin);
         grad.extend_from_slice(&gmax);
         grad.push(galpha);
+
+        self.release_buffer(in_id);
+        self.release_buffer(go_id);
+        self.release_buffer(min_id);
+        self.release_buffer(max_id);
+        self.release_buffer(gmin_id);
+        self.release_buffer(gmax_id);
+        self.release_buffer(ga_id);
+
         (gi, grad)
     }
 

@@ -9,16 +9,14 @@ use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::VulkanLibrary;
 
-/// Информация о GPU, возвращаемая пользователю
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
     pub name: String,
-    /// Приблизительный объём видеопамяти (в мегабайтах)
     pub memory_mb: u64,
     pub device_type: PhysicalDeviceType,
 }
 
-/// Контекст Vulkan: экземпляр, логическое устройство и очередь вычислений
+#[derive(Clone)]
 pub struct GpuContext {
     pub instance: Arc<Instance>,
     pub device: Arc<Device>,
@@ -27,11 +25,8 @@ pub struct GpuContext {
     pub physical_device_index: usize,
 }
 
-/// Перечислить доступные GPU (физические устройства, поддерживающие compute).
-/// Возвращает `None`, если Vulkan не загружен или произошла ошибка.
 pub fn enumerate_gpus() -> Option<Vec<GpuInfo>> {
     let library = VulkanLibrary::new().ok()?;
-
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
@@ -40,36 +35,27 @@ pub fn enumerate_gpus() -> Option<Vec<GpuInfo>> {
         },
     )
     .ok()?;
-
     let devices = instance.enumerate_physical_devices().ok()?;
-
     let mut gpu_list = Vec::new();
     for pd in devices {
         let props = pd.properties();
-        // Суммируем размеры всех куч с флагом DEVICE_LOCAL
         let memory_mb = pd
             .memory_properties()
             .memory_heaps
             .iter()
-            .filter(|h| {
-                h.flags
-                    .contains(vulkano::memory::MemoryHeapFlags::DEVICE_LOCAL)
-            })
+            .filter(|h| h.flags.contains(vulkano::memory::MemoryHeapFlags::DEVICE_LOCAL))
             .map(|h| h.size)
             .sum::<u64>()
             / (1024 * 1024);
-
         gpu_list.push(GpuInfo {
             name: props.device_name.clone(),
             memory_mb,
             device_type: props.device_type,
         });
     }
-
     Some(gpu_list)
 }
 
-/// Создать контекст GPU по индексу (начиная с 0) из списка, полученного `enumerate_gpus()`.
 pub fn create_gpu_context(device_index: usize) -> Result<GpuContext, String> {
     let library = VulkanLibrary::new()
         .map_err(|e| format!("Не удалось загрузить Vulkan: {}", e))?;
@@ -98,7 +84,6 @@ pub fn create_gpu_context(device_index: usize) -> Result<GpuContext, String> {
             )
         })?;
 
-    // Ищем семейство очередей с поддержкой compute
     let queue_family_index = physical
         .queue_family_properties()
         .iter()
@@ -112,7 +97,6 @@ pub fn create_gpu_context(device_index: usize) -> Result<GpuContext, String> {
             )
         })?;
 
-    // Создаём логическое устройство и одну compute-очередь
     let (device, mut queues) = Device::new(
         physical.clone(),
         DeviceCreateInfo {

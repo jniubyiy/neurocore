@@ -14,6 +14,7 @@ use vulkano::sync::{self, GpuFuture};
 
 use super::super::device_spec::{DeviceId, DeviceSpec, DeviceKind};
 use super::pool::MemoryPool;
+use super::ssd_cache::{SsdCacheManager, SsdHandle};
 use super::types::{BufferData, BufferLocation, MemoryDeviceKind, TensorBuffer, TensorBufferId};
 
 use crate::compute_manager::gpu::init::GpuContext;
@@ -24,6 +25,7 @@ pub enum MemoryError {
     DeviceNotFound(MemoryDeviceKind),
     BufferNotFound(TensorBufferId),
     DataNotInLocation(TensorBufferId, BufferLocation),
+    SsdError(String),
 }
 
 pub struct MemoryExecutor {
@@ -32,6 +34,7 @@ pub struct MemoryExecutor {
     buffers: HashMap<TensorBufferId, TensorBuffer>,
     next_buffer_id: AtomicUsize,
     gpu_contexts: HashMap<DeviceId, Arc<GpuContext>>,
+    ssd_cache: Option<SsdCacheManager>,
 }
 
 impl MemoryExecutor {
@@ -42,6 +45,7 @@ impl MemoryExecutor {
             buffers: HashMap::new(),
             next_buffer_id: AtomicUsize::new(0),
             gpu_contexts: HashMap::new(),
+            ssd_cache: None,
         }
     }
 
@@ -55,7 +59,8 @@ impl MemoryExecutor {
         match spec.kind {
             DeviceKind::Cpu => {
                 if !self.pools.contains_key(&MemoryDeviceKind::HostRam) {
-                    self.pools.insert(MemoryDeviceKind::HostRam, MemoryPool::new(max_bytes));
+                    self.pools
+                        .insert(MemoryDeviceKind::HostRam, MemoryPool::new(max_bytes));
                 }
             }
             DeviceKind::Gpu => {
@@ -69,22 +74,43 @@ impl MemoryExecutor {
         self.devices.insert(id, spec);
     }
 
+    pub fn register_ssd_cache(
+        &mut self,
+        path: std::path::PathBuf,
+        max_bytes: u64,
+    ) -> Result<(), MemoryError> {
+        let manager = SsdCacheManager::new(path, max_bytes)?;
+        self.pools.insert(
+            MemoryDeviceKind::SsdCache,
+            MemoryPool::new(max_bytes),
+        );
+        self.ssd_cache = Some(manager);
+        Ok(())
+    }
+
     pub fn allocate(
         &mut self,
         location: MemoryDeviceKind,
         elements: usize,
     ) -> Result<TensorBufferId, MemoryError> {
-        let pool = self.pools.get_mut(&location)
+        let pool = self
+            .pools
+            .get_mut(&location)
             .ok_or(MemoryError::DeviceNotFound(location))?;
         if !pool.can_allocate(elements) {
             return Err(MemoryError::OutOfMemory(location));
         }
-        pool.allocate(elements).expect("Memory pool allocation failed");
+        pool.allocate(elements)
+            .map_err(|e| MemoryError::SsdError(e))?;
 
-        let data = match location {
-            MemoryDeviceKind::HostRam => BufferData::HostRam(vec![0.0f32; elements]),
+        let (data, buffer_location) = match location {
+            MemoryDeviceKind::HostRam => {
+                (BufferData::HostRam(vec![0.0f32; elements]), BufferLocation::HostRam)
+            }
             MemoryDeviceKind::DeviceVram(dev_id) => {
-                let ctx = self.gpu_contexts.get(&dev_id)
+                let ctx = self
+                    .gpu_contexts
+                    .get(&dev_id)
                     .expect("GPU context not registered");
                 let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
                 let buffer = Buffer::new_unsized(
@@ -99,11 +125,22 @@ impl MemoryExecutor {
                     },
                     size_bytes,
                 )
-                .expect("Failed to allocate GPU buffer");
-                BufferData::DeviceVram(buffer)
+                .map_err(|e| MemoryError::SsdError(format!("Failed to allocate GPU buffer: {}", e)))?;
+                (
+                    BufferData::DeviceVram(buffer),
+                    BufferLocation::DeviceVram(dev_id),
+                )
             }
             MemoryDeviceKind::SsdCache => {
-                BufferData::HostRam(vec![0.0f32; elements])
+                let ssd = self
+                    .ssd_cache
+                    .as_ref()
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
+                let handle = ssd.allocate(elements)?;
+                (
+                    BufferData::SsdCache(handle.clone()),
+                    BufferLocation::SsdCache(handle),
+                )
             }
         };
 
@@ -111,7 +148,7 @@ impl MemoryExecutor {
         let buffer = TensorBuffer {
             id,
             size_elements: elements,
-            location: kind_to_location(location),
+            location: buffer_location,
             data,
             pinned: false,
             use_count: 0,
@@ -125,7 +162,10 @@ impl MemoryExecutor {
         id: TensorBufferId,
         target: MemoryDeviceKind,
     ) -> Result<(), MemoryError> {
-        let buffer = self.buffers.get_mut(&id).ok_or(MemoryError::BufferNotFound(id))?;
+        let buffer = self
+            .buffers
+            .get_mut(&id)
+            .ok_or(MemoryError::BufferNotFound(id))?;
         let current_kind = location_to_kind(&buffer.location);
         if current_kind == target {
             return Ok(());
@@ -133,27 +173,31 @@ impl MemoryExecutor {
 
         let elements = buffer.size_elements;
 
+        // освобождаем исходный пул
         if let Some(pool) = self.pools.get_mut(&current_kind) {
             pool.deallocate(elements);
         }
 
-        let new_pool = self.pools.get_mut(&target)
+        // резервируем целевой пул
+        let target_pool = self
+            .pools
+            .get_mut(&target)
             .ok_or(MemoryError::DeviceNotFound(target))?;
-        if !new_pool.can_allocate(elements) {
+        if !target_pool.can_allocate(elements) {
+            // возвращаем память обратно
             if let Some(pool) = self.pools.get_mut(&current_kind) {
                 pool.allocate(elements).ok();
             }
             return Err(MemoryError::OutOfMemory(target));
         }
-        new_pool.allocate(elements).expect("New pool allocation failed");
+        target_pool
+            .allocate(elements)
+            .map_err(|e| MemoryError::SsdError(e))?;
 
-        let new_data = match (current_kind, target) {
-            (MemoryDeviceKind::HostRam, MemoryDeviceKind::DeviceVram(dev_id)) => {
+        // выполняем фактическое перемещение данных
+        let new_data = match (&buffer.data, &buffer.location, target) {
+            (BufferData::HostRam(vec), BufferLocation::HostRam, MemoryDeviceKind::DeviceVram(dev_id)) => {
                 let ctx = self.gpu_contexts.get(&dev_id).expect("No GPU context");
-                let old_vec = match &buffer.data {
-                    BufferData::HostRam(v) => v.clone(),
-                    _ => unreachable!(),
-                };
                 let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
                 let gpu_buf = Buffer::new_unsized(
                     ctx.memory_allocator.clone(),
@@ -167,7 +211,7 @@ impl MemoryExecutor {
                     },
                     size_bytes,
                 )
-                .expect("Failed to create GPU buffer for move");
+                .map_err(|e| MemoryError::SsdError(format!("GPU buffer alloc: {}", e)))?;
                 let staging = Buffer::from_iter(
                     ctx.memory_allocator.clone(),
                     BufferCreateInfo {
@@ -175,21 +219,18 @@ impl MemoryExecutor {
                         ..Default::default()
                     },
                     AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
-                    old_vec.iter().copied(),
+                    vec.iter().copied(),
                 )
-                .expect("Failed to create staging buffer");
+                .map_err(|e| MemoryError::SsdError(format!("Staging buffer: {}", e)))?;
                 copy_buffer_sync(ctx.clone(), staging, gpu_buf.clone());
                 BufferData::DeviceVram(gpu_buf)
             }
-            (MemoryDeviceKind::DeviceVram(dev_id), MemoryDeviceKind::HostRam) => {
+            (BufferData::DeviceVram(device_buf), BufferLocation::DeviceVram(dev_id), MemoryDeviceKind::HostRam) => {
                 let ctx = self.gpu_contexts.get(&dev_id).expect("No GPU context");
-                let device_buf = match &buffer.data {
-                    BufferData::DeviceVram(buf) => buf.clone(),
-                    _ => unreachable!(),
-                };
                 let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
                 let staging = Buffer::new_unsized(
                     ctx.memory_allocator.clone(),
@@ -198,26 +239,133 @@ impl MemoryExecutor {
                         ..Default::default()
                     },
                     AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
                     size_bytes,
                 )
-                .expect("Failed to create staging buffer");
-                copy_buffer_sync(ctx.clone(), device_buf, staging.clone());
+                .map_err(|e| MemoryError::SsdError(format!("Staging buffer: {}", e)))?;
+                copy_buffer_sync(ctx.clone(), device_buf.clone(), staging.clone());
                 let data_vec = {
-                    let guard = staging.read().unwrap();
+                    let guard = staging
+                        .read()
+                        .map_err(|e| MemoryError::SsdError(format!("Read staging: {}", e)))?;
                     let mut v = Vec::with_capacity(guard.len());
                     v.extend_from_slice(&guard);
                     v
                 };
                 BufferData::HostRam(data_vec)
             }
-            _ => return Err(MemoryError::DataNotInLocation(id, buffer.location.clone())),
+            (BufferData::HostRam(vec), BufferLocation::HostRam, MemoryDeviceKind::SsdCache) => {
+                let ssd = self.ssd_cache.as_ref().expect("SSD cache not registered");
+                let handle = ssd.allocate(elements)?;
+                ssd.write(&handle, vec)?;
+                BufferData::SsdCache(handle)
+            }
+            (BufferData::SsdCache(handle), BufferLocation::SsdCache(_), MemoryDeviceKind::HostRam) => {
+                let ssd = self.ssd_cache.as_ref().expect("SSD cache not registered");
+                let data_vec = ssd.read(handle)?;
+                ssd.deallocate(handle)?;
+                BufferData::HostRam(data_vec)
+            }
+            (BufferData::DeviceVram(device_buf), BufferLocation::DeviceVram(dev_id), MemoryDeviceKind::SsdCache) => {
+                let ctx = self.gpu_contexts.get(&dev_id).expect("No GPU context");
+                let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
+                let staging = Buffer::new_unsized(
+                    ctx.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::TRANSFER_DST,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    size_bytes,
+                )
+                .map_err(|e| MemoryError::SsdError(format!("Staging buffer: {}", e)))?;
+                copy_buffer_sync(ctx.clone(), device_buf.clone(), staging.clone());
+                let data_vec = {
+                    let guard = staging
+                        .read()
+                        .map_err(|e| MemoryError::SsdError(format!("Read staging: {}", e)))?;
+                    let mut v = Vec::with_capacity(guard.len());
+                    v.extend_from_slice(&guard);
+                    v
+                };
+                let ssd = self.ssd_cache.as_ref().expect("SSD cache not registered");
+                let handle = ssd.allocate(elements)?;
+                ssd.write(&handle, &data_vec)?;
+                BufferData::SsdCache(handle)
+            }
+            (BufferData::SsdCache(handle), BufferLocation::SsdCache(_), MemoryDeviceKind::DeviceVram(dev_id)) => {
+                let ssd = self.ssd_cache.as_ref().expect("SSD cache not registered");
+                let data_vec = ssd.read(handle)?;
+                ssd.deallocate(handle)?;
+                let ctx = self.gpu_contexts.get(&dev_id).expect("No GPU context");
+                let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
+                let gpu_buf = Buffer::new_unsized(
+                    ctx.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                        ..Default::default()
+                    },
+                    size_bytes,
+                )
+                .map_err(|e| MemoryError::SsdError(format!("GPU buffer alloc: {}", e)))?;
+                let staging = Buffer::from_iter(
+                    ctx.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::TRANSFER_SRC,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    data_vec.iter().copied(),
+                )
+                .map_err(|e| MemoryError::SsdError(format!("Staging buffer: {}", e)))?;
+                copy_buffer_sync(ctx.clone(), staging, gpu_buf.clone());
+                BufferData::DeviceVram(gpu_buf)
+            }
+            _ => {
+                // откат: освобождаем целевой пул и возвращаем исходный
+                if let Some(pool) = self.pools.get_mut(&current_kind) {
+                    pool.allocate(elements).ok();
+                }
+                if let Some(target_pool) = self.pools.get_mut(&target) {
+                    target_pool.deallocate(elements);
+                }
+                return Err(MemoryError::DataNotInLocation(id, buffer.location.clone()));
+            }
         };
 
+        // обновляем местонахождение
         buffer.data = new_data;
-        buffer.location = kind_to_location(target);
+        buffer.location = match target {
+            MemoryDeviceKind::HostRam => BufferLocation::HostRam,
+            MemoryDeviceKind::DeviceVram(dev_id) => BufferLocation::DeviceVram(dev_id),
+            MemoryDeviceKind::SsdCache => {
+                if let BufferData::SsdCache(ref handle) = buffer.data {
+                    BufferLocation::SsdCache(handle.clone())
+                } else {
+                    // на всякий случай создаём фиктивный handle (не должен произойти)
+                    BufferLocation::SsdCache(SsdHandle {
+                        file_path: std::path::PathBuf::new(),
+                        elements: 0,
+                    })
+                }
+            }
+        };
+
         Ok(())
     }
 
@@ -247,10 +395,16 @@ impl MemoryExecutor {
         if let Some(pool) = self.pools.get_mut(&kind) {
             pool.deallocate(buffer.size_elements);
         }
+        if let BufferData::SsdCache(handle) = buffer.data {
+            if let Some(ssd) = &self.ssd_cache {
+                ssd.deallocate(&handle)?;
+            }
+        }
         Ok(())
     }
 }
 
+// Вспомогательные функции
 fn location_to_kind(loc: &BufferLocation) -> MemoryDeviceKind {
     match loc {
         BufferLocation::HostRam => MemoryDeviceKind::HostRam,
@@ -259,22 +413,15 @@ fn location_to_kind(loc: &BufferLocation) -> MemoryDeviceKind {
     }
 }
 
-fn kind_to_location(kind: MemoryDeviceKind) -> BufferLocation {
-    match kind {
-        MemoryDeviceKind::HostRam => BufferLocation::HostRam,
-        MemoryDeviceKind::DeviceVram(id) => BufferLocation::DeviceVram(id),
-        MemoryDeviceKind::SsdCache => BufferLocation::SsdCache(std::path::PathBuf::new()),
-    }
-}
-
 fn copy_buffer_sync(
     ctx: Arc<GpuContext>,
     src: Subbuffer<[f32]>,
     dst: Subbuffer<[f32]>,
 ) {
-    let command_buffer_allocator = Arc::new(
-        StandardCommandBufferAllocator::new(ctx.device.clone(), Default::default()),
-    );
+    let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+        ctx.device.clone(),
+        Default::default(),
+    ));
     let mut builder = AutoCommandBufferBuilder::primary(
         command_buffer_allocator,
         ctx.queue.queue_family_index(),

@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use vulkano::buffer::Subbuffer;
 use crate::compute_manager::device_spec::DeviceId;
 
+// Импортируем единый SsdHandle из ssd_cache
+use super::ssd_cache::SsdHandle;
+
 /// Уникальный идентификатор буфера тензора
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TensorBufferId(pub usize);
@@ -16,19 +19,19 @@ pub enum MemoryDeviceKind {
     SsdCache,
 }
 
-/// Местонахождение данных буфера (аналог MemoryDeviceKind, но с путём для SSD)
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Местонахождение данных буфера
+#[derive(Debug, Clone)]
 pub enum BufferLocation {
     HostRam,
     DeviceVram(DeviceId),
-    SsdCache(PathBuf),
+    SsdCache(SsdHandle),
 }
 
 /// Внутреннее представление данных буфера
 pub enum BufferData {
     HostRam(Vec<f32>),
     DeviceVram(Subbuffer<[f32]>),
-    SsdCache(PathBuf),
+    SsdCache(SsdHandle),
     None,
 }
 

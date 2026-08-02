@@ -8,3 +8,4 @@ pub mod loss_plan;
 pub mod optimizer_plan;
 pub mod logging;
 pub mod compute_manager;
+pub mod device_plan;           // новый модуль

@@ -142,6 +142,15 @@ impl ForwardTimePredictor {
             None
         }
     }
+
+    /// Возвращает путь к файлу модели для конкретного CPU.
+    ///
+    /// # Аргументы
+    /// * `base_dir` – базовый каталог данных (например, `get_data_dir()`).
+    /// * `cpu_index` – индекс CPU (0, 1, ...).
+    pub fn cpu_model_path(base_dir: &PathBuf, cpu_index: usize) -> PathBuf {
+        base_dir.join(format!("chunk_model_cpu{}.json", cpu_index))
+    }
 }
 
 /// Простейший генератор псевдослучайных чисел (нормальное распределение).

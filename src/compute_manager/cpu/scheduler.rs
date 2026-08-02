@@ -26,8 +26,8 @@ pub enum LayerType {
 
 pub struct Scheduler {
     num_workers: usize,
-    chunk_model: ForwardTimePredictor,
-    chunk_model_path: PathBuf,
+    predictors: Vec<ForwardTimePredictor>,   // по одному на CPU
+    predictors_paths: Vec<PathBuf>,          // пути для сохранения
     profile: HardwareProfile,
     cpu_info: CpuInfo,
     cost: CostModel,
@@ -36,11 +36,14 @@ pub struct Scheduler {
 impl Clone for Scheduler {
     fn clone(&self) -> Self {
         let input_dim = 5 + MAX_CORES_FOR_MODEL;
-        let new_model = ForwardTimePredictor::new(input_dim, 8);
+        let mut new_predictors = Vec::with_capacity(self.predictors.len());
+        for _ in 0..self.predictors.len() {
+            new_predictors.push(ForwardTimePredictor::new(input_dim, 8));
+        }
         Scheduler {
             num_workers: self.num_workers,
-            chunk_model: new_model,
-            chunk_model_path: self.chunk_model_path.clone(),
+            predictors: new_predictors,
+            predictors_paths: self.predictors_paths.clone(),
             profile: self.profile.clone(),
             cpu_info: self.cpu_info.clone(),
             cost: self.cost.clone(),
@@ -71,11 +74,13 @@ fn get_data_dir() -> PathBuf {
 }
 
 impl Scheduler {
-    pub fn new(cost: CostModel, cpu_info: CpuInfo) -> Self {
+    /// Создаёт планировщик с заданным количеством CPU.
+    /// Для каждого CPU создаётся отдельная мини-модель, загружаемая/сохраняемая в файлы
+    /// вида `chunk_model_cpu0.json`, `chunk_model_cpu1.json` и т.д.
+    pub fn new_with_cpus(cost: CostModel, cpu_info: CpuInfo, num_cpus: usize) -> Self {
         let num_workers = cost.num_cores;
         let data_dir = get_data_dir();
         let profile_path = data_dir.join("hardware_profile.json");
-        let chunk_model_path = data_dir.join("chunk_model.json");
 
         let profile = HardwareProfile::load(&profile_path)
             .unwrap_or_else(|| {
@@ -84,18 +89,30 @@ impl Scheduler {
                 p
             });
 
+        let mut predictors = Vec::with_capacity(num_cpus);
+        let mut predictors_paths = Vec::with_capacity(num_cpus);
         let input_dim = 5 + MAX_CORES_FOR_MODEL;
-        let chunk_model = ForwardTimePredictor::load(&chunk_model_path, input_dim, 8)
-            .unwrap_or_else(|| ForwardTimePredictor::new(input_dim, 8));
+        for cpu_idx in 0..num_cpus {
+            let model_path = data_dir.join(format!("chunk_model_cpu{}.json", cpu_idx));
+            predictors_paths.push(model_path.clone());
+            let model = ForwardTimePredictor::load(&model_path, input_dim, 8)
+                .unwrap_or_else(|| ForwardTimePredictor::new(input_dim, 8));
+            predictors.push(model);
+        }
 
         Scheduler {
             num_workers,
-            chunk_model,
-            chunk_model_path,
+            predictors,
+            predictors_paths,
             profile,
             cpu_info,
             cost,
         }
+    }
+
+    // Старый конструктор (для обратной совместимости)
+    pub fn new(cost: CostModel, cpu_info: CpuInfo) -> Self {
+        Self::new_with_cpus(cost, cpu_info, 1)
     }
 
     pub fn set_num_workers(&mut self, n: usize) {
@@ -140,11 +157,11 @@ impl Scheduler {
             }
         }
 
-        // Обучаем модель, используя лучший c
+        // Обучаем первую мини-модель (пока не используется отдельная для каждого CPU в планировании)
         let features = self.build_features(total_tasks);
         let target = best_c as f32 / total_tasks as f32;
-        self.chunk_model.train(&features, target, 0.001);
-        self.chunk_model.save(&self.chunk_model_path);
+        self.predictors[0].train(&features, target, 0.001);
+        self.predictors[0].save(&self.predictors_paths[0]);
 
         best_assignment
     }

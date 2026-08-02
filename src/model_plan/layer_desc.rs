@@ -245,11 +245,9 @@ impl LayerDesc {
             // Memory не имеет обучаемых параметров (состояние хранится внутри слоя)
             LayerKind::Memory => 0,
             LayerKind::SoftSparseGate | LayerKind::SoftKeepGate => {
-                // обучаемые пороги по числу признаков
                 self.in_features[0]
             }
             LayerKind::DualAnchor => {
-                // min + max + alpha
                 2 * self.in_features[0] + 1
             }
             LayerKind::LeakyReLU | LayerKind::Identity => 0,
@@ -286,46 +284,4 @@ impl LayerDesc {
             _ => panic!("Unsupported layer kind for UniversalLayer"),
         }
     }
-}
-
-// Макросы
-#[macro_export]
-macro_rules! create_models {
-    // Вариант с явным указанием устройства:
-    // create_models!(func1, func2, ..., device = some_device)
-    // Обратите внимание: Device должен быть импортирован в область вызова,
-    // например: use neurocore::compute_manager::Device;
-    ( $( $func:path ),+ , device = $device:expr $(,)? ) => {
-        ( $(
-            $crate::model_plan::Plan::from_layer_descs($func())
-                .expect("Invalid model description")
-                .build_with_device($device.clone())
-        ,)+ )
-    };
-    // Вариант без устройства (по умолчанию CPU)
-    ( $( $func:path ),+ $(,)? ) => {
-        ( $(
-            $crate::model_plan::Plan::from_layer_descs($func())
-                .expect("Invalid model description")
-                .build()
-        ,)+ )
-    };
-}
-
-#[macro_export]
-macro_rules! create_losses {
-    ( $( $func:path ),+ $(,)? ) => {
-        ( $(
-            $func().build()
-        ,)+ )
-    };
-}
-
-#[macro_export]
-macro_rules! create_optimizers {
-    ( $( ($model:expr, $desc_func:path) ),+ $(,)? ) => {
-        ( $(
-            $model.create_optimizer($desc_func().build_chain())
-        ,)+ )
-    };
 }

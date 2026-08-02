@@ -6,6 +6,7 @@ use crate::compute_manager::cpu::{CostModel, Scheduler, WorkerPool};
 use crate::compute_manager::cpu::hardware::CPU_INFO;
 use crate::compute_manager::cpu::scheduler::LayerInfo;
 use crate::compute_manager::device::Device;
+use crate::compute_manager::device_assignment::{assign_devices, SegmentPlacement};
 use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::gpu::pipeline::PipelineCache;
@@ -269,6 +270,11 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
+        // 5.5 Назначаем устройства сегментам
+        // -----------------------------------------------------------
+        let segment_placement = assign_devices(&segments, &device_plan);
+
+        // -----------------------------------------------------------
         // 6. Создаём GPU-хранилище параметров, если есть GPU
         // -----------------------------------------------------------
         if let Some(ref gpu_compute_mutex) = gpu_compute {
@@ -287,6 +293,7 @@ impl MixedModel {
         // -----------------------------------------------------------
         Ok(MixedModel {
             segments,
+            segment_placement,
             store,
             pool,
             scheduler: Mutex::new(scheduler),

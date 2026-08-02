@@ -14,21 +14,23 @@ impl MixedModel {
         &self,
         proc: &Arc<Vec<Box<dyn UniversalLayer>>>,
         slices: &[ParamSlice],
-        _seg_idx: usize,
+        seg_index: usize,
         params: &[f32],
         streams: &mut Vec<Vec<DynamicTensor>>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
         stream_indices: &Option<Vec<usize>>,
     ) {
-        // Определяем активные потоки (индексы входных потоков, которые будут обработаны)
+        // Получаем информацию о размещении сегмента
+        let placement = &self.segment_placement[seg_index];
+        let _compute_device = &placement.compute_device;
+
+        // Определяем активные потоки
         let active_indices: Vec<usize> = match stream_indices {
             Some(indices) => indices.clone(),
             None => (0..streams.len()).collect(),
         };
 
-        // -------------------------------------------
-        // GPU-путь: обработка всего батча одной командой
-        // -------------------------------------------
+        // --- GPU‑путь ---
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
             let gpu_compute = gpu_compute_mutex.lock().unwrap();
             let num_output_streams = streams.len();
@@ -36,9 +38,7 @@ impl MixedModel {
 
             for &stream_idx in &active_indices {
                 let batch_samples = &streams[stream_idx];
-                // Преобразуем образцы в единую матрицу (batch, features)
                 let input_mat = MixedModel::samples_to_mat(batch_samples);
-                // Запускаем GPU-обработку всей цепочки слоёв
                 let (out_mat, layer_ctxs) = process_forward_gpu(
                     &gpu_compute,
                     proc,
@@ -46,18 +46,14 @@ impl MixedModel {
                     params,
                     &input_mat,
                 );
-                // Преобразуем выходную матрицу обратно в образцы
                 let samples = MixedModel::mat_to_samples(&out_mat);
                 new_streams[stream_idx] = Some(samples);
 
-                // Сохраняем контексты для каждого образца
-                for (_i, ctx_sample) in all_ctxs.iter_mut().enumerate() {
-                    // На каждый образец добавляем полный набор контекстов слоёв
+                for ctx_sample in all_ctxs.iter_mut() {
                     ctx_sample.extend(layer_ctxs.clone());
                 }
             }
 
-            // Заполняем потоки, которые не обрабатывались (остаются без изменений)
             for (i, opt) in new_streams.iter_mut().enumerate() {
                 if opt.is_none() {
                     *opt = Some(streams[i].clone());
@@ -67,9 +63,7 @@ impl MixedModel {
             return;
         }
 
-        // -------------------------------------------
-        // CPU-путь (исходная многопоточная реализация)
-        // -------------------------------------------
+        // --- CPU‑путь (многопоточный) ---
         let num_output_streams = streams.len();
         let mut new_streams: Vec<Option<Vec<DynamicTensor>>> = vec![None; num_output_streams];
 

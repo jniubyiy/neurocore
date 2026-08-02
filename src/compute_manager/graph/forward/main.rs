@@ -41,7 +41,7 @@ impl MixedModel {
         let mut all_ctxs: Vec<Vec<DynamicContext>> = vec![Vec::new(); batch_size];
 
         // Исполняем сегменты графа
-        for seg in self.segments.iter() {
+        for (seg_index, seg) in self.segments.iter().enumerate() {
             match seg {
                 Segment::Unsqueeze(target_dims) => {
                     self.process_unsqueeze_forward_mat(&mut streams, target_dims);
@@ -52,7 +52,7 @@ impl MixedModel {
                 Segment::UniversalProcessor(proc, slices, stream_indices) => {
                     let params = self.store.lock().unwrap().all_params();
                     self.process_universal_processor_forward(
-                        proc, slices, 0, &params, &mut streams, &mut all_ctxs, stream_indices,
+                        proc, slices, seg_index, &params, &mut streams, &mut all_ctxs, stream_indices,
                     );
                 }
                 Segment::SplitterConnector { dim_a, dim_b } => {

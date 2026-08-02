@@ -1,6 +1,7 @@
 // src/compute_manager/memory_executor/executor.rs
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -14,8 +15,10 @@ use vulkano::sync::{self, GpuFuture};
 
 use super::super::device_spec::{DeviceId, DeviceSpec, DeviceKind};
 use super::pool::MemoryPool;
-use super::ssd_cache::{SsdCacheManager, SsdHandle};
-use super::types::{BufferData, BufferLocation, MemoryDeviceKind, TensorBuffer, TensorBufferId};
+use super::ssd_cache::SsdCacheManager;
+use super::types::{
+    BufferData, BufferLocation, MemoryDeviceKind, TensorBuffer, TensorBufferId,
+};
 
 use crate::compute_manager::gpu::init::GpuContext;
 
@@ -74,9 +77,10 @@ impl MemoryExecutor {
         self.devices.insert(id, spec);
     }
 
+    /// Регистрирует SSD-кэш с заданной директорией и максимальным размером.
     pub fn register_ssd_cache(
         &mut self,
-        path: std::path::PathBuf,
+        path: PathBuf,
         max_bytes: u64,
     ) -> Result<(), MemoryError> {
         let manager = SsdCacheManager::new(path, max_bytes)?;
@@ -86,6 +90,14 @@ impl MemoryExecutor {
         );
         self.ssd_cache = Some(manager);
         Ok(())
+    }
+
+    /// Возвращает текущее использование памяти (в байтах) для заданного типа памяти.
+    pub fn current_usage(&self, kind: MemoryDeviceKind) -> usize {
+        self.pools
+            .get(&kind)
+            .map(|p| p.used_elements * 4)   // каждый f32 = 4 байта
+            .unwrap_or(0)
     }
 
     pub fn allocate(
@@ -357,9 +369,8 @@ impl MemoryExecutor {
                 if let BufferData::SsdCache(ref handle) = buffer.data {
                     BufferLocation::SsdCache(handle.clone())
                 } else {
-                    // на всякий случай создаём фиктивный handle (не должен произойти)
-                    BufferLocation::SsdCache(SsdHandle {
-                        file_path: std::path::PathBuf::new(),
+                    BufferLocation::SsdCache(super::ssd_cache::SsdHandle {
+                        file_path: PathBuf::new(),
                         elements: 0,
                     })
                 }

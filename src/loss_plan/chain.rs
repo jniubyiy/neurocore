@@ -4,6 +4,7 @@ use faer::Mat;
 use super::cubes::ElemCube;
 
 /// Цепочка элементарных кубиков, выполняющая последовательное преобразование над батчем.
+#[derive(Debug)]
 pub struct ElementChain {
     cubes: Vec<Box<dyn ElemCube>>,
 }

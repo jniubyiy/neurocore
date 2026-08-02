@@ -8,8 +8,9 @@ use super::expr::{Aggregation, LossExpr};
 /// Описание (план) функции потерь.
 ///
 /// Позволяет сконструировать готовое выражение [`LossExpr`] через метод [`build`].
+#[derive(Debug, Clone)]
 pub struct LossDesc {
-    pub chain: ElementChain,
+    pub chain: Arc<ElementChain>,
     pub aggregation: Aggregation,
     pub total_tasks: usize,
     pub pred_features: usize,
@@ -32,7 +33,7 @@ impl LossDesc {
         target_features: usize,
     ) -> Self {
         Self {
-            chain,
+            chain: Arc::new(chain),
             aggregation,
             total_tasks,
             pred_features,
@@ -43,7 +44,8 @@ impl LossDesc {
     /// Собирает готовое выражение потерь, обёрнутое в `Arc` для безопасного разделения между потоками.
     pub fn build(self) -> Arc<LossExpr> {
         Arc::new(LossExpr::new(
-            self.chain,
+            // Поскольку ElementChain больше не копируется, передаём Arc
+            self.chain.clone(),
             self.aggregation,
             self.total_tasks,
             self.pred_features,

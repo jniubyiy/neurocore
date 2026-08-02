@@ -1,45 +1,28 @@
 // src/loss_plan/cubes.rs
 
 use std::any::Any;
+use std::fmt::Debug;
 use faer::Mat;
 
 /// Элементарный кубик функции потерь (матричная версия).
-///
-/// Каждый кубик принимает на вход матрицу размера `(batch, in_features)`
-/// и возвращает матрицу размера `(batch, out_features)`.
-/// Прямой проход вычисляет выход, обратный — градиенты по входам,
-/// используя переданные матрицы.
-pub trait ElemCube: Any + Send + Sync {
-    /// Число столбцов входной матрицы (признаки на одну задачу).
+pub trait ElemCube: Any + Send + Sync + Debug {
     fn in_features(&self) -> usize;
-
-    /// Число столбцов выходной матрицы.
     fn out_features(&self) -> usize;
-
-    /// Прямой проход: `input` размер `(batch, in_features)` → `(batch, out_features)`.
     fn forward_batch(&self, input: &Mat<f32>) -> Mat<f32>;
-
-    /// Обратный проход:
-    /// `input` – входная матрица (такая же, как при прямом проходе),
-    /// `output_cache` – результат прямого прохода (может игнорироваться),
-    /// `grad_out` – пришедший градиент `(batch, out_features)`.
-    /// Возвращает градиент по входу `(batch, in_features)`.
     fn backward_batch(
         &self,
         input: &Mat<f32>,
         output_cache: &Mat<f32>,
         grad_out: &Mat<f32>,
     ) -> Mat<f32>;
-
-    /// Позволяет downcasting к конкретному типу кубика.
     fn as_any(&self) -> &dyn Any;
 }
 
 // ----------------------------------------------------------------
-// Простейшие кубики
+// Простейшие кубики (Debug реализован через derive)
 // ----------------------------------------------------------------
 
-/// Вычитание двух чисел: `input[:,0] - input[:,1]`.
+#[derive(Debug)]
 pub struct Sub;
 impl ElemCube for Sub {
     fn in_features(&self) -> usize { 2 }
@@ -63,11 +46,10 @@ impl ElemCube for Sub {
             if j == 0 { g } else { -g }
         })
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Квадрат числа: `x²`.
+#[derive(Debug)]
 pub struct Square;
 impl ElemCube for Square {
     fn in_features(&self) -> usize { 1 }
@@ -88,11 +70,10 @@ impl ElemCube for Square {
             2.0 * input[(i, 0)] * grad_out[(i, 0)]
         })
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Натуральный логарифм: `ln(x)`.
+#[derive(Debug)]
 pub struct Log;
 impl ElemCube for Log {
     fn in_features(&self) -> usize { 1 }
@@ -113,11 +94,10 @@ impl ElemCube for Log {
             grad_out[(i, 0)] / input[(i, 0)]
         })
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Унарный минус: `-x`.
+#[derive(Debug)]
 pub struct Neg;
 impl ElemCube for Neg {
     fn in_features(&self) -> usize { 1 }
@@ -135,11 +115,10 @@ impl ElemCube for Neg {
     ) -> Mat<f32> {
         -grad_out
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Умножение двух чисел: `input[:,0] * input[:,1]`.
+#[derive(Debug)]
 pub struct Mul;
 impl ElemCube for Mul {
     fn in_features(&self) -> usize { 2 }
@@ -164,11 +143,10 @@ impl ElemCube for Mul {
             if j == 0 { g * input[(i, 1)] } else { g * input[(i, 0)] }
         })
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Абсолютное значение: `|x|`.
+#[derive(Debug)]
 pub struct Abs;
 impl ElemCube for Abs {
     fn in_features(&self) -> usize { 1 }
@@ -191,11 +169,10 @@ impl ElemCube for Abs {
             if x > 0.0 { g } else if x < 0.0 { -g } else { 0.0 }
         })
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Прибавление константы: `x + scalar`.
+#[derive(Debug)]
 pub struct AddScalar(pub f32);
 impl ElemCube for AddScalar {
     fn in_features(&self) -> usize { 1 }
@@ -213,11 +190,10 @@ impl ElemCube for AddScalar {
     ) -> Mat<f32> {
         grad_out.to_owned()
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// `ln(1 + x)`.
+#[derive(Debug)]
 pub struct Log1p;
 impl ElemCube for Log1p {
     fn in_features(&self) -> usize { 1 }
@@ -238,11 +214,10 @@ impl ElemCube for Log1p {
             grad_out[(i, 0)] / (1.0 + input[(i, 0)])
         })
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Модуль разности двух чисел: `|a - b|`.
+#[derive(Debug)]
 pub struct AbsDiff;
 impl ElemCube for AbsDiff {
     fn in_features(&self) -> usize { 2 }
@@ -269,6 +244,5 @@ impl ElemCube for AbsDiff {
             if j == 0 { grad } else { -grad }
         })
     }
-
     fn as_any(&self) -> &dyn Any { self }
 }

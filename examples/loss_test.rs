@@ -1,202 +1,138 @@
-// examples/loss_test.rs
-// Тестирование потерь: MSE, CrossEntropy, difference_loss, diff_smooth_loss.
-// Использует матричный API LossExpr.
+// examples/linear_test.rs
+// Все 7 вариантов обучения выполняются через макрос run_training!.
+// Библиотека автоматически управляет стеком GPU, RUSTFLAGS не требуется.
+// Для всех вариантов задан seed = 42, гарантирующий одинаковые начальные веса.
+// Выводится время обучения и эпоха с наименьшим (или первым нулевым) loss.
 
-use faer::Mat;
-use neurocore::create_losses;
+use std::time::Instant;
+use neurocore::tensor::Tensor2D;
 
-// -------- Область потерь --------
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+    pub fn linear_model() -> Vec<LayerDesc> {
+        vec![LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
+            .input(Dim::Dim1, &[4])
+            .output(Dim::Dim1, &[2])]
+    }
+}
+
 mod losses {
-    use neurocore::loss_plan::{
-        Aggregation, CrossEntropyWithLogits, ElementChain, LossDesc, Square, Sub,
-    };
-    use neurocore::loss_plan::{Abs, AddScalar, Log1p, AbsDiff};
-
+    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
     pub fn mse() -> LossDesc {
-        let chain = ElementChain::new()
-            .add(Box::new(Sub))
-            .add(Box::new(Square));
-        LossDesc::from_chain(chain, Aggregation::Mean, 4, 1, 1)
-    }
-
-    pub fn cross_entropy() -> LossDesc {
-        let num_classes = 4;
-        let chain = ElementChain::new()
-            .add(Box::new(CrossEntropyWithLogits::new(num_classes)));
-        LossDesc::from_chain(chain, Aggregation::Mean, 1, num_classes, 1)
-    }
-
-    pub fn difference_loss() -> LossDesc {
-        let chain = ElementChain::new()
-            .add(Box::new(Sub))
-            .add(Box::new(Abs))
-            .add(Box::new(AddScalar(1.0)))
-            .add(Box::new(Log1p));
-        LossDesc::from_chain(chain, Aggregation::Mean, 4, 1, 1)
-    }
-
-    pub fn diff_smooth_loss_h() -> LossDesc {
-        let chain = ElementChain::new()
-            .add(Box::new(AbsDiff));
-        LossDesc::from_chain(chain, Aggregation::Mean, 3, 1, 1)
-    }
-
-    pub fn diff_smooth_loss_v() -> LossDesc {
-        let chain = ElementChain::new()
-            .add(Box::new(AbsDiff));
+        let chain = ElementChain::new().add(Box::new(Sub)).add(Box::new(Square));
         LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1)
     }
 }
 
+mod optimizers {
+    use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ApplyUpdate)
+    }
+}
+
+fn data() -> Tensor2D {
+    Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0]])
+}
+
+fn base_training() -> neurocore::training_plan::TrainingPlan {
+    use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+    TrainingPlan::new()
+        .model(models::linear_model)
+        .loss(losses::mse())
+        .optimizer(optimizers::sgd())
+        .epochs(100)
+        .batch_size(1)
+        .train_data(DataSource::from_tensor2d(data()))
+        .init_weights(Initializer::RandomUniform { min: -0.1, max: 0.1 })
+        .output_tensors(vec!["prediction".to_string()])
+        .seed(42)   // воспроизводимость
+}
+
+// Определяем модули для каждого варианта
+macro_rules! define_variant {
+    ($vis:ident, $train_mod:ident, $dev_mod:ident, $dev_expr:expr) => {
+        mod $train_mod {
+            use neurocore::training_plan::TrainingPlan;
+            pub fn plan() -> TrainingPlan { super::base_training() }
+        }
+        mod $dev_mod {
+            use neurocore::device_plan::DevicePlan;
+            pub fn plan() -> DevicePlan { $dev_expr }
+        }
+    }
+}
+
+define_variant!(v1, training_plan_v1, device_plan_v1, DevicePlan::empty().cpu(0, 1).ram(0, 8192));
+define_variant!(v2, training_plan_v2, device_plan_v2, DevicePlan::empty().cpu(0, 4).ram(0, 8192));
+define_variant!(v3, training_plan_v3, device_plan_v3, DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096));
+
+// для варианта 4 (CPU -> GPU) нужно два плана устройств
+mod training_plan_v4 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v4_cpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 1).ram(0, 8192) }
+}
+mod device_plan_v4_gpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096) }
+}
+
+// вариант 5 (GPU -> CPU)
+mod training_plan_v5 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v5_gpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096) }
+}
+mod device_plan_v5_cpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 1).ram(0, 8192) }
+}
+
+define_variant!(v6, training_plan_v6, device_plan_v6, DevicePlan::empty().cpu(0, 4).ram(0, 8192).ssd(0, "neurocore_ssd_cache", 5000));
+define_variant!(v7, training_plan_v7, device_plan_v7, DevicePlan::empty().cpu(0, 4).ram(0, 8192).gpu(0).vram(0, 0, 4096));
+
+fn run_and_report(label: &str, train_fn: fn() -> neurocore::training_plan::TrainingPlan, dev_fn: fn() -> neurocore::device_plan::DevicePlan) {
+    let start = Instant::now();
+    let result = neurocore::run_training!(train_fn, device = dev_fn);
+    let elapsed = start.elapsed();
+    println!("{} - loss: {:.6}, time: {:.2?}", label, result.final_loss, elapsed);
+
+    // найдём эпоху с минимальным loss (или первую нулевую)
+    if let Some((epoch, &min_loss)) = result.loss_history.iter().enumerate().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()) {
+        if min_loss == 0.0 {
+            // ищем первую эпоху с нулевым loss
+            let first_zero = result.loss_history.iter().position(|&l| l == 0.0).unwrap_or(0);
+            println!("  -> loss стал равен нулю на эпохе {}", first_zero);
+        } else {
+            println!("  -> наименьший loss = {:.6} на эпохе {}", min_loss, epoch);
+        }
+    }
+}
+
 fn main() {
-    let (mse,) = create_losses!(losses::mse);
-    let (ce,) = create_losses!(losses::cross_entropy);
-    let (diff_loss,) = create_losses!(losses::difference_loss);
-    let (smooth_h,) = create_losses!(losses::diff_smooth_loss_h);
-    let (smooth_v,) = create_losses!(losses::diff_smooth_loss_v);
+    run_and_report("Вариант 1 (CPU 1 поток)", training_plan_v1::plan, device_plan_v1::plan);
+    run_and_report("Вариант 2 (CPU 4 потока)", training_plan_v2::plan, device_plan_v2::plan);
+    run_and_report("Вариант 3 (GPU)", training_plan_v3::plan, device_plan_v3::plan);
 
-    // ==================== MSE ====================
-    println!("--- MSE ---");
-    let total_elements = 4;
-    let pred = vec![1.0f32, 2.0, 3.0, 4.0];
-    let target = vec![1.5, 1.5, 3.5, 4.5];
+    // вариант 4: CPU затем GPU
+    run_and_report("Вариант 4 (CPU этап)", training_plan_v4::plan, device_plan_v4_cpu::plan);
+    run_and_report("Вариант 4 (GPU этап)", training_plan_v4::plan, device_plan_v4_gpu::plan);
 
-    let in_size = mse.task_input_size(); // 2
-    // Построим матрицу (4, 2)
-    let mut full_input = Mat::zeros(total_elements, in_size);
-    for i in 0..total_elements {
-        full_input[(i, 0)] = pred[i];
-        full_input[(i, 1)] = target[i];
-    }
+    // вариант 5: GPU затем CPU
+    run_and_report("Вариант 5 (GPU этап)", training_plan_v5::plan, device_plan_v5_gpu::plan);
+    run_and_report("Вариант 5 (CPU этап)", training_plan_v5::plan, device_plan_v5_cpu::plan);
 
-    // Прямой проход – весь батч одним чанком
-    let (loss_vec, intermediates) = mse.forward_chunk(&full_input);
-    let loss = mse.aggregate_loss(&loss_vec);
-    println!("MSE loss: {:.6}", loss);
-
-    // Обратный проход
-    let grad_loss = vec![1.0f32; total_elements];
-    let grad_mat = mse.backward_chunk(&intermediates, &grad_loss);
-    // Преобразуем матрицу в плоский вектор (строки подряд)
-    let mut grad_flat = Vec::with_capacity(total_elements * in_size);
-    for i in 0..total_elements {
-        for j in 0..in_size {
-            grad_flat.push(grad_mat[(i, j)]);
-        }
-    }
-    let grad_agg = mse.aggregate_grad(&grad_flat);
-    // Извлекаем градиенты только по pred (первый столбец каждой строки)
-    let grad: Vec<f32> = (0..total_elements)
-        .map(|i| grad_agg[i * in_size]) // pred идёт первым
-        .collect();
-    println!("MSE grad: {:?}", grad);
-
-    // ==================== CrossEntropy ====================
-    println!("\n--- CrossEntropy ---");
-    let pred_logits = vec![0.2f32, 0.5, 0.1, 0.2];
-    let class_index = 1.0f32; // целевой класс 1
-
-    let in_size = ce.task_input_size(); // 5
-    let mut ce_input = Mat::zeros(1, in_size);
-    ce_input[(0, 0)] = pred_logits[0];
-    ce_input[(0, 1)] = pred_logits[1];
-    ce_input[(0, 2)] = pred_logits[2];
-    ce_input[(0, 3)] = pred_logits[3];
-    ce_input[(0, 4)] = class_index;
-
-    let (loss_vec, intermediates) = ce.forward_chunk(&ce_input);
-    let ce_loss = ce.aggregate_loss(&loss_vec);
-    println!("CE loss: {:.6}", ce_loss);
-
-    let grad_loss = vec![1.0f32; 1];
-    let grad_mat = ce.backward_chunk(&intermediates, &grad_loss);
-    let mut grad_flat = Vec::with_capacity(in_size);
-    for j in 0..in_size {
-        grad_flat.push(grad_mat[(0, j)]);
-    }
-    let grad_agg = ce.aggregate_grad(&grad_flat);
-    println!("CE grad (first {}): {:?}", 4, &grad_agg[..4]);
-
-    // ==================== Difference Loss ====================
-    println!("\n--- Difference Loss (ln(1+|p-t|)) ---");
-    let pred = vec![1.0f32, 2.0, 3.0, 4.0];
-    let target = vec![1.5, 1.5, 3.5, 4.5];
-
-    let in_size = diff_loss.task_input_size(); // 2
-    let mut full_input = Mat::zeros(total_elements, in_size);
-    for i in 0..total_elements {
-        full_input[(i, 0)] = pred[i];
-        full_input[(i, 1)] = target[i];
-    }
-
-    let (loss_vec, intermediates) = diff_loss.forward_chunk(&full_input);
-    let loss = diff_loss.aggregate_loss(&loss_vec);
-    println!("Diff loss: {:.6}", loss);
-
-    let grad_loss = vec![1.0f32; total_elements];
-    let grad_mat = diff_loss.backward_chunk(&intermediates, &grad_loss);
-    let mut grad_flat = Vec::with_capacity(total_elements * in_size);
-    for i in 0..total_elements {
-        for j in 0..in_size {
-            grad_flat.push(grad_mat[(i, j)]);
-        }
-    }
-    let grad_agg = diff_loss.aggregate_grad(&grad_flat);
-    let grad: Vec<f32> = (0..total_elements)
-        .map(|i| grad_agg[i * in_size]) // pred
-        .collect();
-    println!("Diff grad: {:?}", grad);
-
-    // ==================== Diff Smooth Loss ====================
-    println!("\n--- Diff Smooth Loss (spatial TV) ---");
-    let error_map = vec![1.0, 0.5, 0.2, 0.9]; // 2x2 row-major
-    // Горизонтальные пары: (e[0], e[1]), (e[2], e[3])
-    let in_size = smooth_h.task_input_size(); // 2
-    let mut horiz_input = Mat::zeros(2, in_size); // 2 задачи
-    horiz_input[(0, 0)] = error_map[0];
-    horiz_input[(0, 1)] = error_map[1];
-    horiz_input[(1, 0)] = error_map[2];
-    horiz_input[(1, 1)] = error_map[3];
-
-    let (loss_vec, _intermediates) = smooth_h.forward_chunk(&horiz_input);
-    let h_val = smooth_h.aggregate_loss(&loss_vec);
-
-    // Вертикальные пары: (e[0], e[2]), (e[1], e[3])
-    let mut vert_input = Mat::zeros(2, in_size);
-    vert_input[(0, 0)] = error_map[0];
-    vert_input[(0, 1)] = error_map[2];
-    vert_input[(1, 0)] = error_map[1];
-    vert_input[(1, 1)] = error_map[3];
-
-    let (loss_vec, intermediates) = smooth_v.forward_chunk(&vert_input);
-    let v_val = smooth_v.aggregate_loss(&loss_vec);
-
-    let total_smooth = h_val + v_val;
-    println!("Smooth loss: {:.6} (horiz={:.6}, vert={:.6})", total_smooth, h_val, v_val);
-
-    // Градиенты гладкости (показываем для наглядности)
-    let grad_loss = vec![1.0f32; 2];
-    let grad_mat_h = smooth_h.backward_chunk(&intermediates, &grad_loss);
-    let mut grad_h_flat = Vec::with_capacity(2 * in_size);
-    for i in 0..2 {
-        for j in 0..in_size {
-            grad_h_flat.push(grad_mat_h[(i, j)]);
-        }
-    }
-    let grad_h_agg = smooth_h.aggregate_grad(&grad_h_flat);
-    println!("Smooth H grad: {:?}", grad_h_agg);
-
-    // вертикальные градиенты пересчитаем заново, т.к. intermediates перезаписан
-    let (_, intermediates_v) = smooth_v.forward_chunk(&vert_input);
-    let grad_mat_v = smooth_v.backward_chunk(&intermediates_v, &grad_loss);
-    let mut grad_v_flat = Vec::with_capacity(2 * in_size);
-    for i in 0..2 {
-        for j in 0..in_size {
-            grad_v_flat.push(grad_mat_v[(i, j)]);
-        }
-    }
-    let grad_v_agg = smooth_v.aggregate_grad(&grad_v_flat);
-    println!("Smooth V grad: {:?}", grad_v_agg);
+    run_and_report("Вариант 6 (CPU + SSD)", training_plan_v6::plan, device_plan_v6::plan);
+    run_and_report("Вариант 7 (Параллельное CPU+GPU)", training_plan_v7::plan, device_plan_v7::plan);
 }
 
 

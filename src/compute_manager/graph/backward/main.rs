@@ -34,7 +34,7 @@ impl MixedModel {
         let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
         let mut ctx_pos = total_context_len;
 
-        for seg in self.segments.iter().rev() {
+        for (seg_idx, seg) in self.segments.iter().enumerate().rev() {
             match seg {
                 Segment::Unsqueeze(target_dims) => {
                     self.process_unsqueeze_backward(&mut streams, target_dims);
@@ -43,7 +43,6 @@ impl MixedModel {
                     self.process_reduce_mean_backward(&mut streams, target_dims);
                 }
                 Segment::UniversalProcessor(proc, slices, stream_indices) => {
-                    // Используем GPU‑backward, если доступен GPU
                     if let Some(ref gpu_compute_mutex) = self.gpu_compute {
                         let gpu_compute = gpu_compute_mutex.lock().unwrap();
                         let result = self.process_universal_processor_backward_gpu(

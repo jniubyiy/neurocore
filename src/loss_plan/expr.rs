@@ -1,10 +1,11 @@
 // src/loss_plan/expr.rs
 
 use faer::Mat;
+use std::sync::Arc;
 use super::chain::ElementChain;
 
 /// Способ агрегирования значений потерь по задачам.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum Aggregation {
     /// Суммировать значения потерь по всем задачам.
     Sum,
@@ -14,7 +15,7 @@ pub enum Aggregation {
 
 /// Выражение функции потерь, построенное на цепочке элементарных кубиков.
 pub struct LossExpr {
-    chain: ElementChain,
+    chain: Arc<ElementChain>,
     aggregation: Aggregation,
     total_tasks: usize,
     pred_features: usize,
@@ -24,7 +25,7 @@ pub struct LossExpr {
 impl LossExpr {
     /// Создаёт новое выражение потерь.
     pub fn new(
-        chain: ElementChain,
+        chain: Arc<ElementChain>,
         aggregation: Aggregation,
         total_tasks: usize,
         pred_features: usize,

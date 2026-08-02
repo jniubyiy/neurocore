@@ -6,6 +6,7 @@ use faer::Mat;
 
 use crate::compute_manager::cpu::{Scheduler, WorkerPool};
 use crate::compute_manager::cpu::scheduler::LayerInfo;
+use crate::compute_manager::device_assignment::SegmentPlacement;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
@@ -21,6 +22,7 @@ use crate::linalg;
 
 pub struct MixedModel {
     pub(crate) segments: Vec<Segment>,
+    pub(crate) segment_placement: Vec<SegmentPlacement>,
     pub(crate) store: Arc<Mutex<ParamStore>>,
     pub(crate) pool: Arc<WorkerPool>,
     pub(crate) scheduler: Mutex<Scheduler>,
@@ -53,6 +55,11 @@ impl MixedModel {
 
     pub fn executor(&self) -> &Box<dyn Executor> {
         &self.executor
+    }
+
+    /// Возвращает ссылку на MemoryExecutor для профилирования памяти и ручного управления.
+    pub fn memory_executor(&self) -> &Arc<Mutex<MemoryExecutor>> {
+        &self.memory_executor
     }
 
     pub fn create_optimizer(&self, chain: OptimizerChain) -> OptimizerExpr {

@@ -3,6 +3,7 @@
 use super::layer_desc::LayerDesc;
 use super::blueprint::LayerKind;
 use crate::compute_manager::device::Device;
+use crate::device_plan::DevicePlan;
 use crate::compute_manager::graph::model::MixedModel;
 
 #[derive(Debug, Clone)]
@@ -116,10 +117,14 @@ impl Plan {
     }
 
     /// Собрать модель, явно указав целевое устройство.
-    /// Для `Device::Cpu` число потоков берётся из описания устройства.
-    /// Для `Device::Gpu` используется GPU с заданным индексом.
     pub fn build_with_device(&self, device: Device) -> MixedModel {
         MixedModel::from_plan_with_device(self.layers.clone(), 1, device)
+            .expect("Plan уже проверен")
+    }
+
+    /// Собрать модель с детализированным планом устройств (разделение Compute/Storage).
+    pub fn build_with_device_plan(&self, device_plan: DevicePlan) -> MixedModel {
+        MixedModel::from_plan_with_device_plan(self.layers.clone(), device_plan)
             .expect("Plan уже проверен")
     }
 

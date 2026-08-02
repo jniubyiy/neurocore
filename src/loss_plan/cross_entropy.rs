@@ -4,6 +4,7 @@ use std::any::Any;
 use faer::Mat;
 use super::cubes::ElemCube;
 
+#[derive(Debug)]
 pub struct CrossEntropyWithLogits {
     pub num_classes: usize,
 }
@@ -27,11 +28,9 @@ impl ElemCube for CrossEntropyWithLogits {
         let batch = input.nrows();
         let nclass = self.num_classes;
 
-        // Вычисляем потери: -log(softmax[class_idx])
         let loss = Mat::from_fn(batch, 1, |i, _| {
             let class_idx = input[(i, nclass)] as usize;
 
-            // Устойчивый softmax: вычитаем max по строке
             let mut max_val = f32::NEG_INFINITY;
             for c in 0..nclass {
                 max_val = max_val.max(input[(i, c)]);
@@ -57,14 +56,12 @@ impl ElemCube for CrossEntropyWithLogits {
         let batch = input.nrows();
         let nclass = self.num_classes;
 
-        // Градиенты по логитам: softmax - one_hot, по индексу класса — 0
         let mut grad = Mat::zeros(batch, nclass + 1);
 
         for i in 0..batch {
             let class_idx = input[(i, nclass)] as usize;
             let g = grad_out[(i, 0)];
 
-            // Устойчивый softmax
             let mut max_val = f32::NEG_INFINITY;
             for c in 0..nclass {
                 max_val = max_val.max(input[(i, c)]);
@@ -80,7 +77,7 @@ impl ElemCube for CrossEntropyWithLogits {
                 let indicator = if j == class_idx { 1.0 } else { 0.0 };
                 grad[(i, j)] = g * (softmax_j - indicator);
             }
-            grad[(i, nclass)] = 0.0; // градиент по индексу класса отсутствует
+            grad[(i, nclass)] = 0.0;
         }
 
         grad

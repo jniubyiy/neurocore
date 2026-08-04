@@ -1,4 +1,4 @@
-// src/training_plan/execution.rs
+// src/plans/training_plan/execution.rs
 
 use std::collections::HashMap;
 use std::thread;
@@ -57,7 +57,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     // --- построение модели ---
     let model_desc = (plan.model_fn)();
     let _ = Plan::from_layer_descs(model_desc.clone())?;
-    let mut model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
+    let model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
 
     // --- инициализация весов ---
     {
@@ -192,30 +192,29 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         // --- валидация ---
         if let Some(ref val_cfg) = plan.validation {
             if (epoch + 1) % val_cfg.frequency == 0 {
-                if let DataSource::Tensor2D(val_data) = &val_cfg.data {
-                    let val_samples = val_data.dim1;
-                    let mut val_loss = 0.0f32;
-                    for start in (0..val_samples).step_by(batch_size) {
-                        let end = (start + batch_size).min(val_samples);
-                        let rows: Vec<Vec<f32>> = (start..end)
-                            .map(|i| val_data.data[i].clone())
-                            .collect();
-                        let batch = Tensor2D::new(rows);
-                        let (pred, _) = model.forward(DynamicTensor::Dim1(batch.clone()));
-                        let (loss, _) = model.compute_loss(
-                            plan.loss_desc.clone(),
-                            &pred,
-                            &DynamicTensor::Dim1(batch.clone()),
-                        );
-                        val_loss += loss * (end - start) as f32;
-                    }
-                    if val_samples > 0 {
-                        println!(
-                            "Validation after epoch {}: avg loss = {:.6}",
-                            epoch + 1,
-                            val_loss / val_samples as f32
-                        );
-                    }
+                let DataSource::Tensor2D(val_data) = &val_cfg.data;
+                let val_samples = val_data.dim1;
+                let mut val_loss = 0.0f32;
+                for start in (0..val_samples).step_by(batch_size) {
+                    let end = (start + batch_size).min(val_samples);
+                    let rows: Vec<Vec<f32>> = (start..end)
+                        .map(|i| val_data.data[i].clone())
+                        .collect();
+                    let batch = Tensor2D::new(rows);
+                    let (pred, _) = model.forward(DynamicTensor::Dim1(batch.clone()));
+                    let (loss, _) = model.compute_loss(
+                        plan.loss_desc.clone(),
+                        &pred,
+                        &DynamicTensor::Dim1(batch.clone()),
+                    );
+                    val_loss += loss * (end - start) as f32;
+                }
+                if val_samples > 0 {
+                    println!(
+                        "Validation after epoch {}: avg loss = {:.6}",
+                        epoch + 1,
+                        val_loss / val_samples as f32
+                    );
                 }
             }
         }
@@ -235,18 +234,17 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
 
     // --- финальный тест ---
     if let Some(test_data) = &plan.test_data {
-        if let DataSource::Tensor2D(t) = test_data {
-            let (pred, _) = model.forward(DynamicTensor::Dim1(t.clone()));
-            if plan.output_tensors.contains(&"prediction".to_string()) {
-                result.tensors.insert("prediction".into(), pred);
-            }
-            let (loss, _) = model.compute_loss(
-                plan.loss_desc.clone(),
-                &result.tensors.get("prediction").unwrap(),
-                &DynamicTensor::Dim1(t.clone()),
-            );
-            result.final_loss = loss;
+        let DataSource::Tensor2D(t) = test_data;
+        let (pred, _) = model.forward(DynamicTensor::Dim1(t.clone()));
+        if plan.output_tensors.contains(&"prediction".to_string()) {
+            result.tensors.insert("prediction".into(), pred);
         }
+        let (loss, _) = model.compute_loss(
+            plan.loss_desc.clone(),
+            &result.tensors.get("prediction").unwrap(),
+            &DynamicTensor::Dim1(t.clone()),
+        );
+        result.final_loss = loss;
     }
 
     if plan.output_tensors.contains(&"loss".to_string()) {

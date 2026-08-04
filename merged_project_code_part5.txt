@@ -7,7 +7,7 @@
 СБОРКА КОДА ПРОЕКТА
 Корень проекта: D:\neurocore
 Часть 5 из 6
-Общее количество строк в этой части: 3062
+Общее количество строк в этой части: 3229
 ================================================================================
 
 ================================================================================
@@ -447,926 +447,1320 @@ fn flat_to_mat(flat: Vec<f32>, rows: usize, cols: usize) -> Mat<f32> {
 ================================================================================
 
 ================================================================================
-ФАЙЛ 2: src\compute_manager\graph\builder.rs
-Полный путь: D:\neurocore\src\compute_manager\graph\builder.rs
+ФАЙЛ 2: src\compute_manager\device_assignment.rs
+Полный путь: D:\neurocore\src\compute_manager\device_assignment.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/compute_manager/graph/builder.rs
+// src/compute_manager/device_assignment.rs
 
-use std::sync::{Arc, Mutex};
-
-use crate::compute_manager::cpu::{CostModel, Scheduler, WorkerPool};
-use crate::compute_manager::cpu::hardware::CPU_INFO;
-use crate::compute_manager::cpu::scheduler::LayerInfo;
-use crate::compute_manager::device::Device;
-use crate::compute_manager::device_assignment::{assign_devices, SegmentPlacement};
+use std::collections::HashMap;
 use crate::compute_manager::device_spec::DeviceId;
-use crate::compute_manager::executor::Executor;
-use crate::compute_manager::gpu::pipeline::PipelineCache;
-use crate::compute_manager::gpu::GpuCompute;
-use crate::compute_manager::gpu::param_store::GpuParamStore;
+use crate::compute_manager::graph::types::Segment;
+use crate::compute_manager::memory_executor::{BufferPriority, MemoryDeviceKind, MemoryError, MemoryExecutor};
 use crate::device_plan::{ComputeDevice, DevicePlan, StorageDevice};
 use crate::layers::UniversalLayer;
-use crate::model_plan::layer_desc::LayerDesc;
-use crate::model_plan::blueprint::LayerKind;
-use crate::model_plan::param_store::{ParamSlice, ParamStore};
 
-use super::model::MixedModel;
-use super::types::Segment;
-
-// ---------- CpuExecutor ----------
-#[derive(Clone)]
-struct CpuExecutor {
-    pool: Arc<WorkerPool>,
-    scheduler: Arc<Mutex<Scheduler>>,
+/// Информация о размещении одного сегмента модели.
+#[derive(Debug, Clone)]
+pub struct SegmentPlacement {
+    /// Индекс сегмента в списке segments модели.
+    pub segment_index: usize,
+    /// На каком вычислительном устройстве исполняется сегмент.
+    pub compute_device: ComputeDevice,
+    /// Где хранятся параметры этого сегмента (если есть).
+    /// None — если сегмент не имеет обучаемых параметров
+    /// (например, ReLU, Sigmoid, Unsqueeze, коннекторы).
+    pub parameter_storage: Option<StorageDevice>,
 }
 
-impl CpuExecutor {
-    fn new(pool: Arc<WorkerPool>, scheduler: Arc<Mutex<Scheduler>>) -> Self {
-        Self { pool, scheduler }
-    }
+/// Оценка потребления памяти для сегмента (в количестве элементов f32).
+#[derive(Debug, Clone, Copy)]
+struct SegmentMemory {
+    /// Память под параметры (веса, bias)
+    pub param_elements: usize,
+    /// Оценочная память под активации (промежуточные тензоры)
+    pub activation_elements: usize,
+    /// Общая память (с запасом)
+    pub total_elements: usize,
 }
 
-impl Executor for CpuExecutor {
-    fn execute_dyn(&self, f: Box<dyn FnOnce() + Send>) {
-        self.pool.execute(f);
-    }
-    fn wait_all(&self) {
-        self.pool.wait_all();
-    }
-    fn num_workers(&self) -> usize {
-        self.scheduler.lock().unwrap().num_workers()
-    }
-    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
-        self.scheduler.lock().unwrap().plan_chunks_assignment(total_tasks)
-    }
-    fn clone_executor(&self) -> Box<dyn Executor> {
-        Box::new(self.clone())
-    }
-}
-
-impl MixedModel {
-    pub fn from_plan(layers: Vec<LayerDesc>, num_threads: usize) -> Result<Self, String> {
-        let plan = DevicePlan::empty()
-            .cpu(0, num_threads)
-            .ram(0, 8192);
-        Self::from_plan_with_device_plan(layers, plan)
-    }
-
-    pub fn from_plan_with_device(
-        layers: Vec<LayerDesc>,
-        _num_threads: usize,
-        device: Device,
-    ) -> Result<Self, String> {
-        let plan = match device {
-            Device::Cpu { threads } => DevicePlan::empty().cpu(0, threads).ram(0, 8192),
-            Device::Gpu { id } => DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(id).vram(0, id, 4096),
-        };
-        Self::from_plan_with_device_plan(layers, plan)
-    }
-
-    pub fn from_plan_with_device_plan(
-        layers: Vec<LayerDesc>,
-        device_plan: DevicePlan,
-    ) -> Result<Self, String> {
-        // -----------------------------------------------------------
-        // 1. Создаём MemoryExecutor и получаем GPU-контекст
-        // -----------------------------------------------------------
-        let (memory_executor, gpu_context) = device_plan.build_memory_executor();
-
-        // -----------------------------------------------------------
-        // 2. Суммарное количество потоков CPU
-        // -----------------------------------------------------------
-        let cpu_threads: usize = device_plan.compute_devices.iter()
-            .filter_map(|d| match d {
-                ComputeDevice::Cpu { threads, .. } => Some(*threads),
-                _ => None,
-            })
-            .sum();
-        let cpu_threads = cpu_threads.max(1);
-
-        // Количество CPU (для mini‑model)
-        let num_cpus = device_plan.compute_devices.iter()
-            .filter(|d| matches!(d, ComputeDevice::Cpu { .. }))
-            .count()
-            .max(1);
-
-        // -----------------------------------------------------------
-        // 3. Параметры и планировщик CPU
-        // -----------------------------------------------------------
-        let store = Arc::new(Mutex::new(ParamStore::new()));
-        let cost = CostModel::calibrate();
-        let mut scheduler = Scheduler::new_with_cpus(cost, CPU_INFO.clone(), num_cpus);
-        scheduler.set_num_workers(cpu_threads);
-        let pool = Arc::new(WorkerPool::new(cpu_threads));
-        let cpu_executor: Box<dyn Executor> = Box::new(CpuExecutor::new(pool.clone(), Arc::new(Mutex::new(scheduler.clone()))));
-
-        // -----------------------------------------------------------
-        // 4. Настройка исполнителя (CPU или GPU)
-        // -----------------------------------------------------------
-        let mut gpu_compute: Option<Mutex<GpuCompute>> = None;
-        let mut gpu_param_store: Option<Mutex<GpuParamStore>> = None;
-        let executor: Box<dyn Executor> = if let Some(gpu_ctx) = gpu_context {
-            // Берём ID первого GPU (они уже проверены в build_memory_executor)
-            let gpu_id = device_plan.compute_devices.iter()
-                .find_map(|d| if let ComputeDevice::Gpu { id } = d { Some(*id) } else { None })
-                .unwrap_or(0);
-            let gpu_executor = crate::compute_manager::gpu::GpuExecutor::new(gpu_ctx.as_ref().clone());
-            let pipeline_cache = Arc::new(PipelineCache::new(gpu_ctx.device.clone()));
-            let gpu_compute_instance = GpuCompute::new(
-                gpu_ctx,
-                pipeline_cache,
-                memory_executor.clone(),
-                DeviceId(gpu_id),
-            );
-            gpu_compute = Some(Mutex::new(gpu_compute_instance));
-            Box::new(gpu_executor)
-        } else {
-            cpu_executor.clone_executor()
-        };
-
-        // -----------------------------------------------------------
-        // 5. Строим сегменты модели
-        // -----------------------------------------------------------
-        let mut segments: Vec<Segment> = Vec::new();
-        let mut layer_infos: Vec<Vec<LayerInfo>> = Vec::new();
-        let mut current_layers: Vec<Box<dyn UniversalLayer>> = Vec::new();
-        let mut current_slices: Vec<ParamSlice> = Vec::new();
-        let mut active_ports: Option<Vec<usize>> = None;
-        let mut current_branch: Option<usize> = None;
-        let mut current_stream_indices: Option<Vec<usize>> = None;
-
-        macro_rules! finalize_universal {
-            () => {
-                if !current_layers.is_empty() {
-                    let infos: Vec<LayerInfo> = current_layers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, layer)| LayerInfo {
-                            id: i,
-                            layer_type: crate::compute_manager::cpu::scheduler::LayerType::Linear,
-                            in_features: layer.input_features(),
-                            out_features: layer.output_features(),
-                            total_rows: 0,
-                        })
-                        .collect();
-                    segments.push(Segment::UniversalProcessor(
-                        Arc::new(std::mem::take(&mut current_layers)),
-                        std::mem::take(&mut current_slices),
-                        current_stream_indices.take(),
-                    ));
-                    layer_infos.push(infos);
-                }
-            };
+impl SegmentMemory {
+    /// Создаёт оценку с коэффициентом запаса 1.2 (20% сверх)
+    pub fn with_safety_margin(param: usize, activation: usize) -> Self {
+        let total = ((param + activation) as f32 * 1.2) as usize;
+        SegmentMemory {
+            param_elements: param,
+            activation_elements: activation,
+            total_elements: total,
         }
+    }
+}
 
-        for desc in &layers {
-            match &desc.kind {
-                LayerKind::SplitterConnector => {
-                    finalize_universal!();
-                    if !desc.out_features.is_empty() && !desc.in_features.is_empty() {
-                        let dims = desc.out_features.clone();
-                        assert_eq!(dims.len(), 2);
-                        segments.push(Segment::SplitterConnector { dim_a: dims[0], dim_b: dims[1] });
-                        active_ports = Some(dims);
-                        current_branch = Some(0);
-                    }
+/// Вычисляет потребление памяти для сегмента на основе его содержимого и размера батча.
+fn calculate_segment_memory(seg: &Segment, batch_size: usize) -> SegmentMemory {
+    match seg {
+        Segment::UniversalProcessor(layers, slices, _) => {
+            // Суммарные параметры из слайсов
+            let param_sum: usize = slices.iter().map(|s| s.len).sum();
+            // Оценка активаций: максимальный размер тензора в слоях
+            let max_feat = layers
+                .iter()
+                .map(|l| l.input_features().max(l.output_features()))
+                .max()
+                .unwrap_or(0);
+            let activation_est = max_feat * batch_size;
+            SegmentMemory::with_safety_margin(param_sum, activation_est)
+        }
+        Segment::Splitter { input_dim, output_dims, .. } => {
+            let p = output_dims[0];
+            let q = output_dims[1];
+            let param_sum = input_dim * p + input_dim * q + p + q;
+            let activation_est = (input_dim + p + q) * batch_size;
+            SegmentMemory::with_safety_margin(param_sum, activation_est)
+        }
+        Segment::Combiner { input_dim, output_dim, .. } => {
+            let param_sum = 2 * input_dim * output_dim + output_dim;
+            let activation_est = (input_dim * 2 + output_dim) * batch_size;
+            SegmentMemory::with_safety_margin(param_sum, activation_est)
+        }
+        Segment::SplitterConnector { dim_a, dim_b } => {
+            // Нет параметров, только активации (вход и два выхода)
+            let activation_est = (dim_a + dim_b) * batch_size;
+            SegmentMemory::with_safety_margin(0, activation_est)
+        }
+        Segment::CombinerConnector { input_dims, output_dim, .. } => {
+            let activation_est = (input_dims.iter().sum::<usize>() + output_dim) * batch_size;
+            SegmentMemory::with_safety_margin(0, activation_est)
+        }
+        Segment::Unsqueeze(_) | Segment::ReduceMean(_) => {
+            // Операции изменения размерности – параметров нет, активации примерно равны входу
+            // Оценим грубо: size = batch_size * среднее число элементов
+            SegmentMemory::with_safety_margin(0, 0)
+        }
+    }
+}
+
+/// Находит наиболее подходящее вычислительное устройство для сегмента,
+/// пытаясь зарезервировать на нём память. Возвращает `Some(ComputeDevice)` и тип хранилища,
+/// если удалось зарезервировать.
+fn try_assign_device(
+    seg: &Segment,
+    memory_need: SegmentMemory,
+    device_plan: &DevicePlan,
+    memory_executor: &mut MemoryExecutor,
+    _last_compute: &ComputeDevice,
+) -> Result<(ComputeDevice, Option<StorageDevice>), MemoryError> {
+    let has_gpu = device_plan.compute_devices.iter().any(|d| matches!(d, ComputeDevice::Gpu { .. }));
+    let default_cpu = device_plan
+        .compute_devices
+        .iter()
+        .find_map(|d| {
+            if let ComputeDevice::Cpu { id, threads } = d {
+                Some(ComputeDevice::Cpu { id: *id, threads: *threads })
+            } else {
+                None
+            }
+        })
+        .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+
+    // Определяем, нужно ли сегменту GPU (если есть параметры и они большие)
+    let (prefer_gpu, has_params) = match seg {
+        Segment::UniversalProcessor(layers, _, _) => {
+            let (use_gpu, hp) = analyze_layers(layers, has_gpu, device_plan.compute_devices.iter().any(|d| matches!(d, ComputeDevice::Gpu { .. })));
+            (use_gpu, hp)
+        }
+        Segment::Splitter { .. } | Segment::Combiner { .. } => {
+            // Обучаемые сплиттеры/комбайнеры – обычно на GPU, если есть
+            (has_gpu, true)
+        }
+        _ => (false, false),
+    };
+
+    // Собираем кандидатов в порядке предпочтения
+    let mut candidates = Vec::new();
+    if prefer_gpu {
+        // Сначала GPU
+        for dev in &device_plan.compute_devices {
+            if let ComputeDevice::Gpu { id } = dev {
+                candidates.push((ComputeDevice::Gpu { id: *id }, MemoryDeviceKind::DeviceVram(DeviceId(*id))));
+            }
+        }
+    }
+    // Затем CPU
+    for dev in &device_plan.compute_devices {
+        if let ComputeDevice::Cpu { id, threads } = dev {
+            candidates.push((ComputeDevice::Cpu { id: *id, threads: *threads }, MemoryDeviceKind::HostRam));
+        }
+    }
+    // Если нет предпочтения GPU, но есть GPU и он не был добавлен, добавим его как fallback
+    if !prefer_gpu && has_gpu {
+        for dev in &device_plan.compute_devices {
+            if let ComputeDevice::Gpu { id } = dev {
+                if !candidates.iter().any(|(c, _)| matches!(c, ComputeDevice::Gpu { id: cid } if *cid == *id)) {
+                    candidates.push((ComputeDevice::Gpu { id: *id }, MemoryDeviceKind::DeviceVram(DeviceId(*id))));
                 }
-                LayerKind::CombinerConnector => {
-                    finalize_universal!();
-                    if !desc.in_features.is_empty() && !desc.out_features.is_empty() {
-                        segments.push(Segment::CombinerConnector {
-                            input_dims: desc.in_features.clone(),
-                            output_dim: desc.out_features[0],
-                        });
-                        active_ports = Some(vec![desc.out_features[0]]);
-                        current_branch = None;
-                    } else if !desc.out_features.is_empty() {
-                        active_ports = Some(desc.out_features.clone());
-                        current_branch = None;
-                    }
-                }
-                LayerKind::Splitter => {
-                    finalize_universal!();
-                    let mut store_lock = store.lock().unwrap();
-                    let slice = store_lock.allocate(desc.param_len());
-                    drop(store_lock);
-                    let p = desc.out_features[0];
-                    let q = desc.out_features[1];
-                    segments.push(Segment::Splitter {
-                        input_dim: desc.in_features[0],
-                        output_dims: vec![p, q],
-                        slice,
-                    });
-                    active_ports = Some(vec![p, q]);
-                    current_branch = Some(0);
-                }
-                LayerKind::Combiner => {
-                    finalize_universal!();
-                    let mut store_lock = store.lock().unwrap();
-                    let slice = store_lock.allocate(desc.param_len());
-                    drop(store_lock);
-                    segments.push(Segment::Combiner {
-                        input_dim: desc.in_features[0],
-                        output_dim: desc.out_features[0],
-                        slice,
-                    });
-                    active_ports = Some(vec![desc.out_features[0]]);
-                    current_branch = None;
-                }
-                LayerKind::Unsqueeze(target_dims) => {
-                    finalize_universal!();
-                    segments.push(Segment::Unsqueeze(target_dims.clone()));
-                }
-                LayerKind::ReduceMean(target_dims) => {
-                    finalize_universal!();
-                    segments.push(Segment::ReduceMean(target_dims.clone()));
-                }
-                _ => {
-                    if current_stream_indices.is_none() {
-                        let indices = if let Some(ref ports) = active_ports {
-                            if let Some(ref mut branch) = current_branch {
-                                if let Some(pos) = ports.iter().position(|&p| p == desc.in_features[0]) {
-                                    *branch = pos;
-                                }
+            }
+        }
+    }
+    // Если всё равно пусто – добавим default_cpu
+    if candidates.is_empty() {
+        candidates.push((default_cpu.clone(), MemoryDeviceKind::HostRam));
+    }
+
+    // Пытаемся зарезервировать память на каждом кандидате
+    for (compute_device, mem_kind) in candidates {
+        // Пропускаем, если устройство не подходит по архитектуре (например, нет GPU)
+        if let ComputeDevice::Gpu { id } = &compute_device {
+            if !device_plan.compute_devices.iter().any(|d| matches!(d, ComputeDevice::Gpu { id: did } if did == id)) {
+                continue;
+            }
+        }
+        // Проверяем, есть ли хранилище для параметров (если есть параметры)
+        let param_storage = if has_params {
+            match &compute_device {
+                ComputeDevice::Gpu { id } => {
+                    // Ищем VRAM, привязанную к этому GPU
+                    device_plan.storage_devices.iter().find_map(|s| {
+                        if let StorageDevice::Vram { gpu_id, id: sid, max_mb } = s {
+                            if *gpu_id == *id {
+                                Some(StorageDevice::Vram { id: *sid, gpu_id: *gpu_id, max_mb: *max_mb })
                             } else {
-                                if let Some(pos) = ports.iter().position(|&p| p == desc.in_features[0]) {
-                                    current_branch = Some(pos);
-                                } else {
-                                    current_branch = Some(0);
-                                }
+                                None
                             }
-                            Some(vec![current_branch.unwrap()])
                         } else {
                             None
-                        };
-                        current_stream_indices = indices;
+                        }
+                    })
+                }
+                ComputeDevice::Cpu { .. } => {
+                    // Для CPU используем RAM
+                    device_plan.storage_devices.iter().find_map(|s| {
+                        if let StorageDevice::Ram { id, max_mb } = s {
+                            Some(StorageDevice::Ram { id: *id, max_mb: *max_mb })
+                        } else {
+                            None
+                        }
+                    })
+                }
+            }
+        } else {
+            None
+        };
+
+        // Пытаемся зарезервировать память
+        let reserve_result = memory_executor.reserve_memory(mem_kind, memory_need.total_elements);
+        match reserve_result {
+            Ok(()) => {
+                // Успешно зарезервировали – возвращаем это устройство
+                return Ok((compute_device, param_storage));
+            }
+            Err(MemoryError::OutOfMemory(_)) => {
+                // Не хватает памяти – пробуем следующее устройство
+                continue;
+            }
+            Err(e) => {
+                // Другая ошибка – логируем и пробуем следующее
+                eprintln!("[assign_devices] Ошибка резервирования памяти: {:?}", e);
+                continue;
+            }
+        }
+    }
+
+    // Если ни одно устройство не подошло – возвращаем ошибку
+    Err(MemoryError::OutOfMemory(MemoryDeviceKind::HostRam))
+}
+
+/// Автоматически распределяет устройства для всех сегментов модели,
+/// учитывая ограничения по памяти (RAM/VRAM).
+///
+/// # Аргументы
+/// * `segments` – список сегментов модели.
+/// * `device_plan` – план устройств (вычислительные и хранилища).
+/// * `memory_executor` – исполнитель памяти для резервирования.
+/// * `batch_size` – размер батча (для оценки активаций).
+///
+/// # Возвращает
+/// * `Ok(Vec<SegmentPlacement>)` – размещение для каждого сегмента.
+/// * `Err(String)` – если не хватает памяти или другая ошибка.
+pub fn assign_devices(
+    segments: &[Segment],
+    device_plan: &DevicePlan,
+    memory_executor: &mut MemoryExecutor,
+    batch_size: usize,
+) -> Result<Vec<SegmentPlacement>, String> {
+    let default_cpu = device_plan
+        .compute_devices
+        .iter()
+        .find_map(|d| {
+            if let ComputeDevice::Cpu { id, threads } = d {
+                Some(ComputeDevice::Cpu { id: *id, threads: *threads })
+            } else {
+                None
+            }
+        })
+        .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+    let first_gpu = device_plan.compute_devices.iter().find_map(|d| {
+        if let ComputeDevice::Gpu { id } = d {
+            Some(ComputeDevice::Gpu { id: *id })
+        } else {
+            None
+        }
+    });
+
+    let mut placements = Vec::with_capacity(segments.len());
+    let mut last_compute = if let Some(ref gpu) = first_gpu {
+        gpu.clone()
+    } else {
+        default_cpu.clone()
+    };
+
+    for (idx, segment) in segments.iter().enumerate() {
+        // Вычисляем потребность в памяти
+        let memory_need = calculate_segment_memory(segment, batch_size);
+
+        // Пытаемся назначить устройство
+        let (compute_device, param_storage) = match segment {
+            Segment::UniversalProcessor(_layers, _, _) => {
+                // Используем общую логику
+                try_assign_device(segment, memory_need, device_plan, memory_executor, &last_compute)
+                    .map_err(|e| format!("Не удалось назначить устройство для сегмента {}: {:?}", idx, e))?
+            }
+            Segment::SplitterConnector { .. }
+            | Segment::CombinerConnector { .. }
+            | Segment::Splitter { .. }
+            | Segment::Combiner { .. } => {
+                // Для коннекторов и сплиттеров стараемся держаться на том же устройстве, что и предыдущий
+                // Пытаемся зарезервировать на last_compute, если не получится – fallback
+                let preferred = last_compute.clone();
+                // Проверяем, можем ли зарезервировать на preferred
+                let mem_kind = match &preferred {
+                    ComputeDevice::Cpu { .. } => MemoryDeviceKind::HostRam,
+                    ComputeDevice::Gpu { id } => MemoryDeviceKind::DeviceVram(DeviceId(*id)),
+                };
+                match memory_executor.reserve_memory(mem_kind, memory_need.total_elements) {
+                    Ok(()) => {
+                        // Успешно на preferred
+                        (preferred, None)
                     }
-                    let mut store_lock = store.lock().unwrap();
-                    let layer = desc.create_universal_layer();
-                    let slice = store_lock.allocate(desc.param_len());
-                    current_layers.push(layer);
-                    current_slices.push(slice);
-                    drop(store_lock);
+                    Err(_) => {
+                        // Fallback на другие устройства
+                        try_assign_device(segment, memory_need, device_plan, memory_executor, &last_compute)
+                            .map_err(|e| format!("Не удалось назначить устройство для сегмента {}: {:?}", idx, e))?
+                    }
+                }
+            }
+            Segment::Unsqueeze(_) | Segment::ReduceMean(_) => {
+                // Операции изменения размерности – обычно на том же устройстве, что и предыдущий
+                let preferred = last_compute.clone();
+                let mem_kind = match &preferred {
+                    ComputeDevice::Cpu { .. } => MemoryDeviceKind::HostRam,
+                    ComputeDevice::Gpu { id } => MemoryDeviceKind::DeviceVram(DeviceId(*id)),
+                };
+                match memory_executor.reserve_memory(mem_kind, memory_need.total_elements) {
+                    Ok(()) => (preferred, None),
+                    Err(_) => {
+                        // Fallback на другие устройства
+                        try_assign_device(segment, memory_need, device_plan, memory_executor, &last_compute)
+                            .map_err(|e| format!("Не удалось назначить устройство для сегмента {}: {:?}", idx, e))?
+                    }
+                }
+            }
+        };
+
+        // Сохраняем размещение
+        placements.push(SegmentPlacement {
+            segment_index: idx,
+            compute_device: compute_device.clone(),
+            parameter_storage: param_storage,
+        });
+
+        // Обновляем last_compute для следующих сегментов (если они без параметров)
+        last_compute = compute_device;
+    }
+
+    Ok(placements)
+}
+
+/// Анализирует список слоёв UniversalProcessor и возвращает (use_gpu, has_params).
+/// use_gpu = true, если GPU доступен и хотя бы один слой содержит много параметров.
+/// has_params = true, если есть обучаемые параметры.
+fn analyze_layers(layers: &[Box<dyn UniversalLayer>], has_gpu: bool, gpu_available: bool) -> (bool, bool) {
+    if !gpu_available || !has_gpu {
+        return (false, layers.iter().any(|l| l.param_len() > 0));
+    }
+    let large_param_threshold = 1000; // число параметров – эвристика
+    let mut use_gpu = false;
+    let mut has_params = false;
+    for layer in layers.iter() {
+        if layer.param_len() > 0 {
+            has_params = true;
+            if layer.param_len() > large_param_threshold {
+                use_gpu = true;
+            }
+        }
+    }
+    // Если GPU есть, но все слои маленькие, то оставляем на CPU
+    (use_gpu, has_params)
+}
+================================================================================
+КОНЕЦ ФАЙЛА: src\compute_manager\device_assignment.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 3: examples_large\mnist_binary_32x32.rs
+Полный путь: D:\neurocore\examples_large\mnist_binary_32x32.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// examples_large/mnist_binary_32x32.rs
+// Классификатор MNIST (32x32 бинарных изображений) с двумя скрытыми слоями.
+// Модель и потери собираются через макросы, оптимизатор – вручную для гибкости.
+// Используются новые удобные методы compute_loss и update_params.
+
+use std::time::Instant;
+use rand::Rng;
+
+use neurocore::compute_manager::DynamicTensor;
+use neurocore::tensor::Tensor2D;
+use neurocore::create_models;
+
+// -----------------------------------------------------------------
+// Описание моделей, потерь и оптимизаторов (всё как отдельные функции)
+// -----------------------------------------------------------------
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+
+    pub fn mnist_classifier() -> Vec<LayerDesc> {
+        let img_size = 32;
+        let input_dim = img_size * img_size;  // 1024
+        let hidden1 = 512;
+        let hidden2 = 256;
+        let num_classes = 10;
+
+        vec![
+            LayerDesc::new("fc1", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[input_dim])
+                .output(Dim::Dim1, &[hidden1]),
+            LayerDesc::new("relu1", LayerKind::ReLU, Dim::Dim1)
+                .input(Dim::Dim1, &[hidden1])
+                .output(Dim::Dim1, &[hidden1]),
+            LayerDesc::new("fc2", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[hidden1])
+                .output(Dim::Dim1, &[hidden2]),
+            LayerDesc::new("relu2", LayerKind::ReLU, Dim::Dim1)
+                .input(Dim::Dim1, &[hidden2])
+                .output(Dim::Dim1, &[hidden2]),
+            LayerDesc::new("fc3", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[hidden2])
+                .output(Dim::Dim1, &[num_classes]),
+            LayerDesc::new("softmax", LayerKind::Softmax, Dim::Dim1)
+                .input(Dim::Dim1, &[num_classes])
+                .output(Dim::Dim1, &[num_classes]),
+        ]
+    }
+}
+
+mod losses {
+    use neurocore::loss_plan::{Aggregation, CrossEntropyWithLogits, ElementChain, LossDesc};
+
+    /// Кросс‑энтропия для классификации с указанным числом классов и размером батча.
+    pub fn cross_entropy_desc(num_classes: usize, batch_size: usize) -> LossDesc {
+        let chain = ElementChain::new()
+            .add(Box::new(CrossEntropyWithLogits::new(num_classes)));
+        LossDesc::from_chain(chain, Aggregation::Mean, batch_size, num_classes, 1)
+    }
+}
+
+mod optimizers {
+    use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+
+    /// Обычный SGD с заданным learning rate.
+    pub fn sgd(lr: f32) -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(lr))
+            .add(OptCubeDesc::ApplyUpdate)
+    }
+}
+
+// -----------------------------------------------------------------
+fn main() {
+    // Параметры обучения
+    let img_size = 32;
+    let num_classes = 10;
+    let batch_size = 32;
+    let epochs = 20;
+    let lr = 0.1;
+
+    // Сборка модели
+    let (mut model,) = create_models!(models::mnist_classifier);
+
+    // Сгенерируем синтетический датасет (500 примеров 32x32)
+    let (train_x, train_y) = generate_dataset(500, img_size);
+    println!("Сгенерировано {} обучающих примеров", train_x.len());
+
+    // Инициализация параметров малыми случайными числами
+    {
+        let mut store = model.param_store().lock().unwrap();
+        let len = store.len();
+        for i in 0..len {
+            store.set_param(i, rand::random::<f32>() * 0.01);
+        }
+    }
+
+    // Создаём описание оптимизатора один раз
+    let sgd_desc = optimizers::sgd(lr);
+
+    let start = Instant::now();
+    for epoch in 0..epochs {
+        let mut total_loss = 0.0;
+        for batch_start in (0..train_x.len()).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(train_x.len());
+            let current_batch_size = batch_end - batch_start;
+
+            // Подготовка батча
+            let batch_x = Tensor2D::new(train_x[batch_start..batch_end].to_vec());
+            let batch_y = Tensor2D::new(train_y[batch_start..batch_end].to_vec());
+
+            // Прямой проход
+            let (pred, contexts) = model.forward(DynamicTensor::Dim1(batch_x.clone()));
+
+            // Функция потерь для текущего размера батча
+            let (loss, delta) = model.compute_loss(
+                losses::cross_entropy_desc(num_classes, current_batch_size),
+                &pred,
+                &DynamicTensor::Dim1(batch_y),
+            );
+            total_loss += loss * current_batch_size as f32;
+
+            // Обратный проход
+            let (_, grads) = model.backward(&contexts, delta);
+            // Обновление параметров
+            model.update_params(sgd_desc.clone(), &grads[0]);
+        }
+        println!(
+            "Epoch {}: avg loss = {:.6}",
+            epoch,
+            total_loss / train_x.len() as f32
+        );
+    }
+    let duration = start.elapsed();
+    println!("Обучение завершено за {:?}", duration);
+
+    // Проверка на первых 10 примерах
+    let test_x = Tensor2D::new(train_x[..10].to_vec());
+    let (pred, _) = model.forward(DynamicTensor::Dim1(test_x));
+    let pred_matrix = match pred {
+        DynamicTensor::Dim1(t) => t,
+        _ => panic!("Ожидался Dim1 (Tensor2D)"),
+    };
+    for i in 0..10 {
+        let pred_class = pred_matrix.data[i]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let true_class = train_y[i][0] as usize;
+        println!(
+            "Пример {}: предсказано {}, истина {}",
+            i, pred_class, true_class
+        );
+    }
+}
+
+/// Генерация синтетического датасета: бинарные изображения 32x32 с шаблонами цифр 0-9.
+fn generate_dataset(num_samples: usize, img_size: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let mut rng = rand::thread_rng();
+    let mut images = Vec::with_capacity(num_samples);
+    let mut labels = Vec::with_capacity(num_samples);
+
+    let templates: Vec<Vec<Vec<f32>>> = (0..10)
+        .map(|digit| {
+            let mut img = vec![vec![0.0f32; img_size]; img_size];
+            match digit {
+                0 => {
+                    let cx = img_size as f32 / 2.0;
+                    let cy = img_size as f32 / 2.0;
+                    let r = img_size as f32 / 2.0 - 2.0;
+                    for i in 0..img_size {
+                        for j in 0..img_size {
+                            let dx = i as f32 - cx;
+                            let dy = j as f32 - cy;
+                            let dist = (dx * dx + dy * dy).sqrt();
+                            if (dist - r).abs() < 2.0 {
+                                img[i][j] = 1.0;
+                            }
+                        }
+                    }
+                }
+                1 => {
+                    for i in 0..img_size {
+                        img[i][img_size / 2] = 1.0;
+                    }
+                }
+                2 => {
+                    for j in 0..img_size {
+                        img[0][j] = 1.0;
+                        img[img_size - 1][j] = 1.0;
+                    }
+                    for i in 0..img_size {
+                        img[i][i] = 1.0;
+                    }
+                }
+                3 => {
+                    for i in 0..img_size {
+                        img[i][0] = 1.0;
+                        img[i][img_size - 1] = 1.0;
+                    }
+                    for j in 0..img_size {
+                        img[img_size / 2][j] = 1.0;
+                    }
+                }
+                4 => {
+                    for i in 0..img_size {
+                        img[i][img_size / 3] = 1.0;
+                    }
+                    for j in 0..img_size {
+                        img[2 * img_size / 3][j] = 1.0;
+                    }
+                }
+                5 => {
+                    for i in 0..img_size {
+                        img[i][0] = 1.0;
+                    }
+                    for j in 0..img_size {
+                        img[img_size / 2][j] = 1.0;
+                        img[img_size - 1][j] = 1.0;
+                    }
+                }
+                6 => {
+                    for i in 0..img_size {
+                        img[i][0] = 1.0;
+                        img[i][img_size - 1] = 1.0;
+                        img[0][i] = 1.0;
+                        img[img_size / 2][i] = 1.0;
+                    }
+                }
+                7 => {
+                    for j in 0..img_size {
+                        img[0][j] = 1.0;
+                    }
+                    for i in 0..img_size {
+                        img[i][img_size - 1 - i] = 1.0;
+                    }
+                }
+                8 => {
+                    for i in 0..img_size {
+                        img[i][0] = 1.0;
+                        img[i][img_size - 1] = 1.0;
+                        img[0][i] = 1.0;
+                        img[img_size - 1][i] = 1.0;
+                    }
+                }
+                9 => {
+                    for i in 0..img_size {
+                        img[i][img_size - 1] = 1.0;
+                    }
+                    for j in 0..img_size {
+                        img[0][j] = 1.0;
+                        img[img_size / 2][j] = 1.0;
+                    }
+                    for i in 0..img_size {
+                        img[i][i] = 1.0;
+                    }
+                }
+                _ => {}
+            }
+            img
+        })
+        .collect();
+
+    for _ in 0..num_samples {
+        let digit = rng.gen_range(0..10);
+        let mut img = templates[digit].clone();
+        // Добавим шум: инвертируем случайные пиксели с вероятностью 10%
+        for i in 0..img_size {
+            for j in 0..img_size {
+                if rng.gen::<f32>() < 0.1 {
+                    img[i][j] = 1.0 - img[i][j];
                 }
             }
         }
-        finalize_universal!();
-
-        let input_stream_count = match segments.first() {
-            Some(Segment::CombinerConnector { input_dims, .. }) => input_dims.len(),
-            _ => 1,
-        };
-        let output_stream_count = match segments.last() {
-            Some(Segment::SplitterConnector { .. }) | Some(Segment::Splitter { .. }) => 2,
-            _ => 1,
-        };
-
-        // -----------------------------------------------------------
-        // 5.5 Назначаем устройства сегментам
-        // -----------------------------------------------------------
-        let segment_placement = assign_devices(&segments, &device_plan);
-
-        // -----------------------------------------------------------
-        // 6. Создаём GPU-хранилище параметров, если есть GPU
-        // -----------------------------------------------------------
-        if let Some(ref gpu_compute_mutex) = gpu_compute {
-            let initial_params = store.lock().unwrap().all_params_vec();
-            let gpu_compute = gpu_compute_mutex.lock().unwrap();
-            let gpu_store = GpuParamStore::from_cpu(
-                gpu_compute.context.memory_allocator.clone(),
-                &initial_params,
-                0,
-            );
-            gpu_param_store = Some(Mutex::new(gpu_store));
-        }
-
-        // -----------------------------------------------------------
-        // 7. Собираем MixedModel
-        // -----------------------------------------------------------
-        Ok(MixedModel {
-            segments,
-            segment_placement,
-            store,
-            pool,
-            scheduler: Mutex::new(scheduler),
-            executor,
-            gpu_compute,
-            gpu_param_store,
-            layer_infos,
-            input_stream_count,
-            output_stream_count,
-            memory_executor,
-        })
+        let flat: Vec<f32> = img.into_iter().flatten().collect();
+        images.push(flat);
+        labels.push(vec![digit as f32]);
     }
-
-    /// Сборка модели с планом устройств (вызывается из макроса create_models!).
-    pub fn build_with_device_plan(
-        plan: crate::model_plan::plan::Plan,
-        device_plan: DevicePlan,
-    ) -> Result<Self, String> {
-        Self::from_plan_with_device_plan(plan.layers, device_plan)
-    }
+    (images, labels)
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\graph\builder.rs
+КОНЕЦ ФАЙЛА: examples_large\mnist_binary_32x32.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 3: src\compute_manager\cpu\scheduler.rs
-Полный путь: D:\neurocore\src\compute_manager\cpu\scheduler.rs
+ФАЙЛ 4: examples\linear_test.rs
+Полный путь: D:\neurocore\examples\linear_test.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/compute_manager/cpu/scheduler.rs
+// examples/linear_test.rs
+// Демонстрация семи вариантов обучения с использованием модульных планов.
+// Вариант 7 включает глубокий анализ (ProfileMode::Full) – вывод времени и памяти
+// для каждого этапа и устройства.
 
-use std::path::PathBuf;
-use crate::compute_manager::cpu::cost::CostModel;
-use crate::compute_manager::cpu::hardware::CpuInfo;
-use crate::compute_manager::cpu::profiler::HardwareProfile;
-use crate::compute_manager::cpu::mini_model::ForwardTimePredictor;
+use neurocore::tensor::Tensor2D;
+use neurocore::training_plan::ProfileMode;
 
-const MAX_CORES_FOR_MODEL: usize = 16;
-const MAX_CHUNKS_PER_WORKER: usize = 10;
-
-#[derive(Debug, Clone)]
-pub struct LayerInfo {
-    pub id: usize,
-    pub layer_type: LayerType,
-    pub in_features: usize,
-    pub out_features: usize,
-    pub total_rows: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum LayerType {
-    Linear,
-    Activation,
-}
-
-pub struct Scheduler {
-    num_workers: usize,
-    predictors: Vec<ForwardTimePredictor>,   // по одному на CPU
-    predictors_paths: Vec<PathBuf>,          // пути для сохранения
-    profile: HardwareProfile,
-    cpu_info: CpuInfo,
-    cost: CostModel,
-}
-
-impl Clone for Scheduler {
-    fn clone(&self) -> Self {
-        let input_dim = 5 + MAX_CORES_FOR_MODEL;
-        let mut new_predictors = Vec::with_capacity(self.predictors.len());
-        for _ in 0..self.predictors.len() {
-            new_predictors.push(ForwardTimePredictor::new(input_dim, 8));
-        }
-        Scheduler {
-            num_workers: self.num_workers,
-            predictors: new_predictors,
-            predictors_paths: self.predictors_paths.clone(),
-            profile: self.profile.clone(),
-            cpu_info: self.cpu_info.clone(),
-            cost: self.cost.clone(),
-        }
+// ─── Модель ────────────────────────────────────────────────────────
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+    pub fn linear_model() -> Vec<LayerDesc> {
+        vec![LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
+            .input(Dim::Dim1, &[4])
+            .output(Dim::Dim1, &[2])]
     }
 }
 
-fn get_data_dir() -> PathBuf {
-    let env_dir = std::env::var("NEUROCORE_DATA_DIR").ok();
-    if let Some(dir) = env_dir {
-        let p = PathBuf::from(dir);
-        if let Err(_) = std::fs::create_dir_all(&p) { /* игнорируем */ }
-        return p;
-    }
-
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
-    if let Some(home) = home {
-        let p = PathBuf::from(home).join(".local/share/neurocore");
-        if let Err(_) = std::fs::create_dir_all(&p) { /* не удалось, fallback */ }
-        else { return p; }
-    }
-
-    let fallback = PathBuf::from("neurocore_data");
-    if let Err(_) = std::fs::create_dir_all(&fallback) {
-        return std::env::temp_dir().join("neurocore_data");
-    }
-    fallback
-}
-
-impl Scheduler {
-    /// Создаёт планировщик с заданным количеством CPU.
-    /// Для каждого CPU создаётся отдельная мини-модель, загружаемая/сохраняемая в файлы
-    /// вида `chunk_model_cpu0.json`, `chunk_model_cpu1.json` и т.д.
-    pub fn new_with_cpus(cost: CostModel, cpu_info: CpuInfo, num_cpus: usize) -> Self {
-        let num_workers = cost.num_cores;
-        let data_dir = get_data_dir();
-        let profile_path = data_dir.join("hardware_profile.json");
-
-        let profile = HardwareProfile::load(&profile_path)
-            .unwrap_or_else(|| {
-                let p = HardwareProfile::calibrate();
-                p.save(&profile_path);
-                p
-            });
-
-        let mut predictors = Vec::with_capacity(num_cpus);
-        let mut predictors_paths = Vec::with_capacity(num_cpus);
-        let input_dim = 5 + MAX_CORES_FOR_MODEL;
-        for cpu_idx in 0..num_cpus {
-            let model_path = data_dir.join(format!("chunk_model_cpu{}.json", cpu_idx));
-            predictors_paths.push(model_path.clone());
-            let model = ForwardTimePredictor::load(&model_path, input_dim, 8)
-                .unwrap_or_else(|| ForwardTimePredictor::new(input_dim, 8));
-            predictors.push(model);
-        }
-
-        Scheduler {
-            num_workers,
-            predictors,
-            predictors_paths,
-            profile,
-            cpu_info,
-            cost,
-        }
-    }
-
-    // Старый конструктор (для обратной совместимости)
-    pub fn new(cost: CostModel, cpu_info: CpuInfo) -> Self {
-        Self::new_with_cpus(cost, cpu_info, 1)
-    }
-
-    pub fn set_num_workers(&mut self, n: usize) {
-        self.num_workers = n;
-    }
-
-    pub fn num_workers(&self) -> usize {
-        self.num_workers
-    }
-
-    /// Основной метод планирования: определяет оптимальное количество чанков,
-    /// разбивает общее число задач на чанки и жадным алгоритмом назначает их ядрам.
-    /// Возвращает для каждого ядра список диапазонов (start, size).
-    pub fn plan_chunks_assignment(&mut self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
-        if total_tasks == 0 {
-            return vec![Vec::new(); self.num_workers];
-        }
-
-        let speeds = &self.profile.core_relative_speeds;
-        let max_chunks = total_tasks.min(self.num_workers * MAX_CHUNKS_PER_WORKER);
-
-        let mut best_penalty = f32::MAX;
-        let mut best_assignment = vec![Vec::new(); self.num_workers];
-        let mut best_c = 1;
-
-        // Перебор возможных количеств чанков
-        for c in 1..=max_chunks {
-            // Разбиваем total_tasks на c равных (с остатком) непрерывных чанков
-            let chunks = split_into_chunks(total_tasks, c);
-            // Жадно назначаем чанки ядрам
-            let assignment = greedy_assign(&chunks, speeds);
-            // Вычисляем нагрузки и штраф
-            let loads: Vec<f64> = assignment
-                .iter()
-                .map(|assigned| assigned.iter().map(|(_, size)| *size as f64).sum())
-                .collect();
-            let penalty = calculate_imbalance(&loads, speeds);
-            if penalty < best_penalty {
-                best_penalty = penalty;
-                best_assignment = assignment;
-                best_c = c;
-            }
-        }
-
-        // Обучаем первую мини-модель (пока не используется отдельная для каждого CPU в планировании)
-        let features = self.build_features(total_tasks);
-        let target = best_c as f32 / total_tasks as f32;
-        self.predictors[0].train(&features, target, 0.001);
-        self.predictors[0].save(&self.predictors_paths[0]);
-
-        best_assignment
-    }
-
-    fn build_features(&self, total_tasks: usize) -> Vec<f32> {
-        let fmadd_ms = (self.cost.fmadd_ns as f32) / 1_000_000.0;
-        let neuron_time_ms = (self.profile.neuron_time_ns as f32) / 1_000_000.0;
-
-        let mut feats = vec![
-            total_tasks as f32,
-            fmadd_ms,
-            neuron_time_ms,
-            self.profile.cache_congestion_factor as f32,
-            self.profile.memory_per_neuron_bytes as f32,
-        ];
-
-        let speeds = &self.profile.core_relative_speeds;
-        for i in 0..MAX_CORES_FOR_MODEL {
-            feats.push(if i < speeds.len() { speeds[i] as f32 } else { 0.0 });
-        }
-        feats
+// ─── Функция потерь ────────────────────────────────────────────────
+mod losses {
+    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
+    pub fn mse() -> LossDesc {
+        let chain = ElementChain::new().add(Box::new(Sub)).add(Box::new(Square));
+        LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1)
     }
 }
 
-// Разбивает total_tasks на num_chunks непрерывных чанков с равномерным распределением остатка.
-fn split_into_chunks(total: usize, num_chunks: usize) -> Vec<(usize, usize)> {
-    let base = total / num_chunks;
-    let rem = total % num_chunks;
-    let mut chunks = Vec::with_capacity(num_chunks);
-    let mut start = 0;
-    for i in 0..num_chunks {
-        let size = if i < rem { base + 1 } else { base };
-        chunks.push((start, size));
-        start += size;
+// ─── Оптимизатор ───────────────────────────────────────────────────
+mod optimizers {
+    use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ApplyUpdate)
     }
-    chunks
 }
 
-// Жадное назначение чанков ядрам с учётом относительных скоростей.
-fn greedy_assign(
-    chunks: &[(usize, usize)],
-    speeds: &[f64],
-) -> Vec<Vec<(usize, usize)>> {
-    let num_workers = speeds.len();
-    let mut assignment: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_workers];
-    let mut loads = vec![0.0; num_workers];
-
-    // Сортируем чанки по убыванию размера
-    let mut sorted_chunks: Vec<(usize, usize)> = chunks.to_vec();
-    sorted_chunks.sort_by(|a, b| b.1.cmp(&a.1));
-
-    for chunk in &sorted_chunks {
-        // Ищем ядро с минимальным ожидаемым временем завершения (load / speed)
-        let mut best_worker = 0;
-        let mut best_time = f64::MAX;
-        for i in 0..num_workers {
-            let speed = if i < speeds.len() { speeds[i] } else { 1.0 };
-            let time = loads[i] / speed;
-            if time < best_time {
-                best_time = time;
-                best_worker = i;
-            }
-        }
-        assignment[best_worker].push(*chunk);
-        loads[best_worker] += chunk.1 as f64;
-    }
-    assignment
+// ─── Данные ────────────────────────────────────────────────────────
+fn data() -> Tensor2D {
+    Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0]])
 }
 
-// Вычисляет среднее абсолютное отклонение нормализованных нагрузок (load/speed).
-fn calculate_imbalance(loads: &[f64], speeds: &[f64]) -> f32 {
-    let n = loads.len();
-    if n == 0 {
-        return 0.0;
+// ─── Общий план обучения (общий для всех вариантов) ─────────────
+fn base_training() -> neurocore::training_plan::TrainingPlan {
+    use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+    TrainingPlan::new()
+        .model(models::linear_model)
+        .loss(losses::mse())
+        .optimizer(optimizers::sgd())
+        .epochs(100)
+        .batch_size(1)
+        .train_data(DataSource::from_tensor2d(data()))
+        .init_weights(Initializer::RandomUniform { min: -0.1, max: 0.1 })
+        .seed(42)
+        .output_tensors(vec!["prediction".to_string()])
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Вариант 1: CPU (1 поток)
+// ═══════════════════════════════════════════════════════════════════
+mod training_plan_v1 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v1 {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 1).ram(0, 8192)
     }
-    let weighted: Vec<f64> = loads
-        .iter()
-        .enumerate()
-        .map(|(i, &load)| {
-            let speed = if i < speeds.len() { speeds[i] } else { 1.0 };
-            load / speed
-        })
-        .collect();
-    let avg = weighted.iter().sum::<f64>() / n as f64;
-    let penalty: f64 = weighted.iter().map(|w| (w - avg).abs()).sum();
-    (penalty / n as f64) as f32
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Вариант 2: CPU (4 потока)
+// ═══════════════════════════════════════════════════════════════════
+mod training_plan_v2 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v2 {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 4).ram(0, 8192)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Вариант 3: GPU (id 0)
+// ═══════════════════════════════════════════════════════════════════
+mod training_plan_v3 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v3 {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Вариант 4: CPU (1 поток) → GPU (id 0)
+// ═══════════════════════════════════════════════════════════════════
+mod training_plan_v4 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v4_cpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 1).ram(0, 8192)
+    }
+}
+mod device_plan_v4_gpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Вариант 5: GPU (id 0) → CPU (1 поток)
+// ═══════════════════════════════════════════════════════════════════
+mod training_plan_v5 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v5_gpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096)
+    }
+}
+mod device_plan_v5_cpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 1).ram(0, 8192)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Вариант 6: CPU (4 потока) + SSD-кэш
+// ═══════════════════════════════════════════════════════════════════
+mod training_plan_v6 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::base_training() }
+}
+mod device_plan_v6 {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 4).ram(0, 8192).ssd(0, "neurocore_ssd_cache", 5000)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Вариант 7: Параллельное CPU + GPU (с глубоким профилированием)
+// ═══════════════════════════════════════════════════════════════════
+mod training_plan_v7 {
+    use neurocore::training_plan::{TrainingPlan, ProfileMode};
+    pub fn plan() -> TrainingPlan {
+        super::base_training()
+            .profile(ProfileMode::Full)   // <-- включаем детальный сбор метрик
+    }
+}
+mod device_plan_v7 {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 4).ram(0, 8192).gpu(0).vram(0, 0, 4096)
+    }
+}
+
+fn print_result(label: &str, r: &neurocore::training_plan::execution::TrainingResult) {
+    println!(
+        "{}  time={:.3}s | best_loss={:.6} @ epoch {} | zero_loss_epoch={:?}",
+        label,
+        r.training_time_secs,
+        r.best_loss,
+        r.best_epoch,
+        r.zero_loss_epoch
+    );
+    if let Some(ref profile) = r.profile {
+        println!("{}", profile.report());
+    }
+}
+
+fn main() {
+    // Вариант 1
+    let r1 = neurocore::run_training!(training_plan_v1::plan, device = device_plan_v1::plan);
+    print_result("V1 CPU 1t", &r1);
+
+    // Вариант 2
+    let r2 = neurocore::run_training!(training_plan_v2::plan, device = device_plan_v2::plan);
+    print_result("V2 CPU 4t", &r2);
+
+    // Вариант 3
+    let r3 = neurocore::run_training!(training_plan_v3::plan, device = device_plan_v3::plan);
+    print_result("V3 GPU   ", &r3);
+
+    // Вариант 4: CPU → GPU
+    let r4_cpu = neurocore::run_training!(training_plan_v4::plan, device = device_plan_v4_cpu::plan);
+    print_result("V4a CPU ", &r4_cpu);
+    let r4_gpu = neurocore::run_training!(training_plan_v4::plan, device = device_plan_v4_gpu::plan);
+    print_result("V4b GPU ", &r4_gpu);
+
+    // Вариант 5: GPU → CPU
+    let r5_gpu = neurocore::run_training!(training_plan_v5::plan, device = device_plan_v5_gpu::plan);
+    print_result("V5a GPU ", &r5_gpu);
+    let r5_cpu = neurocore::run_training!(training_plan_v5::plan, device = device_plan_v5_cpu::plan);
+    print_result("V5b CPU ", &r5_cpu);
+
+    // Вариант 6
+    let r6 = neurocore::run_training!(training_plan_v6::plan, device = device_plan_v6::plan);
+    print_result("V6 SSD  ", &r6);
+
+    // Вариант 7 – с детальным профилем
+    let r7 = neurocore::run_training!(training_plan_v7::plan, device = device_plan_v7::plan);
+    print_result("V7 CPU+GPU (profiled)", &r7);
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\cpu\scheduler.rs
+КОНЕЦ ФАЙЛА: examples\linear_test.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 4: src\compute_manager\gpu\compute\optimizer.rs
-Полный путь: D:\neurocore\src\compute_manager\gpu\compute\optimizer.rs
+ФАЙЛ 5: examples\loss4d_test.rs
+Полный путь: D:\neurocore\examples\loss4d_test.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/compute_manager/gpu/compute/optimizer.rs
-
-use std::sync::Arc;
-use vulkano::buffer::Subbuffer;
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::{Pipeline, PipelineBindPoint};
-use vulkano::sync::{self, GpuFuture};
-use super::base::GpuCompute;
-
-impl GpuCompute {
-    pub fn run_scale_gradient(&self, grads: &Subbuffer<[f32]>, factor: f32, total: usize) {
-        let push = [factor.to_bits(), total as u32];
-        self.run_optimizer_1buf(self.pipeline_cache.scale_grad.clone(), grads, &push);
-    }
-
-    pub fn run_weight_decay(
-        &self,
-        params: &Subbuffer<[f32]>,
-        grads: &Subbuffer<[f32]>,
-        decay: f32,
-        total: usize,
-    ) {
-        let push = [decay.to_bits(), total as u32];
-        let set_layout = self.pipeline_cache.weight_decay.layout().set_layouts().get(0).unwrap().clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, params.clone()),
-                WriteDescriptorSet::buffer(1, grads.clone()),
-            ],
-            [],
-        )
-        .expect("weight_decay descriptor set");
-
-        self.run_optimizer_with_ds(self.pipeline_cache.weight_decay.clone(), descriptor_set, &push);
-    }
-
-    pub fn run_gradient_clip(
-        &self,
-        grads: &Subbuffer<[f32]>,
-        min_val: f32,
-        max_val: f32,
-        total: usize,
-    ) {
-        let push = [min_val.to_bits(), max_val.to_bits(), total as u32];
-        self.run_optimizer_1buf(self.pipeline_cache.grad_clip.clone(), grads, &push);
-    }
-
-    pub fn run_momentum(
-        &self,
-        grads: &Subbuffer<[f32]>,
-        state: &Subbuffer<[f32]>,
-        beta: f32,
-        total: usize,
-    ) {
-        let push = [beta.to_bits(), total as u32];
-        let set_layout = self.pipeline_cache.momentum.layout().set_layouts().get(0).unwrap().clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, grads.clone()),
-                WriteDescriptorSet::buffer(1, state.clone()),
-            ],
-            [],
-        )
-        .expect("momentum descriptor set");
-
-        self.run_optimizer_with_ds(self.pipeline_cache.momentum.clone(), descriptor_set, &push);
-    }
-
-    pub fn run_nesterov_momentum(
-        &self,
-        grads: &Subbuffer<[f32]>,
-        state: &Subbuffer<[f32]>,
-        beta: f32,
-        total: usize,
-    ) {
-        let push = [beta.to_bits(), total as u32];
-        let set_layout = self.pipeline_cache.nesterov_momentum.layout().set_layouts().get(0).unwrap().clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, grads.clone()),
-                WriteDescriptorSet::buffer(1, state.clone()),
-            ],
-            [],
-        )
-        .expect("nesterov_momentum descriptor set");
-
-        self.run_optimizer_with_ds(self.pipeline_cache.nesterov_momentum.clone(), descriptor_set, &push);
-    }
-
-    pub fn run_adam(
-        &self,
-        grads: &Subbuffer<[f32]>,
-        state: &Subbuffer<[f32]>,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        step: usize,
-        total: usize,
-    ) {
-        let bias_correction1 = 1.0f32 - beta1.powi(step as i32);
-        let bias_correction2 = 1.0f32 - beta2.powi(step as i32);
-        let push = [
-            beta1.to_bits(),
-            beta2.to_bits(),
-            eps.to_bits(),
-            bias_correction1.to_bits(),
-            bias_correction2.to_bits(),
-            total as u32,
-        ];
-        let set_layout = self.pipeline_cache.adam.layout().set_layouts().get(0).unwrap().clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, grads.clone()),
-                WriteDescriptorSet::buffer(1, state.clone()),
-            ],
-            [],
-        )
-        .expect("adam descriptor set");
-
-        self.run_optimizer_with_ds(self.pipeline_cache.adam.clone(), descriptor_set, &push);
-    }
-
-    pub fn run_apply_update(
-        &self,
-        params: &Subbuffer<[f32]>,
-        grads: &Subbuffer<[f32]>,
-        total: usize,
-    ) {
-        let push = [total as u32];
-        let set_layout = self.pipeline_cache.apply_update.layout().set_layouts().get(0).unwrap().clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, params.clone()),
-                WriteDescriptorSet::buffer(1, grads.clone()),
-            ],
-            [],
-        )
-        .expect("apply_update descriptor set");
-
-        self.run_optimizer_with_ds(self.pipeline_cache.apply_update.clone(), descriptor_set, &push);
-    }
-
-    fn run_optimizer_1buf<const N: usize>(
-        &self,
-        pipeline: Arc<vulkano::pipeline::ComputePipeline>,
-        buf: &Subbuffer<[f32]>,
-        push: &[u32; N],
-    ) {
-        let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [WriteDescriptorSet::buffer(0, buf.clone())],
-            [],
-        )
-        .expect("optimizer 1‑buf descriptor set");
-
-        self.run_optimizer_with_ds(pipeline, descriptor_set, push);
-    }
-
-    fn run_optimizer_with_ds<const N: usize>(
-        &self,
-        pipeline: Arc<vulkano::pipeline::ComputePipeline>,
-        descriptor_set: Arc<DescriptorSet>,
-        push: &[u32; N],
-    ) {
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.command_buffer_allocator.clone(),
-            self.context.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("optimizer command buffer builder");
-
-        let total_elements = push.last().copied().unwrap_or(1);
-        let dispatch_dim = [((total_elements + 255) / 256) as u32, 1, 1];
-
-        unsafe {
-            builder
-                .bind_pipeline_compute(pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    pipeline.layout().clone(),
-                    0,
-                    descriptor_set,
-                )
-                .unwrap()
-                .push_constants(pipeline.layout().clone(), 0, *push)
-                .unwrap()
-                .dispatch(dispatch_dim)
-                .unwrap();
-        }
-
-        let command_buffer = builder.build().expect("build optimizer command buffer");
-        let future = sync::now(self.context.device.clone())
-            .then_execute(self.context.queue.clone(), command_buffer)
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap();
-        future.wait(None).unwrap();
-    }
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\gpu\compute\optimizer.rs
-================================================================================
-
-================================================================================
-ФАЙЛ 5: src\compute_manager\gpu\compute\matmul.rs
-Полный путь: D:\neurocore\src\compute_manager\gpu\compute\matmul.rs
-Тип: rs
---------------------------------------------------------------------------------
-// src/compute_manager/gpu/compute/matmul.rs
+// examples/loss4d_test.rs
+// Тестирование потерь: MSE, CrossEntropy, difference_loss, diff_smooth_loss.
+// Использует матричный API LossExpr.
 
 use faer::Mat;
-use vulkano::buffer::{BufferUsage, Subbuffer};
+use neurocore::create_losses;
+
+// -------- Область потерь --------
+mod losses {
+    use neurocore::loss_plan::{
+        Aggregation, CrossEntropyWithLogits, ElementChain, LossDesc, Square, Sub,
+    };
+    use neurocore::loss_plan::{Abs, AddScalar, Log1p, AbsDiff};
+
+    pub fn mse() -> LossDesc {
+        let chain = ElementChain::new()
+            .add(Box::new(Sub))
+            .add(Box::new(Square));
+        LossDesc::from_chain(chain, Aggregation::Mean, 4, 1, 1)
+    }
+
+    pub fn cross_entropy() -> LossDesc {
+        let num_classes = 4;
+        let chain = ElementChain::new()
+            .add(Box::new(CrossEntropyWithLogits::new(num_classes)));
+        LossDesc::from_chain(chain, Aggregation::Mean, 1, num_classes, 1)
+    }
+
+    pub fn difference_loss() -> LossDesc {
+        let chain = ElementChain::new()
+            .add(Box::new(Sub))             // p - t
+            .add(Box::new(Abs))             // |p-t|
+            .add(Box::new(AddScalar(1.0)))  // 1 + |p-t|
+            .add(Box::new(Log1p));          // ln(1 + |p-t|)
+        LossDesc::from_chain(chain, Aggregation::Mean, 4, 1, 1)
+    }
+
+    pub fn diff_smooth_loss_h() -> LossDesc {
+        // горизонтальная составляющая: mean(|p_i - p_{i+1}|)
+        let chain = ElementChain::new()
+            .add(Box::new(AbsDiff));
+        LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1) // 2 пары соседей по горизонтали
+    }
+
+    pub fn diff_smooth_loss_v() -> LossDesc {
+        // вертикальная составляющая: mean(|p_i - p_{i+W}|)
+        let chain = ElementChain::new()
+            .add(Box::new(AbsDiff));
+        LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1) // 2 пары соседей по вертикали
+    }
+}
+
+fn main() {
+    let (mse,) = create_losses!(losses::mse);
+    let (ce,) = create_losses!(losses::cross_entropy);
+    let (diff_loss,) = create_losses!(losses::difference_loss);
+    let (smooth_h,) = create_losses!(losses::diff_smooth_loss_h);
+    let (smooth_v,) = create_losses!(losses::diff_smooth_loss_v);
+
+    // ==================== MSE ====================
+    println!("--- MSE (4D) ---");
+    let total_elements = 4;
+    let pred = vec![1.0f32, 2.0, 3.0, 4.0];
+    let target = vec![1.5, 1.5, 3.5, 4.5];
+
+    let in_size = mse.task_input_size(); // = 2
+    let mut full_input = Mat::zeros(total_elements, in_size);
+    for i in 0..total_elements {
+        full_input[(i, 0)] = pred[i];
+        full_input[(i, 1)] = target[i];
+    }
+
+    let (loss_vec, intermediates) = mse.forward_chunk(&full_input);
+    let loss = mse.aggregate_loss(&loss_vec);
+    println!("MSE loss: {:.6}", loss);
+
+    let grad_loss = vec![1.0f32; total_elements];
+    let grad_mat = mse.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_flat = Vec::with_capacity(total_elements * in_size);
+    for i in 0..total_elements {
+        for j in 0..in_size {
+            grad_flat.push(grad_mat[(i, j)]);
+        }
+    }
+    let grad_agg = mse.aggregate_grad(&grad_flat);
+    let grad: Vec<f32> = (0..total_elements)
+        .map(|i| grad_agg[i * in_size]) // градиент по pred (первый элемент)
+        .collect();
+    println!("MSE grad: {:?}", grad);
+
+    // ==================== CrossEntropy ====================
+    println!("\n--- CrossEntropy (4D) ---");
+    let pred_logits = vec![0.2f32, 0.5, 0.1, 0.2];
+    let class_index = 1.0f32; // целевой класс 1
+
+    let in_size = ce.task_input_size(); // num_classes + 1 = 5
+    let mut ce_input = Mat::zeros(1, in_size);
+    ce_input[(0, 0)] = pred_logits[0];
+    ce_input[(0, 1)] = pred_logits[1];
+    ce_input[(0, 2)] = pred_logits[2];
+    ce_input[(0, 3)] = pred_logits[3];
+    ce_input[(0, 4)] = class_index;
+
+    let (loss_vec, intermediates) = ce.forward_chunk(&ce_input);
+    let ce_loss = ce.aggregate_loss(&loss_vec);
+    println!("CE loss: {:.6}", ce_loss);
+
+    let grad_loss = vec![1.0f32; 1];
+    let grad_mat = ce.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_flat = Vec::with_capacity(in_size);
+    for j in 0..in_size {
+        grad_flat.push(grad_mat[(0, j)]);
+    }
+    let grad_agg = ce.aggregate_grad(&grad_flat);
+    // Показываем градиент только по логитам (первые num_classes элементов)
+    println!("CE grad (first {}): {:?}", 4, &grad_agg[..4]);
+
+    // ==================== Difference Loss ====================
+    println!("\n--- Difference Loss (4D) ---");
+    let pred = vec![1.0f32, 2.0, 3.0, 4.0];
+    let target = vec![1.5, 1.5, 3.5, 4.5];
+
+    let in_size = diff_loss.task_input_size(); // = 2
+    let mut full_input = Mat::zeros(total_elements, in_size);
+    for i in 0..total_elements {
+        full_input[(i, 0)] = pred[i];
+        full_input[(i, 1)] = target[i];
+    }
+
+    let (loss_vec, intermediates) = diff_loss.forward_chunk(&full_input);
+    let loss = diff_loss.aggregate_loss(&loss_vec);
+    println!("Diff loss: {:.6}", loss);
+
+    let grad_loss = vec![1.0f32; total_elements];
+    let grad_mat = diff_loss.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_flat = Vec::with_capacity(total_elements * in_size);
+    for i in 0..total_elements {
+        for j in 0..in_size {
+            grad_flat.push(grad_mat[(i, j)]);
+        }
+    }
+    let grad_agg = diff_loss.aggregate_grad(&grad_flat);
+    let grad: Vec<f32> = (0..total_elements)
+        .map(|i| grad_agg[i * in_size]) // градиент по pred
+        .collect();
+    println!("Diff grad: {:?}", grad);
+
+    // ==================== Diff Smooth Loss ====================
+    println!("\n--- Diff Smooth Loss (4D) ---");
+    // Представим карту ошибок размером 2x2 (4 пикселя)
+    let error_map = vec![1.0, 0.5, 0.2, 0.9]; // 2x2 row-major
+    // Горизонтальные пары: (e[0], e[1]), (e[2], e[3])
+    let in_size = smooth_h.task_input_size(); // 2
+    let mut horiz_input = Mat::zeros(2, in_size); // 2 пары
+    horiz_input[(0, 0)] = error_map[0];
+    horiz_input[(0, 1)] = error_map[1];
+    horiz_input[(1, 0)] = error_map[2];
+    horiz_input[(1, 1)] = error_map[3];
+
+    let (loss_vec, _intermediates) = smooth_h.forward_chunk(&horiz_input);
+    let h_val = smooth_h.aggregate_loss(&loss_vec);
+
+    // Вертикальные пары: (e[0], e[2]), (e[1], e[3])
+    let mut vert_input = Mat::zeros(2, in_size);
+    vert_input[(0, 0)] = error_map[0];
+    vert_input[(0, 1)] = error_map[2];
+    vert_input[(1, 0)] = error_map[1];
+    vert_input[(1, 1)] = error_map[3];
+
+    let (loss_vec, intermediates) = smooth_v.forward_chunk(&vert_input);
+    let v_val = smooth_v.aggregate_loss(&loss_vec);
+
+    let total_smooth = h_val + v_val;
+    println!(
+        "Smooth loss: {:.6} (horiz={:.6}, vert={:.6})",
+        total_smooth, h_val, v_val
+    );
+
+    // Градиенты гладкости (показываем для наглядности)
+    let grad_loss = vec![1.0f32; 2];
+    let grad_mat_h = smooth_h.backward_chunk(&intermediates, &grad_loss);
+    let mut grad_h_flat = Vec::with_capacity(2 * in_size);
+    for i in 0..2 {
+        for j in 0..in_size {
+            grad_h_flat.push(grad_mat_h[(i, j)]);
+        }
+    }
+    let grad_h_agg = smooth_h.aggregate_grad(&grad_h_flat);
+    println!("Smooth H grad: {:?}", grad_h_agg);
+
+    // вертикальные градиенты пересчитаем заново
+    let (_, intermediates_v) = smooth_v.forward_chunk(&vert_input);
+    let grad_mat_v = smooth_v.backward_chunk(&intermediates_v, &grad_loss);
+    let mut grad_v_flat = Vec::with_capacity(2 * in_size);
+    for i in 0..2 {
+        for j in 0..in_size {
+            grad_v_flat.push(grad_mat_v[(i, j)]);
+        }
+    }
+    let grad_v_agg = smooth_v.aggregate_grad(&grad_v_flat);
+    println!("Smooth V grad: {:?}", grad_v_agg);
+}
+================================================================================
+КОНЕЦ ФАЙЛА: examples\loss4d_test.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 6: src\compute_manager\device_tensor.rs
+Полный путь: D:\neurocore\src\compute_manager\device_tensor.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// src/compute_manager/device_tensor.rs
+
+use faer::Mat;
+use crate::compute_manager::memory_executor::{MemoryExecutor, TensorBufferId};
+use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::memory_executor::BufferPriority;
+use crate::compute_manager::device_spec::DeviceId;
+
+/// Тензор, который может находиться на CPU (в виде faer::Mat) или на GPU
+/// (в виде буфера, управляемого MemoryExecutor).
+#[derive(Debug)]
+pub enum DeviceTensor {
+    Cpu(Mat<f32>),
+    Gpu {
+        buffer_id: TensorBufferId,
+        rows: usize,
+        cols: usize,
+    },
+}
+
+impl DeviceTensor {
+    pub fn from_cpu(mat: Mat<f32>) -> Self {
+        DeviceTensor::Cpu(mat)
+    }
+
+    pub fn from_gpu(buffer_id: TensorBufferId, rows: usize, cols: usize) -> Self {
+        DeviceTensor::Gpu { buffer_id, rows, cols }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            DeviceTensor::Cpu(mat) => mat.nrows(),
+            DeviceTensor::Gpu { rows, .. } => *rows,
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            DeviceTensor::Cpu(mat) => mat.ncols(),
+            DeviceTensor::Gpu { cols, .. } => *cols,
+        }
+    }
+
+    pub fn is_cpu(&self) -> bool {
+        matches!(self, DeviceTensor::Cpu(_))
+    }
+
+    pub fn is_gpu(&self) -> bool {
+        matches!(self, DeviceTensor::Gpu { .. })
+    }
+
+    /// Читает данные тензора в матрицу на CPU (копирует).
+    pub fn to_cpu(&self, mem_exec: &mut MemoryExecutor) -> Mat<f32> {
+        match self {
+            DeviceTensor::Cpu(mat) => mat.clone(),
+            DeviceTensor::Gpu { buffer_id, rows, cols } => {
+                // временно перемещаем в HostRam, читаем, возвращаем обратно
+                let target_kind = MemoryDeviceKind::HostRam;
+                mem_exec.move_buffer(*buffer_id, target_kind)
+                    .expect("Failed to move GPU buffer to HostRam for reading");
+                let resolved = mem_exec.resolve_buffer(*buffer_id, target_kind)
+                    .expect("Failed to resolve buffer");
+                let slice = resolved.as_host_slice();
+                let total = rows * cols;
+                let data = slice[..total].to_vec();
+                drop(resolved);
+                // возвращаем в VRAM (предполагаем устройство 0 – заглушка)
+                let vram_kind = MemoryDeviceKind::DeviceVram(DeviceId(0));
+                mem_exec.move_buffer(*buffer_id, vram_kind)
+                    .expect("Failed to move buffer back to VRAM");
+                Mat::from_fn(*rows, *cols, |r, c| data[r * cols + c])
+            }
+        }
+    }
+
+    /// Перемещает тензор на GPU, возвращает новый DeviceTensor::Gpu.
+    pub fn to_gpu(&self, mem_exec: &mut MemoryExecutor, gpu_device_id: DeviceId) -> Self {
+        match self {
+            DeviceTensor::Cpu(mat) => {
+                let rows = mat.nrows();
+                let cols = mat.ncols();
+                let total = rows * cols;
+                // собираем плоский вектор без замыканий на mat
+                let mut flat = Vec::with_capacity(total);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        flat.push(mat[(r, c)]);
+                    }
+                }
+                let host_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total, BufferPriority::High)
+                    .expect("Failed to allocate host buffer for GPU upload");
+                {
+                    let mut resolved = mem_exec.resolve_buffer(host_id, MemoryDeviceKind::HostRam)
+                        .expect("Failed to resolve host buffer");
+                    resolved.as_host_slice_mut().copy_from_slice(&flat);
+                }
+                mem_exec.move_buffer(host_id, MemoryDeviceKind::DeviceVram(gpu_device_id))
+                    .expect("Failed to move buffer to GPU VRAM");
+                DeviceTensor::Gpu { buffer_id: host_id, rows, cols }
+            }
+            DeviceTensor::Gpu { buffer_id, rows, cols } => {
+                let total = rows * cols;
+                // копируем через host (временное перемещение)
+                mem_exec.move_buffer(*buffer_id, MemoryDeviceKind::HostRam)
+                    .expect("Failed to move GPU buffer to host for copy");
+                let data_vec = {
+                    let resolved = mem_exec.resolve_buffer(*buffer_id, MemoryDeviceKind::HostRam)
+                        .expect("Failed to resolve buffer");
+                    resolved.as_host_slice()[..total].to_vec()
+                };
+                // возвращаем исходный буфер в VRAM (заглушка: всегда на устройство 0)
+                mem_exec.move_buffer(*buffer_id, MemoryDeviceKind::DeviceVram(DeviceId(0)))
+                    .expect("Failed to restore original GPU buffer");
+                // создаём новый буфер на целевом GPU
+                let new_id = mem_exec.allocate(MemoryDeviceKind::DeviceVram(gpu_device_id), total, BufferPriority::High)
+                    .expect("Failed to allocate new GPU buffer");
+                let host_staging_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total, BufferPriority::High)
+                    .expect("Failed to allocate staging buffer");
+                {
+                    let mut resolved = mem_exec.resolve_buffer(host_staging_id, MemoryDeviceKind::HostRam)
+                        .expect("Failed to resolve staging buffer");
+                    resolved.as_host_slice_mut().copy_from_slice(&data_vec);
+                }
+                mem_exec.move_buffer(host_staging_id, MemoryDeviceKind::DeviceVram(gpu_device_id))
+                    .expect("Failed to move staging buffer to GPU");
+                DeviceTensor::Gpu {
+                    buffer_id: host_staging_id,
+                    rows: *rows,
+                    cols: *cols,
+                }
+            }
+        }
+    }
+
+    /// Преобразует тензор в матрицу на CPU, освобождая GPU-буфер, если он был.
+    pub fn into_cpu(self, mem_exec: &mut MemoryExecutor) -> Mat<f32> {
+        match self {
+            DeviceTensor::Cpu(mat) => mat,
+            DeviceTensor::Gpu { buffer_id, rows, cols } => {
+                mem_exec.move_buffer(buffer_id, MemoryDeviceKind::HostRam)
+                    .expect("Failed to move GPU buffer to host");
+                let data_vec = {
+                    let resolved = mem_exec.resolve_buffer(buffer_id, MemoryDeviceKind::HostRam)
+                        .expect("Failed to resolve buffer");
+                    let total = rows * cols;
+                    resolved.as_host_slice()[..total].to_vec()
+                };
+                mem_exec.deallocate_buffer(buffer_id)
+                    .expect("Failed to deallocate buffer");
+                Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
+            }
+        }
+    }
+
+    /// Преобразует тензор в GPU-тензор, освобождая CPU-матрицу, если она была.
+    pub fn into_gpu(self, mem_exec: &mut MemoryExecutor, gpu_device_id: DeviceId) -> Self {
+        match self {
+            DeviceTensor::Cpu(mat) => {
+                let rows = mat.nrows();
+                let cols = mat.ncols();
+                let total = rows * cols;
+                let mut flat = Vec::with_capacity(total);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        flat.push(mat[(r, c)]);
+                    }
+                }
+                let host_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total, BufferPriority::High)
+                    .expect("Failed to allocate host buffer");
+                {
+                    let mut resolved = mem_exec.resolve_buffer(host_id, MemoryDeviceKind::HostRam)
+                        .expect("Failed to resolve host buffer");
+                    resolved.as_host_slice_mut().copy_from_slice(&flat);
+                }
+                mem_exec.move_buffer(host_id, MemoryDeviceKind::DeviceVram(gpu_device_id))
+                    .expect("Failed to move buffer to GPU");
+                DeviceTensor::Gpu { buffer_id: host_id, rows, cols }
+            }
+            gpu_tensor @ DeviceTensor::Gpu { .. } => gpu_tensor,
+        }
+    }
+}
+================================================================================
+КОНЕЦ ФАЙЛА: src\compute_manager\device_tensor.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 7: src\compute_manager\gpu\compute\activation.rs
+Полный путь: D:\neurocore\src\compute_manager\gpu\compute\activation.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// src/compute_manager/gpu/compute/activation.rs
+
+use faer::Mat;
+use vulkano::buffer::BufferUsage;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use vulkano::sync::{self, GpuFuture};
 use super::base::GpuCompute;
-use crate::compute_manager::memory_executor::TensorBufferId;
 
 impl GpuCompute {
-    fn run_mat_mul_internal(
+    pub fn run_activation_forward(
         &self,
-        a: &Mat<f32>,
-        b: &Mat<f32>,
-        output_rows: usize,
-        output_cols: usize,
-    ) -> (Subbuffer<[f32]>, TensorBufferId) {
-        let k = a.ncols();
-        assert_eq!(k, b.nrows(), "MatMul dimensions mismatch: a.cols={} != b.rows={}", k, b.nrows());
-        let m = output_rows;
-        let n = output_cols;
-
-        let a_data: Vec<f32> = (0..a.nrows())
-            .flat_map(|r| (0..a.ncols()).map(move |c| a[(r, c)]))
-            .collect();
-        let b_data: Vec<f32> = (0..b.nrows())
-            .flat_map(|r| (0..b.ncols()).map(move |c| b[(r, c)]))
-            .collect();
-
-        let (a_buf, a_id) = self.create_storage_buffer_from_slice(&a_data);
-        let (b_buf, b_id) = self.create_storage_buffer_from_slice(&b_data);
-        let (out_buf, out_id) = self.create_buffer(m * n, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
-
-        let pipeline = self.pipeline_cache.mat_mul_pipeline();
-        let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, a_buf.clone()),
-                WriteDescriptorSet::buffer(1, b_buf.clone()),
-                WriteDescriptorSet::buffer(2, out_buf.clone()),
-            ],
-            [],
-        )
-        .expect("descriptor set");
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.command_buffer_allocator.clone(),
-            self.context.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("command buffer builder");
-
-        let dispatch_dim = [
-            ((m + 15) / 16) as u32,
-            ((n + 15) / 16) as u32,
-            1u32,
-        ];
-        let push_constants: [u32; 3] = [m as u32, n as u32, k as u32];
-
-        unsafe {
-            builder
-                .bind_pipeline_compute(pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    pipeline.layout().clone(),
-                    0,
-                    descriptor_set,
-                )
-                .unwrap()
-                .push_constants(pipeline.layout().clone(), 0, push_constants)
-                .unwrap()
-                .dispatch(dispatch_dim)
-                .unwrap();
-        }
-
-        let command_buffer = builder.build().expect("build command buffer");
-        let future = sync::now(self.context.device.clone())
-            .then_execute(self.context.queue.clone(), command_buffer)
-            .unwrap()
-            .then_signal_fence_and_flush()
-            .unwrap();
-        future.wait(None).unwrap();
-
-        self.release_buffer(a_id);
-        self.release_buffer(b_id);
-        (out_buf, out_id)
-    }
-
-    pub fn run_mat_mul(&self, a: &Mat<f32>, b: &Mat<f32>) -> Mat<f32> {
-        let (out_buf, out_id) = self.run_mat_mul_internal(a, b, a.nrows(), b.ncols());
-        self.read_buffer_to_mat(out_buf, out_id, a.nrows(), b.ncols())
-    }
-
-    pub fn run_reduce_sum_cols(&self, mat: &Mat<f32>) -> Vec<f32> {
-        let rows = mat.nrows();
-        let cols = mat.ncols();
+        input: &Mat<f32>,
+        op_type: u32,
+        alpha: f32,
+    ) -> Mat<f32> {
+        let batch = input.nrows();
+        let features = input.ncols();
+        let total_elements = batch * features;
 
         let (input_buf, input_id) = self.create_storage_buffer_from_slice(
-            &(0..rows).flat_map(|r| (0..cols).map(move |c| mat[(r, c)])).collect::<Vec<f32>>(),
+            &(0..batch)
+                .flat_map(|r| (0..features).map(move |c| input[(r, c)]))
+                .collect::<Vec<f32>>(),
         );
-        let (output_buf, output_id) = self.create_buffer(cols, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
-        let pipeline = self.pipeline_cache.reduce_pipeline();
+        let (output_buf, output_id) = self.create_buffer(
+            total_elements,
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
+        );
+
+        let pipeline = self.pipeline_cache.activation_pipeline();
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
         let descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
@@ -1386,8 +1780,7 @@ impl GpuCompute {
         )
         .expect("command buffer builder");
 
-        let dispatch_dim = [cols as u32, 1, 1];
-        let push_constants: [u32; 1] = [rows as u32];
+        let push_constants: [u32; 3] = [op_type, alpha.to_bits(), total_elements as u32];
 
         unsafe {
             builder
@@ -1402,7 +1795,7 @@ impl GpuCompute {
                 .unwrap()
                 .push_constants(pipeline.layout().clone(), 0, push_constants)
                 .unwrap()
-                .dispatch(dispatch_dim)
+                .dispatch([((total_elements + 255) / 256) as u32, 1, 1])
                 .unwrap();
         }
 
@@ -1414,572 +1807,558 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        // Создаём host-visible staging-буфер напрямую через Vulkan‑аллокатор.
-        let staging_size = (cols * std::mem::size_of::<f32>()) as u64;
-        let staging = vulkano::buffer::Buffer::new_unsized(
-            self.context.memory_allocator.clone(),
-            vulkano::buffer::BufferCreateInfo {
-                usage: vulkano::buffer::BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            vulkano::memory::allocator::AllocationCreateInfo {
-                memory_type_filter: vulkano::memory::allocator::MemoryTypeFilter::PREFER_HOST
-                    | vulkano::memory::allocator::MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            staging_size,
-        )
-        .expect("staging buffer for reduce_sum_cols");
-
-        // Копируем результат GPU‑шейдера в staging‑буфер.
-        self.copy_buffer_sync(output_buf, staging.clone());
-
-        // Читаем данные из staging‑буфера.
-        let data_vec = {
-            let guard = staging.read().expect("read staging buffer");
-            guard[..cols].to_vec()
-        };
-
-        // Освобождаем ресурсы через MemoryExecutor.
+        let mat = self.read_buffer_to_mat(output_buf, output_id, batch, features);
         self.release_buffer(input_id);
-        self.release_buffer(output_id);
-        // Staging‑буфер будет автоматически уничтожен при выходе из области видимости.
-
-        data_vec
-    }
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\gpu\compute\matmul.rs
-================================================================================
-
-================================================================================
-ФАЙЛ 6: src\loss_plan\gpu_exec.rs
-Полный путь: D:\neurocore\src\loss_plan\gpu_exec.rs
-Тип: rs
---------------------------------------------------------------------------------
-// src/loss_plan/gpu_exec.rs
-
-use faer::Mat;
-use crate::compute_manager::gpu::compute::GpuCompute;
-use crate::loss_plan::CrossEntropyWithLogits;
-use super::cubes::*;
-use super::expr::LossExpr;
-
-/// Выполняет вычисление потерь и градиентов на GPU.
-pub fn compute_loss_gpu(
-    gpu: &GpuCompute,
-    expr: &LossExpr,
-    pred: &Mat<f32>,
-    target: &Mat<f32>,
-) -> (f32, Mat<f32>) {
-    let chain = expr.chain();
-    let pred_feat = expr.pred_features();
-    let target_feat = expr.target_features();
-    let in_features = pred_feat + target_feat;
-    let total_tasks = expr.num_tasks();   // <-- берём из выражения, а не pred.nrows()
-
-    // Разворачиваем pred и target в плоские векторы по элементам
-    let flat_pred: Vec<f32> = (0..pred.nrows())
-        .flat_map(|r| (0..pred_feat).map(move |c| pred[(r, c)]))
-        .collect();
-    let flat_target: Vec<f32> = (0..target.nrows())
-        .flat_map(|r| (0..target_feat).map(move |c| target[(r, c)]))
-        .collect();
-
-    // Формируем матрицу задач: каждая строка – [pred_i, target_i]
-    let full_input = Mat::from_fn(total_tasks, in_features, |i, j| {
-        if j < pred_feat {
-            flat_pred[i * pred_feat + j]
-        } else {
-            let t_idx = j - pred_feat;
-            flat_target[i * target_feat + t_idx]
-        }
-    });
-
-    // Прямой проход цепочки кубиков на GPU
-    let mut current = full_input.clone();
-    let mut intermediates: Vec<(Mat<f32>, Mat<f32>)> = Vec::with_capacity(chain.cubes().len());
-
-    for cube in chain.cubes() {
-        let input_for_cube = current.clone();
-        let output = run_cube_forward_gpu(cube.as_ref(), gpu, &current);
-        intermediates.push((input_for_cube, output.clone()));
-        current = output;
+        mat
     }
 
-    // current имеет размер (batch, 1) — значения потерь
-    let loss_vec: Vec<f32> = (0..total_tasks).map(|i| current[(i, 0)]).collect();
-    let loss = expr.aggregate_loss(&loss_vec);
+    pub fn run_relu_forward(&self, input: &Mat<f32>) -> Mat<f32> { self.run_activation_forward(input, 0, 0.0) }
+    pub fn run_sigmoid_forward(&self, input: &Mat<f32>) -> Mat<f32> { self.run_activation_forward(input, 1, 0.0) }
+    pub fn run_tanh_forward(&self, input: &Mat<f32>) -> Mat<f32> { self.run_activation_forward(input, 2, 0.0) }
+    pub fn run_leaky_relu_forward(&self, input: &Mat<f32>, alpha: f32) -> Mat<f32> { self.run_activation_forward(input, 3, alpha) }
 
-    // Подготавливаем градиент по потерям с учётом агрегации
-    let grad_scale = match expr.aggregation() {
-        super::expr::Aggregation::Sum => 1.0f32,
-        super::expr::Aggregation::Mean => 1.0f32 / total_tasks as f32,
-    };
-    let grad_loss_mat = Mat::from_fn(total_tasks, 1, |_i, _j| grad_scale);
+    pub fn run_activation_backward(
+        &self,
+        input_or_output: &Mat<f32>,
+        grad_out: &Mat<f32>,
+        op_type: u32,
+        alpha: f32,
+    ) -> Mat<f32> {
+        let batch = input_or_output.nrows();
+        let features = input_or_output.ncols();
+        let total_elements = batch * features;
+        assert_eq!(grad_out.nrows(), batch);
+        assert_eq!(grad_out.ncols(), features);
 
-    // Обратный проход цепочки на GPU
-    let mut grad = grad_loss_mat;
-    for (cube, (inp, _outp)) in chain.cubes().iter().zip(intermediates.iter()).rev() {
-        grad = run_cube_backward_gpu(cube.as_ref(), gpu, inp, &grad);
-    }
-
-    // grad имеет размер (total_tasks, in_features).
-    // Восстанавливаем градиент по pred в исходной матричной форме (pred.nrows(), pred.ncols())
-    let mut grad_pred = Mat::zeros(pred.nrows(), pred.ncols());
-    for i in 0..total_tasks {
-        let start = i * in_features;
-        let row = i / pred_feat;      // pred_feat может быть меньше pred.ncols(), но для данной задачи это 1
-        let col = i % pred_feat;
-        grad_pred[(row, col)] = grad[(i, 0)];   // первый компонент градиента – по pred
-    }
-
-    (loss, grad_pred)
-}
-
-/// Запуск прямого прохода одного кубика на GPU.
-fn run_cube_forward_gpu(cube: &dyn ElemCube, gpu: &GpuCompute, input: &Mat<f32>) -> Mat<f32> {
-    if let Some(_) = cube.as_any().downcast_ref::<Sub>() {
-        let a_col = input.subcols(0, 1).to_owned();
-        let b_col = input.subcols(1, 1).to_owned();
-        return gpu.run_sub_forward(&a_col, &b_col);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Square>() {
-        return gpu.run_square_forward(input);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Abs>() {
-        return gpu.run_abs_forward(input);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Log1p>() {
-        return gpu.run_log1p_forward(input);
-    } else if let Some(_) = cube.as_any().downcast_ref::<AbsDiff>() {
-        let a_col = input.subcols(0, 1).to_owned();
-        let b_col = input.subcols(1, 1).to_owned();
-        return gpu.run_absdiff_forward(&a_col, &b_col);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Log>() {
-        return gpu.run_log_forward(input);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Neg>() {
-        return gpu.run_neg_forward(input);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Mul>() {
-        let a_col = input.subcols(0, 1).to_owned();
-        let b_col = input.subcols(1, 1).to_owned();
-        return gpu.run_mul_forward(&a_col, &b_col);
-    } else if let Some(addscalar) = cube.as_any().downcast_ref::<AddScalar>() {
-        return gpu.run_addscalar_forward(input, addscalar.0);
-    } else if let Some(ce) = cube.as_any().downcast_ref::<CrossEntropyWithLogits>() {
-        return gpu.run_cross_entropy_forward(input, ce.num_classes);
-    }
-    panic!("Unknown loss cube for GPU forward");
-}
-
-/// Запуск обратного прохода одного кубика на GPU.
-fn run_cube_backward_gpu(
-    cube: &dyn ElemCube,
-    gpu: &GpuCompute,
-    input: &Mat<f32>,
-    grad_out: &Mat<f32>,
-) -> Mat<f32> {
-    if let Some(_) = cube.as_any().downcast_ref::<Sub>() {
-        let (ga, gb) = gpu.run_sub_backward(grad_out);
-        let batch = input.nrows();
-        let mut result = Mat::zeros(batch, 2);
-        for i in 0..batch {
-            result[(i, 0)] = ga[(i, 0)];
-            result[(i, 1)] = gb[(i, 0)];
-        }
-        return result;
-    } else if let Some(_) = cube.as_any().downcast_ref::<Square>() {
-        return gpu.run_square_backward(input, grad_out);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Abs>() {
-        return gpu.run_abs_backward(input, grad_out);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Log1p>() {
-        return gpu.run_log1p_backward(input, grad_out);
-    } else if let Some(_) = cube.as_any().downcast_ref::<AbsDiff>() {
-        let (ga, gb) = gpu.run_absdiff_backward(
-            &input.subcols(0, 1).to_owned(),
-            &input.subcols(1, 1).to_owned(),
-            grad_out,
+        let (in_buf, in_id) = self.create_storage_buffer_from_slice(
+            &(0..batch).flat_map(|r| (0..features).map(move |c| input_or_output[(r, c)])).collect::<Vec<f32>>(),
         );
-        let batch = input.nrows();
-        let mut result = Mat::zeros(batch, 2);
-        for i in 0..batch {
-            result[(i, 0)] = ga[(i, 0)];
-            result[(i, 1)] = gb[(i, 0)];
-        }
-        return result;
-    } else if let Some(_) = cube.as_any().downcast_ref::<Log>() {
-        return gpu.run_log_backward(input, grad_out);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Neg>() {
-        return gpu.run_neg_backward(grad_out);
-    } else if let Some(_) = cube.as_any().downcast_ref::<Mul>() {
-        let (ga, gb) = gpu.run_mul_backward(
-            &input.subcols(0, 1).to_owned(),
-            &input.subcols(1, 1).to_owned(),
-            grad_out,
+        let (grad_out_buf, go_id) = self.create_storage_buffer_from_slice(
+            &(0..batch).flat_map(|r| (0..features).map(move |c| grad_out[(r, c)])).collect::<Vec<f32>>(),
         );
-        let batch = input.nrows();
-        let mut result = Mat::zeros(batch, 2);
-        for i in 0..batch {
-            result[(i, 0)] = ga[(i, 0)];
-            result[(i, 1)] = gb[(i, 0)];
-        }
-        return result;
-    } else if let Some(_) = cube.as_any().downcast_ref::<AddScalar>() {
-        return gpu.run_addscalar_backward(grad_out);
-    } else if let Some(ce) = cube.as_any().downcast_ref::<CrossEntropyWithLogits>() {
-        return gpu.run_cross_entropy_backward(input, grad_out, ce.num_classes);
-    }
-    panic!("Unknown loss cube for GPU backward");
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\loss_plan\gpu_exec.rs
-================================================================================
+        let (grad_in_buf, gi_id) = self.create_buffer(total_elements, BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC);
 
-================================================================================
-ФАЙЛ 7: src\layers\soft_sparse_gate\soft_sparse_gate.rs
-Полный путь: D:\neurocore\src\layers\soft_sparse_gate\soft_sparse_gate.rs
-Тип: rs
---------------------------------------------------------------------------------
-use crate::compute_manager::graph::types::DynamicContext;
-use crate::layers::UniversalLayer;
-use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
-use faer::Mat;
-
-pub struct SoftSparseGate {
-    pub in_features: usize,
-    pub temperature: f32,
-}
-
-impl SoftSparseGate {
-    pub fn new(in_features: usize, temperature: f32) -> Self {
-        assert!(temperature > 0.0, "SoftSparseGate: temperature must be positive");
-        Self { in_features, temperature }
-    }
-}
-
-impl UniversalLayer for SoftSparseGate {
-    fn forward_mat(
-        &self,
-        input: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, DynamicContext) {
-        let thresholds = &params[slice.start..slice.start + self.in_features];
-        let tmp = self.temperature;
-
-        let output = Mat::from_fn(input.nrows(), input.ncols(), |r, c| {
-            let x = input[(r, c)];
-            let z = (x.abs() - thresholds[c]) / tmp;
-            x / (1.0 + (-z).exp())
-        });
-
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::SoftSparseGate { input: input_tensor },
-        );
-        (output, ctx)
-    }
-
-    fn backward_mat(
-        &self,
-        ctx: &DynamicContext,
-        delta: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, Vec<f32>) {
-        let thresholds = &params[slice.start..slice.start + self.in_features];
-        let tmp = self.temperature;
-
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::SoftSparseGate { input } => input,
-                _ => panic!("Expected SoftSparseGate context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
-        };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
-
-        let (dx, d_thr) = soft_sparse_gate_backward_mat(&x_mat, delta, thresholds, tmp);
-        (dx, d_thr)
-    }
-
-    fn param_len(&self) -> usize { self.in_features }
-    fn input_features(&self) -> usize { self.in_features }
-    fn output_features(&self) -> usize { self.in_features }
-
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
-
-    fn execute_tasks(
-        &self,
-        input: &Mat<f32>,
-        output: &mut Mat<f32>,
-        task_offset: usize,
-        task_count: usize,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) {
-        let thresholds = &params[slice.start..slice.start + self.in_features];
-        let tmp = self.temperature;
-        let chunk = input.submatrix(task_offset, 0, task_count, self.in_features);
-        let out_chunk = Mat::from_fn(task_count, self.in_features, |r, c| {
-            let x = chunk[(r, c)];
-            let z = (x.abs() - thresholds[c]) / tmp;
-            x / (1.0 + (-z).exp())
-        });
-        for r in 0..task_count {
-            for c in 0..self.in_features {
-                output[(task_offset + r, c)] = out_chunk[(r, c)];
-            }
-        }
-    }
-
-    fn create_sample_context(
-        &self,
-        input_sample: &Mat<f32>,
-        _output_sample: &Mat<f32>,
-    ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::SoftSparseGate { input: t },
+        let pipeline = self.pipeline_cache.activation_backward_pipeline();
+        let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
+        let descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            set_layout.clone(),
+            [
+                WriteDescriptorSet::buffer(0, in_buf.clone()),
+                WriteDescriptorSet::buffer(1, grad_out_buf.clone()),
+                WriteDescriptorSet::buffer(2, grad_in_buf.clone()),
+            ],
+            [],
         )
-    }
+        .expect("descriptor set");
 
-    fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
-        Mat::zeros(batch_size, self.in_features)
-    }
-
-    // Метод для GPU-диспетчеризации
-    fn as_soft_sparse_gate(&self) -> Option<&SoftSparseGate> {
-        Some(self)
-    }
-}
-
-fn soft_sparse_gate_backward_mat(
-    x: &Mat<f32>,
-    dout: &Mat<f32>,
-    thresholds: &[f32],
-    temperature: f32,
-) -> (Mat<f32>, Vec<f32>) {
-    let rows = x.nrows();
-    let cols = x.ncols();
-    assert_eq!(cols, thresholds.len());
-
-    let mut dx = Mat::zeros(rows, cols);
-    let mut d_thr = vec![0.0f32; cols];
-
-    for r in 0..rows {
-        for c in 0..cols {
-            let x_val = x[(r, c)];
-            let abs_x = x_val.abs();
-            let z = (abs_x - thresholds[c]) / temperature;
-            let s = 1.0 / (1.0 + (-z).exp());
-            let ds = s * (1.0 - s) / temperature;
-            let df_dx = s + abs_x * ds;
-            dx[(r, c)] = dout[(r, c)] * df_dx;
-
-            let d_s_dthr = -ds;
-            d_thr[c] += dout[(r, c)] * x_val * d_s_dthr;
-        }
-    }
-
-    (dx, d_thr)
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\layers\soft_sparse_gate\soft_sparse_gate.rs
-================================================================================
-
-================================================================================
-ФАЙЛ 8: src\layers\linear\linear.rs
-Полный путь: D:\neurocore\src\layers\linear\linear.rs
-Тип: rs
---------------------------------------------------------------------------------
-use crate::compute_manager::graph::types::DynamicContext;
-use crate::layers::UniversalLayer;
-use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
-use faer::Mat;
-
-pub struct Linear {
-    in_features: usize,
-    out_features: usize,
-}
-
-impl Linear {
-    pub fn new(in_features: usize, out_features: usize) -> Self {
-        Self { in_features, out_features }
-    }
-
-    pub(crate) fn get_weight_matrix_and_bias(
-        &self,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, Vec<f32>) {
-        let in_feat = self.in_features;
-        let out_feat = self.out_features;
-        let w_start = slice.start;
-        let b_start = w_start + in_feat * out_feat;
-
-        let weight = Mat::from_fn(out_feat, in_feat, |r, c| {
-            params[w_start + r * in_feat + c]
-        });
-        let bias = params[b_start..b_start + out_feat].to_vec();
-        (weight, bias)
-    }
-}
-
-impl UniversalLayer for Linear {
-    fn forward_mat(
-        &self,
-        input: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, DynamicContext) {
-        let (weight, bias) = self.get_weight_matrix_and_bias(params, slice);
-        let batch = input.nrows();
-        let mut output = input * weight.transpose();
-        output += Mat::from_fn(batch, self.out_features, |_, j| bias[j]);
-
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear { input: input_tensor },
-        );
-        (output, ctx)
-    }
-
-    fn backward_mat(
-        &self,
-        ctx: &DynamicContext,
-        delta: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, Vec<f32>) {
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::Linear { input } => input,
-                _ => panic!("Expected Linear context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
-        };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
-        let (weight, _) = self.get_weight_matrix_and_bias(params, slice);
-        let dx = delta * &weight;
-        let dw = delta.transpose() * &x_mat;
-        let batch = delta.nrows();
-        let mut db = vec![0.0f32; self.out_features];
-        for r in 0..batch {
-            for c in 0..self.out_features {
-                db[c] += delta[(r, c)];
-            }
-        }
-
-        let mut grad = Vec::with_capacity(self.param_len());
-        for r in 0..self.out_features {
-            for c in 0..self.in_features {
-                grad.push(dw[(r, c)]);
-            }
-        }
-        grad.extend_from_slice(&db);
-        (dx, grad)
-    }
-
-    fn param_len(&self) -> usize {
-        self.in_features * self.out_features + self.out_features
-    }
-
-    fn input_features(&self) -> usize { self.in_features }
-    fn output_features(&self) -> usize { self.out_features }
-
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
-
-    fn execute_tasks(
-        &self,
-        input: &Mat<f32>,
-        output: &mut Mat<f32>,
-        task_offset: usize,
-        task_count: usize,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) {
-        let (weight, bias) = self.get_weight_matrix_and_bias(params, slice);
-        let chunk = input.submatrix(task_offset, 0, task_count, self.in_features);
-        let mut out_chunk = &chunk * weight.transpose();
-        out_chunk += Mat::from_fn(task_count, self.out_features, |_, j| bias[j]);
-        for r in 0..task_count {
-            for c in 0..self.out_features {
-                output[(task_offset + r, c)] = out_chunk[(r, c)];
-            }
-        }
-    }
-
-    fn create_sample_context(
-        &self,
-        input_sample: &Mat<f32>,
-        _output_sample: &Mat<f32>,
-    ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear { input: t },
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.command_buffer_allocator.clone(),
+            self.context.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
         )
+        .expect("command buffer builder");
+
+        let push_constants: [u32; 3] = [op_type, alpha.to_bits(), total_elements as u32];
+
+        unsafe {
+            builder
+                .bind_pipeline_compute(pipeline.clone())
+                .unwrap()
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    pipeline.layout().clone(),
+                    0,
+                    descriptor_set,
+                )
+                .unwrap()
+                .push_constants(pipeline.layout().clone(), 0, push_constants)
+                .unwrap()
+                .dispatch([((total_elements + 255) / 256) as u32, 1, 1])
+                .unwrap();
+        }
+
+        let command_buffer = builder.build().expect("build command buffer");
+        let future = sync::now(self.context.device.clone())
+            .then_execute(self.context.queue.clone(), command_buffer)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap();
+        future.wait(None).unwrap();
+
+        let mat = self.read_buffer_to_mat(grad_in_buf, gi_id, batch, features);
+        self.release_buffer(in_id);
+        self.release_buffer(go_id);
+        mat
     }
 
-    fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
-        Mat::zeros(batch_size, self.out_features)
+    pub fn run_relu_backward(&self, input: &Mat<f32>, grad_output: &Mat<f32>) -> Mat<f32> { self.run_activation_backward(input, grad_output, 0, 0.0) }
+    pub fn run_sigmoid_backward(&self, output: &Mat<f32>, grad_output: &Mat<f32>) -> Mat<f32> { self.run_activation_backward(output, grad_output, 1, 0.0) }
+    pub fn run_tanh_backward(&self, output: &Mat<f32>, grad_output: &Mat<f32>) -> Mat<f32> { self.run_activation_backward(output, grad_output, 2, 0.0) }
+    pub fn run_leaky_relu_backward(&self, input: &Mat<f32>, grad_output: &Mat<f32>, alpha: f32) -> Mat<f32> { self.run_activation_backward(input, grad_output, 3, alpha) }
+}
+================================================================================
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\compute\activation.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 8: src\model_plan\plan.rs
+Полный путь: D:\neurocore\src\model_plan\plan.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// src/model_plan/plan.rs
+
+use super::layer_desc::LayerDesc;
+use super::blueprint::LayerKind;
+use crate::compute_manager::device::Device;
+use crate::device_plan::DevicePlan;
+use crate::compute_manager::graph::model::MixedModel;
+
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub(crate) layers: Vec<LayerDesc>,
+}
+
+impl Plan {
+    pub(crate) fn from_descs(descs: Vec<LayerDesc>) -> Result<Self, String> {
+        if descs.is_empty() {
+            return Err("План не может быть пустым".into());
+        }
+
+        for (i, desc) in descs.iter().enumerate() {
+            match desc.kind {
+                LayerKind::SplitterConnector | LayerKind::CombinerConnector
+                | LayerKind::Splitter | LayerKind::Combiner
+                | LayerKind::Unsqueeze(_) | LayerKind::ReduceMean(_) => {
+                    // Эти слои могут иметь множественные in_features/out_features
+                }
+                _ => {
+                    if desc.in_features.len() != 1 || desc.out_features.len() != 1 {
+                        return Err(format!(
+                            "Слой {} ({} → {}) имеет нестандартное число входов/выходов. \
+                             Мультивариабельные слои пока не поддерживаются.",
+                            i, desc.in_features.len(), desc.out_features.len()
+                        ));
+                    }
+                    if desc.in_features[0] == 0 || desc.out_features[0] == 0 {
+                        return Err(format!("Слой {}: размерности не могут быть нулевыми", i));
+                    }
+                }
+            }
+        }
+
+        // Проверка совместимости размерностей
+        for i in 1..descs.len() {
+            let prev = &descs[i - 1];
+            let curr = &descs[i];
+
+            if matches!(prev.kind, LayerKind::Unsqueeze(_) | LayerKind::ReduceMean(_))
+                || matches!(curr.kind, LayerKind::Unsqueeze(_) | LayerKind::ReduceMean(_))
+            {
+                continue;
+            }
+
+            let prev_is_splitter = matches!(prev.kind, LayerKind::SplitterConnector | LayerKind::Splitter);
+            let curr_is_combiner = matches!(curr.kind, LayerKind::CombinerConnector | LayerKind::Combiner);
+
+            if prev_is_splitter && curr_is_combiner {
+                if prev.out_features != curr.in_features {
+                    return Err(format!(
+                        "Несовместимость размерностей между Splitter (слой {}) и Combiner (слой {}): выходы {:?} != входы {:?}",
+                        i, i + 1, prev.out_features, curr.in_features
+                    ));
+                }
+            } else if prev_is_splitter {
+                if curr.in_features.len() == 1 {
+                    if curr.in_features[0] != prev.out_features[0] {
+                        return Err(format!(
+                            "Несовместимость размеров между слоем {} (Splitter) и слоем {}: первый выход {} не совпадает с входом {}",
+                            i, i + 1, prev.out_features[0], curr.in_features[0]
+                        ));
+                    }
+                }
+            } else if curr_is_combiner {
+                if prev.out_features.len() == 1 {
+                    if prev.out_features[0] != curr.in_features[0] {
+                        return Err(format!(
+                            "Несовместимость размеров между слоем {} и Combiner (слой {}): выход {} не совпадает с первым входом {}",
+                            i, i + 1, prev.out_features[0], curr.in_features[0]
+                        ));
+                    }
+                }
+            } else {
+                if prev.out_features.len() == 1 && curr.in_features.len() == 1 {
+                    let prev_out = prev.out_features[0];
+                    let curr_in = curr.in_features[0];
+                    if prev_out != curr_in {
+                        return Err(format!(
+                            "Несовместимость размеров последней оси между слоем {} (выход {}) и слоем {} (вход {})",
+                            i, prev_out, i + 1, curr_in
+                        ));
+                    }
+                }
+            }
+        }
+
+        for (i, desc) in descs.iter().enumerate() {
+            if desc.kind == LayerKind::Softmax && i != descs.len() - 1 {
+                return Err("Softmax допускается только на последнем слое".into());
+            }
+        }
+
+        Ok(Plan { layers: descs })
     }
 
-    fn as_linear(&self) -> Option<&Linear> {
-        Some(self)
+    pub fn from_layer_descs(descs: Vec<LayerDesc>) -> Result<Plan, String> {
+        Plan::from_descs(descs)
+    }
+
+    /// Собрать модель с указанным количеством потоков CPU (обратная совместимость).
+    pub fn build_with_threads(&self, threads: usize) -> MixedModel {
+        MixedModel::from_plan(self.layers.clone(), threads)
+            .expect("Plan уже проверен")
+    }
+
+    /// Собрать модель на CPU с одним потоком (по умолчанию).
+    pub fn build(&self) -> MixedModel {
+        self.build_with_device(Device::Cpu { threads: 1 })
+    }
+
+    /// Собрать модель, явно указав целевое устройство.
+    pub fn build_with_device(&self, device: Device) -> MixedModel {
+        MixedModel::from_plan_with_device(self.layers.clone(), 1, device)
+            .expect("Plan уже проверен")
+    }
+
+    /// Собрать модель с детализированным планом устройств (разделение Compute/Storage).
+    pub fn build_with_device_plan(&self, device_plan: DevicePlan) -> MixedModel {
+        MixedModel::from_plan_with_device_plan(self.layers.clone(), device_plan)
+            .expect("Plan уже проверен")
+    }
+
+    pub fn input_dim1(&self) -> usize {
+        self.layers.first().unwrap().in_features[0]
+    }
+
+    pub fn output_dim1(&self) -> usize {
+        self.layers.last().unwrap().out_features[0]
     }
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\layers\linear\linear.rs
+КОНЕЦ ФАЙЛА: src\model_plan\plan.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 9: src\layers\softmax\softmax.rs
-Полный путь: D:\neurocore\src\layers\softmax\softmax.rs
+ФАЙЛ 9: src\loss_plan\expr.rs
+Полный путь: D:\neurocore\src\loss_plan\expr.rs
 Тип: rs
 --------------------------------------------------------------------------------
+// src/loss_plan/expr.rs
+
+use faer::Mat;
+use std::sync::Arc;
+use super::chain::ElementChain;
+
+/// Способ агрегирования значений потерь по задачам.
+#[derive(Debug, Clone, Copy)]
+pub enum Aggregation {
+    /// Суммировать значения потерь по всем задачам.
+    Sum,
+    /// Усреднить значения потерь (разделить на количество задач).
+    Mean,
+}
+
+/// Выражение функции потерь, построенное на цепочке элементарных кубиков.
+pub struct LossExpr {
+    chain: Arc<ElementChain>,
+    aggregation: Aggregation,
+    total_tasks: usize,
+    pred_features: usize,
+    target_features: usize,
+}
+
+impl LossExpr {
+    /// Создаёт новое выражение потерь.
+    pub fn new(
+        chain: Arc<ElementChain>,
+        aggregation: Aggregation,
+        total_tasks: usize,
+        pred_features: usize,
+        target_features: usize,
+    ) -> Self {
+        Self {
+            chain,
+            aggregation,
+            total_tasks,
+            pred_features,
+            target_features,
+        }
+    }
+
+    /// Количество задач.
+    pub fn num_tasks(&self) -> usize {
+        self.total_tasks
+    }
+
+    /// Размер входной матрицы для одной задачи (число столбцов).
+    pub fn task_input_size(&self) -> usize {
+        self.chain.task_input_size()
+    }
+
+    /// Количество признаков предсказания на задачу.
+    pub fn pred_features(&self) -> usize {
+        self.pred_features
+    }
+
+    /// Количество признаков целевой переменной на задачу.
+    pub fn target_features(&self) -> usize {
+        self.target_features
+    }
+
+    /// Получить ссылку на внутреннюю цепочку кубиков.
+    pub fn chain(&self) -> &ElementChain {
+        &self.chain
+    }
+
+    /// Возвращает тип агрегации потерь.
+    pub fn aggregation(&self) -> Aggregation {
+        self.aggregation
+    }
+
+    /// Выполняет прямой проход для чанка задач.
+    pub fn forward_chunk(
+        &self,
+        chunk_input: &Mat<f32>,
+    ) -> (Vec<f32>, Vec<(Mat<f32>, Mat<f32>)>) {
+        let (out_mat, intermediates) = self.chain.forward_batch(chunk_input);
+        let loss_vec: Vec<f32> = (0..out_mat.nrows())
+            .map(|i| out_mat[(i, 0)])
+            .collect();
+        (loss_vec, intermediates)
+    }
+
+    /// Выполняет обратный проход для чанка задач.
+    pub fn backward_chunk(
+        &self,
+        intermediates: &[(Mat<f32>, Mat<f32>)],
+        grad_loss: &[f32],
+    ) -> Mat<f32> {
+        let batch = intermediates.first()
+            .map(|(inp, _)| inp.nrows())
+            .unwrap_or(0);
+        assert_eq!(batch, grad_loss.len(),
+            "backward_chunk: длина grad_loss должна совпадать с размером батча");
+
+        let grad_out = Mat::from_fn(batch, 1, |i, _| grad_loss[i]);
+        self.chain.backward_batch(intermediates, &grad_out)
+    }
+
+    /// Вычисляет итоговое значение потерь путём агрегации значений по отдельным задачам.
+    pub fn aggregate_loss(&self, loss_parts: &[f32]) -> f32 {
+        let sum: f32 = loss_parts.iter().sum();
+        let n = self.total_tasks as f32;
+        match self.aggregation {
+            Aggregation::Sum => sum,
+            Aggregation::Mean => sum / n,
+        }
+    }
+
+    /// Вычисляет агрегированный градиент по входным данным.
+    pub fn aggregate_grad(&self, grad_parts: &[f32]) -> Vec<f32> {
+        let n = self.total_tasks as f32;
+        match self.aggregation {
+            Aggregation::Sum => grad_parts.to_vec(),
+            Aggregation::Mean => grad_parts.iter().map(|g| g / n).collect(),
+        }
+    }
+}
+================================================================================
+КОНЕЦ ФАЙЛА: src\loss_plan\expr.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 10: examples\graph_full.rs
+Полный путь: D:\neurocore\examples\graph_full.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// examples/graph_full.rs
+// Полный граф в стиле graph_model.rs: Splitter, SplitterConnector, CombinerConnector, Combiner.
+
+use neurocore::model_plan::Plan;
+use neurocore::compute_manager::DynamicTensor;
+use neurocore::tensor::Tensor2D;
+use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
+use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+
+mod models {
+    use neurocore::model_plan::{LayerDesc, LayerKind, Dim};
+
+    // Входной Linear + Splitter + SplitterConnector
+    pub fn stage1() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("input", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[6])
+                .output(Dim::Dim1, &[6]),
+            LayerDesc::new("splitter", LayerKind::Splitter, Dim::Dim1)
+                .input(Dim::Dim1, &[6])
+                .output(Dim::Dim1, (&[2], &[4])),
+            LayerDesc::new("split_conn", LayerKind::SplitterConnector, Dim::Dim1)
+                .input(Dim::Dim1, (&[2], &[4])),
+        ]
+    }
+
+    // Ветка A (2 → 3)
+    pub fn branch_a() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("a_in", LayerKind::SplitterConnector, Dim::Dim1)
+                .output(Dim::Dim1, &[2]),
+            LayerDesc::new("a_linear", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[2])
+                .output(Dim::Dim1, &[3]),
+            LayerDesc::new("a_relu", LayerKind::ReLU, Dim::Dim1)
+                .input(Dim::Dim1, &[3])
+                .output(Dim::Dim1, &[3]),
+            LayerDesc::new("a_out", LayerKind::CombinerConnector, Dim::Dim1)
+                .input(Dim::Dim1, &[3]),
+        ]
+    }
+
+    // Ветка B (4 → 3)
+    pub fn branch_b() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("b_in", LayerKind::SplitterConnector, Dim::Dim1)
+                .output(Dim::Dim1, &[4]),
+            LayerDesc::new("b_linear", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[4])
+                .output(Dim::Dim1, &[3]),
+            LayerDesc::new("b_sigmoid", LayerKind::Sigmoid, Dim::Dim1)
+                .input(Dim::Dim1, &[3])
+                .output(Dim::Dim1, &[3]),
+            LayerDesc::new("b_out", LayerKind::CombinerConnector, Dim::Dim1)
+                .input(Dim::Dim1, &[3]),
+        ]
+    }
+
+    // Объединяющая часть: CombinerConnector + Combiner + выход
+    pub fn stage2() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("comb_conn_in", LayerKind::CombinerConnector, Dim::Dim1)
+                .output(Dim::Dim1, (&[3], &[3])),
+            LayerDesc::new("combiner", LayerKind::Combiner, Dim::Dim1)
+                .input(Dim::Dim1, (&[3], &[3]))
+                .output(Dim::Dim1, &[3]),
+            LayerDesc::new("output", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[3])
+                .output(Dim::Dim1, &[1]),
+        ]
+    }
+}
+
+fn main() {
+    let descs: Vec<_> = models::stage1()
+        .into_iter()
+        .chain(models::branch_a())
+        .chain(models::branch_b())
+        .chain(models::stage2())
+        .collect();
+
+    let plan = Plan::from_layer_descs(descs).expect("Invalid plan");
+    let mut model = plan.build();
+
+    // Инициализация параметров
+    {
+        let mut store = model.param_store().lock().unwrap();
+        for i in 0..store.len() {
+            store.set_param(i, rand::random::<f32>() * 0.01);
+        }
+    }
+
+    let x = Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]);
+    let target = Tensor2D::new(vec![vec![0.8]]);
+
+    let sgd_desc = OptimizerDesc::new()
+        .add(OptCubeDesc::ScaleGradient(0.01))
+        .add(OptCubeDesc::ApplyUpdate);
+
+    for epoch in 0..200 {
+        let (pred, ctxs) = model.forward(DynamicTensor::Dim1(x.clone()));
+        let loss_desc = LossDesc::from_chain(
+            ElementChain::new().add(Box::new(Sub)).add(Box::new(Square)),
+            Aggregation::Mean, 1, 1, 1,
+        );
+        let (loss, delta) = model.compute_loss(loss_desc, &pred, &DynamicTensor::Dim1(target.clone()));
+        let (_, grads) = model.backward(&ctxs, delta);
+        model.update_params(sgd_desc.clone(), &grads[0]);
+        if epoch % 50 == 0 {
+            println!("Epoch {}: loss = {:.6}", epoch, loss);
+        }
+    }
+}
+================================================================================
+КОНЕЦ ФАЙЛА: examples\graph_full.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 11: src\layers\layers_special\expand_dim.rs
+Полный путь: D:\neurocore\src\layers\layers_special\expand_dim.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// src/layers/layers_special/expand_dim.rs
+
+use crate::compute_manager::dim_change::{self, DynamicTensor};
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::tensor::Tensor2D;
 use faer::Mat;
 
-pub struct Softmax;
-
-impl Softmax {
-    pub fn new() -> Self { Self }
+pub struct Unsqueeze {
+    pub target_dims: Vec<usize>,
 }
 
-impl UniversalLayer for Softmax {
+impl Unsqueeze {
+    pub fn with_target_dims(target_dims: Vec<usize>) -> Self {
+        Self { target_dims }
+    }
+}
+
+impl UniversalLayer for Unsqueeze {
     fn forward_mat(
         &self,
         input: &Mat<f32>,
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
-        let output = softmax_forward_mat(input);
-        let output_tensor = linalg::faer_to_tensor2d(&output);
+        let tensor = crate::linalg::faer_to_tensor2d(input);
+        let dyn_in = DynamicTensor::Dim1(tensor);
+        let dyn_out = dim_change::unsqueeze_to(dyn_in, self.target_dims.clone());
+        let out_tensor = match &dyn_out {
+            DynamicTensor::Dim1(t) => t.clone(),
+            _ => panic!("Expected Dim1 after unsqueeze"),
+        };
+        let out_mat = crate::linalg::tensor2d_to_faer(&out_tensor);
         let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Softmax { output: output_tensor },
+            crate::layers::context1d::LayerContext1D::Linear {
+                input: Tensor2D::zeros(1, 0),
+            },
         );
-        (output, ctx)
+        (out_mat, ctx)
     }
 
     fn backward_mat(
         &self,
-        ctx: &DynamicContext,
+        _ctx: &DynamicContext,
         delta: &Mat<f32>,
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, Vec<f32>) {
-        let y_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::Softmax { output } => output,
-                _ => panic!("Expected Softmax context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let dyn_delta = DynamicTensor::Dim1(crate::linalg::faer_to_tensor2d(delta));
+        let dyn_in = dim_change::reduce_to(dyn_delta, self.target_dims.clone());
+        let in_tensor = match &dyn_in {
+            DynamicTensor::Dim1(t) => t.clone(),
+            _ => panic!("Expected Dim1 after reduce"),
         };
-        let y_mat = linalg::tensor2d_to_faer(y_tensor);
-        let dx = softmax_backward_mat(&y_mat, delta);
+        let dx = crate::linalg::tensor2d_to_faer(&in_tensor);
         (dx, vec![])
     }
 
@@ -1987,34 +2366,27 @@ impl UniversalLayer for Softmax {
     fn input_features(&self) -> usize { 0 }
     fn output_features(&self) -> usize { 0 }
 
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
+    fn total_tasks(&self, _batch_size: usize) -> usize { 0 }
 
     fn execute_tasks(
         &self,
-        input: &Mat<f32>,
-        output: &mut Mat<f32>,
-        task_offset: usize,
-        task_count: usize,
+        _input: &Mat<f32>,
+        _output: &mut Mat<f32>,
+        _task_offset: usize,
+        _task_count: usize,
         _params: &[f32],
         _slice: &ParamSlice,
-    ) {
-        let chunk = input.submatrix(task_offset, 0, task_count, input.ncols());
-        let out_chunk = softmax_forward_mat(&chunk.to_owned());
-        for r in 0..task_count {
-            for c in 0..out_chunk.ncols() {
-                output[(task_offset + r, c)] = out_chunk[(r, c)];
-            }
-        }
-    }
+    ) {}
 
     fn create_sample_context(
         &self,
         _input_sample: &Mat<f32>,
-        output_sample: &Mat<f32>,
+        _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(output_sample);
         DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Softmax { output: t },
+            crate::layers::context1d::LayerContext1D::Linear {
+                input: Tensor2D::zeros(1, 0),
+            },
         )
     }
 
@@ -2023,292 +2395,45 @@ impl UniversalLayer for Softmax {
     }
 
     // Метод для GPU-диспетчеризации
-    fn as_softmax(&self) -> Option<&Softmax> {
-        Some(self)
-    }
-}
-
-// Вспомогательные матричные функции
-fn softmax_forward_mat(input: &Mat<f32>) -> Mat<f32> {
-    let (batch, n) = (input.nrows(), input.ncols());
-    Mat::from_fn(batch, n, |i, j| {
-        let row = input.row(i);
-        let max_val = (0..n).fold(f32::NEG_INFINITY, |acc, c| acc.max(row[c]));
-        let sum: f32 = (0..n).map(|c| (row[c] - max_val).exp()).sum();
-        (row[j] - max_val).exp() / sum
-    })
-}
-
-fn softmax_backward_mat(y: &Mat<f32>, dout: &Mat<f32>) -> Mat<f32> {
-    let (batch, n) = (y.nrows(), y.ncols());
-    let mut dx = Mat::zeros(batch, n);
-    for r in 0..batch {
-        let mut dot = 0.0f32;
-        for c in 0..n {
-            dot += y[(r, c)] * dout[(r, c)];
-        }
-        for c in 0..n {
-            dx[(r, c)] = y[(r, c)] * (dout[(r, c)] - dot);
-        }
-    }
-    dx
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\layers\softmax\softmax.rs
-================================================================================
-
-================================================================================
-ФАЙЛ 10: src\layers\combiner\combiner.rs
-Полный путь: D:\neurocore\src\layers\combiner\combiner.rs
-Тип: rs
---------------------------------------------------------------------------------
-use crate::model_plan::param_store::ParamSlice;
-use faer::Mat;
-
-pub struct Combiner {
-    input_dim: usize,
-    output_dim: usize,
-}
-
-impl Combiner {
-    pub fn new(input_dims: Vec<usize>, output_dim: usize) -> Self {
-        assert_eq!(input_dims.len(), 2, "Combiner requires exactly two inputs");
-        assert!(input_dims[0] == input_dims[1], "Combiner inputs must have same size for now");
-        Self { input_dim: input_dims[0], output_dim }
-    }
-
-    pub fn input_dim(&self) -> usize { self.input_dim }
-    pub fn output_dim(&self) -> usize { self.output_dim }
-
-    /// Публичный метод для получения матриц весов и смещения из слайса параметров.
-    pub fn get_weights_and_bias(&self, params: &[f32], slice: &ParamSlice) -> (Mat<f32>, Mat<f32>, Vec<f32>) {
-        let in_feat = self.input_dim;
-        let out_feat = self.output_dim;
-        let base = slice.start;
-
-        let wa = Mat::from_fn(out_feat, in_feat, |r, c| {
-            params[base + r * in_feat + c]
-        });
-        let wb_offset = base + out_feat * in_feat;
-        let wb = Mat::from_fn(out_feat, in_feat, |r, c| {
-            params[wb_offset + r * in_feat + c]
-        });
-        let bias_offset = wb_offset + out_feat * in_feat;
-        let bias = params[bias_offset..bias_offset + out_feat].to_vec();
-        (wa, wb, bias)
-    }
-
-    /// Прямой матричный проход: output = ReLU( a @ Wa^T + b @ Wb^T + bias )
-    pub fn forward_mat(
-        &self,
-        a: &Mat<f32>,
-        b: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> Mat<f32> {
-        let (wa, wb, bias) = self.get_weights_and_bias(params, slice);
-        let batch = a.nrows();
-        let out_feat = self.output_dim;
-
-        let mut pre = a * wa.transpose() + b * wb.transpose();
-        pre += Mat::from_fn(batch, out_feat, |_, j| bias[j]);
-        pre.map(|x| x.max(0.0))
-    }
-
-    /// Обратный матричный проход.
-    pub fn backward_mat(
-        &self,
-        a: &Mat<f32>,
-        b: &Mat<f32>,
-        d_out: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, Mat<f32>, Vec<f32>) {
-        let (wa, wb, bias) = self.get_weights_and_bias(params, slice);
-        let rows = a.nrows();
-        let m = self.output_dim;
-
-        let mut pre = a * wa.transpose() + b * wb.transpose();
-        for r in 0..rows {
-            for c in 0..m {
-                pre[(r, c)] += bias[c];
-            }
-        }
-
-        let d_pre = Mat::from_fn(rows, m, |r, c| {
-            if pre[(r, c)] > 0.0 { d_out[(r, c)] } else { 0.0 }
-        });
-
-        let da = &d_pre * &wa;
-        let db = &d_pre * &wb;
-
-        let d_wa = &d_pre.transpose() * a;
-        let d_wb = &d_pre.transpose() * b;
-        let mut d_bias = vec![0.0f32; m];
-        for r in 0..rows {
-            for c in 0..m {
-                d_bias[c] += d_pre[(r, c)];
-            }
-        }
-
-        let mut grad = Vec::with_capacity(self.param_len());
-        for r in 0..m {
-            for c in 0..self.input_dim {
-                grad.push(d_wa[(r, c)]);
-            }
-        }
-        for r in 0..m {
-            for c in 0..self.input_dim {
-                grad.push(d_wb[(r, c)]);
-            }
-        }
-        grad.extend_from_slice(&d_bias);
-
-        (da, db, grad)
-    }
-
-    pub fn param_len(&self) -> usize {
-        2 * self.output_dim * self.input_dim + self.output_dim
-    }
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\layers\combiner\combiner.rs
-================================================================================
-
-================================================================================
-ФАЙЛ 11: src\layers\leaky_relu\leaky_relu.rs
-Полный путь: D:\neurocore\src\layers\leaky_relu\leaky_relu.rs
-Тип: rs
---------------------------------------------------------------------------------
-use crate::compute_manager::graph::types::DynamicContext;
-use crate::layers::UniversalLayer;
-use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
-use faer::Mat;
-
-pub struct LeakyReLU {
-    pub alpha: f32,
-}
-
-impl LeakyReLU {
-    pub fn new(alpha: f32) -> Self { Self { alpha } }
-}
-
-impl UniversalLayer for LeakyReLU {
-    fn forward_mat(
-        &self,
-        input: &Mat<f32>,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) -> (Mat<f32>, DynamicContext) {
-        let output = input.map(|x| if *x > 0.0 { *x } else { self.alpha * (*x) });
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::LeakyReLU { input: input_tensor },
-        );
-        (output, ctx)
-    }
-
-    fn backward_mat(
-        &self,
-        ctx: &DynamicContext,
-        delta: &Mat<f32>,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) -> (Mat<f32>, Vec<f32>) {
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::LeakyReLU { input } => input,
-                _ => panic!("Expected LeakyReLU context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
-        };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
-        let dx = Mat::from_fn(x_mat.nrows(), x_mat.ncols(), |r, c| {
-            let grad = if x_mat[(r, c)] > 0.0 { 1.0 } else { self.alpha };
-            delta[(r, c)] * grad
-        });
-        (dx, vec![])
-    }
-
-    fn param_len(&self) -> usize { 0 }
-    fn input_features(&self) -> usize { 0 }
-    fn output_features(&self) -> usize { 0 }
-
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
-
-    fn execute_tasks(
-        &self,
-        input: &Mat<f32>,
-        output: &mut Mat<f32>,
-        task_offset: usize,
-        task_count: usize,
-        _params: &[f32],
-        _slice: &ParamSlice,
-    ) {
-        let chunk = input.submatrix(task_offset, 0, task_count, input.ncols());
-        let out_chunk = chunk.map(|x| if *x > 0.0 { *x } else { self.alpha * (*x) });
-        for r in 0..task_count {
-            for c in 0..out_chunk.ncols() {
-                output[(task_offset + r, c)] = out_chunk[(r, c)];
-            }
-        }
-    }
-
-    fn create_sample_context(
-        &self,
-        input_sample: &Mat<f32>,
-        _output_sample: &Mat<f32>,
-    ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::LeakyReLU { input: t },
-        )
-    }
-
-    fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {
-        Mat::zeros(0, 0)
-    }
-
-    fn as_leaky_relu(&self) -> Option<&LeakyReLU> {
+    fn as_unsqueeze(&self) -> Option<&Unsqueeze> {
         Some(self)
     }
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\layers\leaky_relu\leaky_relu.rs
+КОНЕЦ ФАЙЛА: src\layers\layers_special\expand_dim.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 12: examples\autoencoder3d.rs
-Полный путь: D:\neurocore\examples\autoencoder3d.rs
+ФАЙЛ 12: examples\autoencoder4d.rs
+Полный путь: D:\neurocore\examples\autoencoder4d.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// examples/autoencoder3d.rs
-// Автоэнкодер с Dim3 (Tensor4D).
+// examples/autoencoder4d.rs
+// Автоэнкодер с Dim4 (Tensor5D).
 // Используются новые удобные методы compute_loss и update_params.
 
 use std::time::Instant;
 use neurocore::compute_manager::DynamicTensor;
-use neurocore::tensor::Tensor4D;
+use neurocore::tensor::Tensor5D;
 use neurocore::create_models;
 
 mod models {
     use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
     pub fn encoder() -> Vec<LayerDesc> {
         vec![
-            LayerDesc::new("fc1", LayerKind::Linear, Dim::Dim3)
-                .input(Dim::Dim3, &[4])
-                .output(Dim::Dim3, &[2]),
-            LayerDesc::new("sigm", LayerKind::Sigmoid, Dim::Dim3)
-                .input(Dim::Dim3, &[2])
-                .output(Dim::Dim3, &[2]),
+            LayerDesc::new("fc1", LayerKind::Linear, Dim::Dim4)
+                .input(Dim::Dim4, &[4])
+                .output(Dim::Dim4, &[2]),
+            LayerDesc::new("sigm", LayerKind::Sigmoid, Dim::Dim4)
+                .input(Dim::Dim4, &[2])
+                .output(Dim::Dim4, &[2]),
         ]
     }
     pub fn decoder() -> Vec<LayerDesc> {
         vec![
-            LayerDesc::new("fc2", LayerKind::Linear, Dim::Dim3)
-                .input(Dim::Dim3, &[2])
-                .output(Dim::Dim3, &[4]),
+            LayerDesc::new("fc2", LayerKind::Linear, Dim::Dim4)
+                .input(Dim::Dim4, &[2])
+                .output(Dim::Dim4, &[4]),
         ]
     }
 }
@@ -2334,20 +2459,20 @@ mod optimizers {
 fn main() {
     let (mut encoder, mut decoder) = create_models!(models::encoder, models::decoder);
 
-    // Данные: Tensor4D [batch=1, dim2=1, dim3=1, features=4]
-    let x = Tensor4D::new(vec![vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]]);
+    // Данные: Tensor5D [batch=1, dim2=1, dim3=1, dim4=1, features=4]
+    let x = Tensor5D::new(vec![vec![vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]]]);
     let target = x.clone();
     let epochs = 500;
 
     let start = Instant::now();
     for epoch in 0..epochs {
-        let (code, ctx_enc) = encoder.forward(DynamicTensor::Dim3(x.clone()));
+        let (code, ctx_enc) = encoder.forward(DynamicTensor::Dim4(x.clone()));
         let (recon, ctx_dec) = decoder.forward(code);
 
         let (loss, delta_loss) = encoder.compute_loss(
             losses::mse(),
             &recon,
-            &DynamicTensor::Dim3(target.clone()),
+            &DynamicTensor::Dim4(target.clone()),
         );
 
         let (delta_code, grads_dec) = decoder.backward(&ctx_dec, delta_loss);
@@ -2362,19 +2487,19 @@ fn main() {
     }
     let duration = start.elapsed();
 
-    let (code, _) = encoder.forward(DynamicTensor::Dim3(x.clone()));
+    let (code, _) = encoder.forward(DynamicTensor::Dim4(x.clone()));
     let (final_recon, _) = decoder.forward(code);
     let (final_loss, _) = encoder.compute_loss(
         losses::mse(),
         &final_recon,
-        &DynamicTensor::Dim3(target),
+        &DynamicTensor::Dim4(target),
     );
 
     println!("Обучение завершено за {:?}", duration);
     println!("Финальный loss: {:.6}", final_loss);
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: examples\autoencoder3d.rs
+КОНЕЦ ФАЙЛА: examples\autoencoder4d.rs
 ================================================================================
 
 ================================================================================
@@ -2478,326 +2603,342 @@ impl UniversalLayer for ReLU {
 ================================================================================
 
 ================================================================================
-ФАЙЛ 14: src\compute_manager\device.rs
-Полный путь: D:\neurocore\src\compute_manager\device.rs
+ФАЙЛ 14: examples\linear4d_test.rs
+Полный путь: D:\neurocore\examples\linear4d_test.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/compute_manager/device.rs
+// examples/linear4d_test.rs
+// Один линейный слой 4 -> 2, размерность Dim4.
+// Используются новые удобные методы compute_loss и update_params.
 
-use std::fmt;
+use std::time::Instant;
+use neurocore::compute_manager::DynamicTensor;
+use neurocore::tensor::Tensor5D;
+use neurocore::create_models;
 
-/// Вычислительное устройство
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Device {
-    /// Центральный процессор с заданным числом потоков
-    Cpu { threads: usize },
-    /// Графический процессор с идентификатором (например, номер в системе)
-    Gpu { id: usize },
-}
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
 
-impl Default for Device {
-    fn default() -> Self {
-        Device::Cpu { threads: 2 } // по умолчанию 2 потока CPU
+    pub fn linear_model() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("linear", LayerKind::Linear, Dim::Dim4)
+                .input(Dim::Dim4, &[4])
+                .output(Dim::Dim4, &[2]),
+        ]
     }
 }
 
-impl fmt::Display for Device {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Device::Cpu { threads } => write!(f, "CPU ({} threads)", threads),
-            Device::Gpu { id } => write!(f, "GPU #{}", id),
+mod losses {
+    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
+
+    pub fn mse() -> LossDesc {
+        let chain = ElementChain::new()
+            .add(Box::new(Sub))
+            .add(Box::new(Square));
+        LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1)
+    }
+}
+
+mod optimizers {
+    use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ApplyUpdate)
+    }
+}
+
+fn main() {
+    let (mut model,) = create_models!(models::linear_model);
+
+    let x = Tensor5D::new(vec![vec![vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]]]);
+    let target = Tensor5D::new(vec![vec![vec![vec![vec![0.8, 1.2]]]]]);
+    let epochs = 500;
+
+    let start = Instant::now();
+    for epoch in 0..epochs {
+        let (pred, ctxs) = model.forward(DynamicTensor::Dim4(x.clone()));
+        let (loss, delta) = model.compute_loss(
+            losses::mse(),
+            &pred,
+            &DynamicTensor::Dim4(target.clone()),
+        );
+        let (_, grads) = model.backward(&ctxs, delta);
+        model.update_params(optimizers::sgd(), &grads[0]);
+
+        if epoch == 0 || epoch % 200 == 0 {
+            println!("Epoch {}: loss = {:.6}", epoch, loss);
         }
     }
-}
+    let duration = start.elapsed();
 
-/// Обнаружение доступных вычислительных устройств
-pub struct DeviceDetector;
+    let (final_pred, _) = model.forward(DynamicTensor::Dim4(x.clone()));
+    let (final_loss, _) = model.compute_loss(
+        losses::mse(),
+        &final_pred,
+        &DynamicTensor::Dim4(target.clone()),
+    );
 
-impl DeviceDetector {
-    /// Возвращает список всех видимых устройств (CPU + GPU)
-    pub fn list_all() -> Vec<Device> {
-        let mut devices = Vec::new();
-
-        // CPU всегда доступен
-        let logical_cores = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-        devices.push(Device::Cpu {
-            threads: logical_cores,
-        });
-
-        // GPU: ищем через gpu‑модуль
-        if let Some(gpu_list) = crate::compute_manager::gpu::detect_gpus() {
-            for (i, _) in gpu_list.iter().enumerate() {
-                devices.push(Device::Gpu { id: i });
-            }
-        }
-
-        devices
-    }
-
-    /// Удобный метод: берёт первый CPU с заданным числом потоков (по умолчанию 2)
-    pub fn default_cpu() -> Device {
-        Device::Cpu { threads: 2 }
-    }
-}
-
-/// Менеджер вычислений, владеющий выбранным устройством
-pub struct ComputeManager {
-    pub device: Device,
-}
-
-impl ComputeManager {
-    pub fn new(device: Device) -> Self {
-        Self { device }
-    }
-
-    /// Позволяет сменить устройство
-    pub fn set_device(&mut self, device: Device) {
-        self.device = device;
-    }
-
-    /// Возвращает строку с информацией о текущем устройстве
-    pub fn info(&self) -> String {
-        format!("Compute device: {}", self.device)
-    }
+    println!("Done. Time: {:?}", duration);
+    println!("Final loss: {:.6}", final_loss);
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\device.rs
+КОНЕЦ ФАЙЛА: examples\linear4d_test.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 15: src\compute_manager\gpu\shaders\layers\dualanchor_bwd.comp
-Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\layers\dualanchor_bwd.comp
-Тип: comp
+ФАЙЛ 15: src\compute_manager\gpu\shaders\compile_shaders.bat
+Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\compile_shaders.bat
+Тип: bat
 --------------------------------------------------------------------------------
-#version 450
-// NO extensions required
+@echo off
+setlocal enabledelayedexpansion
+cd /d "%~dp0"
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+echo ============================================
+echo Compiling all shaders...
+echo ============================================
 
-layout(push_constant) uniform PushConsts {
-    uint total;
-    uint features;
-    float alpha;
-} pc;
+:: Common shaders
+if exist "common\*.comp" (
+    echo --- Common ---
+    for %%f in (common\*.comp) do (
+        echo %%f
+        glslc -fshader-stage=compute -o "%%~dpnf.spv" "%%f"
+        if errorlevel 1 (
+            echo [ERROR] Compilation failed for %%f
+            set FAILED=1
+        )
+    )
+) else (
+    echo No common shaders found.
+)
 
-layout(binding = 0, std430) readonly buffer InputBuf { float x[]; };
-layout(binding = 1, std430) readonly buffer GradOutBuf { float go[]; };
-layout(binding = 2, std430) readonly buffer MinBuf { float min_vals[]; };
-layout(binding = 3, std430) readonly buffer MaxBuf { float max_vals[]; };
-layout(binding = 4, std430) writeonly buffer GradInBuf { float gi[]; };
-layout(binding = 5, std430) buffer GradMinBuf { int gmin[]; };
-layout(binding = 6, std430) buffer GradMaxBuf { int gmax[]; };
-layout(binding = 7, std430) buffer GradAlphaBuf { int galpha[]; };
+:: Layers shaders
+if exist "layers\*.comp" (
+    echo --- Layers ---
+    for %%f in (layers\*.comp) do (
+        echo %%f
+        glslc -fshader-stage=compute -o "%%~dpnf.spv" "%%f"
+        if errorlevel 1 (
+            echo [ERROR] Compilation failed for %%f
+            set FAILED=1
+        )
+    )
+) else (
+    echo No layers shaders found.
+)
 
-void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.total) return;
+:: Loss shaders
+if exist "loss\*.comp" (
+    echo --- Loss ---
+    for %%f in (loss\*.comp) do (
+        echo %%f
+        glslc -fshader-stage=compute -o "%%~dpnf.spv" "%%f"
+        if errorlevel 1 (
+            echo [ERROR] Compilation failed for %%f
+            set FAILED=1
+        )
+    )
+) else (
+    echo No loss shaders found.
+)
 
-    uint c = i % pc.features;
-    float x_val = x[i];
-    float min_v = min_vals[c];
-    float max_v = max_vals[c];
-    float d_min = abs(x_val - min_v);
-    float d_max = abs(x_val - max_v);
-    float is_min = (d_min <= d_max) ? 1.0f : 0.0f;
-    float go_val = go[i];
+:: Optimizer shaders
+if exist "optim\*.comp" (
+    echo --- Optimizers ---
+    for %%f in (optim\*.comp) do (
+        echo %%f
+        glslc -fshader-stage=compute -o "%%~dpnf.spv" "%%f"
+        if errorlevel 1 (
+            echo [ERROR] Compilation failed for %%f
+            set FAILED=1
+        )
+    )
+) else (
+    echo No optimizer shaders found.
+)
 
-    gi[i] = go_val * (1.0f - pc.alpha);
+if defined FAILED (
+    echo ============================================
+    echo [FAIL] Some shaders failed to compile!
+    echo Check errors above.
+    echo ============================================
+) else (
+    echo ============================================
+    echo All shaders compiled successfully!
+    echo ============================================
+)
 
-    // Атомарное сложение для gmin[c]
-    {
-        float inc = go_val * pc.alpha * is_min;
-        int expected = gmin[c];
-        int desired;
-        do {
-            float cur = intBitsToFloat(expected);
-            desired = floatBitsToInt(cur + inc);
-            int old = atomicCompSwap(gmin[c], expected, desired);
-            if (old == expected) break;
-            expected = old;
-        } while (true);
-    }
-
-    // Атомарное сложение для gmax[c]
-    {
-        float inc = go_val * pc.alpha * (1.0f - is_min);
-        int expected = gmax[c];
-        int desired;
-        do {
-            float cur = intBitsToFloat(expected);
-            desired = floatBitsToInt(cur + inc);
-            int old = atomicCompSwap(gmax[c], expected, desired);
-            if (old == expected) break;
-            expected = old;
-        } while (true);
-    }
-
-    // Атомарное сложение для galpha[0]
-    {
-        float closest = (is_min != 0.0f) ? min_v : max_v;
-        float inc = go_val * (closest - x_val);
-        int expected = galpha[0];
-        int desired;
-        do {
-            float cur = intBitsToFloat(expected);
-            desired = floatBitsToInt(cur + inc);
-            int old = atomicCompSwap(galpha[0], expected, desired);
-            if (old == expected) break;
-            expected = old;
-        } while (true);
-    }
-}
+pause
+exit /b 0
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\layers\dualanchor_bwd.comp
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\compile_shaders.bat
 ================================================================================
 
 ================================================================================
-ФАЙЛ 16: src\compute_manager\cpu\worker_pool.rs
-Полный путь: D:\neurocore\src\compute_manager\cpu\worker_pool.rs
+ФАЙЛ 16: examples\soft_keep_gate_example.rs
+Полный путь: D:\neurocore\examples\soft_keep_gate_example.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/compute_manager/cpu/worker_pool.rs
+// examples/soft_keep_gate_example.rs
+// Обучаемый SoftKeepGate: учим пороги сохранять слабые значения и гасить аномалии.
 
-use std::thread;
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
-use std::sync::mpsc::{self, Sender};
+use std::time::Instant;
+use neurocore::compute_manager::DynamicTensor;
+use neurocore::tensor::Tensor2D;
+use neurocore::create_models;
 
-type Task = Box<dyn FnOnce() + Send + 'static>;
-
-pub struct WorkerPool {
-    sender: Sender<Option<Task>>,
-    workers: Vec<thread::JoinHandle<()>>,
-    active_tasks: Arc<AtomicUsize>,
+mod models {
+    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+    pub fn keep_gate_model() -> Vec<LayerDesc> {
+        vec![
+            LayerDesc::new("linear", LayerKind::Linear, Dim::Dim1)
+                .input(Dim::Dim1, &[4])
+                .output(Dim::Dim1, &[4]),
+            LayerDesc::new("keep_gate", LayerKind::SoftKeepGate, Dim::Dim1)
+                .input(Dim::Dim1, &[4])
+                .output(Dim::Dim1, &[4])
+                .extra(vec![1.0]), // temperature
+        ]
+    }
 }
 
-impl WorkerPool {
-    pub fn new(num_threads: usize) -> Self {
-        let (sender, receiver) = mpsc::channel::<Option<Task>>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        let active_tasks = Arc::new(AtomicUsize::new(0));
-        let mut workers = Vec::with_capacity(num_threads);
-        for _ in 0..num_threads {
-            let receiver = Arc::clone(&receiver);
-            let active_tasks = Arc::clone(&active_tasks);
-            let handle = thread::spawn(move || {
-                loop {
-                    let task = {
-                        let rx = receiver.lock().unwrap();
-                        rx.recv().unwrap()
-                    };
-                    match task {
-                        Some(task) => {
-                            task();
-                            active_tasks.fetch_sub(1, Ordering::Release);
-                        }
-                        None => break,
-                    }
-                }
-            });
-            workers.push(handle);
-        }
-        WorkerPool { sender, workers, active_tasks }
+mod losses {
+    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
+    pub fn mse() -> LossDesc {
+        let chain = ElementChain::new().add(Box::new(Sub)).add(Box::new(Square));
+        LossDesc::from_chain(chain, Aggregation::Mean, 4, 1, 1)
     }
+}
 
-    pub fn execute<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
+mod optimizers {
+    use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ApplyUpdate)
+    }
+}
+
+fn main() {
+    let (mut model,) = create_models!(models::keep_gate_model);
     {
-        self.active_tasks.fetch_add(1, Ordering::Release);
-        self.sender.send(Some(Box::new(f))).expect("Worker pool has been dropped");
-    }
-
-    pub fn wait_all(&self) {
-        while self.active_tasks.load(Ordering::Acquire) > 0 {
-            std::hint::spin_loop();
+        let mut store = model.param_store().lock().unwrap();
+        for i in 0..store.len() {
+            store.set_param(i, rand::random::<f32>() * 0.1);
         }
     }
 
-    /// Возвращает количество потоков в пуле.
-    pub fn num_workers(&self) -> usize {
-        self.workers.len()
+    // Вход: полезный слабый сигнал + резкие аномалии
+    let x = Tensor2D::new(vec![vec![0.2, -5.0, 0.3, 10.0]]);
+    // Цель: аномалии обнулены, слабый сигнал сохранён
+    let target = Tensor2D::new(vec![vec![0.2, 0.0, 0.3, 0.0]]);
+
+    let epochs = 200;
+    let start = Instant::now();
+
+    for epoch in 0..epochs {
+        let (pred, ctxs) = model.forward(DynamicTensor::Dim1(x.clone()));
+        let (loss, delta) = model.compute_loss(
+            losses::mse(),
+            &pred,
+            &DynamicTensor::Dim1(target.clone()),
+        );
+        let (_, grads) = model.backward(&ctxs, delta);
+        model.update_params(optimizers::sgd(), &grads[0]);
+
+        if epoch % 50 == 0 {
+            println!("Epoch {}: loss = {:.6}", epoch, loss);
+        }
     }
+
+    let duration = start.elapsed();
+    println!("SoftKeepGate example done in {:?}", duration);
 }
-
-impl Drop for WorkerPool {
-    fn drop(&mut self) {
-        for _ in &self.workers {
-            self.sender.send(None).ok();
-        }
-        for handle in self.workers.drain(..) {
-            handle.join().ok();
-        }
-    }
-}
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\cpu\worker_pool.rs
+КОНЕЦ ФАЙЛА: examples\soft_keep_gate_example.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 17: src\compute_manager\logger.rs
-Полный путь: D:\neurocore\src\compute_manager\logger.rs
+ФАЙЛ 17: src\compute_manager\memory_executor\pool.rs
+Полный путь: D:\neurocore\src\compute_manager\memory_executor\pool.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/compute_manager/logger.rs
+// src/compute_manager/memory_executor/pool.rs
 
-use std::cell::RefCell;
-use std::io::{self, Write};
-use std::sync::Mutex;
-
-thread_local! {
-    pub static LOG_BUF: RefCell<Vec<String>> = RefCell::new(Vec::new());
+/// Пул памяти одного устройства (CPU, GPU или SSD). Учитывает занятое количество элементов f32.
+#[derive(Debug)]
+pub struct MemoryPool {
+    /// Максимальное количество элементов f32, которое разрешено занять
+    pub max_elements: usize,
+    /// Текущее количество занятых элементов
+    pub used_elements: usize,
 }
 
-// Глобальный список адресов (для отладки не используется в хуке)
-static ALL_BUFS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
-pub fn register_thread() {
-    LOG_BUF.with(|buf| {
-        let ptr = buf as *const RefCell<Vec<String>> as usize;
-        ALL_BUFS.lock().unwrap().push(ptr);
-    });
-}
-
-pub fn log(msg: impl Into<String>) {
-    LOG_BUF.with(|buf| {
-        buf.borrow_mut().push(msg.into());
-    });
-}
-
-pub fn dump_all_logs() {
-    let mut stderr = io::stderr();
-    let all_bufs = ALL_BUFS.lock().unwrap();
-    for &ptr_usize in all_bufs.iter() {
-        let buf_ptr = ptr_usize as *const RefCell<Vec<String>>;
-        let buf = unsafe { &*buf_ptr };
-        let msgs = buf.borrow();
-        for msg in msgs.iter() {
-            let _ = writeln!(stderr, "{}", msg);
+impl MemoryPool {
+    pub fn new(max_memory_bytes: u64) -> Self {
+        // Переводим байты в количество f32 (4 байта на элемент)
+        let max_elements = (max_memory_bytes / 4) as usize;
+        MemoryPool {
+            max_elements,
+            used_elements: 0,
         }
     }
-    let _ = stderr.flush();
-}
 
-pub fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        // НЕ вызываем dump_all_logs, чтобы избежать deadlock
-        // Вместо этого просто выводим информацию о панике и бэктрейс
-        eprintln!("FATAL PANIC: {}", info);
-        if let Some(location) = info.location() {
-            eprintln!("  at {}:{}:{}", location.file(), location.line(), location.column());
+    /// Проверить, можно ли выделить указанное количество элементов
+    pub fn can_allocate(&self, elements: usize) -> bool {
+        self.used_elements + elements <= self.max_elements
+    }
+
+    /// Зарезервировать память (увеличивает счётчик) без фактического выделения.
+    /// Используется для планирования распределения.
+    pub fn reserve(&mut self, elements: usize) {
+        self.used_elements += elements;
+    }
+
+    /// Зарезервировать память (увеличивает счётчик) с проверкой возможности.
+    /// Возвращает `Ok(())` если удалось, иначе ошибку.
+    pub fn allocate(&mut self, elements: usize) -> Result<(), String> {
+        if self.can_allocate(elements) {
+            self.used_elements += elements;
+            Ok(())
+        } else {
+            Err(format!(
+                "Memory pool exhausted: needed {}, available {}",
+                elements,
+                self.max_elements - self.used_elements
+            ))
         }
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        eprintln!("{backtrace}");
-        // Принудительно сбрасываем stderr
-        let _ = io::stderr().flush();
-        // Завершаем процесс
-        std::process::abort();
-    }));
+    }
+
+    /// Освободить память (уменьшает счётчик)
+    pub fn deallocate(&mut self, elements: usize) {
+        self.used_elements = self.used_elements.saturating_sub(elements);
+    }
+
+    /// Возвращает количество свободных элементов
+    pub fn free_elements(&self) -> usize {
+        self.max_elements - self.used_elements
+    }
+
+    /// Проверяет, полностью ли пул заполнен
+    pub fn is_full(&self) -> bool {
+        self.used_elements >= self.max_elements
+    }
+
+    /// Возвращает долю использования (0.0..1.0)
+    pub fn usage_ratio(&self) -> f32 {
+        if self.max_elements == 0 {
+            0.0
+        } else {
+            self.used_elements as f32 / self.max_elements as f32
+        }
+    }
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\logger.rs
+КОНЕЦ ФАЙЛА: src\compute_manager\memory_executor\pool.rs
 ================================================================================
 
 ================================================================================
@@ -2865,150 +3006,155 @@ impl LossDesc {
 ================================================================================
 
 ================================================================================
-ФАЙЛ 19: src\compute_manager\cpu\cost.rs
-Полный путь: D:\neurocore\src\compute_manager\cpu\cost.rs
+ФАЙЛ 19: src\compute_manager\gpu\shaders\layers\memory_fwd.comp
+Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\layers\memory_fwd.comp
+Тип: comp
+--------------------------------------------------------------------------------
+#version 450
+// NO extensions required – используем только core Vulkan 1.0
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint features;
+    float alpha;
+} pc;
+
+layout(binding = 0, std430) readonly buffer In {
+    float x[];
+};
+
+// state хранится как int (битовое представление float)
+layout(binding = 1, std430) buffer StateBuf {
+    int state[];   // [min[0..features-1], max[features..2*features-1]]
+};
+
+layout(binding = 2, std430) writeonly buffer Out {
+    float y[];
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.batch * pc.features) return;
+
+    uint c = i % pc.features;
+    float x_val = x[i];
+
+    // Читаем текущие значения, преобразуя биты обратно во float
+    float min_val = intBitsToFloat(state[c]);
+    float max_val = intBitsToFloat(state[pc.features + c]);
+
+    // Основная логика Memory слоя
+    float d_min = abs(x_val - min_val);
+    float d_max = abs(x_val - max_val);
+    float closest = (d_min <= d_max) ? min_val : max_val;
+    float y_val = x_val + pc.alpha * (closest - x_val);
+    y[i] = y_val;
+
+    // Атомарное обновление минимума и максимума через целочисленные атомарные операции
+    // atomicMin/atomicMax для знаковых int корректно работают с битовым представлением float
+    atomicMin(state[c], floatBitsToInt(x_val));
+    atomicMax(state[pc.features + c], floatBitsToInt(x_val));
+}
+================================================================================
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\layers\memory_fwd.comp
+================================================================================
+
+================================================================================
+ФАЙЛ 20: src\layers\splitter_connector\splitter_connector.rs
+Полный путь: D:\neurocore\src\layers\splitter_connector\splitter_connector.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/compute_manager/cpu/cost.rs
+// src/layers/splitter_connector/splitter_connector.rs
 
-use std::time::Instant;
-use std::hint::black_box;
+use crate::compute_manager::graph::types::DynamicContext;
+use crate::linalg;
+use faer::Mat;
 
-#[derive(Debug, Clone)]
-pub struct CostModel {
-    pub fmadd_ns: f64,
-    pub task_overhead_ns: f64,
-    pub barrier_overhead_ns: f64,
-    pub num_cores: usize,
+pub struct SplitterConnector {
+    pub dim_a: usize,
+    pub dim_b: usize,
 }
 
-impl CostModel {
-    pub fn calibrate() -> Self {
-        let num_cores = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
-        let fmadd_ns = {
-            let iterations = 10_000_000u64;
-            let start = Instant::now();
-            let mut sum = 0.0f64;
-            for _ in 0..iterations {
-                sum += black_box(1.0f64) * black_box(2.0f64);
-            }
-            black_box(sum);
-            (start.elapsed().as_secs_f64() * 1e9) / (iterations as f64)
-        };
-        let task_overhead_ns = {
-            let iterations = 100_000;
-            let start = Instant::now();
-            for _ in 0..iterations {
-                black_box((|| {})());
-            }
-            (start.elapsed().as_secs_f64() * 1e9) / (iterations as f64)
-        };
-        let barrier_overhead_ns = 1000.0;
-        CostModel { fmadd_ns, task_overhead_ns, barrier_overhead_ns, num_cores }
+impl SplitterConnector {
+    pub fn new(dim_a: usize, dim_b: usize) -> Self {
+        Self { dim_a, dim_b }
     }
 
-    pub fn min_mac_per_task(&self) -> f64 {
-        self.task_overhead_ns / self.fmadd_ns
+    /// Прямой проход: принимает две матрицы и возвращает их же.
+    pub fn forward_mat(
+        &self,
+        input_a: &Mat<f32>,
+        input_b: &Mat<f32>,
+    ) -> (Mat<f32>, Mat<f32>, DynamicContext) {
+        let ctx = DynamicContext::Ctx1D(
+            crate::layers::context1d::LayerContext1D::SplitterConnector {
+                input: linalg::faer_to_tensor2d(input_a),
+            },
+        );
+        (input_a.clone(), input_b.clone(), ctx)
     }
+
+    /// Обратный проход: просто пробрасывает градиенты обратно.
+    pub fn backward_mat(
+        &self,
+        _ctx: &DynamicContext,
+        delta_a: &Mat<f32>,
+        delta_b: &Mat<f32>,
+    ) -> (Mat<f32>, Mat<f32>, Vec<f32>) {
+        (delta_a.clone(), delta_b.clone(), vec![])
+    }
+
+    pub fn param_len(&self) -> usize { 0 }
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\cpu\cost.rs
+КОНЕЦ ФАЙЛА: src\layers\splitter_connector\splitter_connector.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 20: src\optimizer_plan\cube.rs
-Полный путь: D:\neurocore\src\optimizer_plan\cube.rs
-Тип: rs
+ФАЙЛ 21: src\compute_manager\gpu\shaders\loss\cross_entropy_fwd.comp
+Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\cross_entropy_fwd.comp
+Тип: comp
 --------------------------------------------------------------------------------
-// src/optimizer_plan/cube.rs
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-use std::any::Any;
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint num_classes;
+} pc;
 
-/// Атомарный блок оптимизации.
-///
-/// Каждый кубик выполняет одно элементарное преобразование над градиентами
-/// и/или параметрами, используя своё внутреннее состояние.
-/// Цепочка кубиков, завершающаяся кубиком `ApplyUpdate`, образует
-/// конкретный алгоритм оптимизации.
-///
-/// # Пример
-/// ```ignore
-/// let chain = OptimizerChain::new()
-///     .add(Box::new(ScaleGradient::new(0.01)))
-///     .add(Box::new(Momentum::new(0.9)))
-///     .add(Box::new(ApplyUpdate));
-/// ```
-pub trait OptimizerCube: Send + Sync + Any {
-    /// Размер состояния, выделяемого на каждый оптимизируемый параметр.
-    ///
-    /// Например:
-    /// - `0` для кубиков без памяти (`ScaleGradient`, `ApplyUpdate`)
-    /// - `1` для `Momentum` (одна скорость на параметр)
-    /// - `2` для `AdamTransform` (первый и второй моменты)
-    fn state_size_per_param(&self) -> usize;
+layout(binding = 0, std430) readonly buffer InputBuf {
+    float data[];
+};
+layout(binding = 1, std430) writeonly buffer OutputBuf {
+    float loss[];
+};
 
-    /// Применяет кубик к срезам параметров, градиентов и состояния.
-    ///
-    /// # Аргументы
-    /// * `params` - мутабельный срез всех параметров модели (длина `N`).
-    /// * `grads`  - мутабельный срез градиентов (длина `N`).
-    ///   Кубик может изменять градиенты in‑place (например,
-    ///   `ScaleGradient` умножает их, `AddWeightDecay` добавляет слагаемое).
-    /// * `state`  - мутабельный срез состояния кубика.
-    ///   Его длина равна `N * state_size_per_param()`, где `N` — число параметров.
-    fn apply(&self, params: &mut [f32], grads: &mut [f32], state: &mut [f32]);
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.batch) return;
 
-    /// Позволяет downcasting к конкретному типу кубика.
-    fn as_any(&self) -> &dyn Any;
+    uint base = r * (pc.num_classes + 1);
+    uint class_idx = uint(data[base + pc.num_classes]);
+
+    // Устойчивый softmax: вычитаем максимальный логит
+    float max_val = data[base];
+    for (uint c = 1; c < pc.num_classes; c++) {
+        if (data[base + c] > max_val) max_val = data[base + c];
+    }
+
+    float sum_exp = 0.0f;
+    for (uint c = 0; c < pc.num_classes; c++) {
+        sum_exp += exp(data[base + c] - max_val);
+    }
+
+    float log_softmax = data[base + class_idx] - max_val - log(sum_exp);
+    loss[r] = -log_softmax;
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\optimizer_plan\cube.rs
-================================================================================
-
-================================================================================
-ФАЙЛ 21: src\training_plan\data.rs
-Полный путь: D:\neurocore\src\training_plan\data.rs
-Тип: rs
---------------------------------------------------------------------------------
-// src/training_plan/data.rs
-
-use crate::tensor::Tensor2D;
-use super::plan::DataSource;
-
-impl DataSource {
-    /// Создаёт DataSource из Tensor2D.
-    pub fn from_tensor2d(tensor: Tensor2D) -> Self {
-        DataSource::Tensor2D(tensor)
-    }
-
-    /// Количество примеров.
-    pub fn num_samples(&self) -> usize {
-        match self {
-            DataSource::Tensor2D(t) => t.dim1,
-        }
-    }
-
-    /// Разбивает данные на батчи заданного размера.
-    /// Возвращает вектор батчей (каждый батч — Tensor2D).
-    pub fn batches(&self, batch_size: usize) -> Vec<Tensor2D> {
-        match self {
-            DataSource::Tensor2D(tensor) => {
-                let n = tensor.dim1;
-                let mut batches = Vec::new();
-                for start in (0..n).step_by(batch_size) {
-                    let end = (start + batch_size).min(n);
-                    let rows: Vec<Vec<f32>> = tensor.data[start..end].to_vec();
-                    batches.push(Tensor2D::new(rows));
-                }
-                batches
-            }
-        }
-    }
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\training_plan\data.rs
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\cross_entropy_fwd.comp
 ================================================================================
 
 ================================================================================
@@ -3054,116 +3200,116 @@ void main() {
 ================================================================================
 
 ================================================================================
-ФАЙЛ 23: src\device_plan\macros.rs
-Полный путь: D:\neurocore\src\device_plan\macros.rs
+ФАЙЛ 23: src\tensor\tensor4d.rs
+Полный путь: D:\neurocore\src\tensor\tensor4d.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/device_plan/macros.rs
-
-/// Макрос для создания моделей с автоматическим применением плана устройств.
-///
-/// Обязательно требует наличия модуля `device_plan` с функцией `plan()` в области вызова.
-/// Пример:
-/// ```ignore
-/// mod device_plan {
-///     use neurocore::device_plan::DevicePlan;
-///     pub fn plan() -> DevicePlan {
-///         DevicePlan::empty().cpu(0, 4).ram(0, 8192)
-///     }
-/// }
-///
-/// let (model,) = neurocore::create_models!(models::linear_model);
-/// ```
-#[macro_export]
-macro_rules! create_models {
-    ( $( $func:path ),+ $(,)? ) => {
-        {
-            let plan = device_plan::plan();
-            ( $(
-                $crate::model_plan::Plan::from_layer_descs($func())
-                    .expect("Invalid model description")
-                    .build_with_device_plan(plan.clone())
-            ,)+ )
-        }
-    };
-}
-================================================================================
-КОНЕЦ ФАЙЛА: src\device_plan\macros.rs
-================================================================================
-
-================================================================================
-ФАЙЛ 24: src\tensor\tensor3d.rs
-Полный путь: D:\neurocore\src\tensor\tensor3d.rs
-Тип: rs
---------------------------------------------------------------------------------
-use super::tensor2d::Tensor2D;
+use super::tensor3d::Tensor3D;
 
 #[derive(Debug, Clone)]
-pub struct Tensor3D {
+pub struct Tensor4D {
     pub dim1: usize,
     pub dim2: usize,
     pub dim3: usize,
-    pub data: Vec<Vec<Vec<f32>>>,
+    pub dim4: usize,
+    pub data: Vec<Vec<Vec<Vec<f32>>>>,
 }
 
-impl Tensor3D {
-    pub fn new(data: Vec<Vec<Vec<f32>>>) -> Self {
+impl Tensor4D {
+    pub fn new(data: Vec<Vec<Vec<Vec<f32>>>>) -> Self {
         let dim1 = data.len();
         let dim2 = if dim1 > 0 { data[0].len() } else { 0 };
         let dim3 = if dim2 > 0 { data[0][0].len() } else { 0 };
-        Tensor3D { dim1, dim2, dim3, data }
+        let dim4 = if dim3 > 0 { data[0][0][0].len() } else { 0 };
+        Tensor4D { dim1, dim2, dim3, dim4, data }
     }
-    pub fn zeros(dim1: usize, dim2: usize, dim3: usize) -> Self {
-        Tensor3D { dim1, dim2, dim3, data: vec![vec![vec![0.0; dim3]; dim2]; dim1] }
+    pub fn zeros(dim1: usize, dim2: usize, dim3: usize, dim4: usize) -> Self {
+        Tensor4D { dim1, dim2, dim3, dim4, data: vec![vec![vec![vec![0.0; dim4]; dim3]; dim2]; dim1] }
     }
-    pub fn slice_2d(&self, i: usize) -> Tensor2D {
-        Tensor2D::new(self.data[i].clone())
+    pub fn slice_3d(&self, i: usize) -> Tensor3D {
+        Tensor3D::new(self.data[i].clone())
     }
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\tensor\tensor3d.rs
+КОНЕЦ ФАЙЛА: src\tensor\tensor4d.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 25: src\compute_manager\gpu\shaders\common\reduce.comp
-Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\common\reduce.comp
+ФАЙЛ 24: src\compute_manager\gpu\shaders\loss\abs_bwd.comp
+Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\abs_bwd.comp
 Тип: comp
 --------------------------------------------------------------------------------
 #version 450
-
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConsts {
-    uint rows;
+    uint total;
 } pc;
 
-layout(binding = 0, std430) readonly buffer InBuf {
-    float data[];
+layout(binding = 0, std430) readonly buffer In {
+    float x[];
+};
+layout(binding = 1, std430) readonly buffer GradOut {
+    float go[];
+};
+layout(binding = 2, std430) writeonly buffer GradIn {
+    float gi[];
 };
 
-layout(binding = 1, std430) writeonly buffer OutBuf {
-    float result[];
-};
-
-// Суммирование по строкам: каждая workgroup обрабатывает один столбец
 void main() {
-    uint col = gl_GlobalInvocationID.x;
-    if (col >= gl_NumWorkGroups.x) return; // защита (хотя dispatch делает точно нужное число групп)
-
-    uint cols = gl_NumWorkGroups.x;
-    float sum = 0.0;
-    for (uint r = 0; r < pc.rows; ++r) {
-        sum += data[r * cols + col];
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) return;
+    float val = x[i];
+    if (val > 0.0f) {
+        gi[i] = go[i];
+    } else if (val < 0.0f) {
+        gi[i] = -go[i];
+    } else {
+        gi[i] = 0.0f;
     }
-    result[col] = sum;
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\common\reduce.comp
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\abs_bwd.comp
 ================================================================================
 
 ================================================================================
-ФАЙЛ 26: src\compute_manager\gpu\shaders\loss\mul_fwd.comp
-Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\mul_fwd.comp
+ФАЙЛ 25: src\compute_manager\gpu\mod.rs
+Полный путь: D:\neurocore\src\compute_manager\gpu\mod.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// src/compute_manager/gpu/mod.rs
+
+// Подмодули GPU-подсистемы
+pub mod init;
+pub mod executor;
+pub mod memory;
+pub mod pipeline;
+pub mod compute;
+pub mod processor;
+pub mod param_store;    // <-- добавлено
+
+// Реэкспорт основных типов для удобства использования
+pub use init::GpuContext;
+pub use executor::GpuExecutor;
+pub use memory::GpuTensor;
+pub use compute::GpuCompute;
+pub use processor::process_forward_gpu;
+pub use param_store::GpuParamStore;   // <-- добавлено
+
+/// Обнаружить доступные GPU с помощью Vulkan.
+/// Возвращает список имён устройств (или None, если Vulkan недоступен).
+/// Сохранена для обратной совместимости.
+pub fn detect_gpus() -> Option<Vec<String>> {
+    init::enumerate_gpus()
+        .map(|gpus| gpus.into_iter().map(|g| g.name).collect())
+}
+================================================================================
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\mod.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 26: src\compute_manager\gpu\shaders\loss\absdiff_fwd.comp
+Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\absdiff_fwd.comp
 Тип: comp
 --------------------------------------------------------------------------------
 #version 450
@@ -3186,15 +3332,15 @@ layout(binding = 2, std430) writeonly buffer Out {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.total) return;
-    o[i] = a[i] * b[i];
+    o[i] = abs(a[i] - b[i]);
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\mul_fwd.comp
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\absdiff_fwd.comp
 ================================================================================
 
 ================================================================================
-ФАЙЛ 27: src\compute_manager\gpu\shaders\loss\addscalar_fwd.comp
-Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\addscalar_fwd.comp
+ФАЙЛ 27: src\compute_manager\gpu\shaders\loss\sub_fwd.comp
+Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\sub_fwd.comp
 Тип: comp
 --------------------------------------------------------------------------------
 #version 450
@@ -3202,23 +3348,25 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConsts {
     uint total;
-    float scalar;
 } pc;
 
-layout(binding = 0, std430) readonly buffer In {
-    float x[];
+layout(binding = 0, std430) readonly buffer InA {
+    float a[];
 };
-layout(binding = 1, std430) writeonly buffer Out {
-    float y[];
+layout(binding = 1, std430) readonly buffer InB {
+    float b[];
+};
+layout(binding = 2, std430) writeonly buffer Out {
+    float o[];
 };
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.total) return;
-    y[i] = x[i] + pc.scalar;
+    o[i] = a[i] - b[i];
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\addscalar_fwd.comp
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\sub_fwd.comp
 ================================================================================
 
 ================================================================================
@@ -3250,8 +3398,8 @@ void main() {
 ================================================================================
 
 ================================================================================
-ФАЙЛ 29: src\compute_manager\gpu\shaders\loss\square_fwd.comp
-Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\square_fwd.comp
+ФАЙЛ 29: src\compute_manager\gpu\shaders\loss\log_fwd.comp
+Полный путь: D:\neurocore\src\compute_manager\gpu\shaders\loss\log_fwd.comp
 Тип: comp
 --------------------------------------------------------------------------------
 #version 450
@@ -3271,33 +3419,61 @@ layout(binding = 1, std430) writeonly buffer Out {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.total) return;
-    y[i] = x[i] * x[i];
+    y[i] = log(x[i]);
 }
 ================================================================================
-КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\square_fwd.comp
+КОНЕЦ ФАЙЛА: src\compute_manager\gpu\shaders\loss\log_fwd.comp
 ================================================================================
 
 ================================================================================
-ФАЙЛ 30: src\tensor\mod.rs
-Полный путь: D:\neurocore\src\tensor\mod.rs
+ФАЙЛ 30: src\loss_plan\mod.rs
+Полный путь: D:\neurocore\src\loss_plan\mod.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/tensor/mod.rs
-pub mod tensor2d;
-pub mod tensor3d;
-pub mod tensor4d;
-pub mod tensor5d;
+// src/loss_plan/mod.rs
 
-pub use tensor2d::Tensor2D;
-pub use tensor3d::Tensor3D;
-pub use tensor4d::Tensor4D;
-pub use tensor5d::Tensor5D;
+pub mod cubes;
+pub mod cross_entropy;
+pub mod chain;
+pub mod expr;
+pub mod desc;
+pub mod execution;
+pub mod gpu_exec;
+
+pub use cubes::{ElemCube, Sub, Square, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff};
+pub use cross_entropy::CrossEntropyWithLogits;
+pub use chain::ElementChain;
+pub use expr::{Aggregation, LossExpr};
+pub use desc::LossDesc;
+pub use execution::compute_loss_mat;
+pub use gpu_exec::compute_loss_gpu;
 ================================================================================
-КОНЕЦ ФАЙЛА: src\tensor\mod.rs
+КОНЕЦ ФАЙЛА: src\loss_plan\mod.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 31: src\compute_manager\executor.rs
+ФАЙЛ 31: src\lib.rs
+Полный путь: D:\neurocore\src\lib.rs
+Тип: rs
+--------------------------------------------------------------------------------
+// src/lib.rs
+
+pub mod linalg;
+pub mod tensor;
+pub mod layers;
+pub mod model_plan;
+pub mod loss_plan;
+pub mod optimizer_plan;
+pub mod logging;
+pub mod compute_manager;
+pub mod device_plan;
+pub mod training_plan;
+================================================================================
+КОНЕЦ ФАЙЛА: src\lib.rs
+================================================================================
+
+================================================================================
+ФАЙЛ 32: src\compute_manager\executor.rs
 Полный путь: D:\neurocore\src\compute_manager\executor.rs
 Тип: rs
 --------------------------------------------------------------------------------
@@ -3317,61 +3493,44 @@ pub trait Executor: Send + Sync + 'static {
 ================================================================================
 
 ================================================================================
-ФАЙЛ 32: run_cargo_build copy.bat
-Полный путь: D:\neurocore\run_cargo_build copy.bat
-Тип: bat
---------------------------------------------------------------------------------
-@echo off
-setlocal enabledelayedexpansion
-
-$env:RUSTFLAGS="-C link-args=/STACK:33554432
-cargo clean && cargo build
-
-endlocal
-pause
-================================================================================
-КОНЕЦ ФАЙЛА: run_cargo_build copy.bat
-================================================================================
-
-================================================================================
-ФАЙЛ 33: src\layers\memory\mod.rs
-Полный путь: D:\neurocore\src\layers\memory\mod.rs
+ФАЙЛ 33: src\layers\linear\mod.rs
+Полный путь: D:\neurocore\src\layers\linear\mod.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/layers/memory/mod.rs
+// src/layers/linear/mod.rs
 
-pub mod memory;
+pub mod linear;
 
-pub use memory::Memory;
+pub use linear::Linear;
 ================================================================================
-КОНЕЦ ФАЙЛА: src\layers\memory\mod.rs
+КОНЕЦ ФАЙЛА: src\layers\linear\mod.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 34: src\model_plan\blueprint\mod.rs
-Полный путь: D:\neurocore\src\model_plan\blueprint\mod.rs
+ФАЙЛ 34: src\layers\tanh\mod.rs
+Полный путь: D:\neurocore\src\layers\tanh\mod.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/model_plan/blueprint/mod.rs
+// src/layers/tanh/mod.rs
 
-pub mod layer_kind;
+pub mod tanh;
 
-pub use layer_kind::LayerKind;
+pub use tanh::Tanh;
 ================================================================================
-КОНЕЦ ФАЙЛА: src\model_plan\blueprint\mod.rs
+КОНЕЦ ФАЙЛА: src\layers\tanh\mod.rs
 ================================================================================
 
 ================================================================================
-ФАЙЛ 35: src\layers\soft_sparse_gate\mod.rs
-Полный путь: D:\neurocore\src\layers\soft_sparse_gate\mod.rs
+ФАЙЛ 35: src\layers\leaky_relu\mod.rs
+Полный путь: D:\neurocore\src\layers\leaky_relu\mod.rs
 Тип: rs
 --------------------------------------------------------------------------------
-// src/layers/soft_sparse_gate/mod.rs
+// src/layers/leaky_relu/mod.rs
 
-pub mod soft_sparse_gate;
-pub use soft_sparse_gate::SoftSparseGate;
+pub mod leaky_relu;
+pub use leaky_relu::LeakyReLU;
 ================================================================================
-КОНЕЦ ФАЙЛА: src\layers\soft_sparse_gate\mod.rs
+КОНЕЦ ФАЙЛА: src\layers\leaky_relu\mod.rs
 ================================================================================
 
 

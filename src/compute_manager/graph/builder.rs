@@ -12,7 +12,8 @@ use crate::compute_manager::executor::Executor;
 use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::gpu::GpuCompute;
 use crate::compute_manager::gpu::param_store::GpuParamStore;
-use crate::device_plan::{ComputeDevice, DevicePlan, StorageDevice};
+use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::device_plan::{ComputeDevice, DevicePlan};
 use crate::layers::UniversalLayer;
 use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::blueprint::LayerKind;
@@ -69,17 +70,20 @@ impl MixedModel {
             Device::Cpu { threads } => DevicePlan::empty().cpu(0, threads).ram(0, 8192),
             Device::Gpu { id } => DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(id).vram(0, id, 4096),
         };
-        Self::from_plan_with_device_plan(layers, plan)
+        Self::from_plan_with_device_plan_and_batch(layers, plan, 1)
     }
 
-    pub fn from_plan_with_device_plan(
+    /// Основной конструктор с планом устройств и размером батча (для учёта памяти активаций).
+    pub fn from_plan_with_device_plan_and_batch(
         layers: Vec<LayerDesc>,
         device_plan: DevicePlan,
+        batch_size: usize,
     ) -> Result<Self, String> {
         // -----------------------------------------------------------
         // 1. Создаём MemoryExecutor и получаем GPU-контекст
         // -----------------------------------------------------------
         let (memory_executor, gpu_context) = device_plan.build_memory_executor();
+        let mut mem_exec = memory_executor.lock().unwrap();
 
         // -----------------------------------------------------------
         // 2. Суммарное количество потоков CPU
@@ -114,7 +118,6 @@ impl MixedModel {
         let mut gpu_compute: Option<Mutex<GpuCompute>> = None;
         let mut gpu_param_store: Option<Mutex<GpuParamStore>> = None;
         let executor: Box<dyn Executor> = if let Some(gpu_ctx) = gpu_context {
-            // Берём ID первого GPU (они уже проверены в build_memory_executor)
             let gpu_id = device_plan.compute_devices.iter()
                 .find_map(|d| if let ComputeDevice::Gpu { id } = d { Some(*id) } else { None })
                 .unwrap_or(0);
@@ -270,9 +273,13 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
-        // 5.5 Назначаем устройства сегментам
+        // 5.5 Назначаем устройства сегментам с учётом памяти
         // -----------------------------------------------------------
-        let segment_placement = assign_devices(&segments, &device_plan);
+        let segment_placement = assign_devices(&segments, &device_plan, &mut mem_exec, batch_size)
+            .map_err(|e| format!("Ошибка распределения устройств с учётом памяти: {}", e))?;
+
+        // Завершаем заимствование memory_executor, чтобы можно было переместить его в структуру
+        drop(mem_exec);
 
         // -----------------------------------------------------------
         // 6. Создаём GPU-хранилище параметров, если есть GPU
@@ -307,11 +314,29 @@ impl MixedModel {
         })
     }
 
+    /// Обратно-совместимый конструктор (без batch_size, использует 1).
+    pub fn from_plan_with_device_plan(
+        layers: Vec<LayerDesc>,
+        device_plan: DevicePlan,
+    ) -> Result<Self, String> {
+        Self::from_plan_with_device_plan_and_batch(layers, device_plan, 1)
+    }
+
     /// Сборка модели с планом устройств (вызывается из макроса create_models!).
     pub fn build_with_device_plan(
         plan: crate::model_plan::plan::Plan,
         device_plan: DevicePlan,
     ) -> Result<Self, String> {
-        Self::from_plan_with_device_plan(plan.layers, device_plan)
+        Self::from_plan_with_device_plan_and_batch(plan.layers, device_plan, 1)
+    }
+
+    /// Сборка модели с планом устройств и указанием размера батча.
+    /// Используется для точного учёта памяти.
+    pub fn build_with_device_plan_and_batch(
+        plan: crate::model_plan::plan::Plan,
+        device_plan: DevicePlan,
+        batch_size: usize,
+    ) -> Result<Self, String> {
+        Self::from_plan_with_device_plan_and_batch(plan.layers, device_plan, batch_size)
     }
 }

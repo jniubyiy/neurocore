@@ -3,6 +3,7 @@
 use faer::Mat;
 use crate::compute_manager::memory_executor::{MemoryExecutor, TensorBufferId};
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::memory_executor::BufferPriority;
 use crate::compute_manager::device_spec::DeviceId;
 
 /// Тензор, который может находиться на CPU (в виде faer::Mat) или на GPU
@@ -86,7 +87,7 @@ impl DeviceTensor {
                         flat.push(mat[(r, c)]);
                     }
                 }
-                let host_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total)
+                let host_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total, BufferPriority::High)
                     .expect("Failed to allocate host buffer for GPU upload");
                 {
                     let mut resolved = mem_exec.resolve_buffer(host_id, MemoryDeviceKind::HostRam)
@@ -111,9 +112,9 @@ impl DeviceTensor {
                 mem_exec.move_buffer(*buffer_id, MemoryDeviceKind::DeviceVram(DeviceId(0)))
                     .expect("Failed to restore original GPU buffer");
                 // создаём новый буфер на целевом GPU
-                let new_id = mem_exec.allocate(MemoryDeviceKind::DeviceVram(gpu_device_id), total)
+                let new_id = mem_exec.allocate(MemoryDeviceKind::DeviceVram(gpu_device_id), total, BufferPriority::High)
                     .expect("Failed to allocate new GPU buffer");
-                let host_staging_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total)
+                let host_staging_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total, BufferPriority::High)
                     .expect("Failed to allocate staging buffer");
                 {
                     let mut resolved = mem_exec.resolve_buffer(host_staging_id, MemoryDeviceKind::HostRam)
@@ -164,7 +165,7 @@ impl DeviceTensor {
                         flat.push(mat[(r, c)]);
                     }
                 }
-                let host_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total)
+                let host_id = mem_exec.allocate(MemoryDeviceKind::HostRam, total, BufferPriority::High)
                     .expect("Failed to allocate host buffer");
                 {
                     let mut resolved = mem_exec.resolve_buffer(host_id, MemoryDeviceKind::HostRam)

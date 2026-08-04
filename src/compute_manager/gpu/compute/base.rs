@@ -21,8 +21,9 @@ use crate::compute_manager::memory_executor::{
     MemoryExecutor,
     types::MemoryDeviceKind,
     TensorBufferId,
+    BufferPriority,
 };
-use crate::compute_manager::logger;   // <-- новый модуль
+use crate::compute_manager::logger;
 
 use super::super::init::GpuContext;
 use super::super::pipeline::PipelineCache;
@@ -71,7 +72,7 @@ impl GpuCompute {
     ) -> (Subbuffer<[f32]>, TensorBufferId) {
         let mut mem = self.memory_executor.lock().unwrap();
         let kind = MemoryDeviceKind::DeviceVram(self.gpu_device_id);
-        let id = mem.allocate(kind, elements)
+        let id = mem.allocate(kind, elements, BufferPriority::High)
             .expect("Failed to allocate GPU buffer");
         logger::log(format!("[GPU] create_buffer: id={}, elements={}", id.0, elements));
         let resolved = mem.resolve_buffer(id, kind)
@@ -96,7 +97,7 @@ impl GpuCompute {
         let mut mem = self.memory_executor.lock().unwrap();
 
         // 1. Выделяем HostRam буфер и записываем данные
-        let host_id = mem.allocate(MemoryDeviceKind::HostRam, elements)
+        let host_id = mem.allocate(MemoryDeviceKind::HostRam, elements, BufferPriority::High)
             .expect("Failed to allocate host buffer");
         {
             let mut resolved = mem.resolve_buffer(host_id, MemoryDeviceKind::HostRam)

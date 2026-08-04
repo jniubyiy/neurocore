@@ -163,6 +163,12 @@ impl MixedModel {
     ) -> (DynamicTensor, Vec<Vec<DynamicContext>>) {
         let (outs, ctxs) = self.forward_multi(vec![input]);
         assert_eq!(outs.len(), 1);
+
+        // Подсказка: входной тензор будет использован, но мы не знаем, какие буферы задействованы.
+        // Здесь можно было бы добавить hint_access для буферов, но они ещё не выделены в памяти.
+        // Вместо этого выполняем tick для применения политики.
+        self.memory_executor.lock().unwrap().tick();
+
         (outs.into_iter().next().unwrap(), ctxs)
     }
 
@@ -173,6 +179,10 @@ impl MixedModel {
     ) -> (DynamicTensor, Vec<Vec<f32>>) {
         let (ins, grads) = self.backward_multi(contexts, vec![delta]);
         assert_eq!(ins.len(), 1);
+
+        // Выполняем tick политики управления памятью
+        self.memory_executor.lock().unwrap().tick();
+
         (ins.into_iter().next().unwrap(), grads)
     }
 
@@ -206,6 +216,10 @@ impl MixedModel {
                 ),
             }
         }).collect();
+
+        // Выполняем tick политики управления памятью
+        self.memory_executor.lock().unwrap().tick();
+
         (out_tensors, ctxs)
     }
 
@@ -240,6 +254,10 @@ impl MixedModel {
                 ),
             }
         }).collect();
+
+        // Выполняем tick политики управления памятью
+        self.memory_executor.lock().unwrap().tick();
+
         (in_tensors, grads)
     }
 
@@ -264,6 +282,10 @@ impl MixedModel {
         };
         let (loss, grad_mat) = self.compute_loss_mat(expr, &pred_mat, &target_mat);
         let grad_tensor = DynamicTensor::Dim1(linalg::faer_to_tensor2d(&grad_mat));
+
+        // Выполняем tick политики управления памятью
+        self.memory_executor.lock().unwrap().tick();
+
         (loss, grad_tensor)
     }
 
@@ -274,14 +296,23 @@ impl MixedModel {
         target: &Mat<f32>,
     ) -> (f32, Mat<f32>) {
         let use_gpu = self.gpu_compute.is_some() && (expr.num_tasks() == pred.nrows());
-        if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+        let result = if let Some(ref gpu_compute_mutex) = self.gpu_compute {
             if use_gpu {
                 let gpu_compute = gpu_compute_mutex.lock().unwrap();
-                return crate::loss_plan::compute_loss_gpu(&gpu_compute, &expr, pred, target);
+                crate::loss_plan::compute_loss_gpu(&gpu_compute, &expr, pred, target)
+            } else {
+                let mut scheduler = self.scheduler.lock().unwrap();
+                crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
             }
-        }
-        let mut scheduler = self.scheduler.lock().unwrap();
-        crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
+        } else {
+            let mut scheduler = self.scheduler.lock().unwrap();
+            crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
+        };
+
+        // Выполняем tick политики управления памятью
+        self.memory_executor.lock().unwrap().tick();
+
+        result
     }
 
     // ── Вспомогательные ──

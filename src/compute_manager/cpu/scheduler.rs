@@ -1,6 +1,7 @@
 // src/compute_manager/cpu/scheduler.rs
 
 use std::path::PathBuf;
+
 use crate::compute_manager::cpu::cost::CostModel;
 use crate::compute_manager::cpu::hardware::CpuInfo;
 use crate::compute_manager::cpu::profiler::HardwareProfile;
@@ -8,6 +9,7 @@ use crate::compute_manager::cpu::mini_model::ForwardTimePredictor;
 
 const MAX_CORES_FOR_MODEL: usize = 16;
 const MAX_CHUNKS_PER_WORKER: usize = 10;
+const TRAINING_THRESHOLD: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct LayerInfo {
@@ -24,20 +26,24 @@ pub enum LayerType {
     Activation,
 }
 
+/// Планировщик задач для CPU с персональными мини-моделями для каждого ядра.
 pub struct Scheduler {
     num_workers: usize,
-    predictors: Vec<ForwardTimePredictor>,   // по одному на CPU
-    predictors_paths: Vec<PathBuf>,          // пути для сохранения
+    predictors: Vec<ForwardTimePredictor>,
+    predictors_paths: Vec<PathBuf>,
     profile: HardwareProfile,
     cpu_info: CpuInfo,
     cost: CostModel,
+    training_data: Vec<Vec<(usize, f64)>>,
+    training_threshold: usize,
 }
 
 impl Clone for Scheduler {
     fn clone(&self) -> Self {
+        let num_cpus = self.predictors.len();
         let input_dim = 5 + MAX_CORES_FOR_MODEL;
-        let mut new_predictors = Vec::with_capacity(self.predictors.len());
-        for _ in 0..self.predictors.len() {
+        let mut new_predictors = Vec::with_capacity(num_cpus);
+        for _ in 0..num_cpus {
             new_predictors.push(ForwardTimePredictor::new(input_dim, 8));
         }
         Scheduler {
@@ -47,6 +53,8 @@ impl Clone for Scheduler {
             profile: self.profile.clone(),
             cpu_info: self.cpu_info.clone(),
             cost: self.cost.clone(),
+            training_data: vec![Vec::new(); num_cpus],
+            training_threshold: self.training_threshold,
         }
     }
 }
@@ -55,28 +63,26 @@ fn get_data_dir() -> PathBuf {
     let env_dir = std::env::var("NEUROCORE_DATA_DIR").ok();
     if let Some(dir) = env_dir {
         let p = PathBuf::from(dir);
-        if let Err(_) = std::fs::create_dir_all(&p) { /* игнорируем */ }
+        let _ = std::fs::create_dir_all(&p);
         return p;
     }
 
     let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
     if let Some(home) = home {
         let p = PathBuf::from(home).join(".local/share/neurocore");
-        if let Err(_) = std::fs::create_dir_all(&p) { /* не удалось, fallback */ }
-        else { return p; }
+        if std::fs::create_dir_all(&p).is_ok() {
+            return p;
+        }
     }
 
     let fallback = PathBuf::from("neurocore_data");
-    if let Err(_) = std::fs::create_dir_all(&fallback) {
+    if std::fs::create_dir_all(&fallback).is_err() {
         return std::env::temp_dir().join("neurocore_data");
     }
     fallback
 }
 
 impl Scheduler {
-    /// Создаёт планировщик с заданным количеством CPU.
-    /// Для каждого CPU создаётся отдельная мини-модель, загружаемая/сохраняемая в файлы
-    /// вида `chunk_model_cpu0.json`, `chunk_model_cpu1.json` и т.д.
     pub fn new_with_cpus(cost: CostModel, cpu_info: CpuInfo, num_cpus: usize) -> Self {
         let num_workers = cost.num_cores;
         let data_dir = get_data_dir();
@@ -107,10 +113,11 @@ impl Scheduler {
             profile,
             cpu_info,
             cost,
+            training_data: vec![Vec::new(); num_cpus],
+            training_threshold: TRAINING_THRESHOLD,
         }
     }
 
-    // Старый конструктор (для обратной совместимости)
     pub fn new(cost: CostModel, cpu_info: CpuInfo) -> Self {
         Self::new_with_cpus(cost, cpu_info, 1)
     }
@@ -123,28 +130,166 @@ impl Scheduler {
         self.num_workers
     }
 
-    /// Основной метод планирования: определяет оптимальное количество чанков,
-    /// разбивает общее число задач на чанки и жадным алгоритмом назначает их ядрам.
-    /// Возвращает для каждого ядра список диапазонов (start, size).
+    pub fn report_execution_time(&mut self, cpu_idx: usize, task_size: usize, duration_ns: f64) {
+        if cpu_idx >= self.training_data.len() {
+            return;
+        }
+
+        self.training_data[cpu_idx].push((task_size, duration_ns));
+
+        if self.training_data[cpu_idx].len() >= self.training_threshold {
+            // Забираем данные для этого CPU
+            let data = std::mem::take(&mut self.training_data[cpu_idx]);
+
+            // Строим признаки для каждого элемента заранее, чтобы не держать mutable borrow на predictor
+            // во время вызова self.build_time_features (который заимствует self неизменно)
+            let mut features_list = Vec::with_capacity(data.len());
+            let mut targets = Vec::with_capacity(data.len());
+            for (size, time) in &data {
+                let features = self.build_time_features(*size);
+                let target = (*time / 1_000_000_000.0) as f32;
+                features_list.push(features);
+                targets.push(target);
+            }
+
+            // Теперь mutable borrow на predictor
+            let predictor = &mut self.predictors[cpu_idx];
+            for (features, target) in features_list.into_iter().zip(targets) {
+                predictor.train(&features, target, 0.001);
+            }
+
+            // Сохраняем модель
+            if cpu_idx < self.predictors_paths.len() {
+                predictor.save(&self.predictors_paths[cpu_idx]);
+            }
+        }
+    }
+
+    pub fn predict_time(&self, cpu_idx: usize, task_size: usize) -> Option<f64> {
+        if cpu_idx >= self.predictors.len() {
+            return None;
+        }
+        let features = self.build_time_features(task_size);
+        let pred = self.predictors[cpu_idx].predict(&features);
+        if pred > 0.0 {
+            Some(pred as f64)
+        } else {
+            None
+        }
+    }
+
     pub fn plan_chunks_assignment(&mut self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
         if total_tasks == 0 {
             return vec![Vec::new(); self.num_workers];
         }
 
-        let speeds = &self.profile.core_relative_speeds;
+        let speeds = self.profile.core_relative_speeds.clone();
         let max_chunks = total_tasks.min(self.num_workers * MAX_CHUNKS_PER_WORKER);
 
+        let has_trained_model = self.predictors.iter().enumerate().any(|(idx, _)| {
+            !self.training_data[idx].is_empty()
+        });
+
+        if has_trained_model {
+            self.plan_with_predictions(total_tasks, max_chunks, &speeds)
+        } else {
+            self.plan_fallback(total_tasks, max_chunks, &speeds)
+        }
+    }
+
+    fn plan_with_predictions(
+        &mut self,
+        total_tasks: usize,
+        max_chunks: usize,
+        speeds: &[f64],
+    ) -> Vec<Vec<(usize, usize)>> {
+        let num_workers = self.num_workers;
+        let mut best_assignment = vec![Vec::new(); num_workers];
+        let mut best_max_time = f64::MAX;
+
+        let max_c = max_chunks.min(total_tasks);
+        for c in 1..=max_c {
+            let chunks = split_into_chunks(total_tasks, c);
+            let assignment = self.assign_chunks_with_predictions(&chunks);
+            let mut max_time = 0.0;
+            for cpu_idx in 0..num_workers {
+                let mut total_time = 0.0;
+                for &(_start, size) in &assignment[cpu_idx] {
+                    if let Some(time) = self.predict_time(cpu_idx, size) {
+                        total_time += time;
+                    } else {
+                        let speed = if cpu_idx < speeds.len() { speeds[cpu_idx] } else { 1.0 };
+                        total_time += size as f64 / speed;
+                    }
+                }
+                if total_time > max_time {
+                    max_time = total_time;
+                }
+            }
+            if max_time < best_max_time {
+                best_max_time = max_time;
+                best_assignment = assignment;
+            }
+        }
+
+        best_assignment
+    }
+
+    fn assign_chunks_with_predictions(&self, chunks: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+        let num_workers = self.num_workers;
+        let mut assignment: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_workers];
+        let mut load_times = vec![0.0; num_workers];
+
+        let mut sorted_chunks: Vec<(usize, usize)> = chunks.to_vec();
+        sorted_chunks.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for &(start, size) in &sorted_chunks {
+            let mut best_cpu = 0;
+            let mut best_time = f64::MAX;
+            for cpu_idx in 0..num_workers {
+                let time = if let Some(pred) = self.predict_time(cpu_idx, size) {
+                    load_times[cpu_idx] + pred
+                } else {
+                    let speed = if cpu_idx < self.profile.core_relative_speeds.len() {
+                        self.profile.core_relative_speeds[cpu_idx]
+                    } else {
+                        1.0
+                    };
+                    load_times[cpu_idx] + size as f64 / speed
+                };
+                if time < best_time {
+                    best_time = time;
+                    best_cpu = cpu_idx;
+                }
+            }
+            assignment[best_cpu].push((start, size));
+            if let Some(pred) = self.predict_time(best_cpu, size) {
+                load_times[best_cpu] += pred;
+            } else {
+                let speed = if best_cpu < self.profile.core_relative_speeds.len() {
+                    self.profile.core_relative_speeds[best_cpu]
+                } else {
+                    1.0
+                };
+                load_times[best_cpu] += size as f64 / speed;
+            }
+        }
+
+        assignment
+    }
+
+    fn plan_fallback(
+        &mut self,
+        total_tasks: usize,
+        max_chunks: usize,
+        speeds: &[f64],
+    ) -> Vec<Vec<(usize, usize)>> {
         let mut best_penalty = f32::MAX;
         let mut best_assignment = vec![Vec::new(); self.num_workers];
-        let mut best_c = 1;
 
-        // Перебор возможных количеств чанков
         for c in 1..=max_chunks {
-            // Разбиваем total_tasks на c равных (с остатком) непрерывных чанков
             let chunks = split_into_chunks(total_tasks, c);
-            // Жадно назначаем чанки ядрам
             let assignment = greedy_assign(&chunks, speeds);
-            // Вычисляем нагрузки и штраф
             let loads: Vec<f64> = assignment
                 .iter()
                 .map(|assigned| assigned.iter().map(|(_, size)| *size as f64).sum())
@@ -153,25 +298,18 @@ impl Scheduler {
             if penalty < best_penalty {
                 best_penalty = penalty;
                 best_assignment = assignment;
-                best_c = c;
             }
         }
-
-        // Обучаем первую мини-модель (пока не используется отдельная для каждого CPU в планировании)
-        let features = self.build_features(total_tasks);
-        let target = best_c as f32 / total_tasks as f32;
-        self.predictors[0].train(&features, target, 0.001);
-        self.predictors[0].save(&self.predictors_paths[0]);
 
         best_assignment
     }
 
-    fn build_features(&self, total_tasks: usize) -> Vec<f32> {
+    fn build_time_features(&self, task_size: usize) -> Vec<f32> {
         let fmadd_ms = (self.cost.fmadd_ns as f32) / 1_000_000.0;
         let neuron_time_ms = (self.profile.neuron_time_ns as f32) / 1_000_000.0;
 
         let mut feats = vec![
-            total_tasks as f32,
+            task_size as f32,
             fmadd_ms,
             neuron_time_ms,
             self.profile.cache_congestion_factor as f32,
@@ -186,7 +324,6 @@ impl Scheduler {
     }
 }
 
-// Разбивает total_tasks на num_chunks непрерывных чанков с равномерным распределением остатка.
 fn split_into_chunks(total: usize, num_chunks: usize) -> Vec<(usize, usize)> {
     let base = total / num_chunks;
     let rem = total % num_chunks;
@@ -200,7 +337,6 @@ fn split_into_chunks(total: usize, num_chunks: usize) -> Vec<(usize, usize)> {
     chunks
 }
 
-// Жадное назначение чанков ядрам с учётом относительных скоростей.
 fn greedy_assign(
     chunks: &[(usize, usize)],
     speeds: &[f64],
@@ -209,12 +345,10 @@ fn greedy_assign(
     let mut assignment: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_workers];
     let mut loads = vec![0.0; num_workers];
 
-    // Сортируем чанки по убыванию размера
     let mut sorted_chunks: Vec<(usize, usize)> = chunks.to_vec();
     sorted_chunks.sort_by(|a, b| b.1.cmp(&a.1));
 
     for chunk in &sorted_chunks {
-        // Ищем ядро с минимальным ожидаемым временем завершения (load / speed)
         let mut best_worker = 0;
         let mut best_time = f64::MAX;
         for i in 0..num_workers {
@@ -231,7 +365,6 @@ fn greedy_assign(
     assignment
 }
 
-// Вычисляет среднее абсолютное отклонение нормализованных нагрузок (load/speed).
 fn calculate_imbalance(loads: &[f64], speeds: &[f64]) -> f32 {
     let n = loads.len();
     if n == 0 {

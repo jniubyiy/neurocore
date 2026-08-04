@@ -11,7 +11,6 @@ use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 
 use crate::layers::UniversalLayer;
 
-/// Динамический контекст слоя (объединяет все размерности).
 #[derive(Clone)]
 pub enum DynamicContext {
     Ctx1D(LayerContext1D),
@@ -20,7 +19,6 @@ pub enum DynamicContext {
     Ctx4D(LayerContext4D),
 }
 
-/// Батч тензоров с динамической размерностью.
 pub enum DynamicBatchTensor {
     Dim1(Vec<Tensor2D>),
     Dim2(Vec<Tensor3D>),
@@ -28,7 +26,7 @@ pub enum DynamicBatchTensor {
     Dim4(Vec<Tensor5D>),
 }
 
-pub(crate) enum Segment {
+pub enum Segment {
     UniversalProcessor(
         Arc<Vec<Box<dyn UniversalLayer>>>,
         Vec<ParamSlice>,
@@ -56,3 +54,4 @@ pub(crate) enum Segment {
         slice: ParamSlice,
     },
 }
+

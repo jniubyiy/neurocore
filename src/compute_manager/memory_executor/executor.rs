@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::{
@@ -19,6 +20,7 @@ use super::ssd_cache::SsdCacheManager;
 use super::types::{
     BufferData, BufferLocation, MemoryDeviceKind, TensorBuffer, TensorBufferId,
 };
+use super::policy::{BufferMetadata, BufferPriority, MemoryPolicy, MemoryTier};
 
 use crate::compute_manager::gpu::init::GpuContext;
 
@@ -38,6 +40,8 @@ pub struct MemoryExecutor {
     next_buffer_id: AtomicUsize,
     gpu_contexts: HashMap<DeviceId, Arc<GpuContext>>,
     ssd_cache: Option<SsdCacheManager>,
+    policy: MemoryPolicy,
+    tick_counter: usize,
 }
 
 impl MemoryExecutor {
@@ -49,6 +53,8 @@ impl MemoryExecutor {
             next_buffer_id: AtomicUsize::new(0),
             gpu_contexts: HashMap::new(),
             ssd_cache: None,
+            policy: MemoryPolicy::default(),
+            tick_counter: 0,
         }
     }
 
@@ -77,7 +83,6 @@ impl MemoryExecutor {
         self.devices.insert(id, spec);
     }
 
-    /// Регистрирует SSD-кэш с заданной директорией и максимальным размером.
     pub fn register_ssd_cache(
         &mut self,
         path: PathBuf,
@@ -92,6 +97,11 @@ impl MemoryExecutor {
         Ok(())
     }
 
+    /// Установить политику управления памятью.
+    pub fn set_policy(&mut self, policy: MemoryPolicy) {
+        self.policy = policy;
+    }
+
     /// Возвращает текущее использование памяти (в байтах) для заданного типа памяти.
     pub fn current_usage(&self, kind: MemoryDeviceKind) -> usize {
         self.pools
@@ -100,10 +110,38 @@ impl MemoryExecutor {
             .unwrap_or(0)
     }
 
+    /// Возвращает использование в долях (0.0..1.0) для VRAM и RAM.
+    fn get_usage_ratios(&self) -> (f32, f32) {
+        let vram_used = self.pools
+            .iter()
+            .filter(|(k, _)| matches!(k, MemoryDeviceKind::DeviceVram(_)))
+            .map(|(_, p)| p.used_elements)
+            .sum::<usize>();
+        let vram_total = self.pools
+            .iter()
+            .filter(|(k, _)| matches!(k, MemoryDeviceKind::DeviceVram(_)))
+            .map(|(_, p)| p.max_elements)
+            .sum::<usize>();
+
+        let ram_used = self.pools
+            .get(&MemoryDeviceKind::HostRam)
+            .map(|p| p.used_elements)
+            .unwrap_or(0);
+        let ram_total = self.pools
+            .get(&MemoryDeviceKind::HostRam)
+            .map(|p| p.max_elements)
+            .unwrap_or(1);
+
+        let vram_ratio = if vram_total > 0 { vram_used as f32 / vram_total as f32 } else { 0.0 };
+        let ram_ratio = if ram_total > 0 { ram_used as f32 / ram_total as f32 } else { 0.0 };
+        (vram_ratio, ram_ratio)
+    }
+
     pub fn allocate(
         &mut self,
         location: MemoryDeviceKind,
         elements: usize,
+        priority: BufferPriority,
     ) -> Result<TensorBufferId, MemoryError> {
         let pool = self
             .pools
@@ -157,6 +195,7 @@ impl MemoryExecutor {
         };
 
         let id = TensorBufferId(self.next_buffer_id.fetch_add(1, Ordering::SeqCst));
+        let metadata = BufferMetadata::new(elements, priority);
         let buffer = TensorBuffer {
             id,
             size_elements: elements,
@@ -164,9 +203,29 @@ impl MemoryExecutor {
             data,
             pinned: false,
             use_count: 0,
+            metadata,
         };
         self.buffers.insert(id, buffer);
         Ok(id)
+    }
+
+    /// Резервирует память на указанном устройстве без фактического выделения буфера.
+    /// Используется для планирования распределения сегментов модели.
+    pub fn reserve_memory(&mut self, kind: MemoryDeviceKind, elements: usize) -> Result<(), MemoryError> {
+        let pool = self.pools.get_mut(&kind).ok_or(MemoryError::DeviceNotFound(kind))?;
+        if pool.can_allocate(elements) {
+            pool.reserve(elements);
+            Ok(())
+        } else {
+            Err(MemoryError::OutOfMemory(kind))
+        }
+    }
+
+    /// Освобождает ранее зарезервированную память (без фактического освобождения буфера).
+    pub fn release_reserved_memory(&mut self, kind: MemoryDeviceKind, elements: usize) {
+        if let Some(pool) = self.pools.get_mut(&kind) {
+            pool.deallocate(elements);
+        }
     }
 
     pub fn move_buffer(
@@ -178,6 +237,10 @@ impl MemoryExecutor {
             .buffers
             .get_mut(&id)
             .ok_or(MemoryError::BufferNotFound(id))?;
+
+        // Обновляем статистику доступа
+        buffer.metadata.touch();
+
         let current_kind = location_to_kind(&buffer.location);
         if current_kind == target {
             return Ok(());
@@ -388,6 +451,7 @@ impl MemoryExecutor {
         self.move_buffer(id, target)?;
         let buffer = self.buffers.get_mut(&id).unwrap();
         buffer.use_count += 1;
+        buffer.metadata.touch();
         Ok(ResolvedBuffer {
             buffer: buffer as *mut TensorBuffer,
             _owner: std::marker::PhantomData,
@@ -413,6 +477,102 @@ impl MemoryExecutor {
         }
         Ok(())
     }
+
+    /// Подсказка планировщика: эти буферы будут скоро использованы, повысить приоритет.
+    pub fn hint_access(&mut self, ids: &[TensorBufferId]) {
+        for &id in ids {
+            if let Some(buffer) = self.buffers.get_mut(&id) {
+                if buffer.metadata.priority != BufferPriority::High {
+                    buffer.metadata.priority = BufferPriority::High;
+                }
+                buffer.metadata.touch();
+            }
+        }
+    }
+
+    /// Выполнить один "тик" политики управления памятью.
+    pub fn tick(&mut self) {
+        self.tick_counter += 1;
+
+        let (vram_usage, ram_usage) = self.get_usage_ratios();
+
+        let buffer_ids: Vec<TensorBufferId> = self.buffers.keys().copied().collect();
+
+        for id in buffer_ids {
+            let (current_tier, _priority, _size, _pinned, metadata) = {
+                let buffer = match self.buffers.get(&id) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                if buffer.pinned {
+                    continue;
+                }
+                let tier = location_to_tier(&buffer.location);
+                let priority = buffer.metadata.priority;
+                let size = buffer.size_elements;
+                let pinned = buffer.pinned;
+                let metadata = buffer.metadata.clone();
+                (tier, priority, size, pinned, metadata)
+            };
+
+            if let Some(target_tier) = self.policy.decide_movement(
+                &metadata,
+                current_tier,
+                vram_usage,
+                ram_usage,
+            ) {
+                let target_kind = tier_to_kind(target_tier);
+                if let Err(e) = self.move_buffer(id, target_kind) {
+                    eprintln!("[MemoryExecutor] Failed to move buffer {:?}: {:?}", id, e);
+                }
+            }
+        }
+
+        for buffer in self.buffers.values_mut() {
+            buffer.metadata.reset_period_counter();
+        }
+    }
+
+    /// Принудительно выгрузить данные с VRAM, чтобы освободить указанное количество МБ.
+    pub fn force_evict(&mut self, target_free_mb: u64) -> Result<(), MemoryError> {
+        let target_bytes = target_free_mb * 1024 * 1024;
+
+        let mut candidates: Vec<(TensorBufferId, BufferPriority, Instant, usize)> = self.buffers
+            .iter()
+            .filter(|(_, b)| matches!(b.location, BufferLocation::DeviceVram(_)))
+            .map(|(id, b)| (*id, b.metadata.priority, b.metadata.last_access, b.size_elements))
+            .collect();
+
+        candidates.sort_by_key(|(_, priority, last_access, _)| {
+            let priority_order = match priority {
+                BufferPriority::High => 0,
+                BufferPriority::Medium => 1,
+                BufferPriority::Low => 2,
+            };
+            (priority_order, *last_access)
+        });
+
+        let mut freed_bytes = 0u64;
+        for (id, _priority, _last_access, size) in candidates {
+            if freed_bytes >= target_bytes {
+                break;
+            }
+            if let Some(buffer) = self.buffers.get(&id) {
+                if buffer.pinned {
+                    continue;
+                }
+            }
+            let target = if ram_usage_ratio(&self.pools) < 0.7 {
+                MemoryDeviceKind::HostRam
+            } else {
+                MemoryDeviceKind::SsdCache
+            };
+            self.move_buffer(id, target)?;
+            freed_bytes += (size * 4) as u64;
+        }
+
+        Ok(())
+    }
 }
 
 // Вспомогательные функции
@@ -422,6 +582,28 @@ fn location_to_kind(loc: &BufferLocation) -> MemoryDeviceKind {
         BufferLocation::DeviceVram(id) => MemoryDeviceKind::DeviceVram(*id),
         BufferLocation::SsdCache(_) => MemoryDeviceKind::SsdCache,
     }
+}
+
+fn location_to_tier(loc: &BufferLocation) -> MemoryTier {
+    match loc {
+        BufferLocation::HostRam => MemoryTier::Ram,
+        BufferLocation::DeviceVram(_) => MemoryTier::Vram,
+        BufferLocation::SsdCache(_) => MemoryTier::Ssd,
+    }
+}
+
+fn tier_to_kind(tier: MemoryTier) -> MemoryDeviceKind {
+    match tier {
+        MemoryTier::Ram => MemoryDeviceKind::HostRam,
+        MemoryTier::Vram => MemoryDeviceKind::DeviceVram(DeviceId(0)),
+        MemoryTier::Ssd => MemoryDeviceKind::SsdCache,
+    }
+}
+
+fn ram_usage_ratio(pools: &HashMap<MemoryDeviceKind, MemoryPool>) -> f32 {
+    let used = pools.get(&MemoryDeviceKind::HostRam).map(|p| p.used_elements).unwrap_or(0);
+    let total = pools.get(&MemoryDeviceKind::HostRam).map(|p| p.max_elements).unwrap_or(1);
+    used as f32 / total as f32
 }
 
 fn copy_buffer_sync(

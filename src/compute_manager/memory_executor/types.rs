@@ -3,9 +3,8 @@
 use std::path::PathBuf;
 use vulkano::buffer::Subbuffer;
 use crate::compute_manager::device_spec::DeviceId;
-
-// Импортируем единый SsdHandle из ssd_cache
 use super::ssd_cache::SsdHandle;
+use super::policy::BufferMetadata;
 
 /// Уникальный идентификатор буфера тензора
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,4 +42,6 @@ pub struct TensorBuffer {
     pub data: BufferData,
     pub pinned: bool,
     pub use_count: usize,
+    /// Метаданные для политики управления памятью
+    pub metadata: BufferMetadata,
 }

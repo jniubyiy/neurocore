@@ -24,7 +24,14 @@ impl MemoryPool {
         self.used_elements + elements <= self.max_elements
     }
 
-    /// Зарезервировать память (увеличивает счётчик)
+    /// Зарезервировать память (увеличивает счётчик) без фактического выделения.
+    /// Используется для планирования распределения.
+    pub fn reserve(&mut self, elements: usize) {
+        self.used_elements += elements;
+    }
+
+    /// Зарезервировать память (увеличивает счётчик) с проверкой возможности.
+    /// Возвращает `Ok(())` если удалось, иначе ошибку.
     pub fn allocate(&mut self, elements: usize) -> Result<(), String> {
         if self.can_allocate(elements) {
             self.used_elements += elements;
@@ -41,5 +48,24 @@ impl MemoryPool {
     /// Освободить память (уменьшает счётчик)
     pub fn deallocate(&mut self, elements: usize) {
         self.used_elements = self.used_elements.saturating_sub(elements);
+    }
+
+    /// Возвращает количество свободных элементов
+    pub fn free_elements(&self) -> usize {
+        self.max_elements - self.used_elements
+    }
+
+    /// Проверяет, полностью ли пул заполнен
+    pub fn is_full(&self) -> bool {
+        self.used_elements >= self.max_elements
+    }
+
+    /// Возвращает долю использования (0.0..1.0)
+    pub fn usage_ratio(&self) -> f32 {
+        if self.max_elements == 0 {
+            0.0
+        } else {
+            self.used_elements as f32 / self.max_elements as f32
+        }
     }
 }

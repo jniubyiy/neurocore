@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::compute_manager::device_spec::DeviceSpec;
 use crate::compute_manager::gpu::init::GpuContext;
 use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::memory_executor::MemoryPolicy;
 
 // ---------------------------------------------------------------------------
 // Устройства (Compute / Storage)
@@ -35,6 +36,13 @@ pub struct DevicePlan {
     pub compute_devices: Vec<ComputeDevice>,
     pub storage_devices: Vec<StorageDevice>,
     pub default_compute_id: usize,
+
+    // Параметры политики управления памятью
+    pub vram_high_watermark: f32,
+    pub vram_low_watermark: f32,
+    pub ssd_eviction_age_secs: u64,
+    pub promotion_threshold: usize,
+    pub max_vram_buffer_elements: usize,
 }
 
 impl DevicePlan {
@@ -44,6 +52,11 @@ impl DevicePlan {
             compute_devices: Vec::new(),
             storage_devices: Vec::new(),
             default_compute_id: 0,
+            vram_high_watermark: 0.8,
+            vram_low_watermark: 0.4,
+            ssd_eviction_age_secs: 60,
+            promotion_threshold: 5,
+            max_vram_buffer_elements: 10_000_000,
         }
     }
 
@@ -53,6 +66,11 @@ impl DevicePlan {
             compute_devices: vec![ComputeDevice::Cpu { id: 0, threads: 2 }],
             storage_devices: vec![StorageDevice::Ram { id: 0, max_mb: 8192 }],
             default_compute_id: 0,
+            vram_high_watermark: 0.8,
+            vram_low_watermark: 0.4,
+            ssd_eviction_age_secs: 60,
+            promotion_threshold: 5,
+            max_vram_buffer_elements: 10_000_000,
         }
     }
 
@@ -98,6 +116,34 @@ impl DevicePlan {
         self
     }
 
+    /// Устанавливает политику управления VRAM.
+    /// - `high_watermark`: порог заполнения VRAM (0.0..1.0), после которого начинается выгрузка.
+    /// - `low_watermark`: порог, при котором можно загружать новые данные в VRAM.
+    pub fn with_vram_policy(mut self, high_watermark: f32, low_watermark: f32) -> Self {
+        self.vram_high_watermark = high_watermark.clamp(0.0, 1.0);
+        self.vram_low_watermark = low_watermark.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Устанавливает время неиспользования (в секундах), после которого буфер может быть выгружен на SSD.
+    pub fn with_ssd_eviction_age(mut self, age_secs: u64) -> Self {
+        self.ssd_eviction_age_secs = age_secs;
+        self
+    }
+
+    /// Устанавливает порог числа обращений для продвижения буфера в VRAM.
+    pub fn with_promotion_threshold(mut self, threshold: usize) -> Self {
+        self.promotion_threshold = threshold;
+        self
+    }
+
+    /// Устанавливает максимальный размер буфера (в элементах f32), который может быть размещён в VRAM.
+    /// Буферы больше этого размера будут реже продвигаться в VRAM.
+    pub fn with_max_vram_buffer_elements(mut self, max_elements: usize) -> Self {
+        self.max_vram_buffer_elements = max_elements;
+        self
+    }
+
     // ---------- Геттеры ----------
 
     pub fn default_compute_id(&self) -> usize {
@@ -108,6 +154,8 @@ impl DevicePlan {
     ///
     /// Формат: `"cpu:<id>:<threads>; gpu:<id>; ram:<id>:<mb>; vram:<id>:<gpu_id>:<mb>; ssd:<id>:<path>:<mb>"`
     /// Элементы разделяются `;`, пробелы игнорируются.
+    /// Дополнительно можно указать параметры политики:
+    /// `vram_high=<float>; vram_low=<float>; ssd_age=<u64>; promotion=<usize>; max_vram_elems=<usize>`
     pub fn from_config_string(config: &str) -> Result<Self, String> {
         let mut plan = DevicePlan::empty();
         let cleaned = config.replace(' ', "").replace('\t', "");
@@ -153,7 +201,6 @@ impl DevicePlan {
                     let path_and_id = &rest[..last_colon];
                     let mb_str = &rest[last_colon + 1..];
                     let mb: u64 = mb_str.parse().map_err(|_| format!("Неверный размер SSD в '{}'", token))?;
-                    // разделяем путь и id: первый ':' отделяет id от пути
                     if let Some(first_colon) = path_and_id.find(':') {
                         let id_str = &path_and_id[..first_colon];
                         let path = &path_and_id[first_colon + 1..];
@@ -165,8 +212,23 @@ impl DevicePlan {
                 } else {
                     return Err(format!("Неверный формат SSD: {}", token));
                 }
+            } else if token.starts_with("vram_high=") {
+                let val: f32 = token[10..].parse().map_err(|_| format!("Неверное значение vram_high: {}", token))?;
+                plan.vram_high_watermark = val.clamp(0.0, 1.0);
+            } else if token.starts_with("vram_low=") {
+                let val: f32 = token[9..].parse().map_err(|_| format!("Неверное значение vram_low: {}", token))?;
+                plan.vram_low_watermark = val.clamp(0.0, 1.0);
+            } else if token.starts_with("ssd_age=") {
+                let val: u64 = token[8..].parse().map_err(|_| format!("Неверное значение ssd_age: {}", token))?;
+                plan.ssd_eviction_age_secs = val;
+            } else if token.starts_with("promotion=") {
+                let val: usize = token[10..].parse().map_err(|_| format!("Неверное значение promotion: {}", token))?;
+                plan.promotion_threshold = val;
+            } else if token.starts_with("max_vram_elems=") {
+                let val: usize = token[15..].parse().map_err(|_| format!("Неверное значение max_vram_elems: {}", token))?;
+                plan.max_vram_buffer_elements = val;
             } else {
-                return Err(format!("Неизвестный тип устройства: '{}'", token));
+                return Err(format!("Неизвестный тип устройства или параметр: '{}'", token));
             }
         }
         Ok(plan)
@@ -215,6 +277,18 @@ impl DevicePlan {
             }
             _ => None,
         });
+
+        // Настройка политики памяти
+        {
+            let policy = MemoryPolicy::new(
+                self.vram_high_watermark,
+                self.vram_low_watermark,
+                self.ssd_eviction_age_secs,
+                self.promotion_threshold,
+                self.max_vram_buffer_elements,
+            );
+            mem_exec.lock().unwrap().set_policy(policy);
+        }
 
         (mem_exec, gpu_ctx)
     }

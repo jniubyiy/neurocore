@@ -1,7 +1,9 @@
 // src/compute_manager/graph/forward/segments/processors.rs
 
 use std::sync::Arc;
+use std::time::Instant;
 
+use crate::compute_manager::cpu::worker_pool::WorkerPool;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
@@ -72,6 +74,9 @@ impl MixedModel {
 
         let mut receivers = Vec::with_capacity(active_indices.len());
 
+        // Канал для сбора времени выполнения чанков на каждом CPU
+        let (time_tx, time_rx) = std::sync::mpsc::channel();
+
         for &stream_idx in &active_indices {
             let batch = streams[stream_idx].clone();
             let batch_len = batch.len();
@@ -83,6 +88,7 @@ impl MixedModel {
             let params = params.to_vec();
 
             let (tx, rx) = std::sync::mpsc::channel();
+            let time_tx = time_tx.clone();
 
             for (_worker_id, ranges) in assignment.iter().enumerate() {
                 if ranges.is_empty() { continue; }
@@ -92,13 +98,20 @@ impl MixedModel {
                 let slices = Arc::clone(&slices);
                 let params = params.clone();
                 let tx = tx.clone();
+                let time_tx = time_tx.clone();
                 let executor = self.executor.clone_executor();
 
                 executor.execute_dyn(Box::new(move || {
+                    // Получаем индекс текущего CPU (воркера)
+                    let cpu_idx = WorkerPool::current_worker_index();
+
                     let mut results: Vec<(usize, DynamicTensor)> = Vec::new();
                     let mut ctxs: Vec<(usize, Vec<DynamicContext>)> = Vec::new();
 
                     for (range_start, range_size) in &ranges {
+                        // Замеряем время выполнения этого чанка
+                        let start = Instant::now();
+
                         let chunk_mat = MixedModel::samples_to_mat(
                             &batch[*range_start..*range_start + *range_size]
                         );
@@ -107,6 +120,12 @@ impl MixedModel {
                                 &layers, &slices, &chunk_mat, &params,
                             );
                         let samples = MixedModel::mat_to_samples(&chunk_out_mat);
+
+                        let duration = start.elapsed().as_nanos() as f64;
+
+                        // Отправляем информацию о времени выполнения
+                        let _ = time_tx.send((cpu_idx, *range_size, duration));
+
                         for (i, sample) in samples.into_iter().enumerate() {
                             results.push((*range_start + i, sample));
                         }
@@ -114,13 +133,18 @@ impl MixedModel {
                             ctxs.push((*range_start + i, chunk_ctxs.clone()));
                         }
                     }
-                    tx.send((results, ctxs)).ok();
+                    let _ = tx.send((results, ctxs));
                 }));
             }
             receivers.push((stream_idx, rx));
         }
 
         self.executor.wait_all();
+
+        // Собираем и обрабатываем все времена выполнения
+        while let Ok((cpu_idx, chunk_size, duration_ns)) = time_rx.try_recv() {
+            self.scheduler.lock().unwrap().report_execution_time(cpu_idx, chunk_size, duration_ns);
+        }
 
         for (stream_idx, rx) in receivers {
             let batch_len = streams[stream_idx].len();

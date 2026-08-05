@@ -1,80 +1,92 @@
 // examples/linear4d_test.rs
-// Один линейный слой 4 -> 2, размерность Dim4.
-// Используются новые удобные методы compute_loss и update_params.
+// Полноценное обучение автоэнкодера 256 -> 256 (Tensor5D) через TrainingPlan.
+// Данные нормированы в [0, 1] для стабильности.
 
-use std::time::Instant;
-use neurocore::compute_manager::DynamicTensor;
-use neurocore::tensor::Tensor5D;
-use neurocore::create_models;
+use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+
+mod device_plan {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192) }
+}
 
 mod models {
-    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
-
+    use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
     pub fn linear_model() -> Vec<LayerDesc> {
         vec![
-            LayerDesc::new("linear", LayerKind::Linear, Dim::Dim4)
-                .input(Dim::Dim4, &[4])
-                .output(Dim::Dim4, &[2]),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[4], B[4], C[4], D[4]))
+                .output(shape!(batch, A[4], B[4], C[4], D[4])),
         ]
     }
 }
 
 mod losses {
-    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
-
+    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub, SumColumns};
     pub fn mse() -> LossDesc {
         let chain = ElementChain::new()
-            .add(Box::new(Sub))
-            .add(Box::new(Square));
-        LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1)
+            .add(Box::new(Sub::new(256)))
+            .add(Box::new(Square))
+            .add(Box::new(SumColumns));
+        LossDesc::from_chain(chain, Aggregation::Mean, 1, 256, 256)
     }
 }
 
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
-
     pub fn sgd() -> OptimizerDesc {
         OptimizerDesc::new()
-            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ScaleGradient(0.001))
             .add(OptCubeDesc::ApplyUpdate)
     }
 }
 
-fn main() {
-    let (mut model,) = create_models!(models::linear_model);
+mod training_plan {
+    use super::models;
+    use super::losses;
+    use super::optimizers;
+    use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+    use neurocore::tensor::Tensor5D;
 
-    let x = Tensor5D::new(vec![vec![vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]]]);
-    let target = Tensor5D::new(vec![vec![vec![vec![vec![0.8, 1.2]]]]]);
-    let epochs = 500;
-
-    let start = Instant::now();
-    for epoch in 0..epochs {
-        let (pred, ctxs) = model.forward(DynamicTensor::Dim4(x.clone()));
-        let (loss, delta) = model.compute_loss(
-            losses::mse(),
-            &pred,
-            &DynamicTensor::Dim4(target.clone()),
-        );
-        let (_, grads) = model.backward(&ctxs, delta);
-        model.update_params(optimizers::sgd(), &grads[0]);
-
-        if epoch == 0 || epoch % 200 == 0 {
-            println!("Epoch {}: loss = {:.6}", epoch, loss);
+    pub fn plan() -> TrainingPlan {
+        // Нормированные значения в [0, 1]
+        let values: Vec<f32> = (0..256).map(|i| i as f32 / 256.0).collect();
+        let mut data = Vec::with_capacity(1);
+        let mut dim2 = Vec::with_capacity(4);
+        for a in 0..4 {
+            let mut dim3 = Vec::with_capacity(4);
+            for b in 0..4 {
+                let mut dim4 = Vec::with_capacity(4);
+                for c in 0..4 {
+                    let mut dim5 = Vec::with_capacity(4);
+                    for d in 0..4 {
+                        let idx = a * 64 + b * 16 + c * 4 + d;
+                        dim5.push(values[idx]);
+                    }
+                    dim4.push(dim5);
+                }
+                dim3.push(dim4);
+            }
+            dim2.push(dim3);
         }
+        data.push(dim2);
+        let x = Tensor5D::new(data);
+        let ds = DataSource::from_tensor5d(x);
+        TrainingPlan::new()
+            .model(models::linear_model)
+            .loss(losses::mse())
+            .optimizer(optimizers::sgd())
+            .epochs(100)
+            .batch_size(1)
+            .train_data(ds)
+            .init_weights(Initializer::RandomUniform { min: -0.01, max: 0.01 })
     }
-    let duration = start.elapsed();
-
-    let (final_pred, _) = model.forward(DynamicTensor::Dim4(x.clone()));
-    let (final_loss, _) = model.compute_loss(
-        losses::mse(),
-        &final_pred,
-        &DynamicTensor::Dim4(target.clone()),
-    );
-
-    println!("Done. Time: {:?}", duration);
-    println!("Final loss: {:.6}", final_loss);
 }
 
+fn main() {
+    let r = neurocore::run_training!(training_plan::plan, device = device_plan::plan);
+    println!("Training done. Final loss: {:.6}", r.final_loss);
+}
 
 
 

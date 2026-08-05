@@ -22,6 +22,7 @@
 ///             .epochs(10)
 ///             .batch_size(32)
 ///             .train_data(DataSource::from_tensor2d(...))
+///             .target_data(DataSource::from_tensor2d(...))
 ///     }
 /// }
 ///

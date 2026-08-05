@@ -1,92 +1,60 @@
-// src/loss_plan/execution.rs
+// src/plans/loss_plan/execution.rs
 
-use std::sync::{Arc, mpsc};
-
+use std::sync::Arc;
 use faer::Mat;
 use crate::compute_manager::cpu::{Scheduler, WorkerPool};
 use super::expr::LossExpr;
 
+/// Вычисляет значение функции потерь и градиент по предсказанию на CPU.
+///
+/// # Аргументы
+/// * `expr` – выражение потерь (цепочка кубиков + агрегация).
+/// * `pred` – матрица предсказаний `(batch, pred_features)`.
+/// * `target` – матрица целей `(batch, target_features)`.
+/// * `_scheduler` – планировщик (зарезервирован для будущей параллелизации по батчам).
+/// * `_pool` – пул потоков (зарезервирован).
+///
+/// # Возвращает
+/// * `loss` – агрегированное значение потерь (скаляр).
+/// * `grad_pred` – матрица градиентов по pred той же размерности, что и `pred`.
 pub fn compute_loss_mat(
     expr: &Arc<LossExpr>,
     pred: &Mat<f32>,
     target: &Mat<f32>,
-    scheduler: &mut Scheduler,
-    pool: &WorkerPool,
+    _scheduler: &mut Scheduler,
+    _pool: &WorkerPool,
 ) -> (f32, Mat<f32>) {
     let pred_feat = expr.pred_features();
     let target_feat = expr.target_features();
+    let batch = pred.nrows();
+    assert_eq!(batch, target.nrows(), "Pred and target must have the same batch size");
+    assert_eq!(pred.ncols(), pred_feat, "Pred cols mismatch");
+    assert_eq!(target.ncols(), target_feat, "Target cols mismatch");
+
     let in_features = pred_feat + target_feat;
 
-    // Разворачиваем матрицы в плоские векторы поэлементно
-    let flat_pred: Vec<f32> = (0..pred.nrows())
-        .flat_map(|r| (0..pred_feat).map(move |c| pred[(r, c)]))
-        .collect();
-    let flat_target: Vec<f32> = (0..target.nrows())
-        .flat_map(|r| (0..target_feat).map(move |c| target[(r, c)]))
-        .collect();
-
-    let total_tasks = flat_pred.len() / pred_feat;
-
-    // Формируем матрицу задач, каждая строка: [pred_i, target_i]
-    let full_input = Mat::from_fn(total_tasks, in_features, |i, j| {
-        if j < pred_feat {
-            flat_pred[i * pred_feat + j]
-        } else {
-            let t_idx = j - pred_feat;
-            flat_target[i * target_feat + t_idx]
-        }
-    });
-
-    let assignment = scheduler.plan_chunks_assignment(total_tasks);
-    let full_input = Arc::new(full_input);
-    let (tx, rx) = mpsc::channel();
-    let mut tasks_sent = 0;
-
-    for (_worker_id, ranges) in assignment.iter().enumerate() {
-        if ranges.is_empty() { continue; }
-        let ranges = ranges.clone();
-        let full_input = Arc::clone(&full_input);
-        let expr = Arc::clone(expr);
-        let tx = tx.clone();
-        pool.execute(move || {
-            let mut loss_contrib = Vec::new();
-            let mut grad_contrib = Vec::new();
-            for (start, count) in &ranges {
-                let chunk = full_input.submatrix(*start, 0, *count, in_features).to_owned();
-                let (loss_vec, intermediates) = expr.forward_chunk(&chunk);
-                let grad_loss = vec![1.0f32; *count];
-                let grad_mat = expr.backward_chunk(&intermediates, &grad_loss);
-                loss_contrib.extend_from_slice(&loss_vec);
-                for i in 0..*count {
-                    for j in 0..in_features {
-                        grad_contrib.push(grad_mat[(i, j)]);
-                    }
-                }
-            }
-            tx.send((loss_contrib, grad_contrib)).ok();
-        });
-        tasks_sent += 1;
-    }
-    pool.wait_all();
-
-    let mut all_loss = Vec::with_capacity(total_tasks);
-    let mut all_grad = Vec::with_capacity(total_tasks * in_features);
-    for _ in 0..tasks_sent {
-        if let Ok((loss, grad)) = rx.recv() {
-            all_loss.extend_from_slice(&loss);
-            all_grad.extend_from_slice(&grad);
-        }
-    }
-
-    let loss = expr.aggregate_loss(&all_loss);
-    let grad_flat = expr.aggregate_grad(&all_grad);
-
-    // Корректно восстанавливаем градиент по pred в матрицу (total_tasks x pred_feat)
-    let mut grad_pred = Mat::zeros(pred.nrows(), pred.ncols());
-    for i in 0..total_tasks {
-        let start = i * in_features;
+    // Формируем полную матрицу [pred | target]
+    let mut full_input = Mat::zeros(batch, in_features);
+    for i in 0..batch {
         for j in 0..pred_feat {
-            grad_pred[(i, j)] = grad_flat[start + j];
+            full_input[(i, j)] = pred[(i, j)];
+        }
+        for j in 0..target_feat {
+            full_input[(i, pred_feat + j)] = target[(i, j)];
+        }
+    }
+
+    let (loss_vec, intermediates) = expr.forward_chunk(&full_input);
+    let loss = expr.aggregate_loss(&loss_vec);
+
+    let grad_loss = vec![1.0f32; batch];
+    let grad_full = expr.backward_chunk(&intermediates, &grad_loss);
+
+    // Извлекаем градиент только по pred (первые pred_feat столбцов)
+    let mut grad_pred = Mat::zeros(batch, pred_feat);
+    for i in 0..batch {
+        for j in 0..pred_feat {
+            grad_pred[(i, j)] = grad_full[(i, j)];
         }
     }
 

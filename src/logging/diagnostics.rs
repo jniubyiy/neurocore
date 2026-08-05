@@ -1,4 +1,4 @@
-// src/compute_manager/diagnostics.rs
+// src/logging/diagnostics.rs
 
 use std::collections::HashMap;
 use std::fmt::Write;

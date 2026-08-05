@@ -1,4 +1,4 @@
-// src/loss_plan/expr.rs
+// src/plans/loss_plan/expr.rs
 
 use faer::Mat;
 use std::sync::Arc;
@@ -14,16 +14,31 @@ pub enum Aggregation {
 }
 
 /// Выражение функции потерь, построенное на цепочке элементарных кубиков.
+///
+/// Принимает матрицы размера `(batch, pred_features + target_features)`,
+/// где `batch` — количество сэмплов в батче (значение `total_tasks`).
 pub struct LossExpr {
     chain: Arc<ElementChain>,
     aggregation: Aggregation,
+    /// Количество сэмплов в батче (размер `batch`)
     total_tasks: usize,
+    /// Число признаков предсказания на один сэмпл
     pred_features: usize,
+    /// Число признаков целевой переменной на один сэмпл
     target_features: usize,
 }
 
 impl LossExpr {
     /// Создаёт новое выражение потерь.
+    ///
+    /// # Аргументы
+    /// * `chain` – цепочка элементарных кубиков (первый кубик должен принимать
+    ///   `pred_features + target_features` столбцов).
+    /// * `aggregation` – способ агрегирования.
+    /// * `total_tasks` – размер батча (`batch`).
+    /// * `pred_features` – количество выходных признаков модели на один сэмпл.
+    /// * `target_features` – количество целевых признаков на один сэмпл
+    ///   (обычно равно `pred_features`).
     pub fn new(
         chain: Arc<ElementChain>,
         aggregation: Aggregation,
@@ -40,22 +55,23 @@ impl LossExpr {
         }
     }
 
-    /// Количество задач.
+    /// Количество сэмплов в батче (размер `batch`).
     pub fn num_tasks(&self) -> usize {
         self.total_tasks
     }
 
-    /// Размер входной матрицы для одной задачи (число столбцов).
+    /// Размер входной матрицы для одного сэмпла (число столбцов).
+    /// Равно `pred_features + target_features`.
     pub fn task_input_size(&self) -> usize {
-        self.chain.task_input_size()
+        self.pred_features + self.target_features
     }
 
-    /// Количество признаков предсказания на задачу.
+    /// Количество признаков предсказания на сэмпл.
     pub fn pred_features(&self) -> usize {
         self.pred_features
     }
 
-    /// Количество признаков целевой переменной на задачу.
+    /// Количество признаков целевой переменной на сэмпл.
     pub fn target_features(&self) -> usize {
         self.target_features
     }
@@ -70,7 +86,15 @@ impl LossExpr {
         self.aggregation
     }
 
-    /// Выполняет прямой проход для чанка задач.
+    /// Выполняет прямой проход для всего батча.
+    ///
+    /// # Аргументы
+    /// * `chunk_input` – матрица размера `(batch, pred_features + target_features)`,
+    ///   где каждая строка содержит признаки предсказания и цели для одного сэмпла.
+    ///
+    /// # Возвращает
+    /// * вектор значений потерь (длина равна `batch`),
+    /// * вектор промежуточных результатов кубиков для обратного прохода.
     pub fn forward_chunk(
         &self,
         chunk_input: &Mat<f32>,
@@ -82,7 +106,14 @@ impl LossExpr {
         (loss_vec, intermediates)
     }
 
-    /// Выполняет обратный проход для чанка задач.
+    /// Выполняет обратный проход для всего батча.
+    ///
+    /// # Аргументы
+    /// * `intermediates` – промежуточные результаты прямого прохода.
+    /// * `grad_loss` – градиент по значениям потерь (вектор длины `batch`).
+    ///
+    /// # Возвращает
+    /// матрицу градиентов по входным данным размера `(batch, pred_features + target_features)`.
     pub fn backward_chunk(
         &self,
         intermediates: &[(Mat<f32>, Mat<f32>)],
@@ -98,7 +129,7 @@ impl LossExpr {
         self.chain.backward_batch(intermediates, &grad_out)
     }
 
-    /// Вычисляет итоговое значение потерь путём агрегации значений по отдельным задачам.
+    /// Вычисляет итоговое значение потерь путём агрегации значений по отдельным сэмплам.
     pub fn aggregate_loss(&self, loss_parts: &[f32]) -> f32 {
         let sum: f32 = loss_parts.iter().sum();
         let n = self.total_tasks as f32;
@@ -109,6 +140,9 @@ impl LossExpr {
     }
 
     /// Вычисляет агрегированный градиент по входным данным.
+    ///
+    /// `grad_parts` – плоский вектор, содержащий все элементы матрицы градиентов
+    /// (полученной из `backward_chunk`) в row-major порядке.
     pub fn aggregate_grad(&self, grad_parts: &[f32]) -> Vec<f32> {
         let n = self.total_tasks as f32;
         match self.aggregation {

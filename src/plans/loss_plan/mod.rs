@@ -1,4 +1,4 @@
-// src/loss_plan/mod.rs
+// src/plans/loss_plan/mod.rs
 
 pub mod cubes;
 pub mod cross_entropy;
@@ -8,7 +8,7 @@ pub mod desc;
 pub mod execution;
 pub mod gpu_exec;
 
-pub use cubes::{ElemCube, Sub, Square, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff};
+pub use cubes::{ElemCube, Sub, Square, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff, SumColumns};
 pub use cross_entropy::CrossEntropyWithLogits;
 pub use chain::ElementChain;
 pub use expr::{Aggregation, LossExpr};

@@ -1,4 +1,4 @@
-// src/loss_plan/chain.rs
+// src/plans/loss_plan/chain.rs
 
 use faer::Mat;
 use super::cubes::ElemCube;

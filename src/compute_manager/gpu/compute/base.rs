@@ -23,7 +23,7 @@ use crate::compute_manager::memory_executor::{
     TensorBufferId,
     BufferPriority,
 };
-use crate::compute_manager::logger;
+use crate::logging::panic_logger;
 
 use super::super::init::GpuContext;
 use super::super::pipeline::PipelineCache;
@@ -74,7 +74,7 @@ impl GpuCompute {
         let kind = MemoryDeviceKind::DeviceVram(self.gpu_device_id);
         let id = mem.allocate(kind, elements, BufferPriority::High)
             .expect("Failed to allocate GPU buffer");
-        logger::log(format!("[GPU] create_buffer: id={}, elements={}", id.0, elements));
+        panic_logger::log(format!("[GPU] create_buffer: id={}, elements={}", id.0, elements));
         let resolved = mem.resolve_buffer(id, kind)
             .expect("Failed to resolve buffer");
         let buf = resolved.as_device_buffer().clone();
@@ -83,7 +83,7 @@ impl GpuCompute {
     }
 
     pub fn release_buffer(&self, id: TensorBufferId) {
-        logger::log(format!("[GPU] release_buffer: id={}", id.0));
+        panic_logger::log(format!("[GPU] release_buffer: id={}", id.0));
         self.memory_executor.lock().unwrap().release_buffer(id);
     }
 
@@ -93,7 +93,7 @@ impl GpuCompute {
         data: &[f32],
     ) -> (Subbuffer<[f32]>, TensorBufferId) {
         let elements = data.len();
-        logger::log(format!("[GPU] create_storage_buffer_from_slice: {} elems", elements));
+        panic_logger::log(format!("[GPU] create_storage_buffer_from_slice: {} elems", elements));
         let mut mem = self.memory_executor.lock().unwrap();
 
         // 1. Выделяем HostRam буфер и записываем данные
@@ -284,7 +284,7 @@ impl GpuCompute {
         cols: usize,
     ) -> Mat<f32> {
         let total = rows * cols;
-        logger::log(format!(
+        panic_logger::log(format!(
             "[GPU] read_buffer_to_mat: buffer_id={}, rows={}, cols={} ({} elems)",
             buffer_id.0, rows, cols, total
         ));
@@ -302,7 +302,7 @@ impl GpuCompute {
             let resolved = mem.resolve_buffer(buffer_id, MemoryDeviceKind::HostRam)
                 .expect("Failed to resolve host buffer");
             let slice = resolved.as_host_slice();
-            logger::log(format!(
+            panic_logger::log(format!(
                 "[GPU] read_buffer_to_mat: read {} bytes, first values: {:?}",
                 slice.len() * 4,
                 &slice[..total.min(4)]
@@ -315,4 +315,4 @@ impl GpuCompute {
 
         Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
     }
-}
+}  

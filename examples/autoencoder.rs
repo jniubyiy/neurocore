@@ -8,21 +8,22 @@ use neurocore::training_plan::ProfileMode;
 
 // ═══════════════ Модели ═══════════════
 mod models {
-    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+    use neurocore::model_plan::{LayerDesc, LayerKind, shape};
+
     pub fn encoder() -> Vec<LayerDesc> {
         vec![
-            LayerDesc::new("fc1", LayerKind::Linear, Dim::Dim1)
-                .input(Dim::Dim1, &[4])
-                .output(Dim::Dim1, &[2]),
-            LayerDesc::new("sigm", LayerKind::Sigmoid, Dim::Dim1)
-                .input(Dim::Dim1, &[2])
-                .output(Dim::Dim1, &[2]),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[4]))
+                .output(shape!(batch, A[2])),
+            LayerDesc::new(LayerKind::Sigmoid)
+                .input(shape!(batch, A[2]))
+                .output(shape!(batch, A[2])),
         ]
     }
     pub fn decoder() -> Vec<LayerDesc> {
-        vec![LayerDesc::new("fc2", LayerKind::Linear, Dim::Dim1)
-            .input(Dim::Dim1, &[2])
-            .output(Dim::Dim1, &[4])]
+        vec![LayerDesc::new(LayerKind::Linear)
+            .input(shape!(batch, A[2]))
+            .output(shape!(batch, A[4]))]
     }
 }
 

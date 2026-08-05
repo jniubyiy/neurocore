@@ -1,6 +1,7 @@
 // src/plans/training_plan/execution.rs
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 
@@ -10,6 +11,7 @@ use rand::SeedableRng;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::device_plan::{ComputeDevice, DevicePlan};
+use crate::logging::training_monitor::TrainingMonitor;
 use crate::model_plan::Plan;
 use crate::tensor::Tensor2D;
 
@@ -26,6 +28,8 @@ pub struct TrainingResult {
     pub best_loss: f32,
     pub zero_loss_epoch: Option<usize>,
     pub profile: Option<ProfileResult>,
+    /// Сводка мониторинга обучения, если был включён.
+    pub monitor_summary: Option<crate::logging::TrainingSummary>,
 }
 
 /// Выполняет план обучения. Для GPU запускает весь цикл в отдельном потоке
@@ -81,15 +85,51 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         }
     }
 
-    // --- оптимизатор ---
+    // --- оптимизатор (сначала строим цепочку, чтобы извлечь learning rate) ---
     let opt_chain = plan.optimizer_desc.build_chain();
+
+    // --- learning rate для монитора (ищем первый ScaleGradient в цепочке) ---
+    let learning_rate = opt_chain
+        .cubes()
+        .iter()
+        .find_map(|cube| {
+            cube.as_any()
+                .downcast_ref::<crate::optimizer_plan::cubes::ScaleGradient>()
+                .map(|sg| sg.factor)
+        })
+        .unwrap_or(0.01);
+
     let mut optimizer = model.create_optimizer(opt_chain);
 
+    // --- монитор обучения ---
+    let mut monitor = if plan.monitoring {
+        let dump_dir = PathBuf::from("nan_dumps");
+        let _ = std::fs::create_dir_all(&dump_dir);
+        Some(TrainingMonitor::new(
+            plan.monitor_config.clone(),
+            learning_rate,
+            dump_dir,
+        ))
+    } else {
+        None
+    };
+
+    // --- извлечение данных ---
     let train_data = match &plan.train_data {
-        Some(DataSource::Tensor2D(t)) => t.clone(),
+        Some(data) => data.clone(),
         None => return Err("Training data not provided".into()),
     };
-    let num_samples = train_data.dim1;
+    let target_data = match &plan.target_data {
+        Some(data) => data.clone(),
+        None => train_data.clone(), // цель совпадает с входными данными (автоэнкодер)
+    };
+    assert_eq!(
+        train_data.num_samples(),
+        target_data.num_samples(),
+        "Training data and target data must have the same number of samples"
+    );
+
+    let num_samples = train_data.num_samples();
     let batch_size = plan.batch_size.max(1);
 
     // --- профилировщик ---
@@ -108,14 +148,16 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
 
         for start in (0..num_samples).step_by(batch_size) {
             let end = (start + batch_size).min(num_samples);
-            let rows: Vec<Vec<f32>> = (start..end)
-                .map(|i| train_data.data[i].clone())
-                .collect();
-            let batch_tensor = Tensor2D::new(rows);
+            let batch_size_actual = end - start;
+
+            // входной батч
+            let batch_tensor = train_data.batch(start, end);
+            // целевой батч
+            let target_batch = target_data.batch(start, end);
 
             // forward
             let t0 = Instant::now();
-            let (pred, ctxs) = model.forward(DynamicTensor::Dim1(batch_tensor.clone()));
+            let (pred, ctxs) = model.forward(batch_tensor.clone());
             let forward_dt = t0.elapsed().as_nanos() as u64;
 
             // loss
@@ -123,7 +165,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
             let (loss, delta) = model.compute_loss(
                 plan.loss_desc.clone(),
                 &pred,
-                &DynamicTensor::Dim1(batch_tensor.clone()),
+                &target_batch,
             );
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
@@ -132,7 +174,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
             let (_, grads) = model.backward(&ctxs, delta);
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
-            // update
+            // обновление параметров
             let t3 = Instant::now();
             {
                 let mut store = model.param_store().lock().unwrap();
@@ -142,7 +184,12 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
             }
             let update_dt = t3.elapsed().as_nanos() as u64;
 
-            epoch_loss += loss * (end - start) as f32;
+            epoch_loss += loss * batch_size_actual as f32;
+
+            // --- мониторинг шага ---
+            if let Some(ref mut mon) = monitor {
+                mon.record_step(loss, Some(&grads[0]), None);
+            }
 
             // профилирование одного шага
             if let Some(ref mut prof) = profiler {
@@ -155,18 +202,14 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
                 if prof.mode == ProfileMode::Memory || prof.mode == ProfileMode::Full {
                     let mem = model.memory_executor();
                     let me = mem.lock().unwrap();
-                    // Собираем использование по всем зарегистрированным типам памяти
                     let kinds = [
                         MemoryDeviceKind::HostRam,
-                        // DeviceVram для каждого GPU — упрощённо берём все возможные (можно перебрать device_plan)
-                        // для полноты добавим только HostRam и SsdCache
                         MemoryDeviceKind::SsdCache,
                     ];
                     for kind in &kinds {
                         let used = me.current_usage(*kind);
                         prof.record_memory(0, &format!("{:?}", kind), "batch", used, used);
                     }
-                    // Для DeviceVram нужно перебирать GPU, но пока пропустим, чтобы не усложнять
                 }
             }
         }
@@ -189,23 +232,31 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
             println!("Epoch {}: avg loss = {:.6}", epoch, avg_loss);
         }
 
+        // --- завершение эпохи для монитора ---
+        if let Some(ref mut mon) = monitor {
+            let summary = mon.end_epoch();
+            if !summary.warnings.is_empty() {
+                println!("--- Warnings after epoch {} ---", epoch);
+                for w in &summary.warnings {
+                    println!("  - {:?}", w);
+                }
+            }
+        }
+
         // --- валидация ---
         if let Some(ref val_cfg) = plan.validation {
             if (epoch + 1) % val_cfg.frequency == 0 {
-                let DataSource::Tensor2D(val_data) = &val_cfg.data;
-                let val_samples = val_data.dim1;
+                let val_data = &val_cfg.data;
+                let val_samples = val_data.num_samples();
                 let mut val_loss = 0.0f32;
                 for start in (0..val_samples).step_by(batch_size) {
                     let end = (start + batch_size).min(val_samples);
-                    let rows: Vec<Vec<f32>> = (start..end)
-                        .map(|i| val_data.data[i].clone())
-                        .collect();
-                    let batch = Tensor2D::new(rows);
-                    let (pred, _) = model.forward(DynamicTensor::Dim1(batch.clone()));
+                    let batch = val_data.batch(start, end);
+                    let (pred, _) = model.forward(batch.clone());
                     let (loss, _) = model.compute_loss(
                         plan.loss_desc.clone(),
                         &pred,
-                        &DynamicTensor::Dim1(batch.clone()),
+                        &batch,
                     );
                     val_loss += loss * (end - start) as f32;
                 }
@@ -230,19 +281,20 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         best_loss,
         zero_loss_epoch,
         profile: None,
+        monitor_summary: None,
     };
 
     // --- финальный тест ---
     if let Some(test_data) = &plan.test_data {
-        let DataSource::Tensor2D(t) = test_data;
-        let (pred, _) = model.forward(DynamicTensor::Dim1(t.clone()));
+        let test_dynamic = test_data.to_dynamic_tensor();
+        let (pred, _) = model.forward(test_dynamic.clone());
         if plan.output_tensors.contains(&"prediction".to_string()) {
             result.tensors.insert("prediction".into(), pred);
         }
         let (loss, _) = model.compute_loss(
             plan.loss_desc.clone(),
             &result.tensors.get("prediction").unwrap(),
-            &DynamicTensor::Dim1(t.clone()),
+            &test_dynamic,
         );
         result.final_loss = loss;
     }
@@ -257,6 +309,22 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     // --- финализация профиля ---
     if let Some(prof) = profiler {
         result.profile = Some(prof.finish());
+    }
+
+    // --- итог мониторинга ---
+    if let Some(mon) = monitor {
+        let summary = mon.summary();
+        println!("=== Training Monitor Summary ===");
+        println!("Epochs: {}", summary.epochs);
+        println!("Final loss: {:.6}", summary.final_loss);
+        println!("NaN steps: {}", summary.nan_count);
+        if !summary.warnings.is_empty() {
+            println!("Warnings:");
+            for w in &summary.warnings {
+                println!("  - {:?}", w);
+            }
+        }
+        result.monitor_summary = Some(summary);
     }
 
     Ok(result)

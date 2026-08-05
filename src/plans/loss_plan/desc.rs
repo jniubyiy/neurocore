@@ -1,4 +1,4 @@
-// src/loss_plan/desc.rs
+// src/plans/loss_plan/desc.rs
 
 use std::sync::Arc;
 
@@ -7,7 +7,15 @@ use super::expr::{Aggregation, LossExpr};
 
 /// Описание (план) функции потерь.
 ///
-/// Позволяет сконструировать готовое выражение [`LossExpr`] через метод [`build`].
+/// Хранит цепочку элементарных кубиков, способ агрегации и размерности данных.
+/// Параметры `total_tasks`, `pred_features`, `target_features` соответствуют
+/// новому векторному представлению:
+/// - `total_tasks` – размер батча (количество сэмплов),
+/// - `pred_features` – число признаков предсказания на один сэмпл,
+/// - `target_features` – число признаков цели на один сэмпл (обычно равно `pred_features`).
+///
+/// Первый кубик цепочки должен принимать `pred_features + target_features` столбцов
+/// (например, `Sub::new(pred_features)`).
 #[derive(Debug, Clone)]
 pub struct LossDesc {
     pub chain: Arc<ElementChain>,
@@ -18,13 +26,15 @@ pub struct LossDesc {
 }
 
 impl LossDesc {
-    /// Создаёт описание на основе готовой цепочки кубиков и параметров агрегации.
+    /// Создаёт описание на основе готовой цепочки кубиков и параметров данных.
     ///
-    /// * `chain` — цепочка элементарных кубиков.
-    /// * `aggregation` — способ агрегирования (сумма или среднее).
-    /// * `total_tasks` — общее количество задач (например, элементов батча).
-    /// * `pred_features` — количество признаков предсказания на одну задачу.
-    /// * `target_features` — количество признаков целевой переменной на одну задачу.
+    /// # Аргументы
+    /// * `chain` – цепочка элементарных кубиков. Первый кубик должен быть способен
+    ///   принять матрицу с числом столбцов, равным `pred_features + target_features`.
+    /// * `aggregation` – способ агрегирования (сумма или среднее).
+    /// * `total_tasks` – размер батча (количество сэмплов).
+    /// * `pred_features` – количество признаков предсказания на один сэмпл.
+    /// * `target_features` – количество признаков целевой переменной на один сэмпл.
     pub fn from_chain(
         chain: ElementChain,
         aggregation: Aggregation,
@@ -44,8 +54,7 @@ impl LossDesc {
     /// Собирает готовое выражение потерь, обёрнутое в `Arc` для безопасного разделения между потоками.
     pub fn build(self) -> Arc<LossExpr> {
         Arc::new(LossExpr::new(
-            // Поскольку ElementChain больше не копируется, передаём Arc
-            self.chain.clone(),
+            self.chain,
             self.aggregation,
             self.total_tasks,
             self.pred_features,

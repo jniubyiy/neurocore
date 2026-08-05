@@ -1,4 +1,4 @@
-// src/model_plan/plan.rs
+// src/plans/model_plan/plan.rs
 
 use super::layer_desc::LayerDesc;
 use super::blueprint::LayerKind;
@@ -12,86 +12,148 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Создаёт план из списка описаний слоёв.
+    pub fn from_layer_descs(descs: Vec<LayerDesc>) -> Result<Plan, String> {
+        Plan::from_descs(descs)
+    }
+
+    /// Внутренний метод проверки и создания плана.
     pub(crate) fn from_descs(descs: Vec<LayerDesc>) -> Result<Self, String> {
         if descs.is_empty() {
             return Err("План не может быть пустым".into());
         }
 
+        // 1. Проверка каждого слоя по отдельности
         for (i, desc) in descs.iter().enumerate() {
             match desc.kind {
-                LayerKind::SplitterConnector | LayerKind::CombinerConnector
-                | LayerKind::Splitter | LayerKind::Combiner
-                | LayerKind::Unsqueeze(_) | LayerKind::ReduceMean(_) => {
-                    // Эти слои могут иметь множественные in_features/out_features
-                }
+                // Слои, допускающие множественные входы/выходы – без дополнительных ограничений
+                LayerKind::SplitterConnector
+                | LayerKind::CombinerConnector
+                | LayerKind::Splitter
+                | LayerKind::Combiner
+                | LayerKind::Unsqueeze
+                | LayerKind::ReduceMean => {}
+
+                // Обычные слои: теперь разрешено произвольное количество осей (потоков),
+                // они интерпретируются как размерности одного тензора.
                 _ => {
-                    if desc.in_features.len() != 1 || desc.out_features.len() != 1 {
+                    // Проверяем только, что размеры не нулевые
+                    if desc.input_shape.streams.is_empty() {
                         return Err(format!(
-                            "Слой {} ({} → {}) имеет нестандартное число входов/выходов. \
-                             Мультивариабельные слои пока не поддерживаются.",
-                            i, desc.in_features.len(), desc.out_features.len()
+                            "Слой {}: входной тензор должен иметь хотя бы одну размерность", i
                         ));
                     }
-                    if desc.in_features[0] == 0 || desc.out_features[0] == 0 {
-                        return Err(format!("Слой {}: размерности не могут быть нулевыми", i));
+                    if desc.output_shape.streams.is_empty() {
+                        return Err(format!(
+                            "Слой {}: выходной тензор должен иметь хотя бы одну размерность", i
+                        ));
+                    }
+                    for (j, &dim) in desc.input_shape.streams.iter().enumerate() {
+                        if dim == 0 {
+                            return Err(format!(
+                                "Слой {}: входная размерность {} равна нулю", i, j
+                            ));
+                        }
+                    }
+                    for (j, &dim) in desc.output_shape.streams.iter().enumerate() {
+                        if dim == 0 {
+                            return Err(format!(
+                                "Слой {}: выходная размерность {} равна нулю", i, j
+                            ));
+                        }
                     }
                 }
             }
         }
 
-        // Проверка совместимости размерностей
+        // 2. Проверка совместимости между соседними слоями
         for i in 1..descs.len() {
             let prev = &descs[i - 1];
             let curr = &descs[i];
 
-            if matches!(prev.kind, LayerKind::Unsqueeze(_) | LayerKind::ReduceMean(_))
-                || matches!(curr.kind, LayerKind::Unsqueeze(_) | LayerKind::ReduceMean(_))
+            // Unsqueeze и ReduceMean меняют размерность – их совместимость определяется сохранением числа элементов
+            if matches!(prev.kind, LayerKind::Unsqueeze | LayerKind::ReduceMean)
+                || matches!(curr.kind, LayerKind::Unsqueeze | LayerKind::ReduceMean)
             {
                 continue;
             }
 
-            let prev_is_splitter = matches!(prev.kind, LayerKind::SplitterConnector | LayerKind::Splitter);
-            let curr_is_combiner = matches!(curr.kind, LayerKind::CombinerConnector | LayerKind::Combiner);
+            let prev_out = &prev.output_shape.streams;
+            let curr_in = &curr.input_shape.streams;
+
+            // Splitter / SplitterConnector → ожидается несколько выходов
+            let prev_is_splitter = matches!(
+                prev.kind,
+                LayerKind::SplitterConnector | LayerKind::Splitter
+            );
+            // Combiner / CombinerConnector → ожидается несколько входов
+            let curr_is_combiner = matches!(
+                curr.kind,
+                LayerKind::CombinerConnector | LayerKind::Combiner
+            );
 
             if prev_is_splitter && curr_is_combiner {
-                if prev.out_features != curr.in_features {
+                // Количество потоков должно совпадать
+                if prev_out.len() != curr_in.len() {
                     return Err(format!(
-                        "Несовместимость размерностей между Splitter (слой {}) и Combiner (слой {}): выходы {:?} != входы {:?}",
-                        i, i + 1, prev.out_features, curr.in_features
+                        "Несовместимость числа потоков между Splitter (слой {}) и Combiner (слой {}): выходов {}, входов {}",
+                        i, i + 1, prev_out.len(), curr_in.len()
                     ));
                 }
-            } else if prev_is_splitter {
-                if curr.in_features.len() == 1 {
-                    if curr.in_features[0] != prev.out_features[0] {
+                // Размеры признаков попарно
+                for (p, (out_sz, in_sz)) in prev_out.iter().zip(curr_in.iter()).enumerate() {
+                    if out_sz != in_sz {
                         return Err(format!(
-                            "Несовместимость размеров между слоем {} (Splitter) и слоем {}: первый выход {} не совпадает с входом {}",
-                            i, i + 1, prev.out_features[0], curr.in_features[0]
+                            "Размеры не совпадают между Splitter (слой {}) поток {} и Combiner (слой {}): {} vs {}",
+                            i, p, i + 1, out_sz, in_sz
                         ));
                     }
+                }
+            } else if prev_is_splitter {
+                // После Splitter'а может идти обычный слой – тогда берём первый выходной поток
+                if curr_in.len() == 1 {
+                    if prev_out[0] != curr_in[0] {
+                        return Err(format!(
+                            "Размеры не совпадают между Splitter (слой {}) первый выход {} и вход слоя {} ({} входной поток)",
+                            i, prev_out[0], i + 1, curr_in[0]
+                        ));
+                    }
+                } else {
+                    // Если следующий слой ожидает несколько входов, но не Combiner – пока считаем ошибкой
+                    return Err(format!(
+                        "Слой {} (kind {:?}) не может следовать за Splitter'ом с несколькими выходами",
+                        i + 1, curr.kind
+                    ));
                 }
             } else if curr_is_combiner {
-                if prev.out_features.len() == 1 {
-                    if prev.out_features[0] != curr.in_features[0] {
+                // Перед Combiner'ом может идти обычный слой – тогда его выход должен совпадать с первым входом Combiner'а
+                if prev_out.len() == 1 {
+                    if prev_out[0] != curr_in[0] {
                         return Err(format!(
-                            "Несовместимость размеров между слоем {} и Combiner (слой {}): выход {} не совпадает с первым входом {}",
-                            i, i + 1, prev.out_features[0], curr.in_features[0]
+                            "Размеры не совпадают между слоем {} (выход {}) и Combiner (слой {}) первый вход {}",
+                            i, prev_out[0], i + 1, curr_in[0]
                         ));
                     }
+                } else {
+                    return Err(format!(
+                        "Слой {} (kind {:?}) не может предшествовать Combiner'у с несколькими входами",
+                        i, prev.kind
+                    ));
                 }
             } else {
-                if prev.out_features.len() == 1 && curr.in_features.len() == 1 {
-                    let prev_out = prev.out_features[0];
-                    let curr_in = curr.in_features[0];
-                    if prev_out != curr_in {
-                        return Err(format!(
-                            "Несовместимость размеров последней оси между слоем {} (выход {}) и слоем {} (вход {})",
-                            i, prev_out, i + 1, curr_in
-                        ));
-                    }
+                // Обычная пара слоёв: сравниваем общее количество признаков
+                let prev_total = prev_out.iter().product::<usize>();
+                let curr_total = curr_in.iter().product::<usize>();
+                if prev_total != curr_total {
+                    return Err(format!(
+                        "Несовместимость общего числа признаков между слоем {} (выход {} элементов) и слоем {} (вход {} элементов)",
+                        i, prev_total, i + 1, curr_total
+                    ));
                 }
             }
         }
 
+        // 3. Softmax разрешён только на последнем слое
         for (i, desc) in descs.iter().enumerate() {
             if desc.kind == LayerKind::Softmax && i != descs.len() - 1 {
                 return Err("Softmax допускается только на последнем слое".into());
@@ -99,10 +161,6 @@ impl Plan {
         }
 
         Ok(Plan { layers: descs })
-    }
-
-    pub fn from_layer_descs(descs: Vec<LayerDesc>) -> Result<Plan, String> {
-        Plan::from_descs(descs)
     }
 
     /// Собрать модель с указанным количеством потоков CPU (обратная совместимость).
@@ -128,11 +186,19 @@ impl Plan {
             .expect("Plan уже проверен")
     }
 
+    /// Размерность входа (первый поток первого слоя).
     pub fn input_dim1(&self) -> usize {
-        self.layers.first().unwrap().in_features[0]
+        self.layers
+            .first()
+            .map(|l| l.input_shape.streams[0])
+            .unwrap_or(0)
     }
 
+    /// Размерность выхода (первый поток последнего слоя).
     pub fn output_dim1(&self) -> usize {
-        self.layers.last().unwrap().out_features[0]
+        self.layers
+            .last()
+            .map(|l| l.output_shape.streams[0])
+            .unwrap_or(0)
     }
 }

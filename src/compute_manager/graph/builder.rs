@@ -54,14 +54,14 @@ impl Executor for CpuExecutor {
 }
 
 impl MixedModel {
-    pub fn from_plan(layers: Vec<LayerDesc>, num_threads: usize) -> Result<Self, String> {
+    pub(crate) fn from_plan(layers: Vec<LayerDesc>, num_threads: usize) -> Result<Self, String> {
         let plan = DevicePlan::empty()
             .cpu(0, num_threads)
             .ram(0, 8192);
         Self::from_plan_with_device_plan(layers, plan)
     }
 
-    pub fn from_plan_with_device(
+    pub(crate) fn from_plan_with_device(
         layers: Vec<LayerDesc>,
         _num_threads: usize,
         device: Device,
@@ -74,7 +74,7 @@ impl MixedModel {
     }
 
     /// Основной конструктор с планом устройств и размером батча (для учёта памяти активаций).
-    pub fn from_plan_with_device_plan_and_batch(
+    pub(crate) fn from_plan_with_device_plan_and_batch(
         layers: Vec<LayerDesc>,
         device_plan: DevicePlan,
         batch_size: usize,
@@ -174,73 +174,79 @@ impl MixedModel {
             match &desc.kind {
                 LayerKind::SplitterConnector => {
                     finalize_universal!();
-                    if !desc.out_features.is_empty() && !desc.in_features.is_empty() {
-                        let dims = desc.out_features.clone();
-                        assert_eq!(dims.len(), 2);
-                        segments.push(Segment::SplitterConnector { dim_a: dims[0], dim_b: dims[1] });
-                        active_ports = Some(dims);
-                        current_branch = Some(0);
-                    }
+                    // Для SplitterConnector выходные потоки задают dim_a и dim_b
+                    let dims = &desc.output_shape.streams;
+                    assert_eq!(dims.len(), 2);
+                    segments.push(Segment::SplitterConnector {
+                        dim_a: dims[0],
+                        dim_b: dims[1],
+                    });
+                    active_ports = Some(dims.clone());
+                    current_branch = Some(0);
                 }
                 LayerKind::CombinerConnector => {
                     finalize_universal!();
-                    if !desc.in_features.is_empty() && !desc.out_features.is_empty() {
-                        segments.push(Segment::CombinerConnector {
-                            input_dims: desc.in_features.clone(),
-                            output_dim: desc.out_features[0],
-                        });
-                        active_ports = Some(vec![desc.out_features[0]]);
-                        current_branch = None;
-                    } else if !desc.out_features.is_empty() {
-                        active_ports = Some(desc.out_features.clone());
-                        current_branch = None;
-                    }
+                    let input_dims = &desc.input_shape.streams;
+                    let output_dim = desc.output_shape.streams[0];
+                    segments.push(Segment::CombinerConnector {
+                        input_dims: input_dims.clone(),
+                        output_dim,
+                    });
+                    active_ports = Some(vec![output_dim]);
+                    current_branch = None;
                 }
                 LayerKind::Splitter => {
                     finalize_universal!();
+                    let input_dim = desc.input_shape.streams[0];
+                    let output_dims = desc.output_shape.streams.clone();
+                    // Сначала сохраняем для active_ports, чтобы не перемещать
+                    active_ports = Some(output_dims.clone());
                     let mut store_lock = store.lock().unwrap();
                     let slice = store_lock.allocate(desc.param_len());
                     drop(store_lock);
-                    let p = desc.out_features[0];
-                    let q = desc.out_features[1];
                     segments.push(Segment::Splitter {
-                        input_dim: desc.in_features[0],
-                        output_dims: vec![p, q],
+                        input_dim,
+                        output_dims,
                         slice,
                     });
-                    active_ports = Some(vec![p, q]);
                     current_branch = Some(0);
                 }
                 LayerKind::Combiner => {
                     finalize_universal!();
+                    let input_dim = desc.input_shape.streams[0];
+                    let output_dim = desc.output_shape.streams[0];
                     let mut store_lock = store.lock().unwrap();
                     let slice = store_lock.allocate(desc.param_len());
                     drop(store_lock);
                     segments.push(Segment::Combiner {
-                        input_dim: desc.in_features[0],
-                        output_dim: desc.out_features[0],
+                        input_dim,
+                        output_dim,
                         slice,
                     });
-                    active_ports = Some(vec![desc.out_features[0]]);
+                    active_ports = Some(vec![output_dim]);
                     current_branch = None;
                 }
-                LayerKind::Unsqueeze(target_dims) => {
+                LayerKind::Unsqueeze => {
                     finalize_universal!();
-                    segments.push(Segment::Unsqueeze(target_dims.clone()));
+                    // target_dims — это выходная форма (новые размеры)
+                    let target_dims = desc.output_shape.streams.clone();
+                    segments.push(Segment::Unsqueeze(target_dims));
                 }
-                LayerKind::ReduceMean(target_dims) => {
+                LayerKind::ReduceMean => {
                     finalize_universal!();
-                    segments.push(Segment::ReduceMean(target_dims.clone()));
+                    let target_dims = desc.output_shape.streams.clone();
+                    segments.push(Segment::ReduceMean(target_dims));
                 }
                 _ => {
+                    // Обычный слой: определяем, в каком потоке он выполняется
                     if current_stream_indices.is_none() {
                         let indices = if let Some(ref ports) = active_ports {
                             if let Some(ref mut branch) = current_branch {
-                                if let Some(pos) = ports.iter().position(|&p| p == desc.in_features[0]) {
+                                if let Some(pos) = ports.iter().position(|&p| p == desc.input_shape.streams[0]) {
                                     *branch = pos;
                                 }
                             } else {
-                                if let Some(pos) = ports.iter().position(|&p| p == desc.in_features[0]) {
+                                if let Some(pos) = ports.iter().position(|&p| p == desc.input_shape.streams[0]) {
                                     current_branch = Some(pos);
                                 } else {
                                     current_branch = Some(0);
@@ -296,7 +302,40 @@ impl MixedModel {
         }
 
         // -----------------------------------------------------------
-        // 7. Собираем MixedModel
+        // 7. Вычисляем ожидаемые формы входных и выходных тензоров
+        // -----------------------------------------------------------
+        let input_shapes: Vec<Vec<usize>> = vec![layers.first().unwrap().input_shape.streams.clone()];
+        let output_shapes: Vec<Vec<usize>> = if output_stream_count == 1 {
+            vec![layers.last().unwrap().output_shape.streams.clone()]
+        } else {
+            // Для моделей с несколькими выходами (например, Splitter) нужно разбить
+            // общий список выходных размеров на части для каждой ветви.
+            // Пока используем простую логику: если последний слой Splitter,
+            // то его output_shape.streams содержит размеры всех выходов подряд,
+            // а output_dims известны из сегмента. Но для универсальности
+            // мы можем извлечь их из последнего сегмента.
+            let last_segment = segments.last().unwrap();
+            match last_segment {
+                Segment::Splitter { output_dims, .. } => {
+                    // Предполагаем, что каждый выходной поток одномерный (dim),
+                    // но для многомерных нужно знать полную форму.
+                    // В будущем можно расширить.
+                    output_dims.iter().map(|&d| vec![d]).collect()
+                }
+                Segment::SplitterConnector { dim_a, dim_b } => {
+                    vec![vec![*dim_a], vec![*dim_b]]
+                }
+                _ => {
+                    // fallback: если не Splitter, но несколько выходов, 
+                    // собираем из output_shape последнего слоя? 
+                    // Такой случай пока не поддерживается.
+                    vec![]
+                }
+            }
+        };
+
+        // -----------------------------------------------------------
+        // 8. Собираем MixedModel
         // -----------------------------------------------------------
         Ok(MixedModel {
             segments,
@@ -311,11 +350,13 @@ impl MixedModel {
             input_stream_count,
             output_stream_count,
             memory_executor,
+            input_shapes,
+            output_shapes,
         })
     }
 
     /// Обратно-совместимый конструктор (без batch_size, использует 1).
-    pub fn from_plan_with_device_plan(
+    pub(crate) fn from_plan_with_device_plan(
         layers: Vec<LayerDesc>,
         device_plan: DevicePlan,
     ) -> Result<Self, String> {
@@ -323,7 +364,7 @@ impl MixedModel {
     }
 
     /// Сборка модели с планом устройств (вызывается из макроса create_models!).
-    pub fn build_with_device_plan(
+    pub(crate) fn build_with_device_plan(
         plan: crate::model_plan::plan::Plan,
         device_plan: DevicePlan,
     ) -> Result<Self, String> {
@@ -332,7 +373,7 @@ impl MixedModel {
 
     /// Сборка модели с планом устройств и указанием размера батча.
     /// Используется для точного учёта памяти.
-    pub fn build_with_device_plan_and_batch(
+    pub(crate) fn build_with_device_plan_and_batch(
         plan: crate::model_plan::plan::Plan,
         device_plan: DevicePlan,
         batch_size: usize,

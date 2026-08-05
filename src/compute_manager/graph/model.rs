@@ -34,6 +34,12 @@ pub struct MixedModel {
     pub(crate) input_stream_count: usize,
     pub(crate) output_stream_count: usize,
     pub(crate) memory_executor: Arc<Mutex<MemoryExecutor>>,
+
+    // Ожидаемые размерности входных и выходных тензоров (без batch).
+    // Для каждого потока (stream) хранится вектор размерностей пространственных осей.
+    // Например, для Dim1: [features], для Dim2: [dim2, dim3] и т.д.
+    pub(crate) input_shapes: Vec<Vec<usize>>,
+    pub(crate) output_shapes: Vec<Vec<usize>>,
 }
 
 impl MixedModel {
@@ -164,11 +170,7 @@ impl MixedModel {
         let (outs, ctxs) = self.forward_multi(vec![input]);
         assert_eq!(outs.len(), 1);
 
-        // Подсказка: входной тензор будет использован, но мы не знаем, какие буферы задействованы.
-        // Здесь можно было бы добавить hint_access для буферов, но они ещё не выделены в памяти.
-        // Вместо этого выполняем tick для применения политики.
         self.memory_executor.lock().unwrap().tick();
-
         (outs.into_iter().next().unwrap(), ctxs)
     }
 
@@ -180,9 +182,7 @@ impl MixedModel {
         let (ins, grads) = self.backward_multi(contexts, vec![delta]);
         assert_eq!(ins.len(), 1);
 
-        // Выполняем tick политики управления памятью
         self.memory_executor.lock().unwrap().tick();
-
         (ins.into_iter().next().unwrap(), grads)
     }
 
@@ -202,24 +202,21 @@ impl MixedModel {
 
         let (out_mats, ctxs) = self.forward_mat_multi(&mats);
 
-        let out_tensors = out_mats.into_iter().zip(inputs.iter()).map(|(mat, original)| {
-            match original {
-                DynamicTensor::Dim1(_) => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
-                DynamicTensor::Dim2(t) => DynamicTensor::Dim2(
-                    linalg::faer_to_tensor3d(&mat, t.dim1, t.dim2, mat.ncols()),
-                ),
-                DynamicTensor::Dim3(t) => DynamicTensor::Dim3(
-                    linalg::faer_to_tensor4d(&mat, t.dim1, t.dim2, t.dim3, mat.ncols()),
-                ),
-                DynamicTensor::Dim4(t) => DynamicTensor::Dim4(
-                    linalg::faer_to_tensor5d(&mat, t.dim1, t.dim2, t.dim3, t.dim4, mat.ncols()),
-                ),
-            }
-        }).collect();
+        let out_tensors = out_mats.into_iter()
+            .zip(self.output_shapes.iter())
+            .map(|(mat, shape)| {
+                let batch = mat.nrows();
+                match shape.len() {
+                    1 => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
+                    2 => DynamicTensor::Dim2(linalg::faer_to_tensor3d(&mat, batch, shape[0], shape[1])),
+                    3 => DynamicTensor::Dim3(linalg::faer_to_tensor4d(&mat, batch, shape[0], shape[1], shape[2])),
+                    4 => DynamicTensor::Dim4(linalg::faer_to_tensor5d(&mat, batch, shape[0], shape[1], shape[2], shape[3])),
+                    _ => panic!("Unsupported output tensor dimensionality: {} spatial dims", shape.len()),
+                }
+            })
+            .collect();
 
-        // Выполняем tick политики управления памятью
         self.memory_executor.lock().unwrap().tick();
-
         (out_tensors, ctxs)
     }
 
@@ -240,24 +237,21 @@ impl MixedModel {
 
         let (in_mats, grads) = self.backward_mat_multi(contexts, &delta_mats);
 
-        let in_tensors = in_mats.into_iter().zip(deltas.iter()).map(|(mat, original)| {
-            match original {
-                DynamicTensor::Dim1(_) => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
-                DynamicTensor::Dim2(t) => DynamicTensor::Dim2(
-                    linalg::faer_to_tensor3d(&mat, t.dim1, t.dim2, mat.ncols()),
-                ),
-                DynamicTensor::Dim3(t) => DynamicTensor::Dim3(
-                    linalg::faer_to_tensor4d(&mat, t.dim1, t.dim2, t.dim3, mat.ncols()),
-                ),
-                DynamicTensor::Dim4(t) => DynamicTensor::Dim4(
-                    linalg::faer_to_tensor5d(&mat, t.dim1, t.dim2, t.dim3, t.dim4, mat.ncols()),
-                ),
-            }
-        }).collect();
+        let in_tensors = in_mats.into_iter()
+            .zip(self.input_shapes.iter())
+            .map(|(mat, shape)| {
+                let batch = mat.nrows();
+                match shape.len() {
+                    1 => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
+                    2 => DynamicTensor::Dim2(linalg::faer_to_tensor3d(&mat, batch, shape[0], shape[1])),
+                    3 => DynamicTensor::Dim3(linalg::faer_to_tensor4d(&mat, batch, shape[0], shape[1], shape[2])),
+                    4 => DynamicTensor::Dim4(linalg::faer_to_tensor5d(&mat, batch, shape[0], shape[1], shape[2], shape[3])),
+                    _ => panic!("Unsupported input tensor dimensionality: {} spatial dims", shape.len()),
+                }
+            })
+            .collect();
 
-        // Выполняем tick политики управления памятью
         self.memory_executor.lock().unwrap().tick();
-
         (in_tensors, grads)
     }
 
@@ -283,9 +277,7 @@ impl MixedModel {
         let (loss, grad_mat) = self.compute_loss_mat(expr, &pred_mat, &target_mat);
         let grad_tensor = DynamicTensor::Dim1(linalg::faer_to_tensor2d(&grad_mat));
 
-        // Выполняем tick политики управления памятью
         self.memory_executor.lock().unwrap().tick();
-
         (loss, grad_tensor)
     }
 
@@ -309,9 +301,7 @@ impl MixedModel {
             crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
         };
 
-        // Выполняем tick политики управления памятью
         self.memory_executor.lock().unwrap().tick();
-
         result
     }
 

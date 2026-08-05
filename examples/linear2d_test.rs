@@ -1,78 +1,76 @@
 // examples/linear2d_test.rs
-// Один линейный слой 4 -> 2, размерность Dim2.
-// Используются новые удобные методы compute_loss и update_params.
+// Полноценное обучение автоэнкодера 16 -> 16 (Tensor3D) через TrainingPlan.
 
-use std::time::Instant;
-use neurocore::compute_manager::DynamicTensor;
-use neurocore::tensor::Tensor3D;
-use neurocore::create_models;
+use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+
+mod device_plan {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192) }
+}
 
 mod models {
-    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
-
+    use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
     pub fn linear_model() -> Vec<LayerDesc> {
         vec![
-            LayerDesc::new("linear", LayerKind::Linear, Dim::Dim2)
-                .input(Dim::Dim2, &[4])
-                .output(Dim::Dim2, &[2]),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[4], B[4]))
+                .output(shape!(batch, A[4], B[4])),
         ]
     }
 }
 
 mod losses {
-    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
-
+    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub, SumColumns};
     pub fn mse() -> LossDesc {
         let chain = ElementChain::new()
-            .add(Box::new(Sub))
-            .add(Box::new(Square));
-        LossDesc::from_chain(chain, Aggregation::Mean, 2, 1, 1)
+            .add(Box::new(Sub::new(16)))
+            .add(Box::new(Square))
+            .add(Box::new(SumColumns));
+        LossDesc::from_chain(chain, Aggregation::Mean, 1, 16, 16)
     }
 }
 
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
-
     pub fn sgd() -> OptimizerDesc {
         OptimizerDesc::new()
-            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ScaleGradient(0.0001))
             .add(OptCubeDesc::ApplyUpdate)
     }
 }
 
-fn main() {
-    let (mut model,) = create_models!(models::linear_model);
+mod training_plan {
+    use super::models;
+    use super::losses;
+    use super::optimizers;
+    use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+    use neurocore::tensor::Tensor3D;
 
-    let x = Tensor3D::new(vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]);
-    let target = Tensor3D::new(vec![vec![vec![0.8, 1.2]]]);
-    let epochs = 500;
-
-    let start = Instant::now();
-    for epoch in 0..epochs {
-        let (pred, ctxs) = model.forward(DynamicTensor::Dim2(x.clone()));
-        let (loss, delta) = model.compute_loss(
-            losses::mse(),
-            &pred,
-            &DynamicTensor::Dim2(target.clone()),
-        );
-        let (_, grads) = model.backward(&ctxs, delta);
-        model.update_params(optimizers::sgd(), &grads[0]);
-
-        if epoch == 0 || epoch % 200 == 0 {
-            println!("Epoch {}: loss = {:.6}", epoch, loss);
-        }
+    pub fn plan() -> TrainingPlan {
+        let x = Tensor3D::new(vec![
+            vec![
+                vec![1.0, 2.0, 3.0, 4.0],
+                vec![5.0, 6.0, 7.0, 8.0],
+                vec![9.0, 10.0, 11.0, 12.0],
+                vec![13.0, 14.0, 15.0, 16.0],
+            ],
+        ]);
+        let ds = DataSource::from_tensor3d(x);
+        TrainingPlan::new()
+            .model(models::linear_model)
+            .loss(losses::mse())
+            .optimizer(optimizers::sgd())
+            .epochs(100)
+            .batch_size(1)
+            .train_data(ds)
+            .init_weights(Initializer::RandomUniform { min: -0.01, max: 0.01 })
     }
-    let duration = start.elapsed();
+}
 
-    let (final_pred, _) = model.forward(DynamicTensor::Dim2(x.clone()));
-    let (final_loss, _) = model.compute_loss(
-        losses::mse(),
-        &final_pred,
-        &DynamicTensor::Dim2(target.clone()),
-    );
-
-    println!("Done. Time: {:?}", duration);
-    println!("Final loss: {:.6}", final_loss);
+fn main() {
+    let r = neurocore::run_training!(training_plan::plan, device = device_plan::plan);
+    println!("Training done. Final loss: {:.6}", r.final_loss);
 }
 
 

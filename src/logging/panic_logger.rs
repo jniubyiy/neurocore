@@ -1,4 +1,4 @@
-// src/compute_manager/logger.rs
+// src/logging/panic_logger.rs
 
 use std::cell::RefCell;
 use std::io::{self, Write};

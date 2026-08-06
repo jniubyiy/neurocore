@@ -1,5 +1,7 @@
+// src/layers/combiner_connector/combiner_connector.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct CombinerConnector;
@@ -9,16 +11,15 @@ impl CombinerConnector {
         Self
     }
 
-    /// Прямой проход: возвращает входную матрицу без изменений.
+    /// Прямой проход: возвращает входную матрицу без изменений,
+    /// сохраняя её в матричном контексте для потенциального использования в обратном проходе.
     pub fn forward_mat(
         &self,
         input: &Mat<f32>,
     ) -> (Mat<f32>, DynamicContext) {
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::CombinerConnector {
-                inputs: vec![linalg::faer_to_tensor2d(input)],
-            },
-        );
+        let ctx = DynamicContext::Mat(MatContext::CombinerConnector {
+            inputs: vec![input.clone()],
+        });
         (input.clone(), ctx)
     }
 
@@ -31,5 +32,7 @@ impl CombinerConnector {
         (delta.clone(), vec![])
     }
 
-    pub fn param_len(&self) -> usize { 0 }
+    pub fn param_len(&self) -> usize {
+        0
+    }
 }

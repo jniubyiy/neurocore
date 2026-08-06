@@ -16,11 +16,7 @@ pub mod soft_sparse_gate;
 pub mod soft_keep_gate;
 pub mod dual_anchor;
 
-pub mod context1d;
-pub mod context2d;
-pub mod context3d;
-pub mod context4d;
-
+pub mod mat_context;
 pub mod layers_special;
 
 use crate::model_plan::param_store::ParamSlice;
@@ -69,7 +65,7 @@ pub trait UniversalLayer: Send + Sync + 'static {
         Mat::zeros(batch_size, self.output_features())
     }
 
-    // ----- Методы для GPU-диспетчеризации (возвращают Some(self), если слой того же типа) -----
+    // ----- Методы для GPU-диспетчеризации -----
     fn as_linear(&self) -> Option<&Linear> { None }
     fn as_relu(&self) -> Option<&ReLU> { None }
     fn as_sigmoid(&self) -> Option<&Sigmoid> { None }
@@ -85,7 +81,7 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_memory(&self) -> Option<&Memory> { None }
 }
 
-// Реэкспорт слоёв
+// Публичные реэкспорты
 pub use linear::Linear;
 pub use relu::ReLU;
 pub use sigmoid::Sigmoid;
@@ -102,10 +98,5 @@ pub use soft_sparse_gate::SoftSparseGate;
 pub use soft_keep_gate::SoftKeepGate;
 pub use dual_anchor::DualAnchor;
 
-pub use context1d::{Layer, LayerContext1D, LayerInfo};
-pub use context2d::{Layer2D, LayerContext as LayerContext2D};
-pub use context3d::{Layer3D, LayerContext3D};
-pub use context4d::{Layer4D, LayerContext4D};
-
+pub use mat_context::{MatContext, LayerInfo};
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
-

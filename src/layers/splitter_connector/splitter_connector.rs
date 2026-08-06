@@ -1,7 +1,7 @@
 // src/layers/splitter_connector/splitter_connector.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct SplitterConnector {
@@ -14,21 +14,21 @@ impl SplitterConnector {
         Self { dim_a, dim_b }
     }
 
-    /// Прямой проход: принимает две матрицы и возвращает их же.
+    /// Прямой проход: принимает две матрицы и возвращает их же,
+    /// сохраняя входную матрицу `a` в матричном контексте для обратного прохода.
     pub fn forward_mat(
         &self,
         input_a: &Mat<f32>,
         input_b: &Mat<f32>,
     ) -> (Mat<f32>, Mat<f32>, DynamicContext) {
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::SplitterConnector {
-                input: linalg::faer_to_tensor2d(input_a),
-            },
-        );
+        let ctx = DynamicContext::Mat(MatContext::SplitterConnector {
+            input: input_a.clone(),
+        });
         (input_a.clone(), input_b.clone(), ctx)
     }
 
-    /// Обратный проход: просто пробрасывает градиенты обратно.
+    /// Обратный проход: градиенты проходят насквозь без изменений.
+    /// Контекст не используется, оставлен для совместимости с сигнатурой вызова.
     pub fn backward_mat(
         &self,
         _ctx: &DynamicContext,
@@ -38,5 +38,7 @@ impl SplitterConnector {
         (delta_a.clone(), delta_b.clone(), vec![])
     }
 
-    pub fn param_len(&self) -> usize { 0 }
+    pub fn param_len(&self) -> usize {
+        0
+    }
 }

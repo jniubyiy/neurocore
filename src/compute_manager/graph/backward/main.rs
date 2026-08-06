@@ -5,6 +5,7 @@ use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::layers::UniversalLayer;
+use crate::layers::mat_context::MatContext;
 use crate::linalg;
 
 impl MixedModel {
@@ -83,30 +84,15 @@ impl MixedModel {
                 Segment::Splitter { input_dim, output_dims, slice } => {
                     assert!(ctx_pos > 0, "Backward: no context for Splitter");
                     let ctx = &contexts[0][ctx_pos - 1];
-                    let (x_tensor, pre_a_flat, pre_b_flat) = match ctx {
-                        DynamicContext::Ctx1D(c) => match c {
-                            crate::layers::context1d::LayerContext1D::Splitter { input, pre_a, pre_b } =>
-                                (input, pre_a.clone(), pre_b.clone()),
-                            _ => panic!("Expected Splitter context"),
-                        },
-                        _ => panic!("Expected Ctx1D"),
+                    let (x_mat, pre_a_mat, pre_b_mat) = match ctx {
+                        DynamicContext::Mat(MatContext::Splitter { input, pre_a, pre_b }) =>
+                            (input.clone(), pre_a.clone(), pre_b.clone()),
+                        _ => panic!("Expected Splitter context"),
                     };
 
-                    let da_tensor = DynamicTensor::Dim1(crate::tensor::Tensor2D::new(
-                        streams[0].iter().map(|d| match d { DynamicTensor::Dim1(t) => t.data[0].clone(), _ => panic!() }).collect()
-                    ));
-                    let db_tensor = DynamicTensor::Dim1(crate::tensor::Tensor2D::new(
-                        streams[1].iter().map(|d| match d { DynamicTensor::Dim1(t) => t.data[0].clone(), _ => panic!() }).collect()
-                    ));
+                    let da_mat = samples_to_mat(&streams[0]);
+                    let db_mat = samples_to_mat(&streams[1]);
 
-                    let x_mat = linalg::tensor2d_to_faer(x_tensor);
-                    let da_mat = linalg::tensor2d_to_faer(&match da_tensor { DynamicTensor::Dim1(t) => t, _ => unreachable!() });
-                    let db_mat = linalg::tensor2d_to_faer(&match db_tensor { DynamicTensor::Dim1(t) => t, _ => unreachable!() });
-                    let batch = x_mat.nrows();
-                    let p = output_dims[0];
-                    let q = output_dims[1];
-                    let pre_a_mat = flat_to_mat(pre_a_flat, batch, p);
-                    let pre_b_mat = flat_to_mat(pre_b_flat, batch, q);
                     let (wa, wb, _, _) = crate::layers::Splitter::new(*input_dim, output_dims.clone()).get_weights_and_biases(&params, slice);
                     let (dx_mat, grad) = if let Some(ref gpu) = self.gpu_compute {
                         let gpu = gpu.lock().unwrap();
@@ -120,49 +106,25 @@ impl MixedModel {
                         total_grad[slice.start + idx] += g;
                     }
 
-                    let dx_tensor = linalg::faer_to_tensor2d(&dx_mat);
-                    let mut combined_stream = Vec::with_capacity(streams[0].len());
-                    for r in 0..streams[0].len() {
-                        combined_stream.push(DynamicTensor::Dim1(crate::tensor::Tensor2D::new(vec![dx_tensor.data[r].clone()])));
-                    }
+                    let combined_stream = mat_to_samples(&dx_mat);
                     streams = vec![combined_stream];
                     ctx_pos -= 1;
                 }
                 Segment::Combiner { input_dim, output_dim, slice } => {
                     assert!(ctx_pos > 0, "Backward: no context for Combiner");
                     let ctx = &contexts[0][ctx_pos - 1];
-                    let (a_tensor, b_tensor) = match ctx {
-                        DynamicContext::Ctx1D(c) => match c {
-                            crate::layers::context1d::LayerContext1D::Combiner { input_a, input_b, .. } =>
-                                (input_a, input_b),
-                            _ => panic!("Expected Combiner context"),
-                        },
-                        _ => panic!("Expected Ctx1D"),
+                    let (a_mat, b_mat, pre_mat) = match ctx {
+                        DynamicContext::Mat(MatContext::Combiner { input_a, input_b, pre_act }) =>
+                            (input_a.clone(), input_b.clone(), pre_act.clone()),
+                        _ => panic!("Expected Combiner context"),
                     };
 
-                    let delta_single = DynamicTensor::Dim1(crate::tensor::Tensor2D::new(
-                        streams[0].iter().map(|d| match d { DynamicTensor::Dim1(t) => t.data[0].clone(), _ => panic!() }).collect()
-                    ));
-                    let dout_mat = linalg::tensor2d_to_faer(&match delta_single { DynamicTensor::Dim1(t) => t, _ => unreachable!() });
-
-                    let a_mat = linalg::tensor2d_to_faer(a_tensor);
-                    let b_mat = linalg::tensor2d_to_faer(b_tensor);
+                    let dout_mat = samples_to_mat(&streams[0]);
 
                     let combiner = crate::layers::Combiner::new(vec![*input_dim, *input_dim], *output_dim);
+                    let (wa, wb, _) = combiner.get_weights_and_bias(&params, slice);
                     let (da_mat, db_mat, grad) = if let Some(ref gpu) = self.gpu_compute {
                         let gpu = gpu.lock().unwrap();
-                        let (wa, wb, bias) = combiner.get_weights_and_bias(&params, slice);
-                        let batch = a_mat.nrows();
-                        let m = *output_dim;
-                        let pre_mat = {
-                            let mut pre = &a_mat * wa.transpose() + &b_mat * wb.transpose();
-                            for i in 0..batch {
-                                for j in 0..m {
-                                    pre[(i, j)] += bias[j];
-                                }
-                            }
-                            pre
-                        };
                         gpu.run_combiner_backward(&a_mat, &b_mat, &dout_mat, &pre_mat, &wa, &wb)
                     } else {
                         combiner.backward_mat(&a_mat, &b_mat, &dout_mat, &params, slice)
@@ -172,14 +134,8 @@ impl MixedModel {
                         total_grad[slice.start + idx] += g;
                     }
 
-                    let da_tensor = linalg::faer_to_tensor2d(&da_mat);
-                    let db_tensor = linalg::faer_to_tensor2d(&db_mat);
-                    let mut stream_a = Vec::with_capacity(streams[0].len());
-                    let mut stream_b = Vec::with_capacity(streams[0].len());
-                    for r in 0..streams[0].len() {
-                        stream_a.push(DynamicTensor::Dim1(crate::tensor::Tensor2D::new(vec![da_tensor.data[r].clone()])));
-                        stream_b.push(DynamicTensor::Dim1(crate::tensor::Tensor2D::new(vec![db_tensor.data[r].clone()])));
-                    }
+                    let stream_a = mat_to_samples(&da_mat);
+                    let stream_b = mat_to_samples(&db_mat);
                     streams = vec![stream_a, stream_b];
                     ctx_pos -= 1;
                 }
@@ -190,23 +146,7 @@ impl MixedModel {
             "backward_mat_multi: input stream count mismatch");
 
         let in_mats: Vec<Mat<f32>> = streams.iter()
-            .map(|stream| {
-                let first = stream.first().unwrap();
-                let features = match first { DynamicTensor::Dim1(t) => t.dim2, _ => panic!() };
-                let batch = stream.len();
-                let mut mat = Mat::zeros(batch, features);
-                for (i, sample) in stream.iter().enumerate() {
-                    match sample {
-                        DynamicTensor::Dim1(t) => {
-                            for (j, &val) in t.data[0].iter().enumerate() {
-                                mat[(i, j)] = val;
-                            }
-                        }
-                        _ => panic!("Only Dim1 in backward"),
-                    }
-                }
-                mat
-            })
+            .map(|stream| samples_to_mat(stream))
             .collect();
 
         (in_mats, vec![total_grad])
@@ -313,34 +253,22 @@ impl MixedModel {
         streams: &Vec<Vec<DynamicTensor>>,
         dim_a: usize,
         dim_b: usize,
-        batch_size: usize,
+        _batch_size: usize,
         ctx_pos: usize,
     ) -> (Vec<Vec<DynamicTensor>>, usize) {
         let stream_a = &streams[0];
         let stream_b = &streams[1];
-        let mut data_a = Vec::with_capacity(batch_size);
-        let mut data_b = Vec::with_capacity(batch_size);
-        for (d_a, d_b) in stream_a.iter().zip(stream_b.iter()) {
-            if let (DynamicTensor::Dim1(t_a), DynamicTensor::Dim1(t_b)) = (d_a, d_b) {
-                data_a.push(t_a.data[0].clone());
-                data_b.push(t_b.data[0].clone());
-            } else { panic!("Expected Dim1"); }
-        }
-        let delta_a_mat = linalg::tensor2d_to_faer(&crate::tensor::Tensor2D::new(data_a));
-        let delta_b_mat = linalg::tensor2d_to_faer(&crate::tensor::Tensor2D::new(data_b));
+        let delta_a_mat = samples_to_mat(stream_a);
+        let delta_b_mat = samples_to_mat(stream_b);
+
         let connector = crate::layers::SplitterConnector::new(dim_a, dim_b);
-        let ctx = DynamicContext::Ctx1D(crate::layers::context1d::LayerContext1D::SplitterConnector {
-            input: crate::tensor::Tensor2D::zeros(1, 0),
+        let ctx = DynamicContext::Mat(MatContext::SplitterConnector {
+            input: Mat::zeros(0, 0),
         });
         let (in_a_mat, in_b_mat, _) = connector.backward_mat(&ctx, &delta_a_mat, &delta_b_mat);
-        let in_a_tensor = linalg::faer_to_tensor2d(&in_a_mat);
-        let in_b_tensor = linalg::faer_to_tensor2d(&in_b_mat);
-        let mut new_a = Vec::with_capacity(batch_size);
-        let mut new_b = Vec::with_capacity(batch_size);
-        for r in 0..batch_size {
-            new_a.push(DynamicTensor::Dim1(crate::tensor::Tensor2D::new(vec![in_a_tensor.data[r].clone()])));
-            new_b.push(DynamicTensor::Dim1(crate::tensor::Tensor2D::new(vec![in_b_tensor.data[r].clone()])));
-        }
+
+        let new_a = mat_to_samples(&in_a_mat);
+        let new_b = mat_to_samples(&in_b_mat);
         (vec![new_a, new_b], ctx_pos - 1)
     }
 
@@ -348,30 +276,19 @@ impl MixedModel {
         &self,
         streams: &Vec<Vec<DynamicTensor>>,
         input_dims: Vec<usize>,
-        batch_size: usize,
+        _batch_size: usize,
         ctx_pos: usize,
     ) -> (Vec<Vec<DynamicTensor>>, usize) {
         let n = input_dims.len();
         let mut out_streams = Vec::with_capacity(n);
-        for (_i, stream) in streams.iter().enumerate() {
-            let mut data = Vec::with_capacity(batch_size);
-            for d in stream.iter() {
-                if let DynamicTensor::Dim1(t) = d {
-                    data.push(t.data[0].clone());
-                } else { panic!("Expected Dim1"); }
-            }
-            let delta_mat = linalg::tensor2d_to_faer(&crate::tensor::Tensor2D::new(data));
+        for stream in streams.iter() {
+            let delta_mat = samples_to_mat(stream);
             let connector = crate::layers::CombinerConnector::new(vec![]);
-            let ctx = DynamicContext::Ctx1D(crate::layers::context1d::LayerContext1D::CombinerConnector {
-                inputs: vec![crate::tensor::Tensor2D::zeros(1, 0)],
+            let ctx = DynamicContext::Mat(MatContext::CombinerConnector {
+                inputs: vec![Mat::zeros(0, 0)],
             });
             let (in_mat, _) = connector.backward_mat(&ctx, &delta_mat);
-            let in_tensor = linalg::faer_to_tensor2d(&in_mat);
-            let mut new_stream = Vec::with_capacity(batch_size);
-            for r in 0..batch_size {
-                new_stream.push(DynamicTensor::Dim1(crate::tensor::Tensor2D::new(vec![in_tensor.data[r].clone()])));
-            }
-            out_streams.push(new_stream);
+            out_streams.push(mat_to_samples(&in_mat));
         }
         (out_streams, ctx_pos - 1)
     }
@@ -420,8 +337,4 @@ fn backward_universal_batch_mat(
         }
     }
     (current_delta, total_grad)
-}
-
-fn flat_to_mat(flat: Vec<f32>, rows: usize, cols: usize) -> Mat<f32> {
-    Mat::from_fn(rows, cols, |i, j| flat[i * cols + j])
 }

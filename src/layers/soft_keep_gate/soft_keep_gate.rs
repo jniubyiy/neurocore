@@ -1,9 +1,7 @@
-// src/layers/soft_keep_gate/soft_keep_gate.rs
-
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct SoftKeepGate {
@@ -34,10 +32,7 @@ impl UniversalLayer for SoftKeepGate {
             x / (1.0 + (-z).exp())
         });
 
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::SoftKeepGate { input: input_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::SoftKeepGate { input: input.clone() });
         (output, ctx)
     }
 
@@ -51,14 +46,10 @@ impl UniversalLayer for SoftKeepGate {
         let thresholds = &params[slice.start..slice.start + self.in_features];
         let tmp = self.temperature;
 
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::SoftKeepGate { input } => input,
-                _ => panic!("Expected SoftKeepGate context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::SoftKeepGate { input }) => input.clone(),
+            _ => panic!("Expected SoftKeepGate context"),
         };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
 
         let (dx, d_thr) = soft_keep_gate_backward_mat(&x_mat, delta, thresholds, tmp);
         (dx, d_thr)
@@ -99,17 +90,13 @@ impl UniversalLayer for SoftKeepGate {
         input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::SoftKeepGate { input: t },
-        )
+        DynamicContext::Mat(MatContext::SoftKeepGate { input: input_sample.clone() })
     }
 
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
         Mat::zeros(batch_size, self.in_features)
     }
 
-    // Добавленный метод для GPU-диспетчеризации
     fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> {
         Some(self)
     }
@@ -138,7 +125,7 @@ fn soft_keep_gate_backward_mat(
             let df_dx = s - abs_x * ds;
             dx[(r, c)] = dout[(r, c)] * df_dx;
 
-            let d_s_dthr = s * (1.0 - s) / temperature;
+            let d_s_dthr = ds;
             d_thr[c] += dout[(r, c)] * x_val * d_s_dthr;
         }
     }

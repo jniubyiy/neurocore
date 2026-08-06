@@ -2,10 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::layers::context1d::LayerContext1D;
-use crate::layers::context2d::LayerContext;
-use crate::layers::context3d::LayerContext3D;
-use crate::layers::context4d::LayerContext4D;
+use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 
@@ -13,10 +10,7 @@ use crate::layers::UniversalLayer;
 
 #[derive(Clone)]
 pub enum DynamicContext {
-    Ctx1D(LayerContext1D),
-    Ctx2D(LayerContext),
-    Ctx3D(LayerContext3D),
-    Ctx4D(LayerContext4D),
+    Mat(MatContext),
 }
 
 pub enum DynamicBatchTensor {

@@ -1,7 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct Softmax;
@@ -18,10 +18,7 @@ impl UniversalLayer for Softmax {
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
         let output = softmax_forward_mat(input);
-        let output_tensor = linalg::faer_to_tensor2d(&output);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Softmax { output: output_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::Softmax { output: output.clone() });
         (output, ctx)
     }
 
@@ -32,14 +29,10 @@ impl UniversalLayer for Softmax {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, Vec<f32>) {
-        let y_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::Softmax { output } => output,
-                _ => panic!("Expected Softmax context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let y_mat = match ctx {
+            DynamicContext::Mat(MatContext::Softmax { output }) => output.clone(),
+            _ => panic!("Expected Softmax context"),
         };
-        let y_mat = linalg::tensor2d_to_faer(y_tensor);
         let dx = softmax_backward_mat(&y_mat, delta);
         (dx, vec![])
     }
@@ -73,17 +66,13 @@ impl UniversalLayer for Softmax {
         _input_sample: &Mat<f32>,
         output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(output_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Softmax { output: t },
-        )
+        DynamicContext::Mat(MatContext::Softmax { output: output_sample.clone() })
     }
 
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {
         Mat::zeros(0, 0) // форма определяется входом
     }
 
-    // Метод для GPU-диспетчеризации
     fn as_softmax(&self) -> Option<&Softmax> {
         Some(self)
     }

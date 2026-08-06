@@ -1,10 +1,10 @@
 // src/layers/layers_special/reduce_dim.rs
 
-use crate::compute_manager::dim_change::{self, DynamicTensor};
+use crate::compute_manager::dim_change;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
+use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
-use crate::tensor::Tensor2D;
 use faer::Mat;
 
 pub struct ReduceMean {
@@ -35,21 +35,10 @@ impl UniversalLayer for ReduceMean {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
-        let _batch = input.nrows();
-        let _in_features = input.ncols();
-        let tensor = crate::linalg::faer_to_tensor2d(input);
-        let dyn_in = DynamicTensor::Dim1(tensor);
-        let dyn_out = dim_change::reduce_to(dyn_in, self.target_dims.clone());
-        let out_tensor = match &dyn_out {
-            DynamicTensor::Dim1(t) => t.clone(),
-            _ => panic!("Expected Dim1 after reduce"),
-        };
-        let out_mat = crate::linalg::tensor2d_to_faer(&out_tensor);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear {
-                input: Tensor2D::zeros(1, 0),
-            },
-        );
+        let out_mat = dim_change::reduce_mat(input, &self.target_dims);
+        let ctx = DynamicContext::Mat(MatContext::ReduceMean {
+            input: input.clone(),
+        });
         (out_mat, ctx)
     }
 
@@ -60,13 +49,7 @@ impl UniversalLayer for ReduceMean {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, Vec<f32>) {
-        let dyn_delta = DynamicTensor::Dim1(crate::linalg::faer_to_tensor2d(delta));
-        let dyn_in = dim_change::unsqueeze_to(dyn_delta, self.input_dims.clone());
-        let in_tensor = match &dyn_in {
-            DynamicTensor::Dim1(t) => t.clone(),
-            _ => panic!("Expected Dim1 after unsqueeze"),
-        };
-        let dx = crate::linalg::tensor2d_to_faer(&in_tensor);
+        let dx = dim_change::unsqueeze_mat(delta, &self.input_dims);
         (dx, vec![])
     }
 
@@ -88,21 +71,18 @@ impl UniversalLayer for ReduceMean {
 
     fn create_sample_context(
         &self,
-        _input_sample: &Mat<f32>,
+        input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear {
-                input: Tensor2D::zeros(1, 0),
-            },
-        )
+        DynamicContext::Mat(MatContext::ReduceMean {
+            input: input_sample.clone(),
+        })
     }
 
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {
         Mat::zeros(0, 0)
     }
 
-    // Метод для GPU-диспетчеризации
     fn as_reduce_mean(&self) -> Option<&ReduceMean> {
         Some(self)
     }

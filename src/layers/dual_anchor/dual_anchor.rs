@@ -1,13 +1,11 @@
-// src/layers/dual_anchor/dual_anchor.rs
-
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct DualAnchor {
-    pub features: usize,   // сделано публичным для доступа из processor.rs
+    pub features: usize,
 }
 
 impl DualAnchor {
@@ -47,10 +45,7 @@ impl UniversalLayer for DualAnchor {
             x + alpha * (closest - x)
         });
 
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::DualAnchor1D { input: input_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::DualAnchor1D { input: input.clone() });
         (output, ctx)
     }
 
@@ -62,14 +57,10 @@ impl UniversalLayer for DualAnchor {
         slice: &ParamSlice,
     ) -> (Mat<f32>, Vec<f32>) {
         let (min_vals, max_vals, alpha) = self.get_params(params, slice);
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::DualAnchor1D { input } => input,
-                _ => panic!("Expected DualAnchor1D context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::DualAnchor1D { input }) => input.clone(),
+            _ => panic!("Expected DualAnchor1D context"),
         };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
 
         let (dx, grad) = dual_anchor_backward_mat(&x_mat, delta, &min_vals, &max_vals, alpha);
         (dx, grad)
@@ -115,17 +106,13 @@ impl UniversalLayer for DualAnchor {
         input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::DualAnchor1D { input: t },
-        )
+        DynamicContext::Mat(MatContext::DualAnchor1D { input: input_sample.clone() })
     }
 
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
         Mat::zeros(batch_size, self.features)
     }
 
-    // Метод для GPU-диспетчеризации
     fn as_dual_anchor(&self) -> Option<&DualAnchor> {
         Some(self)
     }

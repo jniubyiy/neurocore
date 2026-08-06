@@ -1,7 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct LeakyReLU {
@@ -20,10 +20,7 @@ impl UniversalLayer for LeakyReLU {
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
         let output = input.map(|x| if *x > 0.0 { *x } else { self.alpha * (*x) });
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::LeakyReLU { input: input_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::LeakyReLU { input: input.clone() });
         (output, ctx)
     }
 
@@ -34,14 +31,10 @@ impl UniversalLayer for LeakyReLU {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, Vec<f32>) {
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::LeakyReLU { input } => input,
-                _ => panic!("Expected LeakyReLU context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::LeakyReLU { input }) => input.clone(),
+            _ => panic!("Expected LeakyReLU context"),
         };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
         let dx = Mat::from_fn(x_mat.nrows(), x_mat.ncols(), |r, c| {
             let grad = if x_mat[(r, c)] > 0.0 { 1.0 } else { self.alpha };
             delta[(r, c)] * grad
@@ -78,10 +71,7 @@ impl UniversalLayer for LeakyReLU {
         input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::LeakyReLU { input: t },
-        )
+        DynamicContext::Mat(MatContext::LeakyReLU { input: input_sample.clone() })
     }
 
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {

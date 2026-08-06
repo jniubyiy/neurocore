@@ -1,7 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct Tanh;
@@ -18,10 +18,7 @@ impl UniversalLayer for Tanh {
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
         let output = input.map(|x| x.tanh());
-        let output_tensor = linalg::faer_to_tensor2d(&output);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Tanh { output: output_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::Tanh { output: output.clone() });
         (output, ctx)
     }
 
@@ -32,14 +29,10 @@ impl UniversalLayer for Tanh {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, Vec<f32>) {
-        let y_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::Tanh { output } => output,
-                _ => panic!("Expected Tanh context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let y_mat = match ctx {
+            DynamicContext::Mat(MatContext::Tanh { output }) => output.clone(),
+            _ => panic!("Expected Tanh context"),
         };
-        let y_mat = linalg::tensor2d_to_faer(y_tensor);
         let dx = Mat::from_fn(y_mat.nrows(), y_mat.ncols(), |r, c| {
             let val = y_mat[(r, c)];
             delta[(r, c)] * (1.0 - val * val)
@@ -76,10 +69,7 @@ impl UniversalLayer for Tanh {
         _input_sample: &Mat<f32>,
         output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(output_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Tanh { output: t },
-        )
+        DynamicContext::Mat(MatContext::Tanh { output: output_sample.clone() })
     }
 
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {

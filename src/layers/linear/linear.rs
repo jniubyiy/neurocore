@@ -1,7 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct Linear {
@@ -44,10 +44,7 @@ impl UniversalLayer for Linear {
         let mut output = input * weight.transpose();
         output += Mat::from_fn(batch, self.out_features, |_, j| bias[j]);
 
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear { input: input_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::Linear { input: input.clone() });
         (output, ctx)
     }
 
@@ -58,14 +55,10 @@ impl UniversalLayer for Linear {
         params: &[f32],
         slice: &ParamSlice,
     ) -> (Mat<f32>, Vec<f32>) {
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::Linear { input } => input,
-                _ => panic!("Expected Linear context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::Linear { input }) => input.clone(),
+            _ => panic!("Expected Linear context"),
         };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
         let (weight, _) = self.get_weight_matrix_and_bias(params, slice);
         let dx = delta * &weight;
         let dw = delta.transpose() * &x_mat;
@@ -121,10 +114,7 @@ impl UniversalLayer for Linear {
         input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear { input: t },
-        )
+        DynamicContext::Mat(MatContext::Linear { input: input_sample.clone() })
     }
 
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {

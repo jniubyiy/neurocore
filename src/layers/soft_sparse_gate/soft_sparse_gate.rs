@@ -1,7 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct SoftSparseGate {
@@ -32,10 +32,7 @@ impl UniversalLayer for SoftSparseGate {
             x / (1.0 + (-z).exp())
         });
 
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::SoftSparseGate { input: input_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::SoftSparseGate { input: input.clone() });
         (output, ctx)
     }
 
@@ -49,14 +46,10 @@ impl UniversalLayer for SoftSparseGate {
         let thresholds = &params[slice.start..slice.start + self.in_features];
         let tmp = self.temperature;
 
-        let x_tensor = match ctx {
-            DynamicContext::Ctx1D(c) => match c {
-                crate::layers::context1d::LayerContext1D::SoftSparseGate { input } => input,
-                _ => panic!("Expected SoftSparseGate context"),
-            },
-            _ => panic!("Expected Ctx1D context"),
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::SoftSparseGate { input }) => input.clone(),
+            _ => panic!("Expected SoftSparseGate context"),
         };
-        let x_mat = linalg::tensor2d_to_faer(x_tensor);
 
         let (dx, d_thr) = soft_sparse_gate_backward_mat(&x_mat, delta, thresholds, tmp);
         (dx, d_thr)
@@ -97,17 +90,13 @@ impl UniversalLayer for SoftSparseGate {
         input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::SoftSparseGate { input: t },
-        )
+        DynamicContext::Mat(MatContext::SoftSparseGate { input: input_sample.clone() })
     }
 
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
         Mat::zeros(batch_size, self.in_features)
     }
 
-    // Метод для GPU-диспетчеризации
     fn as_soft_sparse_gate(&self) -> Option<&SoftSparseGate> {
         Some(self)
     }

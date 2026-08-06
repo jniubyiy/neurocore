@@ -1,7 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 
 pub struct Identity;
@@ -17,11 +17,7 @@ impl UniversalLayer for Identity {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear {
-                input: linalg::faer_to_tensor2d(input),
-            },
-        );
+        let ctx = DynamicContext::Mat(MatContext::Identity { input: input.clone() });
         (input.clone(), ctx)
     }
 
@@ -63,11 +59,7 @@ impl UniversalLayer for Identity {
         input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Linear {
-                input: linalg::faer_to_tensor2d(input_sample),
-            },
-        )
+        DynamicContext::Mat(MatContext::Identity { input: input_sample.clone() })
     }
 
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {

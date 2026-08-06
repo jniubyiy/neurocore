@@ -3,6 +3,7 @@
 use faer::Mat;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
+use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
 use super::compute::GpuCompute;
 
@@ -18,36 +19,33 @@ pub fn process_forward_gpu(
 
     for (layer, slice) in layers.iter().zip(slices.iter()) {
         if let Some(linear) = layer.as_linear() {
-            let input_tensor = crate::linalg::faer_to_tensor2d(&current);
             let (weight, bias) = linear.get_weight_matrix_and_bias(params, slice);
             current = gpu_compute.run_linear_forward(&current, &weight, &bias);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Linear { input: input_tensor },
-            ));
+            ctxs.push(DynamicContext::Mat(MatContext::Linear {
+                input: current.clone(), // сохраняем вход (до линейного преобразования)
+            }));
         } else if let Some(_) = layer.as_relu() {
-            let input_tensor = crate::linalg::faer_to_tensor2d(&current);
+            let input_for_ctx = current.clone();
             current = gpu_compute.run_relu_forward(&current);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::ReLU { input: input_tensor },
-            ));
+            ctxs.push(DynamicContext::Mat(MatContext::ReLU {
+                input: input_for_ctx,
+            }));
         } else if let Some(_) = layer.as_sigmoid() {
             current = gpu_compute.run_sigmoid_forward(&current);
-            let output_tensor = crate::linalg::faer_to_tensor2d(&current);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Sigmoid { output: output_tensor },
-            ));
+            ctxs.push(DynamicContext::Mat(MatContext::Sigmoid {
+                output: current.clone(),
+            }));
         } else if let Some(_) = layer.as_tanh() {
             current = gpu_compute.run_tanh_forward(&current);
-            let output_tensor = crate::linalg::faer_to_tensor2d(&current);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Tanh { output: output_tensor },
-            ));
+            ctxs.push(DynamicContext::Mat(MatContext::Tanh {
+                output: current.clone(),
+            }));
         } else if let Some(leaky) = layer.as_leaky_relu() {
-            let input_tensor = crate::linalg::faer_to_tensor2d(&current);
+            let input_for_ctx = current.clone();
             current = gpu_compute.run_leaky_relu_forward(&current, leaky.alpha);
-            ctxs.push(DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::LeakyReLU { input: input_tensor },
-            ));
+            ctxs.push(DynamicContext::Mat(MatContext::LeakyReLU {
+                input: input_for_ctx,
+            }));
         } else if layer.as_identity().is_some() {
             let (out, ctx) = layer.forward_mat(&current, params, slice);
             current = out;
@@ -84,14 +82,10 @@ pub fn process_backward_gpu(
 
         if let Some(linear) = layer.as_linear() {
             let (weight, _) = linear.get_weight_matrix_and_bias(params, slice);
-            let input_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::Linear { input } => input,
-                    _ => panic!("Expected Linear context"),
-                },
-                _ => panic!("Expected Ctx1D"),
+            let input_mat = match ctx {
+                DynamicContext::Mat(MatContext::Linear { input }) => input.clone(),
+                _ => panic!("Expected Linear context"),
             };
-            let input_mat = crate::linalg::tensor2d_to_faer(input_tensor);
             let (dx, dw, db) = gpu_compute.run_linear_backward(&input_mat, &weight, &current_grad);
             current_grad = dx;
 
@@ -108,74 +102,43 @@ pub fn process_backward_gpu(
                 total_grad[b_start + i] += v;
             }
         } else if let Some(_) = layer.as_relu() {
-            let input_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::ReLU { input } => input,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let input_mat = match ctx {
+                DynamicContext::Mat(MatContext::ReLU { input }) => input.clone(),
+                _ => panic!("Expected ReLU context"),
             };
-            let input_mat = crate::linalg::tensor2d_to_faer(input_tensor);
             current_grad = gpu_compute.run_relu_backward(&input_mat, &current_grad);
         } else if let Some(_) = layer.as_sigmoid() {
-            let output_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::Sigmoid { output } => output,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let output_mat = match ctx {
+                DynamicContext::Mat(MatContext::Sigmoid { output }) => output.clone(),
+                _ => panic!("Expected Sigmoid context"),
             };
-            let output_mat = crate::linalg::tensor2d_to_faer(output_tensor);
             current_grad = gpu_compute.run_sigmoid_backward(&output_mat, &current_grad);
         } else if let Some(_) = layer.as_tanh() {
-            let output_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::Tanh { output } => output,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let output_mat = match ctx {
+                DynamicContext::Mat(MatContext::Tanh { output }) => output.clone(),
+                _ => panic!("Expected Tanh context"),
             };
-            let output_mat = crate::linalg::tensor2d_to_faer(output_tensor);
             current_grad = gpu_compute.run_tanh_backward(&output_mat, &current_grad);
         } else if let Some(leaky) = layer.as_leaky_relu() {
-            let input_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::LeakyReLU { input } => input,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let input_mat = match ctx {
+                DynamicContext::Mat(MatContext::LeakyReLU { input }) => input.clone(),
+                _ => panic!("Expected LeakyReLU context"),
             };
-            let input_mat = crate::linalg::tensor2d_to_faer(input_tensor);
             current_grad = gpu_compute.run_leaky_relu_backward(&input_mat, &current_grad, leaky.alpha);
         } else if let Some(_) = layer.as_softmax() {
-            let output_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::Softmax { output } => output,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let output_mat = match ctx {
+                DynamicContext::Mat(MatContext::Softmax { output }) => output.clone(),
+                _ => panic!("Expected Softmax context"),
             };
-            let output_mat = crate::linalg::tensor2d_to_faer(output_tensor);
             current_grad = gpu_compute.run_softmax_backward(&output_mat, &current_grad);
-        } else if let Some(_) = layer.as_memory() {
-            let memory = layer.as_memory().unwrap();
-            let _input_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::Memory { input } => input,
-                    _ => panic!(),
-                },
-                _ => panic!(),
-            };
+        } else if let Some(memory) = layer.as_memory() {
+            // Memory backward не требует контекста (использует alpha)
             current_grad = gpu_compute.run_memory_backward(&current_grad, memory.alpha);
         } else if let Some(softsparse) = layer.as_soft_sparse_gate() {
-            let input_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::SoftSparseGate { input } => input,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let input_mat = match ctx {
+                DynamicContext::Mat(MatContext::SoftSparseGate { input }) => input.clone(),
+                _ => panic!("Expected SoftSparseGate context"),
             };
-            let input_mat = crate::linalg::tensor2d_to_faer(input_tensor);
             let thresholds = &params[slice.start..slice.start + softsparse.in_features];
             let (dx, d_thr) = gpu_compute.run_softsparse_backward(
                 &input_mat,
@@ -188,14 +151,10 @@ pub fn process_backward_gpu(
                 total_grad[slice.start + i] += g;
             }
         } else if let Some(softkeep) = layer.as_soft_keep_gate() {
-            let input_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::SoftKeepGate { input } => input,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let input_mat = match ctx {
+                DynamicContext::Mat(MatContext::SoftKeepGate { input }) => input.clone(),
+                _ => panic!("Expected SoftKeepGate context"),
             };
-            let input_mat = crate::linalg::tensor2d_to_faer(input_tensor);
             let thresholds = &params[slice.start..slice.start + softkeep.in_features];
             let (dx, d_thr) = gpu_compute.run_softkeep_backward(
                 &input_mat,
@@ -208,14 +167,10 @@ pub fn process_backward_gpu(
                 total_grad[slice.start + i] += g;
             }
         } else if let Some(dual) = layer.as_dual_anchor() {
-            let input_tensor = match ctx {
-                DynamicContext::Ctx1D(c) => match c {
-                    crate::layers::context1d::LayerContext1D::DualAnchor1D { input } => input,
-                    _ => panic!(),
-                },
-                _ => panic!(),
+            let input_mat = match ctx {
+                DynamicContext::Mat(MatContext::DualAnchor1D { input }) => input.clone(),
+                _ => panic!("Expected DualAnchor1D context"),
             };
-            let input_mat = crate::linalg::tensor2d_to_faer(input_tensor);
             let features = dual.features;
             let min_vals = &params[slice.start..slice.start + features];
             let max_vals = &params[slice.start + features..slice.start + 2 * features];

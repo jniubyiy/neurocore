@@ -1,7 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
-use crate::linalg;
+use crate::layers::mat_context::MatContext;
 use faer::Mat;
 use std::sync::Mutex;
 
@@ -66,10 +66,7 @@ impl UniversalLayer for Memory {
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
         let output = self.forward_mat_impl(input);
-        let input_tensor = linalg::faer_to_tensor2d(input);
-        let ctx = DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Memory { input: input_tensor },
-        );
+        let ctx = DynamicContext::Mat(MatContext::Memory { input: input.clone() });
         (output, ctx)
     }
 
@@ -114,10 +111,7 @@ impl UniversalLayer for Memory {
         input_sample: &Mat<f32>,
         _output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        let t = linalg::faer_to_tensor2d(input_sample);
-        DynamicContext::Ctx1D(
-            crate::layers::context1d::LayerContext1D::Memory { input: t },
-        )
+        DynamicContext::Mat(MatContext::Memory { input: input_sample.clone() })
     }
 
     fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {

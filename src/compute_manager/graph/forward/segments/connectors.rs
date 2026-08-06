@@ -6,9 +6,11 @@ use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::layers::splitter_connector::SplitterConnector;
 use crate::layers::combiner_connector::CombinerConnector;
-use crate::layers::Splitter;
-use crate::layers::Combiner;
+use crate::layers::splitter::Splitter;
+use crate::layers::combiner::Combiner;
 use crate::linalg;
+use crate::layers::mat_context::MatContext;
+use faer::Mat;
 
 impl MixedModel {
     // ---------------------------------------------------------------
@@ -133,7 +135,6 @@ impl MixedModel {
                 panic!("Splitter forward: expected Dim1");
             }
         }
-        let data_clone = data.clone();
         let input_mat = linalg::tensor2d_to_faer(&Tensor2D::new(data));
 
         let params = self.store.lock().unwrap().all_params();
@@ -146,18 +147,14 @@ impl MixedModel {
             let (a_mat, b_mat, pre_a_mat, pre_b_mat) =
                 gpu.run_splitter_forward(&input_mat, &wa, &bias_a, &wb, &bias_b);
 
+            let ctx = DynamicContext::Mat(MatContext::Splitter {
+                input: input_mat.clone(),
+                pre_a: pre_a_mat.clone(),
+                pre_b: pre_b_mat.clone(),
+            });
+
             let a_tensor = linalg::faer_to_tensor2d(&a_mat);
             let b_tensor = linalg::faer_to_tensor2d(&b_mat);
-            let pre_a_flat = mat_to_flat(&pre_a_mat);
-            let pre_b_flat = mat_to_flat(&pre_b_mat);
-
-            let ctx = DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Splitter {
-                    input: Tensor2D::new(data_clone),
-                    pre_a: pre_a_flat,
-                    pre_b: pre_b_flat,
-                },
-            );
 
             let mut stream_a = Vec::with_capacity(batch_size);
             let mut stream_b = Vec::with_capacity(batch_size);
@@ -173,18 +170,14 @@ impl MixedModel {
             // --- CPU путь (оригинальный) ---
             let (a_mat, b_mat, pre_a_mat, pre_b_mat) = splitter.forward_mat(&input_mat, &params, &slice);
 
+            let ctx = DynamicContext::Mat(MatContext::Splitter {
+                input: input_mat.clone(),
+                pre_a: pre_a_mat.clone(),
+                pre_b: pre_b_mat.clone(),
+            });
+
             let a_tensor = linalg::faer_to_tensor2d(&a_mat);
             let b_tensor = linalg::faer_to_tensor2d(&b_mat);
-            let pre_a_flat = mat_to_flat(&pre_a_mat);
-            let pre_b_flat = mat_to_flat(&pre_b_mat);
-
-            let ctx = DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Splitter {
-                    input: Tensor2D::new(data_clone),
-                    pre_a: pre_a_flat,
-                    pre_b: pre_b_flat,
-                },
-            );
 
             let mut stream_a = Vec::with_capacity(batch_size);
             let mut stream_b = Vec::with_capacity(batch_size);
@@ -223,8 +216,6 @@ impl MixedModel {
                 panic!("Combiner forward: expected Dim1");
             }
         }
-        let data_a_clone = data_a.clone();
-        let data_b_clone = data_b.clone();
 
         let a_mat = linalg::tensor2d_to_faer(&Tensor2D::new(data_a));
         let b_mat = linalg::tensor2d_to_faer(&Tensor2D::new(data_b));
@@ -238,15 +229,13 @@ impl MixedModel {
             let gpu = gpu_compute_mutex.lock().unwrap();
             let (out_mat, pre_mat) = gpu.run_combiner_forward(&a_mat, &b_mat, &wa, &wb, &bias);
 
-            let out_tensor = linalg::faer_to_tensor2d(&out_mat);
-            let ctx = DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Combiner {
-                    input_a: Tensor2D::new(data_a_clone),
-                    input_b: Tensor2D::new(data_b_clone),
-                    pre_act: mat_to_flat(&pre_mat), // сохраняем pre для backward
-                },
-            );
+            let ctx = DynamicContext::Mat(MatContext::Combiner {
+                input_a: a_mat.clone(),
+                input_b: b_mat.clone(),
+                pre_act: pre_mat.clone(),
+            });
 
+            let out_tensor = linalg::faer_to_tensor2d(&out_mat);
             let mut combined_stream = Vec::with_capacity(batch_size);
             for r in 0..batch_size {
                 combined_stream.push(DynamicTensor::Dim1(Tensor2D::new(vec![out_tensor.data[r].clone()])));
@@ -258,15 +247,13 @@ impl MixedModel {
         } else {
             // --- CPU путь (оригинальный) ---
             let out_mat = combiner.forward_mat(&a_mat, &b_mat, &params, &slice);
-            let out_tensor = linalg::faer_to_tensor2d(&out_mat);
-            let ctx = DynamicContext::Ctx1D(
-                crate::layers::context1d::LayerContext1D::Combiner {
-                    input_a: Tensor2D::new(data_a_clone),
-                    input_b: Tensor2D::new(data_b_clone),
-                    pre_act: Vec::new(), // CPU-версия не сохраняет pre, но мы оставим как было
-                },
-            );
+            let ctx = DynamicContext::Mat(MatContext::Combiner {
+                input_a: a_mat.clone(),
+                input_b: b_mat.clone(),
+                pre_act: Mat::zeros(batch_size, output_dim),
+            });
 
+            let out_tensor = linalg::faer_to_tensor2d(&out_mat);
             let mut combined_stream = Vec::with_capacity(batch_size);
             for r in 0..batch_size {
                 combined_stream.push(DynamicTensor::Dim1(Tensor2D::new(vec![out_tensor.data[r].clone()])));

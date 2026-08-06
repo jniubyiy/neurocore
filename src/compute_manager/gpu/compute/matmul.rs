@@ -93,7 +93,7 @@ impl GpuCompute {
 
     pub fn run_mat_mul(&self, a: &Mat<f32>, b: &Mat<f32>) -> Mat<f32> {
         let (out_buf, out_id) = self.run_mat_mul_internal(a, b, a.nrows(), b.ncols());
-        self.read_buffer_to_mat(out_buf, out_id, a.nrows(), b.ncols())
+        self.read_buffer_to_mat(out_id, a.nrows(), b.ncols())
     }
 
     pub fn run_reduce_sum_cols(&self, mat: &Mat<f32>) -> Vec<f32> {

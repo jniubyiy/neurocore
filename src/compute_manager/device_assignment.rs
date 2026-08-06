@@ -27,17 +27,20 @@ struct SegmentMemory {
     pub param_elements: usize,
     /// Оценочная память под активации (промежуточные тензоры)
     pub activation_elements: usize,
+    /// Оценка дополнительной памяти под временные буферы (staging, градиенты)
+    pub temp_buffer_elements: usize,
     /// Общая память (с запасом)
     pub total_elements: usize,
 }
 
 impl SegmentMemory {
-    /// Создаёт оценку с коэффициентом запаса 1.2 (20% сверх)
-    pub fn with_safety_margin(param: usize, activation: usize) -> Self {
-        let total = ((param + activation) as f32 * 1.2) as usize;
+    /// Создаёт оценку с коэффициентом запаса 1.2 (20% сверх) и учётом временных буферов.
+    pub fn with_safety_margin(param: usize, activation: usize, temp: usize) -> Self {
+        let total = ((param + activation + temp) as f32 * 1.2) as usize;
         SegmentMemory {
             param_elements: param,
             activation_elements: activation,
+            temp_buffer_elements: temp,
             total_elements: total,
         }
     }
@@ -56,33 +59,36 @@ fn calculate_segment_memory(seg: &Segment, batch_size: usize) -> SegmentMemory {
                 .max()
                 .unwrap_or(0);
             let activation_est = max_feat * batch_size;
-            SegmentMemory::with_safety_margin(param_sum, activation_est)
+            // Оценка временных буферов (например, для промежуточных результатов matmul)
+            let temp_est = (param_sum + activation_est) / 2;
+            SegmentMemory::with_safety_margin(param_sum, activation_est, temp_est)
         }
         Segment::Splitter { input_dim, output_dims, .. } => {
             let p = output_dims[0];
             let q = output_dims[1];
             let param_sum = input_dim * p + input_dim * q + p + q;
             let activation_est = (input_dim + p + q) * batch_size;
-            SegmentMemory::with_safety_margin(param_sum, activation_est)
+            let temp_est = (param_sum + activation_est) / 2;
+            SegmentMemory::with_safety_margin(param_sum, activation_est, temp_est)
         }
         Segment::Combiner { input_dim, output_dim, .. } => {
             let param_sum = 2 * input_dim * output_dim + output_dim;
             let activation_est = (input_dim * 2 + output_dim) * batch_size;
-            SegmentMemory::with_safety_margin(param_sum, activation_est)
+            let temp_est = (param_sum + activation_est) / 2;
+            SegmentMemory::with_safety_margin(param_sum, activation_est, temp_est)
         }
         Segment::SplitterConnector { dim_a, dim_b } => {
             // Нет параметров, только активации (вход и два выхода)
             let activation_est = (dim_a + dim_b) * batch_size;
-            SegmentMemory::with_safety_margin(0, activation_est)
+            SegmentMemory::with_safety_margin(0, activation_est, 0)
         }
         Segment::CombinerConnector { input_dims, output_dim, .. } => {
             let activation_est = (input_dims.iter().sum::<usize>() + output_dim) * batch_size;
-            SegmentMemory::with_safety_margin(0, activation_est)
+            SegmentMemory::with_safety_margin(0, activation_est, 0)
         }
         Segment::Unsqueeze(_) | Segment::ReduceMean(_) => {
             // Операции изменения размерности – параметров нет, активации примерно равны входу
-            // Оценим грубо: size = batch_size * среднее число элементов
-            SegmentMemory::with_safety_margin(0, 0)
+            SegmentMemory::with_safety_margin(0, 0, 0)
         }
     }
 }

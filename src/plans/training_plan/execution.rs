@@ -58,6 +58,17 @@ pub fn execute(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Training
 fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<TrainingResult, String> {
     let start_time = Instant::now();
 
+    // --- проверка использования многопотоковых данных ---
+    if plan.train_data_streams.is_some() || plan.target_data_streams.is_some() ||
+       plan.test_input_streams.is_some() || plan.test_target_streams.is_some() {
+        return Err(
+            "Многопотоковые данные (train_data_streams, target_data_streams, \
+             test_input_streams, test_target_streams) пока не поддерживаются \
+             в автоматическом обучении. Используйте ручной цикл с forward_multi/backward_multi."
+                .to_string(),
+        );
+    }
+
     // --- построение модели ---
     let model_desc = (plan.model_fn)();
     let _ = Plan::from_layer_descs(model_desc.clone())?;
@@ -285,16 +296,32 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     };
 
     // --- финальный тест ---
-    if let Some(test_data) = &plan.test_data {
-        let test_dynamic = test_data.to_dynamic_tensor();
-        let (pred, _) = model.forward(test_dynamic.clone());
+    if let Some(test_input) = &plan.test_data {
+        let test_input_dynamic = test_input.to_dynamic_tensor();
+        let (pred, _) = model.forward(test_input_dynamic.clone());
+
+        // Сохраняем предсказание в результат, если запрошено пользователем
         if plan.output_tensors.contains(&"prediction".to_string()) {
-            result.tensors.insert("prediction".into(), pred);
+            result.tensors.insert("prediction".into(), pred.clone());
         }
+
+        // Определяем цель для теста
+        let target_for_test = match &plan.test_target_data {
+            Some(t) => {
+                assert_eq!(
+                    test_input.num_samples(),
+                    t.num_samples(),
+                    "Test input and test target must have the same number of samples"
+                );
+                t.to_dynamic_tensor()
+            }
+            None => test_input_dynamic.clone(), // обратная совместимость: цель = вход
+        };
+
         let (loss, _) = model.compute_loss(
             plan.loss_desc.clone(),
-            &result.tensors.get("prediction").unwrap(),
-            &test_dynamic,
+            &pred,
+            &target_for_test,
         );
         result.final_loss = loss;
     }

@@ -36,8 +36,6 @@ pub struct MixedModel {
     pub(crate) memory_executor: Arc<Mutex<MemoryExecutor>>,
 
     // Ожидаемые размерности входных и выходных тензоров (без batch).
-    // Для каждого потока (stream) хранится вектор размерностей пространственных осей.
-    // Например, для Dim1: [features], для Dim2: [dim2, dim3] и т.д.
     pub(crate) input_shapes: Vec<Vec<usize>>,
     pub(crate) output_shapes: Vec<Vec<usize>>,
 }
@@ -169,8 +167,6 @@ impl MixedModel {
     ) -> (DynamicTensor, Vec<Vec<DynamicContext>>) {
         let (outs, ctxs) = self.forward_multi(vec![input]);
         assert_eq!(outs.len(), 1);
-
-        self.memory_executor.lock().unwrap().tick();
         (outs.into_iter().next().unwrap(), ctxs)
     }
 
@@ -181,8 +177,6 @@ impl MixedModel {
     ) -> (DynamicTensor, Vec<Vec<f32>>) {
         let (ins, grads) = self.backward_multi(contexts, vec![delta]);
         assert_eq!(ins.len(), 1);
-
-        self.memory_executor.lock().unwrap().tick();
         (ins.into_iter().next().unwrap(), grads)
     }
 
@@ -216,7 +210,11 @@ impl MixedModel {
             })
             .collect();
 
-        self.memory_executor.lock().unwrap().tick();
+        // После завершения forward можно очистить давно неиспользуемые временные буферы
+        if let Ok(mut exec) = self.memory_executor.lock() {
+            exec.cleanup_temp_pools(std::time::Duration::from_secs(30));
+        }
+
         (out_tensors, ctxs)
     }
 
@@ -251,7 +249,6 @@ impl MixedModel {
             })
             .collect();
 
-        self.memory_executor.lock().unwrap().tick();
         (in_tensors, grads)
     }
 
@@ -277,7 +274,6 @@ impl MixedModel {
         let (loss, grad_mat) = self.compute_loss_mat(expr, &pred_mat, &target_mat);
         let grad_tensor = DynamicTensor::Dim1(linalg::faer_to_tensor2d(&grad_mat));
 
-        self.memory_executor.lock().unwrap().tick();
         (loss, grad_tensor)
     }
 
@@ -301,7 +297,6 @@ impl MixedModel {
             crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
         };
 
-        self.memory_executor.lock().unwrap().tick();
         result
     }
 

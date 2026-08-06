@@ -5,6 +5,9 @@ pub mod pool;
 pub mod executor;
 pub mod ssd_cache;
 pub mod policy;
+pub mod raw_buffer;
+pub mod temp_pool;
+pub mod data_mover;
 
 pub use executor::MemoryExecutor;
 pub use executor::MemoryError;

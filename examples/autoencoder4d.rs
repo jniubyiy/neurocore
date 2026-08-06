@@ -1,93 +1,86 @@
 // examples/autoencoder4d.rs
-// Автоэнкодер с Dim4 (Tensor5D).
-// Используются новые удобные методы compute_loss и update_params.
+// Автоэнкодер 256 -> 16 -> 256, размерность Dim4 (Tensor5D).
 
-use std::time::Instant;
-use neurocore::compute_manager::DynamicTensor;
 use neurocore::tensor::Tensor5D;
-use neurocore::create_models;
 
 mod models {
-    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
-    pub fn encoder() -> Vec<LayerDesc> {
+    use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
+    pub fn autoencoder() -> Vec<LayerDesc> {
         vec![
-            LayerDesc::new("fc1", LayerKind::Linear, Dim::Dim4)
-                .input(Dim::Dim4, &[4])
-                .output(Dim::Dim4, &[2]),
-            LayerDesc::new("sigm", LayerKind::Sigmoid, Dim::Dim4)
-                .input(Dim::Dim4, &[2])
-                .output(Dim::Dim4, &[2]),
-        ]
-    }
-    pub fn decoder() -> Vec<LayerDesc> {
-        vec![
-            LayerDesc::new("fc2", LayerKind::Linear, Dim::Dim4)
-                .input(Dim::Dim4, &[2])
-                .output(Dim::Dim4, &[4]),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[4], B[4], C[4], D[4]))
+                .output(shape!(batch, A[2], B[2], C[2], D[2])),
+            LayerDesc::new(LayerKind::Sigmoid)
+                .input(shape!(batch, A[2], B[2], C[2], D[2]))
+                .output(shape!(batch, A[2], B[2], C[2], D[2])),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[2], B[2], C[2], D[2]))
+                .output(shape!(batch, A[4], B[4], C[4], D[4])),
         ]
     }
 }
 
 mod losses {
-    use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub};
+    use neurocore::loss_plan::{
+        Aggregation, ElementChain, LossDesc, Square, Sub, SumColumns,
+    };
     pub fn mse() -> LossDesc {
-        let chain = ElementChain::new().add(Box::new(Sub)).add(Box::new(Square));
-        LossDesc::from_chain(chain, Aggregation::Mean, 4, 1, 1)
+        let chain = ElementChain::new()
+            .add(Box::new(Sub::new(256)))
+            .add(Box::new(Square))
+            .add(Box::new(SumColumns));
+        LossDesc::from_chain(chain, Aggregation::Mean, 1, 256, 256)
     }
 }
 
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
-    pub fn sgd_encoder() -> OptimizerDesc {
-        OptimizerDesc::new().add(OptCubeDesc::ScaleGradient(0.01)).add(OptCubeDesc::ApplyUpdate)
+    pub fn sgd() -> OptimizerDesc {
+        OptimizerDesc::new()
+            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ApplyUpdate)
     }
-    pub fn sgd_decoder() -> OptimizerDesc {
-        OptimizerDesc::new().add(OptCubeDesc::ScaleGradient(0.01)).add(OptCubeDesc::ApplyUpdate)
+}
+
+fn data() -> Tensor5D {
+    let vals: Vec<f32> = (0..256).map(|i| (i as f32 + 1.0) / 256.0).collect();
+    let mut idx = 0;
+    let d1 = (0..4).map(|_| {
+        (0..4).map(|_| {
+            (0..4).map(|_| {
+                (0..4).map(|_| { let v = vals[idx]; idx+=1; v }).collect()
+            }).collect()
+        }).collect()
+    }).collect();
+    Tensor5D::new(vec![d1])
+}
+
+mod device_plan {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192) }
+}
+
+mod training_plan {
+    use super::*;
+    use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+    pub fn plan() -> TrainingPlan {
+        TrainingPlan::new()
+            .model(models::autoencoder)
+            .loss(losses::mse())
+            .optimizer(optimizers::sgd())
+            .epochs(100)
+            .batch_size(1)
+            .train_data(DataSource::from_tensor5d(data()))
+            .target_data(DataSource::from_tensor5d(data()))
+            .init_weights(Initializer::RandomUniform { min: -0.1, max: 0.1 })
+            .seed(42)
+            .output_tensors(vec!["prediction".to_string()])
     }
 }
 
 fn main() {
-    let (mut encoder, mut decoder) = create_models!(models::encoder, models::decoder);
-
-    // Данные: Tensor5D [batch=1, dim2=1, dim3=1, dim4=1, features=4]
-    let x = Tensor5D::new(vec![vec![vec![vec![vec![1.0, 2.0, 3.0, 4.0]]]]]);
-    let target = x.clone();
-    let epochs = 500;
-
-    let start = Instant::now();
-    for epoch in 0..epochs {
-        let (code, ctx_enc) = encoder.forward(DynamicTensor::Dim4(x.clone()));
-        let (recon, ctx_dec) = decoder.forward(code);
-
-        let (loss, delta_loss) = encoder.compute_loss(
-            losses::mse(),
-            &recon,
-            &DynamicTensor::Dim4(target.clone()),
-        );
-
-        let (delta_code, grads_dec) = decoder.backward(&ctx_dec, delta_loss);
-        decoder.update_params(optimizers::sgd_decoder(), &grads_dec[0]);
-
-        let (_, grads_enc) = encoder.backward(&ctx_enc, delta_code);
-        encoder.update_params(optimizers::sgd_encoder(), &grads_enc[0]);
-
-        if epoch == 0 || epoch % 100 == 0 {
-            println!("Epoch {}: loss = {:.6}", epoch, loss);
-        }
-    }
-    let duration = start.elapsed();
-
-    let (code, _) = encoder.forward(DynamicTensor::Dim4(x.clone()));
-    let (final_recon, _) = decoder.forward(code);
-    let (final_loss, _) = encoder.compute_loss(
-        losses::mse(),
-        &final_recon,
-        &DynamicTensor::Dim4(target),
-    );
-
-    println!("Обучение завершено за {:?}", duration);
-    println!("Финальный loss: {:.6}", final_loss);
+    let result = neurocore::run_training!(training_plan::plan, device = device_plan::plan);
+    println!("Autoencoder4D done. Final loss: {:.6}, time: {:.3}s, best epoch: {}",
+        result.final_loss, result.training_time_secs, result.best_epoch);
 }
-
-
-

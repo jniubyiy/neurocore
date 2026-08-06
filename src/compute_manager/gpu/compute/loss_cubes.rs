@@ -19,7 +19,7 @@ impl GpuCompute {
             a_buf, b_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, pred.nrows(), pred.ncols());
+        let mat = self.read_buffer_to_mat(out_id, pred.nrows(), pred.ncols());
         self.release_buffer(a_id);
         self.release_buffer(b_id);
         mat
@@ -76,8 +76,8 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let ga = self.read_buffer_to_mat(ga_buf, ga_id, grad_out.nrows(), grad_out.ncols());
-        let gb = self.read_buffer_to_mat(gb_buf, gb_id, grad_out.nrows(), grad_out.ncols());
+        let ga = self.read_buffer_to_mat(ga_id, grad_out.nrows(), grad_out.ncols());
+        let gb = self.read_buffer_to_mat(gb_id, grad_out.nrows(), grad_out.ncols());
         self.release_buffer(go_id);
         (ga, gb)
     }
@@ -91,7 +91,7 @@ impl GpuCompute {
             in_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(out_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         mat
     }
@@ -147,7 +147,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(gi_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         self.release_buffer(go_id);
         mat
@@ -162,7 +162,7 @@ impl GpuCompute {
             in_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(out_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         mat
     }
@@ -218,7 +218,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(gi_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         self.release_buffer(go_id);
         mat
@@ -233,7 +233,7 @@ impl GpuCompute {
             in_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(out_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         mat
     }
@@ -289,7 +289,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(gi_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         self.release_buffer(go_id);
         mat
@@ -305,7 +305,7 @@ impl GpuCompute {
             a_buf, b_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, a.nrows(), a.ncols());
+        let mat = self.read_buffer_to_mat(out_id, a.nrows(), a.ncols());
         self.release_buffer(a_id);
         self.release_buffer(b_id);
         mat
@@ -366,8 +366,8 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let ga = self.read_buffer_to_mat(ga_buf, ga_id, a.nrows(), a.ncols());
-        let gb = self.read_buffer_to_mat(gb_buf, gb_id, a.nrows(), a.ncols());
+        let ga = self.read_buffer_to_mat(ga_id, a.nrows(), a.ncols());
+        let gb = self.read_buffer_to_mat(gb_id, a.nrows(), a.ncols());
         self.release_buffer(a_id);
         self.release_buffer(b_id);
         self.release_buffer(go_id);
@@ -383,7 +383,7 @@ impl GpuCompute {
             in_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(out_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         mat
     }
@@ -439,7 +439,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(gi_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         self.release_buffer(go_id);
         mat
@@ -454,7 +454,7 @@ impl GpuCompute {
             in_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(out_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         mat
     }
@@ -508,7 +508,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, grad_out.nrows(), grad_out.ncols());
+        let mat = self.read_buffer_to_mat(gi_id, grad_out.nrows(), grad_out.ncols());
         self.release_buffer(go_id);
         mat
     }
@@ -523,7 +523,7 @@ impl GpuCompute {
             a_buf, b_buf, total,
             [total as u32],
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, a.nrows(), a.ncols());
+        let mat = self.read_buffer_to_mat(out_id, a.nrows(), a.ncols());
         self.release_buffer(a_id);
         self.release_buffer(b_id);
         mat
@@ -584,8 +584,8 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let ga = self.read_buffer_to_mat(ga_buf, ga_id, a.nrows(), a.ncols());
-        let gb = self.read_buffer_to_mat(gb_buf, gb_id, a.nrows(), a.ncols());
+        let ga = self.read_buffer_to_mat(ga_id, a.nrows(), a.ncols());
+        let gb = self.read_buffer_to_mat(gb_id, a.nrows(), a.ncols());
         self.release_buffer(a_id);
         self.release_buffer(b_id);
         self.release_buffer(go_id);
@@ -602,7 +602,7 @@ impl GpuCompute {
             in_buf, total,
             push_data,
         );
-        let mat = self.read_buffer_to_mat(out_buf, out_id, input.nrows(), input.ncols());
+        let mat = self.read_buffer_to_mat(out_id, input.nrows(), input.ncols());
         self.release_buffer(in_id);
         mat
     }
@@ -656,7 +656,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, grad_out.nrows(), grad_out.ncols());
+        let mat = self.read_buffer_to_mat(gi_id, grad_out.nrows(), grad_out.ncols());
         self.release_buffer(go_id);
         mat
     }
@@ -711,7 +711,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, 1);
+        let mat = self.read_buffer_to_mat(out_id, batch, 1);
         self.release_buffer(in_id);
         mat
     }
@@ -773,7 +773,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, batch, num_classes + 1);
+        let mat = self.read_buffer_to_mat(gi_id, batch, num_classes + 1);
         self.release_buffer(in_id);
         self.release_buffer(go_id);
         mat

@@ -1,20 +1,16 @@
 // examples_large/mnist_binary_32x32.rs
-// Классификатор MNIST (32x32 бинарных изображений) с двумя скрытыми слоями.
-// Модель и потери собираются через макросы, оптимизатор – вручную для гибкости.
-// Используются новые удобные методы compute_loss и update_params.
+// Классификатор MNIST (32x32 бинарных изображений) через TrainingPlan.
+// Два варианта обучения: CPU (16 потоков) и GPU (id 0).
+// Демонстрирует обучение с разными train_data / target_data,
+// а также раздельное тестирование с test_data и test_target_data.
 
-use std::time::Instant;
+use neurocore::tensor::Tensor2D;
 use rand::Rng;
 
-use neurocore::compute_manager::DynamicTensor;
-use neurocore::tensor::Tensor2D;
-use neurocore::create_models;
-
-// -----------------------------------------------------------------
-// Описание моделей, потерь и оптимизаторов (всё как отдельные функции)
-// -----------------------------------------------------------------
+// ═══════════════ Модель ═══════════════
 mod models {
-    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+    use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
 
     pub fn mnist_classifier() -> Vec<LayerDesc> {
         let img_size = 32;
@@ -24,32 +20,36 @@ mod models {
         let num_classes = 10;
 
         vec![
-            LayerDesc::new("fc1", LayerKind::Linear, Dim::Dim1)
-                .input(Dim::Dim1, &[input_dim])
-                .output(Dim::Dim1, &[hidden1]),
-            LayerDesc::new("relu1", LayerKind::ReLU, Dim::Dim1)
-                .input(Dim::Dim1, &[hidden1])
-                .output(Dim::Dim1, &[hidden1]),
-            LayerDesc::new("fc2", LayerKind::Linear, Dim::Dim1)
-                .input(Dim::Dim1, &[hidden1])
-                .output(Dim::Dim1, &[hidden2]),
-            LayerDesc::new("relu2", LayerKind::ReLU, Dim::Dim1)
-                .input(Dim::Dim1, &[hidden2])
-                .output(Dim::Dim1, &[hidden2]),
-            LayerDesc::new("fc3", LayerKind::Linear, Dim::Dim1)
-                .input(Dim::Dim1, &[hidden2])
-                .output(Dim::Dim1, &[num_classes]),
-            LayerDesc::new("softmax", LayerKind::Softmax, Dim::Dim1)
-                .input(Dim::Dim1, &[num_classes])
-                .output(Dim::Dim1, &[num_classes]),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[input_dim]))
+                .output(shape!(batch, A[hidden1])),
+            LayerDesc::new(LayerKind::ReLU)
+                .input(shape!(batch, A[hidden1]))
+                .output(shape!(batch, A[hidden1])),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[hidden1]))
+                .output(shape!(batch, A[hidden2])),
+            LayerDesc::new(LayerKind::ReLU)
+                .input(shape!(batch, A[hidden2]))
+                .output(shape!(batch, A[hidden2])),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[hidden2]))
+                .output(shape!(batch, A[num_classes])),
+            LayerDesc::new(LayerKind::Softmax)
+                .input(shape!(batch, A[num_classes]))
+                .output(shape!(batch, A[num_classes])),
         ]
     }
 }
 
+// ═══════════════ Потери ═══════════════
 mod losses {
-    use neurocore::loss_plan::{Aggregation, CrossEntropyWithLogits, ElementChain, LossDesc};
+    use neurocore::loss_plan::{
+        Aggregation, CrossEntropyWithLogits, ElementChain, LossDesc,
+    };
 
-    /// Кросс‑энтропия для классификации с указанным числом классов и размером батча.
+    /// Кросс‑энтропия для классификации.
+    /// pred_features = num_classes (логиты), target_features = 1 (индекс класса)
     pub fn cross_entropy_desc(num_classes: usize, batch_size: usize) -> LossDesc {
         let chain = ElementChain::new()
             .add(Box::new(CrossEntropyWithLogits::new(num_classes)));
@@ -57,10 +57,10 @@ mod losses {
     }
 }
 
+// ═══════════════ Оптимизатор ═══════════════
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
 
-    /// Обычный SGD с заданным learning rate.
     pub fn sgd(lr: f32) -> OptimizerDesc {
         OptimizerDesc::new()
             .add(OptCubeDesc::ScaleGradient(lr))
@@ -68,93 +68,7 @@ mod optimizers {
     }
 }
 
-// -----------------------------------------------------------------
-fn main() {
-    // Параметры обучения
-    let img_size = 32;
-    let num_classes = 10;
-    let batch_size = 32;
-    let epochs = 20;
-    let lr = 0.1;
-
-    // Сборка модели
-    let (mut model,) = create_models!(models::mnist_classifier);
-
-    // Сгенерируем синтетический датасет (500 примеров 32x32)
-    let (train_x, train_y) = generate_dataset(500, img_size);
-    println!("Сгенерировано {} обучающих примеров", train_x.len());
-
-    // Инициализация параметров малыми случайными числами
-    {
-        let mut store = model.param_store().lock().unwrap();
-        let len = store.len();
-        for i in 0..len {
-            store.set_param(i, rand::random::<f32>() * 0.01);
-        }
-    }
-
-    // Создаём описание оптимизатора один раз
-    let sgd_desc = optimizers::sgd(lr);
-
-    let start = Instant::now();
-    for epoch in 0..epochs {
-        let mut total_loss = 0.0;
-        for batch_start in (0..train_x.len()).step_by(batch_size) {
-            let batch_end = (batch_start + batch_size).min(train_x.len());
-            let current_batch_size = batch_end - batch_start;
-
-            // Подготовка батча
-            let batch_x = Tensor2D::new(train_x[batch_start..batch_end].to_vec());
-            let batch_y = Tensor2D::new(train_y[batch_start..batch_end].to_vec());
-
-            // Прямой проход
-            let (pred, contexts) = model.forward(DynamicTensor::Dim1(batch_x.clone()));
-
-            // Функция потерь для текущего размера батча
-            let (loss, delta) = model.compute_loss(
-                losses::cross_entropy_desc(num_classes, current_batch_size),
-                &pred,
-                &DynamicTensor::Dim1(batch_y),
-            );
-            total_loss += loss * current_batch_size as f32;
-
-            // Обратный проход
-            let (_, grads) = model.backward(&contexts, delta);
-            // Обновление параметров
-            model.update_params(sgd_desc.clone(), &grads[0]);
-        }
-        println!(
-            "Epoch {}: avg loss = {:.6}",
-            epoch,
-            total_loss / train_x.len() as f32
-        );
-    }
-    let duration = start.elapsed();
-    println!("Обучение завершено за {:?}", duration);
-
-    // Проверка на первых 10 примерах
-    let test_x = Tensor2D::new(train_x[..10].to_vec());
-    let (pred, _) = model.forward(DynamicTensor::Dim1(test_x));
-    let pred_matrix = match pred {
-        DynamicTensor::Dim1(t) => t,
-        _ => panic!("Ожидался Dim1 (Tensor2D)"),
-    };
-    for i in 0..10 {
-        let pred_class = pred_matrix.data[i]
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
-            .0;
-        let true_class = train_y[i][0] as usize;
-        println!(
-            "Пример {}: предсказано {}, истина {}",
-            i, pred_class, true_class
-        );
-    }
-}
-
-/// Генерация синтетического датасета: бинарные изображения 32x32 с шаблонами цифр 0-9.
+// ═══════════════ Генерация синтетического датасета ═══════════════
 fn generate_dataset(num_samples: usize, img_size: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let mut rng = rand::thread_rng();
     let mut images = Vec::with_capacity(num_samples);
@@ -277,4 +191,82 @@ fn generate_dataset(num_samples: usize, img_size: usize) -> (Vec<Vec<f32>>, Vec<
         labels.push(vec![digit as f32]);
     }
     (images, labels)
+}
+
+// ═══════════════ Планы устройств ═══════════════
+mod device_plan_cpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 16).ram(0, 8192)
+    }
+}
+
+mod device_plan_gpu {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty()
+            .cpu(0, 2)
+            .ram(0, 8192)
+            .gpu(0)
+            .vram(0, 0, 4096)
+    }
+}
+
+// ═══════════════ План обучения (общий, с 200 эпохами) ═══════════════
+mod training_plan {
+    use super::*;
+    use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+
+    pub fn plan() -> TrainingPlan {
+        let num_samples = 500;
+        let img_size = 32;
+        let num_classes = 10;
+        let batch_size = 32;
+
+        let (train_x, train_y) = generate_dataset(num_samples, img_size);
+
+        // Тестовые данные – первые 10 примеров
+        let test_x = train_x[..10].to_vec();
+        let test_y = train_y[..10].to_vec();
+
+        TrainingPlan::new()
+            .model(models::mnist_classifier)
+            .loss(losses::cross_entropy_desc(num_classes, batch_size))
+            .optimizer(optimizers::sgd(0.1))
+            .epochs(200)                               // <-- увеличено до 200
+            .batch_size(batch_size)
+            .train_data(DataSource::from_tensor2d(Tensor2D::new(train_x)))
+            .target_data(DataSource::from_tensor2d(Tensor2D::new(train_y)))
+            .test_data(DataSource::from_tensor2d(Tensor2D::new(test_x)))
+            .test_target_data(DataSource::from_tensor2d(Tensor2D::new(test_y)))
+            .init_weights(Initializer::RandomUniform {
+                min: -0.01,
+                max: 0.01,
+            })
+            .seed(42)
+    }
+}
+
+fn main() {
+    // Вариант 1: CPU (16 потоков)
+    println!("=== Обучение на CPU (16 потоков) ===");
+    let r_cpu = neurocore::run_training!(
+        training_plan::plan,
+        device = device_plan_cpu::plan
+    );
+    println!(
+        "CPU: Final loss (тест) = {:.6}, время = {:.3}с, лучшая эпоха = {}",
+        r_cpu.final_loss, r_cpu.training_time_secs, r_cpu.best_epoch
+    );
+
+    // Вариант 2: GPU
+    println!("\n=== Обучение на GPU ===");
+    let r_gpu = neurocore::run_training!(
+        training_plan::plan,
+        device = device_plan_gpu::plan
+    );
+    println!(
+        "GPU: Final loss (тест) = {:.6}, время = {:.3}с, лучшая эпоха = {}",
+        r_gpu.final_loss, r_gpu.training_time_secs, r_gpu.best_epoch
+    );
 }

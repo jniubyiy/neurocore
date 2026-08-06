@@ -1,34 +1,32 @@
 // examples/classifier2d.rs
-// Классификатор на 2 класса, размерность Dim2.
-// Используются новые удобные методы compute_loss и update_params.
+// Классификатор на 2 класса, размерность Dim2 (Tensor3D).
+// Вход: 4 признака (2×2), выход: 2 логита.
 
-use std::time::Instant;
-use neurocore::compute_manager::DynamicTensor;
 use neurocore::tensor::Tensor3D;
-use neurocore::create_models;
 
 mod models {
-    use neurocore::model_plan::{Dim, LayerDesc, LayerKind};
+    use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
 
     pub fn classifier() -> Vec<LayerDesc> {
         vec![
-            LayerDesc::new("fc", LayerKind::Linear, Dim::Dim2)
-                .input(Dim::Dim2, &[2])
-                .output(Dim::Dim2, &[2]),
-            LayerDesc::new("softmax", LayerKind::Softmax, Dim::Dim2)
-                .input(Dim::Dim2, &[2])
-                .output(Dim::Dim2, &[2]),
+            LayerDesc::new(LayerKind::Linear)
+                .input(shape!(batch, A[2], B[2]))   // 2*2 = 4 признака
+                .output(shape!(batch, A[2])),       // 2 логита
         ]
     }
 }
 
 mod losses {
-    use neurocore::loss_plan::{LossDesc, CrossEntropyWithLogits, ElementChain, Aggregation};
+    use neurocore::loss_plan::{
+        Aggregation, CrossEntropyWithLogits, ElementChain, LossDesc,
+    };
 
     pub fn cross_entropy() -> LossDesc {
+        let num_classes = 2;
         let chain = ElementChain::new()
-            .add(Box::new(CrossEntropyWithLogits::new(2)));
-        LossDesc::from_chain(chain, Aggregation::Sum, 1, 2, 1)
+            .add(Box::new(CrossEntropyWithLogits::new(num_classes)));
+        LossDesc::from_chain(chain, Aggregation::Sum, 1, num_classes, 1)
     }
 }
 
@@ -42,48 +40,66 @@ mod optimizers {
     }
 }
 
-fn main() {
-    let (mut model,) = create_models!(models::classifier);
+// Данные: два сэмпла, каждый размерности [2,2] = 4 признака
+fn train_data() -> Tensor3D {
+    Tensor3D::new(vec![
+        vec![
+            vec![1.0, 2.0],
+            vec![3.0, 4.0],
+        ],
+        vec![
+            vec![4.0, 3.0],
+            vec![2.0, 1.0],
+        ],
+    ])
+}
 
-    let x1 = Tensor3D::new(vec![vec![vec![1.0, 2.0]]]);
-    let x2 = Tensor3D::new(vec![vec![vec![2.0, 1.0]]]);
-    let y1 = Tensor3D::new(vec![vec![vec![0.0]]]); // класс 0
-    let y2 = Tensor3D::new(vec![vec![vec![1.0]]]); // класс 1
-    let epochs = 200;
+// Целевые метки: [0, 1] в Tensor3D формы [2,1,1]
+fn target_data() -> Tensor3D {
+    Tensor3D::new(vec![
+        vec![vec![0.0]],
+        vec![vec![1.0]],
+    ])
+}
 
-    let start = Instant::now();
-    for epoch in 0..epochs {
-        for (x, y) in &[(&x1, &y1), (&x2, &y2)] {
-            let (pred, ctxs) = model.forward(DynamicTensor::Dim2((*x).clone()));
-            let (_, delta) = model.compute_loss(
-                losses::cross_entropy(),
-                &pred,
-                &DynamicTensor::Dim2((*y).clone()),
-            );
-            let (_, grads) = model.backward(&ctxs, delta);
-            model.update_params(optimizers::sgd(), &grads[0]);
-        }
-
-        if epoch % 50 == 0 {
-            let (pred, _) = model.forward(DynamicTensor::Dim2(x1.clone()));
-            let (loss, _) = model.compute_loss(
-                losses::cross_entropy(),
-                &pred,
-                &DynamicTensor::Dim2(y1.clone()),
-            );
-            println!("Epoch {}: loss = {:.6}", epoch, loss);
-        }
+mod device_plan {
+    use neurocore::device_plan::DevicePlan;
+    pub fn plan() -> DevicePlan {
+        DevicePlan::empty().cpu(0, 4).ram(0, 8192)
     }
-    let duration = start.elapsed();
+}
 
-    let (final_pred, _) = model.forward(DynamicTensor::Dim2(x1.clone()));
-    let (final_loss, _) = model.compute_loss(
-        losses::cross_entropy(),
-        &final_pred,
-        &DynamicTensor::Dim2(y1.clone()),
+mod training_plan {
+    use super::*;
+    use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+
+    pub fn plan() -> TrainingPlan {
+        TrainingPlan::new()
+            .model(models::classifier)
+            .loss(losses::cross_entropy())
+            .optimizer(optimizers::sgd())
+            .epochs(200)
+            .batch_size(1)
+            .train_data(DataSource::from_tensor3d(train_data()))
+            .target_data(DataSource::from_tensor3d(target_data()))
+            .init_weights(Initializer::RandomUniform {
+                min: -0.1,
+                max: 0.1,
+            })
+            .seed(42)
+            .output_tensors(vec!["prediction".to_string()])
+    }
+}
+
+fn main() {
+    let result = neurocore::run_training!(
+        training_plan::plan,
+        device = device_plan::plan
     );
-    println!("Done. Time: {:?}", duration);
-    println!("Final loss: {:.6}", final_loss);
+    println!(
+        "Classifier2D done. Final loss: {:.6}, time: {:.3}s, best epoch: {}",
+        result.final_loss, result.training_time_secs, result.best_epoch
+    );
 }
 
 

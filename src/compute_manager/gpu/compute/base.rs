@@ -22,6 +22,7 @@ use crate::compute_manager::memory_executor::{
     types::MemoryDeviceKind,
     TensorBufferId,
     BufferPriority,
+    executor::RawBufferId,
 };
 use crate::logging::panic_logger;
 
@@ -64,7 +65,35 @@ impl GpuCompute {
         }
     }
 
-    /// Выделить буфер в VRAM через MemoryExecutor. Возвращает Subbuffer и ID для освобождения.
+    /// Запрашивает временный GPU-буфер из пула переиспользуемых буферов.
+    /// Буфер не требует ручного освобождения – после использования его следует вернуть через `release_temp_buffer`.
+    pub fn acquire_temp_buffer(
+        &self,
+        elements: usize,
+    ) -> (Subbuffer<[f32]>, RawBufferId) {
+        let mut mem = self.memory_executor.lock().unwrap();
+        mem.acquire_temp_buffer(
+            MemoryDeviceKind::DeviceVram(self.gpu_device_id),
+            elements,
+        )
+    }
+
+    /// Возвращает ранее полученный временный буфер обратно в пул.
+    pub fn release_temp_buffer(
+        &self,
+        buffer: Subbuffer<[f32]>,
+        raw_id: RawBufferId,
+    ) {
+        let mut mem = self.memory_executor.lock().unwrap();
+        mem.release_temp_buffer(
+            MemoryDeviceKind::DeviceVram(self.gpu_device_id),
+            buffer,
+            raw_id,
+        );
+    }
+
+    /// Выделить долгоживущий буфер в VRAM через MemoryExecutor.
+    /// Для временных нужд лучше использовать `acquire_temp_buffer`.
     pub fn create_buffer(
         &self,
         elements: usize,
@@ -88,6 +117,7 @@ impl GpuCompute {
     }
 
     /// Создать буфер в DeviceVram и заполнить данными из CPU.
+    /// Временные буферы (staging) возвращаются в пул после использования.
     pub fn create_storage_buffer_from_slice(
         &self,
         data: &[f32],
@@ -118,6 +148,7 @@ impl GpuCompute {
     }
 
     /// Копирует данные из одного буфера в другой (синхронно).
+    /// Для временных staging-буферов использует пул.
     pub fn copy_buffer_sync(&self, src: Subbuffer<[f32]>, dst: Subbuffer<[f32]>) {
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
@@ -150,6 +181,7 @@ impl GpuCompute {
     }
 
     /// Запуск шейдера с 1 входом и 1 выходом.
+    /// Входной и выходной буферы должны существовать всё время выполнения.
     pub fn run_elementwise_1in_1out<const N: usize>(
         &self,
         pipeline: Arc<vulkano::pipeline::ComputePipeline>,
@@ -276,9 +308,9 @@ impl GpuCompute {
     }
 
     /// Читает GPU-буфер в матрицу и освобождает буфер.
+    /// Использует временный staging-буфер из пула.
     pub fn read_buffer_to_mat(
         &self,
-        _buffer: Subbuffer<[f32]>,   // больше не используется
         buffer_id: TensorBufferId,
         rows: usize,
         cols: usize,
@@ -315,4 +347,4 @@ impl GpuCompute {
 
         Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
     }
-}  
+}

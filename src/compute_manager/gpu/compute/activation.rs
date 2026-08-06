@@ -77,7 +77,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(output_buf, output_id, batch, features);
+        let mat = self.read_buffer_to_mat(output_id, batch, features);
         self.release_buffer(input_id);
         mat
     }
@@ -156,7 +156,7 @@ impl GpuCompute {
             .unwrap();
         future.wait(None).unwrap();
 
-        let mat = self.read_buffer_to_mat(grad_in_buf, gi_id, batch, features);
+        let mat = self.read_buffer_to_mat(gi_id, batch, features);
         self.release_buffer(in_id);
         self.release_buffer(go_id);
         mat

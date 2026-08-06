@@ -50,7 +50,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        let mat = self.read_buffer_to_mat(out_id, batch, features);
         self.release_buffer(in_id);
         mat
     }
@@ -80,7 +80,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let mat = self.read_buffer_to_mat(gi_buf, gi_id, grad_out.nrows(), grad_out.ncols());
+        let mat = self.read_buffer_to_mat(gi_id, grad_out.nrows(), grad_out.ncols());
         self.release_buffer(go_id);
         mat
     }
@@ -116,7 +116,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        let mat = self.read_buffer_to_mat(out_id, batch, features);
         self.release_buffer(in_id);
         self.release_buffer(th_id);
         mat
@@ -157,7 +157,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let gi = self.read_buffer_to_mat(gi_buf, gi_id, batch, features);
+        let gi = self.read_buffer_to_mat(gi_id, batch, features);
         let (staging, staging_id) = self.create_buffer(features, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(gthresh_buf, staging.clone());
         let gthresh = {
@@ -203,7 +203,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        let mat = self.read_buffer_to_mat(out_id, batch, features);
         self.release_buffer(in_id);
         self.release_buffer(th_id);
         mat
@@ -244,7 +244,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let gi = self.read_buffer_to_mat(gi_buf, gi_id, batch, features);
+        let gi = self.read_buffer_to_mat(gi_id, batch, features);
         let (staging, staging_id) = self.create_buffer(features, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(gthresh_buf, staging.clone());
         let gthresh = {
@@ -293,7 +293,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let mat = self.read_buffer_to_mat(out_buf, out_id, batch, features);
+        let mat = self.read_buffer_to_mat(out_id, batch, features);
         self.release_buffer(in_id);
         self.release_buffer(min_id);
         self.release_buffer(max_id);
@@ -342,7 +342,7 @@ impl GpuCompute {
 
         self.run_custom_shader(pipeline, descriptor_set, push, total);
 
-        let gi = self.read_buffer_to_mat(gi_buf, gi_id, batch, features);
+        let gi = self.read_buffer_to_mat(gi_id, batch, features);
 
         let (gmin_staging, gms_id) = self.create_buffer(features, BufferUsage::TRANSFER_DST);
         self.copy_buffer_sync(gmin_buf, gmin_staging.clone());

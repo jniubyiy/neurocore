@@ -21,8 +21,10 @@ use super::types::{
     BufferData, BufferLocation, MemoryDeviceKind, TensorBuffer, TensorBufferId,
 };
 use super::raw_buffer::{RawBufferId, RawBufferRegistry};
+use super::temp_pool::TempBufferPool;
 use super::executor::MemoryError;
 
+/// Перемещает буфер между уровнями памяти, используя пул временных буферов для staging.
 pub fn move_buffer_data(
     id: TensorBufferId,
     target: MemoryDeviceKind,
@@ -32,6 +34,7 @@ pub fn move_buffer_data(
     ssd_cache: &Option<SsdCacheManager>,
     buffer_to_raw: &mut HashMap<TensorBufferId, RawBufferId>,
     raw_registry: &mut RawBufferRegistry,
+    temp_pool: &mut TempBufferPool,
 ) -> Result<(), MemoryError> {
     let buffer = buffers
         .get_mut(&id)
@@ -69,6 +72,31 @@ pub fn move_buffer_data(
         None
     };
 
+    // Вспомогательная функция для получения staging‑буфера из пула
+    let acquire_staging = |temp_pool: &mut TempBufferPool,
+                          dev_id: DeviceId,
+                          size_bytes: u64,
+                          pools: &mut HashMap<MemoryDeviceKind, MemoryPool>,
+                          raw_registry: &mut RawBufferRegistry,
+                          gpu_contexts: &HashMap<DeviceId, Arc<GpuContext>>|
+     -> (Subbuffer<[f32]>, RawBufferId) {
+        let elements = (size_bytes / 4) as usize;
+        temp_pool.acquire(
+            MemoryDeviceKind::HostRam,
+            elements,
+            gpu_contexts,
+            pools,
+            raw_registry,
+        )
+    };
+
+    // Вспомогательная функция для возврата staging‑буфера в пул
+    let release_staging = |temp_pool: &mut TempBufferPool,
+                          buf: Subbuffer<[f32]>,
+                          raw: RawBufferId| {
+        temp_pool.release(MemoryDeviceKind::HostRam, buf, raw);
+    };
+
     let new_data = match (&buffer.data, &buffer.location, target) {
         (
             BufferData::HostRam(vec),
@@ -81,29 +109,17 @@ pub fn move_buffer_data(
                 .expect("No GPU context");
             let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
 
-            let staging_raw = raw_registry.register(
-                dev_id,
-                size_bytes,
-                MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                pools,
-            );
-            let staging = Buffer::from_iter(
-                ctx.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::TRANSFER_SRC,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                vec.iter().copied(),
-            )
-            .map_err(|e| {
-                raw_registry.unregister(staging_raw, pools);
-                MemoryError::SsdError(format!("Staging buffer: {}", e))
-            })?;
+            let (staging_buf, staging_raw) =
+                acquire_staging(temp_pool, dev_id, size_bytes, pools, raw_registry, gpu_contexts);
+            // Заполняем staging данными
+            {
+                let mut write_guard = staging_buf.write().map_err(|e| {
+                    release_staging(temp_pool, staging_buf.clone(), staging_raw);
+                    MemoryError::SsdError(format!("write staging: {}", e))
+                })?;
+                write_guard.copy_from_slice(vec);
+            }
+
             let gpu_buf = Buffer::new_unsized(
                 ctx.memory_allocator.clone(),
                 BufferCreateInfo {
@@ -117,12 +133,12 @@ pub fn move_buffer_data(
                 size_bytes,
             )
             .map_err(|e| {
-                raw_registry.unregister(staging_raw, pools);
+                release_staging(temp_pool, staging_buf.clone(), staging_raw);
                 MemoryError::SsdError(format!("GPU buffer alloc: {}", e))
             })?;
 
-            copy_buffer_sync(ctx.clone(), staging.clone(), gpu_buf.clone());
-            raw_registry.unregister(staging_raw, pools);
+            copy_buffer_sync(ctx.clone(), staging_buf.clone(), gpu_buf.clone());
+            release_staging(temp_pool, staging_buf, staging_raw);
 
             let new_raw_id = raw_registry.register(
                 dev_id,
@@ -144,41 +160,21 @@ pub fn move_buffer_data(
                 .expect("No GPU context");
             let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
 
-            let staging_raw = raw_registry.register(
-                *dev_id,
-                size_bytes,
-                MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                pools,
-            );
-            let staging = Buffer::new_unsized(
-                ctx.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::TRANSFER_DST,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                size_bytes,
-            )
-            .map_err(|e| {
-                raw_registry.unregister(staging_raw, pools);
-                MemoryError::SsdError(format!("Staging buffer: {}", e))
-            })?;
+            let (staging_buf, staging_raw) =
+                acquire_staging(temp_pool, *dev_id, size_bytes, pools, raw_registry, gpu_contexts);
+            // Копируем из GPU в staging
+            copy_buffer_sync(ctx.clone(), device_buf.clone(), staging_buf.clone());
 
-            copy_buffer_sync(ctx.clone(), device_buf.clone(), staging.clone());
             let data_vec = {
-                let guard = staging.read().map_err(|e| {
-                    raw_registry.unregister(staging_raw, pools);
-                    MemoryError::SsdError(format!("Read staging: {}", e))
+                let guard = staging_buf.read().map_err(|e| {
+                    release_staging(temp_pool, staging_buf.clone(), staging_raw);
+                    MemoryError::SsdError(format!("read staging: {}", e))
                 })?;
                 let mut v = Vec::with_capacity(guard.len());
                 v.extend_from_slice(&guard);
                 v
             };
-            raw_registry.unregister(staging_raw, pools);
+            release_staging(temp_pool, staging_buf, staging_raw);
 
             if let Some(old_raw) = buffer_to_raw.remove(&id) {
                 raw_registry.unregister(old_raw, pools);
@@ -220,41 +216,20 @@ pub fn move_buffer_data(
                 .expect("No GPU context");
             let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
 
-            let staging_raw = raw_registry.register(
-                *dev_id,
-                size_bytes,
-                MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                pools,
-            );
-            let staging = Buffer::new_unsized(
-                ctx.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::TRANSFER_DST,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                size_bytes,
-            )
-            .map_err(|e| {
-                raw_registry.unregister(staging_raw, pools);
-                MemoryError::SsdError(format!("Staging buffer: {}", e))
-            })?;
+            let (staging_buf, staging_raw) =
+                acquire_staging(temp_pool, *dev_id, size_bytes, pools, raw_registry, gpu_contexts);
+            copy_buffer_sync(ctx.clone(), device_buf.clone(), staging_buf.clone());
 
-            copy_buffer_sync(ctx.clone(), device_buf.clone(), staging.clone());
             let data_vec = {
-                let guard = staging.read().map_err(|e| {
-                    raw_registry.unregister(staging_raw, pools);
-                    MemoryError::SsdError(format!("Read staging: {}", e))
+                let guard = staging_buf.read().map_err(|e| {
+                    release_staging(temp_pool, staging_buf.clone(), staging_raw);
+                    MemoryError::SsdError(format!("read staging: {}", e))
                 })?;
                 let mut v = Vec::with_capacity(guard.len());
                 v.extend_from_slice(&guard);
                 v
             };
-            raw_registry.unregister(staging_raw, pools);
+            release_staging(temp_pool, staging_buf, staging_raw);
 
             let ssd = ssd_cache
                 .as_ref()
@@ -285,29 +260,17 @@ pub fn move_buffer_data(
                 .expect("No GPU context");
             let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
 
-            let staging_raw = raw_registry.register(
-                dev_id,
-                size_bytes,
-                MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                pools,
-            );
-            let staging = Buffer::from_iter(
-                ctx.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::TRANSFER_SRC,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                data_vec.iter().copied(),
-            )
-            .map_err(|e| {
-                raw_registry.unregister(staging_raw, pools);
-                MemoryError::SsdError(format!("Staging buffer: {}", e))
-            })?;
+            let (staging_buf, staging_raw) =
+                acquire_staging(temp_pool, dev_id, size_bytes, pools, raw_registry, gpu_contexts);
+            // Заполняем staging данными
+            {
+                let mut write_guard = staging_buf.write().map_err(|e| {
+                    release_staging(temp_pool, staging_buf.clone(), staging_raw);
+                    MemoryError::SsdError(format!("write staging: {}", e))
+                })?;
+                write_guard.copy_from_slice(&data_vec);
+            }
+
             let gpu_buf = Buffer::new_unsized(
                 ctx.memory_allocator.clone(),
                 BufferCreateInfo {
@@ -321,12 +284,12 @@ pub fn move_buffer_data(
                 size_bytes,
             )
             .map_err(|e| {
-                raw_registry.unregister(staging_raw, pools);
+                release_staging(temp_pool, staging_buf.clone(), staging_raw);
                 MemoryError::SsdError(format!("GPU buffer alloc: {}", e))
             })?;
 
-            copy_buffer_sync(ctx.clone(), staging.clone(), gpu_buf.clone());
-            raw_registry.unregister(staging_raw, pools);
+            copy_buffer_sync(ctx.clone(), staging_buf.clone(), gpu_buf.clone());
+            release_staging(temp_pool, staging_buf, staging_raw);
 
             let new_raw_id = raw_registry.register(
                 dev_id,

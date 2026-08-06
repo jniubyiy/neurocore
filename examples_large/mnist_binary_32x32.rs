@@ -1,13 +1,11 @@
 // examples_large/mnist_binary_32x32.rs
 // Классификатор MNIST (32x32 бинарных изображений) через TrainingPlan.
-// Два варианта обучения: CPU (16 потоков) и GPU (id 0).
-// Демонстрирует обучение с разными train_data / target_data,
-// а также раздельное тестирование с test_data и test_target_data.
+// Только GPU‑обучение с gradient clipping и уменьшенным learning rate.
+// Демонстрирует раздельные train/test с разными входами и целями.
 
 use neurocore::tensor::Tensor2D;
 use rand::Rng;
 
-// ═══════════════ Модель ═══════════════
 mod models {
     use neurocore::model_plan::{LayerKind, LayerDesc};
     use neurocore::shape;
@@ -42,14 +40,11 @@ mod models {
     }
 }
 
-// ═══════════════ Потери ═══════════════
 mod losses {
     use neurocore::loss_plan::{
         Aggregation, CrossEntropyWithLogits, ElementChain, LossDesc,
     };
 
-    /// Кросс‑энтропия для классификации.
-    /// pred_features = num_classes (логиты), target_features = 1 (индекс класса)
     pub fn cross_entropy_desc(num_classes: usize, batch_size: usize) -> LossDesc {
         let chain = ElementChain::new()
             .add(Box::new(CrossEntropyWithLogits::new(num_classes)));
@@ -57,18 +52,20 @@ mod losses {
     }
 }
 
-// ═══════════════ Оптимизатор ═══════════════
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
 
-    pub fn sgd(lr: f32) -> OptimizerDesc {
+    pub fn sgd_with_clipping(lr: f32) -> OptimizerDesc {
         OptimizerDesc::new()
             .add(OptCubeDesc::ScaleGradient(lr))
+            .add(OptCubeDesc::GradientClip {
+                min: Some(-1.0),
+                max: Some(1.0),
+            })
             .add(OptCubeDesc::ApplyUpdate)
     }
 }
 
-// ═══════════════ Генерация синтетического датасета ═══════════════
 fn generate_dataset(num_samples: usize, img_size: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let mut rng = rand::thread_rng();
     let mut images = Vec::with_capacity(num_samples);
@@ -178,7 +175,6 @@ fn generate_dataset(num_samples: usize, img_size: usize) -> (Vec<Vec<f32>>, Vec<
     for _ in 0..num_samples {
         let digit = rng.gen_range(0..10);
         let mut img = templates[digit].clone();
-        // Добавим шум: инвертируем случайные пиксели с вероятностью 10%
         for i in 0..img_size {
             for j in 0..img_size {
                 if rng.gen::<f32>() < 0.1 {
@@ -193,15 +189,7 @@ fn generate_dataset(num_samples: usize, img_size: usize) -> (Vec<Vec<f32>>, Vec<
     (images, labels)
 }
 
-// ═══════════════ Планы устройств ═══════════════
-mod device_plan_cpu {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan {
-        DevicePlan::empty().cpu(0, 16).ram(0, 8192)
-    }
-}
-
-mod device_plan_gpu {
+mod device_plan {
     use neurocore::device_plan::DevicePlan;
     pub fn plan() -> DevicePlan {
         DevicePlan::empty()
@@ -212,7 +200,6 @@ mod device_plan_gpu {
     }
 }
 
-// ═══════════════ План обучения (общий, с 200 эпохами) ═══════════════
 mod training_plan {
     use super::*;
     use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
@@ -224,16 +211,14 @@ mod training_plan {
         let batch_size = 32;
 
         let (train_x, train_y) = generate_dataset(num_samples, img_size);
-
-        // Тестовые данные – первые 10 примеров
         let test_x = train_x[..10].to_vec();
         let test_y = train_y[..10].to_vec();
 
         TrainingPlan::new()
             .model(models::mnist_classifier)
             .loss(losses::cross_entropy_desc(num_classes, batch_size))
-            .optimizer(optimizers::sgd(0.1))
-            .epochs(200)                               // <-- увеличено до 200
+            .optimizer(optimizers::sgd_with_clipping(0.01))  // уменьшен lr + clipping
+            .epochs(200)
             .batch_size(batch_size)
             .train_data(DataSource::from_tensor2d(Tensor2D::new(train_x)))
             .target_data(DataSource::from_tensor2d(Tensor2D::new(train_y)))
@@ -248,25 +233,12 @@ mod training_plan {
 }
 
 fn main() {
-    // Вариант 1: CPU (16 потоков)
-    println!("=== Обучение на CPU (16 потоков) ===");
-    let r_cpu = neurocore::run_training!(
+    let result = neurocore::run_training!(
         training_plan::plan,
-        device = device_plan_cpu::plan
+        device = device_plan::plan
     );
     println!(
-        "CPU: Final loss (тест) = {:.6}, время = {:.3}с, лучшая эпоха = {}",
-        r_cpu.final_loss, r_cpu.training_time_secs, r_cpu.best_epoch
-    );
-
-    // Вариант 2: GPU
-    println!("\n=== Обучение на GPU ===");
-    let r_gpu = neurocore::run_training!(
-        training_plan::plan,
-        device = device_plan_gpu::plan
-    );
-    println!(
-        "GPU: Final loss (тест) = {:.6}, время = {:.3}с, лучшая эпоха = {}",
-        r_gpu.final_loss, r_gpu.training_time_secs, r_gpu.best_epoch
+        "GPU обучение завершено. Final loss (тест) = {:.6}, время = {:.3}с, лучшая эпоха = {}",
+        result.final_loss, result.training_time_secs, result.best_epoch
     );
 }

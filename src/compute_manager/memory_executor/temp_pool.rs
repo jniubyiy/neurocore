@@ -14,6 +14,7 @@ use super::raw_buffer::RawBufferId;
 use super::types::MemoryDeviceKind;
 
 /// Пул временных GPU-буферов для переиспользования.
+/// Поддерживает как VRAM, так и host‑visible буферы (для staging).
 pub struct TempBufferPool {
     /// Очереди буферов, сгруппированные по типу памяти.
     buffers: HashMap<MemoryDeviceKind, VecDeque<(Subbuffer<[f32]>, RawBufferId, Instant)>>,
@@ -36,11 +37,6 @@ impl TempBufferPool {
         pools: &mut HashMap<MemoryDeviceKind, MemoryPool>,
         raw_registry: &mut RawBufferRegistry,
     ) -> (Subbuffer<[f32]>, RawBufferId) {
-        let device_id = match kind {
-            MemoryDeviceKind::DeviceVram(id) => id,
-            _ => panic!("TempBufferPool only supports DeviceVram"),
-        };
-
         let queue = self.buffers.entry(kind).or_insert_with(VecDeque::new);
 
         // Ищем подходящий буфер
@@ -49,30 +45,48 @@ impl TempBufferPool {
             return (buf, raw_id);
         }
 
-        // Создаём новый буфер
+        // Определяем параметры создания в зависимости от типа памяти
+        let (device_id, memory_type_filter, buffer_usage) = match kind {
+            MemoryDeviceKind::DeviceVram(dev_id) => (
+                dev_id,
+                MemoryTypeFilter::PREFER_DEVICE,
+                BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+            ),
+            MemoryDeviceKind::HostRam => {
+                // Для host-буферов берём первое попавшееся GPU-устройство, чтобы получить аллокатор.
+                // На практике staging-буферы всегда привязаны к конкретному GPU, но здесь мы используем упрощение.
+                // В реальном коде gpu_contexts будет содержать хотя бы один контекст.
+                let dev_id = gpu_contexts.keys().next().copied().unwrap_or(DeviceId(0));
+                (
+                    dev_id,
+                    MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                )
+            }
+            _ => panic!("TempBufferPool: unsupported memory kind {:?}", kind),
+        };
+
         let ctx = gpu_contexts
             .get(&device_id)
             .expect("GPU context not found");
+
         let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
         let buffer = Buffer::new_unsized(
             ctx.memory_allocator.clone(),
             BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER
-                    | BufferUsage::TRANSFER_SRC
-                    | BufferUsage::TRANSFER_DST,
+                usage: buffer_usage,
                 ..Default::default()
             },
             AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                memory_type_filter,
                 ..Default::default()
             },
             size_bytes,
         )
-        .expect("Failed to create temp GPU buffer");
+        .expect("Failed to create temp buffer");
 
         // Регистрируем как сырой буфер
-        let raw_id =
-            raw_registry.register(device_id, size_bytes, MemoryTypeFilter::PREFER_DEVICE, pools);
+        let raw_id = raw_registry.register(device_id, size_bytes, memory_type_filter, pools);
 
         (buffer, raw_id)
     }
@@ -110,7 +124,6 @@ impl TempBufferPool {
             }
         }
 
-        // Удаляем raw-буферы вне итерации по очереди
         for raw_id in ids_to_remove {
             raw_registry.unregister(raw_id, pools);
         }

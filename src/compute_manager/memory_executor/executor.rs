@@ -17,7 +17,7 @@ use super::types::{
     BufferData, BufferLocation, MemoryDeviceKind, TensorBuffer, TensorBufferId,
 };
 use super::policy::{BufferMetadata, BufferPriority, MemoryPolicy, MemoryTier};
-use super::raw_buffer::{RawBufferRegistry}; // RawBufferId реэкспортируется публично ниже
+use super::raw_buffer::{RawBufferRegistry};
 use super::temp_pool::TempBufferPool;
 use super::data_mover;
 
@@ -285,6 +285,7 @@ impl MemoryExecutor {
             pinned: false,
             use_count: 0,
             metadata,
+            is_temp: false,  // долгоживущий буфер
         };
         self.buffers.insert(id, buffer);
         Ok(id)
@@ -322,6 +323,7 @@ impl MemoryExecutor {
             &self.ssd_cache,
             &mut self.buffer_to_raw,
             &mut self.raw_registry,
+            &mut self.temp_pool,
         )
     }
 
@@ -452,6 +454,10 @@ impl MemoryExecutor {
     pub fn release_buffer(&mut self, id: TensorBufferId) {
         if let Some(buffer) = self.buffers.get_mut(&id) {
             buffer.use_count = buffer.use_count.saturating_sub(1);
+            // Автоматическое удаление временных буферов, когда use_count достиг нуля
+            if buffer.is_temp && buffer.use_count == 0 {
+                let _ = self.deallocate_buffer(id);
+            }
         }
     }
 

@@ -1,16 +1,16 @@
 // src/compute_manager/graph/forward/main.rs
 
+use std::time::Instant;
 use faer::Mat;
 use crate::compute_manager::dim_change;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
+use crate::device_plan::plan::ComputeDevice;
 
 impl MixedModel {
     /// Прямой матричный проход с множественными входами и выходами.
-    /// Вход: срез матриц (по одной на каждый входной поток).
-    /// Выход: вектор выходных матриц и контексты (один набор контекстов для всего батча).
     pub fn forward_mat_multi(
-        &self,
+        &mut self,
         inputs: &[Mat<f32>],
     ) -> (Vec<Mat<f32>>, Vec<Vec<DynamicContext>>) {
         assert_eq!(
@@ -34,13 +34,16 @@ impl MixedModel {
             );
         }
 
-        // Начальные потоки матриц (каждый элемент — матрица для одного потока)
         let mut stream_matrices: Vec<Mat<f32>> = inputs.to_vec();
-        // Контексты для каждого сэмпла в батче (пока пустые)
         let mut all_ctxs: Vec<Vec<DynamicContext>> = vec![Vec::new(); batch_size];
 
-        // Исполняем сегменты графа
-        for (seg_index, seg) in self.segments.iter().enumerate() {
+        // Клонируем сегменты перед итерацией, чтобы избежать удержания
+        // неизменяемой ссылки на self.segments при мутабельных вызовах self.process_*.
+        let segments = self.segments.clone();
+
+        for (seg_index, seg) in segments.iter().enumerate() {
+            let start = Instant::now();
+
             match seg {
                 Segment::Unsqueeze(target_dims) => {
                     for mat in &mut stream_matrices {
@@ -71,6 +74,7 @@ impl MixedModel {
                         batch_size,
                         &mut stream_matrices,
                         &mut all_ctxs,
+                        seg_index,
                     );
                 }
                 Segment::CombinerConnector { input_dims, .. } => {
@@ -79,6 +83,7 @@ impl MixedModel {
                         batch_size,
                         &mut stream_matrices,
                         &mut all_ctxs,
+                        seg_index,
                     );
                 }
                 Segment::Splitter {
@@ -93,6 +98,7 @@ impl MixedModel {
                         batch_size,
                         &mut stream_matrices,
                         &mut all_ctxs,
+                        seg_index,
                     );
                 }
                 Segment::Combiner {
@@ -107,9 +113,17 @@ impl MixedModel {
                         batch_size,
                         &mut stream_matrices,
                         &mut all_ctxs,
+                        seg_index,
                     );
                 }
             }
+
+            let duration = start.elapsed().as_nanos() as f64;
+            let device = self.segment_placement
+                .get(seg_index)
+                .map(|p| p.compute_device.clone())
+                .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+            self.record_segment_timing(seg_index, &device, duration);
         }
 
         assert_eq!(
@@ -121,10 +135,8 @@ impl MixedModel {
         (stream_matrices, all_ctxs)
     }
 
-    /// Обычный матричный проход (один вход – один выход).
-    /// Оставлен для обратной совместимости.
     pub fn forward_mat(
-        &self,
+        &mut self,
         input: &Mat<f32>,
     ) -> (Mat<f32>, Vec<Vec<DynamicContext>>) {
         let (outs, ctxs) = self.forward_mat_multi(&[input.clone()]);

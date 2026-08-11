@@ -5,9 +5,10 @@ use crate::compute_manager::memory_executor::{MemoryExecutor, TensorBufferId};
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 use crate::compute_manager::memory_executor::BufferPriority;
 use crate::compute_manager::device_spec::DeviceId;
+use crate::compute_manager::persistent_buffer::DeviceBufferId;
 
 /// Тензор, который может находиться на CPU (в виде faer::Mat) или на GPU
-/// (в виде буфера, управляемого MemoryExecutor).
+/// (в виде буфера, управляемого MemoryExecutor, либо постоянного (persistent) буфера).
 #[derive(Debug)]
 pub enum DeviceTensor {
     Cpu(Mat<f32>),
@@ -15,6 +16,13 @@ pub enum DeviceTensor {
         buffer_id: TensorBufferId,
         rows: usize,
         cols: usize,
+    },
+    /// Постоянный GPU‑буфер, выделенный заранее и живущий всю эпоху.
+    GpuPersistent {
+        buffer: vulkano::buffer::Subbuffer<[f32]>,
+        rows: usize,
+        cols: usize,
+        persistent_id: DeviceBufferId,
     },
 }
 
@@ -27,10 +35,33 @@ impl DeviceTensor {
         DeviceTensor::Gpu { buffer_id, rows, cols }
     }
 
+    /// Создаёт тензор, ссылающийся на постоянный GPU‑буфер.
+    pub fn from_persistent_gpu(
+        buffer: vulkano::buffer::Subbuffer<[f32]>,
+        rows: usize,
+        cols: usize,
+        persistent_id: DeviceBufferId,
+    ) -> Self {
+        DeviceTensor::GpuPersistent {
+            buffer,
+            rows,
+            cols,
+            persistent_id,
+        }
+    }
+
+    /// Создаёт тензор, ссылающийся на постоянный CPU‑буфер (представлен как Mat).
+    /// В будущем может быть заменено на прямую работу с CPU persistent, но пока используем Mat.
+    pub fn from_persistent_cpu(mat: Mat<f32>) -> Self {
+        // Для CPU persistent буферов можно было бы хранить ссылку, но пока Mat достаточно.
+        DeviceTensor::Cpu(mat)
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             DeviceTensor::Cpu(mat) => mat.nrows(),
             DeviceTensor::Gpu { rows, .. } => *rows,
+            DeviceTensor::GpuPersistent { rows, .. } => *rows,
         }
     }
 
@@ -38,6 +69,7 @@ impl DeviceTensor {
         match self {
             DeviceTensor::Cpu(mat) => mat.ncols(),
             DeviceTensor::Gpu { cols, .. } => *cols,
+            DeviceTensor::GpuPersistent { cols, .. } => *cols,
         }
     }
 
@@ -46,7 +78,7 @@ impl DeviceTensor {
     }
 
     pub fn is_gpu(&self) -> bool {
-        matches!(self, DeviceTensor::Gpu { .. })
+        matches!(self, DeviceTensor::Gpu { .. } | DeviceTensor::GpuPersistent { .. })
     }
 
     /// Читает данные тензора в матрицу на CPU (копирует).
@@ -70,6 +102,25 @@ impl DeviceTensor {
                     .expect("Failed to move buffer back to VRAM");
                 Mat::from_fn(*rows, *cols, |r, c| data[r * cols + c])
             }
+            DeviceTensor::GpuPersistent { buffer, rows, cols, .. } => {
+                // Копируем данные из постоянного GPU‑буфера на CPU через staging.
+                // Используем временный буфер.
+                let total = rows * cols;
+                // Для простоты создадим временный CPU‑буфер через mem_exec, скопируем туда данные.
+                let host_kind = MemoryDeviceKind::HostRam;
+                let staging_id = mem_exec.allocate(host_kind, total, BufferPriority::High)
+                    .expect("Failed to allocate staging buffer");
+                // Копируем GPU -> Host через команды Vulkan. Это требует GpuCompute, но здесь у нас только mem_exec.
+                // Вместо этого используем более простой подход: читаем напрямую, если буфер host‑visible?
+                // Так как persistent буфер может быть device‑local, проще временно вызвать GpuCompute.
+                // В данном контексте мы не имеем доступа к GpuCompute, поэтому этот метод может вызываться редко.
+                // Для полной реализации нужно передать GpuCompute, но пока оставим заглушку.
+                // В идеале DeviceTensor не должен заниматься копированием; это дело GpuCompute.
+                // Поэтому для persistent буферов этот метод не будет использоваться напрямую.
+                // Вместо этого будем использовать специализированные методы в GpuCompute.
+                // Но для обратной совместимости можно запаниковать, указав, что для persistent нужен GpuCompute.
+                panic!("to_cpu on GpuPersistent requires GpuCompute; use gpu_compute.read_persistent_buffer instead");
+            }
         }
     }
 
@@ -80,7 +131,6 @@ impl DeviceTensor {
                 let rows = mat.nrows();
                 let cols = mat.ncols();
                 let total = rows * cols;
-                // собираем плоский вектор без замыканий на mat
                 let mut flat = Vec::with_capacity(total);
                 for r in 0..rows {
                     for c in 0..cols {
@@ -129,6 +179,18 @@ impl DeviceTensor {
                     cols: *cols,
                 }
             }
+            DeviceTensor::GpuPersistent { buffer, rows, cols, persistent_id } => {
+                // Перенос persistent буфера на другой GPU невозможен без пересоздания.
+                // Вместо этого возвращаем тот же тензор, считая, что устройство не меняется.
+                // Или можно создать новый persistent на другом GPU, но это требует изменения DevicePlacement.
+                // Пока оставляем без изменений.
+                DeviceTensor::GpuPersistent {
+                    buffer: buffer.clone(),
+                    rows: *rows,
+                    cols: *cols,
+                    persistent_id: persistent_id.clone(),
+                }
+            }
         }
     }
 
@@ -148,6 +210,12 @@ impl DeviceTensor {
                 mem_exec.deallocate_buffer(buffer_id)
                     .expect("Failed to deallocate buffer");
                 Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
+            }
+            DeviceTensor::GpuPersistent { buffer, rows, cols, persistent_id: _ } => {
+                // Нельзя просто так освободить persistent буфер, он управляется извне.
+                // Поэтому здесь мы не освобождаем, а просто читаем данные.
+                // Нужно использовать GpuCompute для чтения. Вызываем panic или реализуем через GpuCompute.
+                panic!("into_cpu on GpuPersistent not supported without GpuCompute");
             }
         }
     }
@@ -176,7 +244,7 @@ impl DeviceTensor {
                     .expect("Failed to move buffer to GPU");
                 DeviceTensor::Gpu { buffer_id: host_id, rows, cols }
             }
-            gpu_tensor @ DeviceTensor::Gpu { .. } => gpu_tensor,
+            gpu_tensor @ DeviceTensor::Gpu { .. } | gpu_tensor @ DeviceTensor::GpuPersistent { .. } => gpu_tensor,
         }
     }
 }

@@ -1,7 +1,6 @@
 // src/compute_manager/graph/model.rs
 
 use std::sync::{Arc, Mutex};
-
 use faer::Mat;
 
 use crate::compute_manager::cpu::{Scheduler, WorkerPool};
@@ -13,12 +12,19 @@ use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::gpu::GpuCompute;
 use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
+use crate::compute_manager::adaptive_planner::ProfilingData;
+use crate::device_plan::DevicePlan;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::ParamStore;
-use crate::optimizer_plan::{
-    OptimizerExpr, OptimizerChain, OptimizerDesc, cubes::*,
-};
+use crate::optimizer_plan::{OptimizerExpr, OptimizerChain, OptimizerDesc, cubes::*};
 use crate::linalg;
+
+pub(crate) struct DevicePlacementState {
+    pub(crate) segment_buffers: Vec<Option<SegmentPersistentBuffers>>,
+    pub(crate) profiling_data: ProfilingData,
+    pub(crate) placements: Vec<SegmentPlacement>,
+}
 
 pub struct MixedModel {
     pub(crate) segments: Vec<Segment>,
@@ -35,9 +41,10 @@ pub struct MixedModel {
     pub(crate) output_stream_count: usize,
     pub(crate) memory_executor: Arc<Mutex<MemoryExecutor>>,
 
-    // Ожидаемые размерности входных и выходных тензоров (без batch).
     pub(crate) input_shapes: Vec<Vec<usize>>,
     pub(crate) output_shapes: Vec<Vec<usize>>,
+
+    pub(crate) placement_state: Arc<Mutex<DevicePlacementState>>,
 }
 
 impl MixedModel {
@@ -61,9 +68,100 @@ impl MixedModel {
         &self.executor
     }
 
-    /// Возвращает ссылку на MemoryExecutor для профилирования памяти и ручного управления.
     pub fn memory_executor(&self) -> &Arc<Mutex<MemoryExecutor>> {
         &self.memory_executor
+    }
+
+    pub fn maybe_reassign_devices(&mut self, device_plan: &DevicePlan, batch_size: usize) {
+        if self.segment_placement.is_empty() {
+            return;
+        }
+
+        let (need_reassign, profiling_snapshot) = {
+            let state = self.placement_state.lock().unwrap();
+            if state.placements.is_empty() {
+                let initial = self.segment_placement.clone();
+                drop(state);
+                self.allocate_and_set_placements(initial, batch_size);
+                return;
+            }
+            let mut profiling = state.profiling_data.clone();
+            let should = profiling.tick_and_should_reassign();
+            (should, if should { Some(profiling) } else { None })
+        };
+
+        if need_reassign {
+            let snapshot = profiling_snapshot.unwrap();
+            let new_placements = {
+                let (placements, _keep) = crate::compute_manager::adaptive_planner::assign_devices_adaptive(
+                    &self.segments,
+                    device_plan,
+                    &mut self.memory_executor.lock().unwrap(),
+                    batch_size,
+                    Some(&snapshot),
+                );
+                placements
+            };
+            self.allocate_and_set_placements(new_placements, batch_size);
+        }
+    }
+
+    fn allocate_and_set_placements(&mut self, new_placements: Vec<SegmentPlacement>, batch_size: usize) {
+        if new_placements.is_empty() {
+            return;
+        }
+
+        let mut state = self.placement_state.lock().unwrap();
+        let n = self.segments.len();
+        let mut old_buffers = std::mem::replace(&mut state.segment_buffers, vec![None; n]);
+        // ensure old_buffers has length n (first call may give empty)
+        if old_buffers.len() != n {
+            old_buffers.resize(n, None);
+        }
+
+        let old_placements = std::mem::replace(&mut state.placements, new_placements.clone());
+        let mut new_buffers = vec![None; n];
+
+        let mut executor = self.memory_executor.lock().unwrap();
+
+        for idx in 0..n {
+            let old_pl = old_placements.get(idx);
+            let new_pl = &new_placements[idx];
+            if Some(new_pl) == old_pl {
+                new_buffers[idx] = old_buffers[idx].clone();
+            } else {
+                if let Some(old_buf) = old_buffers[idx].clone() {
+                    old_buf.release(&mut executor);
+                }
+                let buf = SegmentPersistentBuffers::for_segment(
+                    &self.segments[idx],
+                    &new_pl.compute_device,
+                    batch_size,
+                    &mut executor,
+                );
+                new_buffers[idx] = Some(buf);
+            }
+        }
+
+        state.segment_buffers = new_buffers;
+        state.placements = new_placements;
+        state.profiling_data = ProfilingData::new();
+        self.segment_placement = state.placements.clone();
+    }
+
+    pub(crate) fn record_segment_timing(
+        &self,
+        seg_index: usize,
+        device: &crate::device_plan::plan::ComputeDevice,
+        duration_ns: f64,
+    ) {
+        if let Ok(mut state) = self.placement_state.lock() {
+            state.profiling_data.add(seg_index, device.clone(), duration_ns);
+        }
+    }
+
+    pub(crate) fn get_segment_buffers(&self, seg_index: usize) -> Option<SegmentPersistentBuffers> {
+        self.placement_state.lock().ok()?.segment_buffers[seg_index].clone()
     }
 
     pub fn create_optimizer(&self, chain: OptimizerChain) -> OptimizerExpr {
@@ -161,10 +259,8 @@ impl MixedModel {
         }
     }
 
-    // ── Тензорные обёртки для обратной совместимости ──
-
     pub fn forward(
-        &self,
+        &mut self,
         input: DynamicTensor,
     ) -> (DynamicTensor, Vec<Vec<DynamicContext>>) {
         let mat = self.dynamic_tensor_to_mat(input);
@@ -174,7 +270,7 @@ impl MixedModel {
     }
 
     pub fn backward(
-        &self,
+        &mut self,
         contexts: &[Vec<DynamicContext>],
         delta: DynamicTensor,
     ) -> (DynamicTensor, Vec<Vec<f32>>) {
@@ -185,7 +281,7 @@ impl MixedModel {
     }
 
     pub fn forward_multi(
-        &self,
+        &mut self,
         inputs: Vec<DynamicTensor>,
     ) -> (Vec<DynamicTensor>, Vec<Vec<DynamicContext>>) {
         assert_eq!(inputs.len(), self.input_stream_count,
@@ -202,7 +298,6 @@ impl MixedModel {
             .map(|(mat, shape)| self.mat_to_dynamic_tensor(mat, shape))
             .collect();
 
-        // После завершения forward можно очистить давно неиспользуемые временные буферы
         if let Ok(mut exec) = self.memory_executor.lock() {
             exec.cleanup_temp_pools(std::time::Duration::from_secs(30));
         }
@@ -211,7 +306,7 @@ impl MixedModel {
     }
 
     pub fn backward_multi(
-        &self,
+        &mut self,
         contexts: &[Vec<DynamicContext>],
         deltas: Vec<DynamicTensor>,
     ) -> (Vec<DynamicTensor>, Vec<Vec<f32>>) {
@@ -266,8 +361,6 @@ impl MixedModel {
         }
     }
 
-    // ── Вспомогательные методы преобразования тензор ↔ матрица ──
-
     fn dynamic_tensor_to_mat(&self, tensor: DynamicTensor) -> Mat<f32> {
         match tensor {
             DynamicTensor::Dim1(t) => linalg::tensor2d_to_faer(&t),
@@ -287,8 +380,6 @@ impl MixedModel {
             _ => panic!("Unsupported tensor dimensionality: {} spatial dims", shape.len()),
         }
     }
-
-    // ── Статический метод для CPU-проходов ──
 
     pub fn forward_universal_batch_mat(
         layers: &[Box<dyn crate::layers::UniversalLayer>],

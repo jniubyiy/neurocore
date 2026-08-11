@@ -2,13 +2,16 @@
 
 use faer::Mat;
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::layers::UniversalLayer;
 use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
 use super::compute::GpuCompute;
 
+/// Прямой проход на GPU с persistent-буферами (пока буферы не используются для передачи данных).
 pub fn process_forward_gpu(
     gpu_compute: &GpuCompute,
+    _segment_buffers: &SegmentPersistentBuffers,
     layers: &[Box<dyn UniversalLayer>],
     slices: &[ParamSlice],
     params: &[f32],
@@ -20,7 +23,6 @@ pub fn process_forward_gpu(
     for (layer, slice) in layers.iter().zip(slices.iter()) {
         if let Some(linear) = layer.as_linear() {
             let (weight, bias) = linear.get_weight_matrix_and_bias(params, slice);
-            // Сохраняем вход ДО линейного преобразования
             let input_for_ctx = current.clone();
             current = gpu_compute.run_linear_forward(&current, &weight, &bias);
             ctxs.push(DynamicContext::Mat(MatContext::Linear {
@@ -59,11 +61,15 @@ pub fn process_forward_gpu(
         }
     }
 
+    // В текущей версии persistent-буферы не используются для передачи данных,
+    // все результаты возвращаются через матрицы.
     (current, ctxs)
 }
 
+/// Обратный проход на GPU с persistent-буферами (пока буферы не используются).
 pub fn process_backward_gpu(
     gpu_compute: &GpuCompute,
+    _segment_buffers: &SegmentPersistentBuffers,
     layers: &[Box<dyn UniversalLayer>],
     slices: &[ParamSlice],
     contexts: &[DynamicContext],
@@ -134,7 +140,6 @@ pub fn process_backward_gpu(
             };
             current_grad = gpu_compute.run_softmax_backward(&output_mat, &current_grad);
         } else if let Some(memory) = layer.as_memory() {
-            // Memory backward не требует контекста (использует alpha)
             current_grad = gpu_compute.run_memory_backward(&current_grad, memory.alpha);
         } else if let Some(softsparse) = layer.as_soft_sparse_gate() {
             let input_mat = match ctx {

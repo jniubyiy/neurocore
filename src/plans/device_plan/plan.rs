@@ -1,4 +1,4 @@
-// src/device_plan/plan.rs
+// src/plans/device_plan/plan.rs
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,7 @@ use crate::compute_manager::memory_executor::MemoryPolicy;
 // ---------------------------------------------------------------------------
 
 /// Вычислительное устройство.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ComputeDevice {
     Cpu { id: usize, threads: usize },
     Gpu { id: usize },

@@ -11,20 +11,19 @@ use crate::compute_manager::cpu::{CostModel, Scheduler, WorkerPool};
 use crate::compute_manager::cpu::hardware::CPU_INFO;
 use crate::compute_manager::cpu::scheduler::LayerInfo;
 use crate::compute_manager::device::Device;
-use crate::compute_manager::device_assignment::{assign_devices, SegmentPlacement};
+use crate::compute_manager::device_assignment::assign_devices_initial;
 use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::gpu::GpuCompute;
 use crate::compute_manager::gpu::param_store::GpuParamStore;
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::graph::model::{DevicePlacementState, MixedModel};
 use crate::device_plan::{ComputeDevice, DevicePlan};
 use crate::layers::UniversalLayer;
 use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::blueprint::LayerKind;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 
-use super::model::MixedModel;
 use super::types::Segment;
 
 // ---------- CpuExecutor ----------
@@ -78,7 +77,7 @@ impl MixedModel {
         Self::from_plan_with_device_plan_and_batch(layers, plan, 1)
     }
 
-    /// Основной конструктор с планом устройств и размером батча (для учёта памяти активаций).
+    /// Основной конструктор с планом устройств и размером батча.
     pub(crate) fn from_plan_with_device_plan_and_batch(
         layers: Vec<LayerDesc>,
         device_plan: DevicePlan,
@@ -88,10 +87,7 @@ impl MixedModel {
         // 1. Создаём MemoryExecutor и получаем GPU-контекст
         // -----------------------------------------------------------
         let (memory_executor, gpu_context) = device_plan.build_memory_executor();
-
         eprintln!("[BUILDER] gpu_context is_some = {}", gpu_context.is_some());
-
-        let mut mem_exec = memory_executor.lock().unwrap();
 
         // -----------------------------------------------------------
         // 2. Суммарное количество потоков CPU
@@ -291,12 +287,9 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
-        // 5.5 Назначаем устройства сегментам с учётом памяти
+        // 5.5 Получаем начальное размещение без резервирования памяти
         // -----------------------------------------------------------
-        let segment_placement = assign_devices(&segments, &device_plan, &mut mem_exec, batch_size)
-            .map_err(|e| format!("Ошибка распределения устройств с учётом памяти: {}", e))?;
-
-        drop(mem_exec);
+        let segment_placement = assign_devices_initial(&segments, &device_plan, batch_size);
 
         // -----------------------------------------------------------
         // 6. Создаём GPU-хранилище параметров, если есть GPU
@@ -315,7 +308,6 @@ impl MixedModel {
 
         // -----------------------------------------------------------
         // 7. Вычисляем ожидаемые формы входных и выходных тензоров
-        //    (используются только для восстановления формы при тензорных обёртках)
         // -----------------------------------------------------------
         let input_shapes: Vec<Vec<usize>> = vec![layers.first().unwrap().input_shape.streams.clone()];
         let output_shapes: Vec<Vec<usize>> = if output_stream_count == 1 {
@@ -342,11 +334,11 @@ impl MixedModel {
         );
 
         // -----------------------------------------------------------
-        // 8. Собираем MixedModel
+        // 8. Собираем MixedModel с начальным состоянием размещения
         // -----------------------------------------------------------
-        Ok(MixedModel {
+        let mut model = MixedModel {
             segments,
-            segment_placement,
+            segment_placement: segment_placement.clone(),
             store,
             pool,
             scheduler: Mutex::new(scheduler),
@@ -359,7 +351,19 @@ impl MixedModel {
             memory_executor,
             input_shapes,
             output_shapes,
-        })
+            placement_state: Arc::new(Mutex::new(DevicePlacementState {
+                segment_buffers: vec![],
+                profiling_data: crate::compute_manager::adaptive_planner::ProfilingData::new(),
+                placements: vec![],
+            })),
+        };
+
+        // -----------------------------------------------------------
+        // 9. Выделяем постоянные буферы для начального размещения
+        // -----------------------------------------------------------
+        model.maybe_reassign_devices(&device_plan, batch_size);
+
+        Ok(model)
     }
 
     /// Обратно-совместимый конструктор (без batch_size, использует 1).

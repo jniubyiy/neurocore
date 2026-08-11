@@ -52,6 +52,9 @@ pub struct MemoryExecutor {
     // Компоненты управления памятью
     raw_registry: RawBufferRegistry,
     temp_pool: TempBufferPool,
+
+    // Закреплённые (pinned) буферы, которые не участвуют в автоматическом вытеснении
+    pinned_buffers: HashSet<TensorBufferId>,
 }
 
 impl MemoryExecutor {
@@ -69,6 +72,7 @@ impl MemoryExecutor {
             buffer_to_raw: HashMap::new(),
             raw_registry: RawBufferRegistry::new(),
             temp_pool: TempBufferPool::new(),
+            pinned_buffers: HashSet::new(),
         }
     }
 
@@ -282,13 +286,35 @@ impl MemoryExecutor {
             size_elements: elements,
             location: buffer_location,
             data,
-            pinned: false,
+            pinned: false,      // будет обновлено при вызове allocate_pinned
             use_count: 0,
             metadata,
-            is_temp: false,  // долгоживущий буфер
+            is_temp: false,
         };
         self.buffers.insert(id, buffer);
         Ok(id)
+    }
+
+    /// Выделяет буфер и сразу помечает его как закреплённый (pinned).
+    /// Такой буфер не будет участвовать в автоматическом вытеснении.
+    pub fn allocate_pinned(
+        &mut self,
+        location: MemoryDeviceKind,
+        elements: usize,
+        priority: BufferPriority,
+    ) -> Result<TensorBufferId, MemoryError> {
+        let id = self.allocate(location, elements, priority)?;
+        if let Some(buffer) = self.buffers.get_mut(&id) {
+            buffer.pinned = true;
+        }
+        self.pinned_buffers.insert(id);
+        Ok(id)
+    }
+
+    /// Освобождает закреплённый буфер и удаляет его из системы.
+    pub fn deallocate_pinned(&mut self, id: TensorBufferId) -> Result<(), MemoryError> {
+        self.pinned_buffers.remove(&id);
+        self.deallocate_buffer(id)
     }
 
     pub fn reserve_memory(&mut self, kind: MemoryDeviceKind, elements: usize) -> Result<(), MemoryError> {
@@ -349,6 +375,7 @@ impl MemoryExecutor {
                 location_to_kind(&b.location) == kind
                     && !b.pinned
                     && !self.upcoming_ids.contains(&b.id)
+                    && !self.pinned_buffers.contains(&b.id) // дополнительная защита
             })
             .map(|(id, b)| (*id, b.metadata.priority, b.metadata.last_access, b.size_elements))
             .collect();
@@ -464,6 +491,8 @@ impl MemoryExecutor {
     // --- Удаление буфера ---
 
     pub fn deallocate_buffer(&mut self, id: TensorBufferId) -> Result<(), MemoryError> {
+        // Удаляем из закреплённых, если там был
+        self.pinned_buffers.remove(&id);
         let buffer = self.buffers.remove(&id).ok_or(MemoryError::BufferNotFound(id))?;
         let kind = location_to_kind(&buffer.location);
         if let Some(pool) = self.pools.get_mut(&kind) {
@@ -474,7 +503,6 @@ impl MemoryExecutor {
                 ssd.deallocate(&handle)?;
             }
         }
-        // Если был raw-буфер, разрегистрируем его
         if let Some(raw_id) = self.buffer_to_raw.remove(&id) {
             self.raw_registry.unregister(raw_id, &mut self.pools);
         }
@@ -542,7 +570,7 @@ impl MemoryExecutor {
 
         let mut candidates: Vec<(TensorBufferId, BufferPriority, Instant, usize)> = self.buffers
             .iter()
-            .filter(|(_, b)| matches!(b.location, BufferLocation::DeviceVram(_)))
+            .filter(|(_, b)| matches!(b.location, BufferLocation::DeviceVram(_)) && !b.pinned)
             .map(|(id, b)| (*id, b.metadata.priority, b.metadata.last_access, b.size_elements))
             .collect();
 

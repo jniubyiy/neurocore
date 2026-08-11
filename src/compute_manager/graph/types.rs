@@ -13,6 +13,7 @@ pub enum DynamicContext {
 }
 
 /// Типы сегментов вычислительного графа.
+#[derive(Clone)]
 pub enum Segment {
     UniversalProcessor(
         Arc<Vec<Box<dyn UniversalLayer>>>,

@@ -181,4 +181,26 @@ impl ParamStore {
         let segments = Arc::get_mut(&mut self.segments).unwrap();
         segments[seg_idx].get_mut().unwrap()[pos] += delta;
     }
+
+    /// Копирует параметры, принадлежащие слайсу, в предоставленный буфер.
+    pub fn copy_params_to(&self, slice: ParamSlice, dest: &mut [f32]) {
+        assert_eq!(dest.len(), slice.len);
+        let mut pos = slice.start;
+        let mut dest_offset = 0;
+        while pos < slice.start + slice.len {
+            let seg_idx = pos / SEGMENT_SIZE;
+            let in_seg = pos % SEGMENT_SIZE;
+            let seg_len = SEGMENT_SIZE - in_seg;
+            let take = (slice.start + slice.len - pos).min(seg_len);
+            let seg = self.segments[seg_idx].lock().unwrap();
+            dest[dest_offset..dest_offset + take].copy_from_slice(&seg[in_seg..in_seg + take]);
+            pos += take;
+            dest_offset += take;
+        }
+    }
+
+    /// Заменяет параметры в слайсе данными из src (псевдоним для set_slice с дополнительным именем для ясности намерений).
+    pub fn replace_params(&mut self, slice: ParamSlice, src: &[f32]) {
+        self.set_slice(slice, src);
+    }
 }

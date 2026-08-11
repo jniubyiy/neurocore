@@ -24,6 +24,7 @@ use crate::compute_manager::memory_executor::{
     TensorBufferId,
     BufferPriority,
 };
+use crate::compute_manager::persistent_buffer::{DeviceBuffer, DeviceBufferId};
 use super::super::init::GpuContext;
 use super::super::pipeline::PipelineCache;
 
@@ -156,6 +157,84 @@ impl GpuCompute {
         Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
     }
 
+    // --- Работа с постоянными (persistent) буферами ---
+
+    /// Копирует данные из одного persistent буфера в другой (оба должны быть на GPU).
+    /// Использует временный staging-буфер в VRAM (или напрямую копирует, если поддерживается).
+    pub fn copy_persistent_to_persistent(
+        &self,
+        src: &DeviceBuffer,
+        dst: &DeviceBuffer,
+    ) {
+        let src_buf = self.resolve_persistent_to_subbuffer(src);
+        let dst_buf = self.resolve_persistent_to_subbuffer(dst);
+        self.copy_buffer_sync(src_buf, dst_buf);
+    }
+
+    /// Загружает данные CPU (срез f32) в постоянный GPU-буфер.
+    pub fn fill_persistent_buffer(
+        &self,
+        buffer: &DeviceBuffer,
+        data: &[f32],
+    ) {
+        let elements = buffer.size_elements;
+        assert_eq!(data.len(), elements, "Data size must match buffer size");
+
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        {
+            let mut write_guard = staging_buf.write().expect("write staging buffer");
+            write_guard[..elements].copy_from_slice(data);
+        }
+        let dst_buf = self.resolve_persistent_to_subbuffer(buffer);
+        self.copy_buffer_sync(staging_buf.clone(), dst_buf);
+        self.release_staging_buffer(staging_buf, staging_raw);
+    }
+
+    /// Выгружает данные из постоянного GPU-буфера в вектор f32 на CPU.
+    pub fn read_persistent_buffer(
+        &self,
+        buffer: &DeviceBuffer,
+    ) -> Vec<f32> {
+        let elements = buffer.size_elements;
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        let src_buf = self.resolve_persistent_to_subbuffer(buffer);
+        self.copy_buffer_sync(src_buf, staging_buf.clone());
+
+        let data_vec = {
+            let guard = staging_buf.read().expect("read staging buffer");
+            let slice = &guard[..elements];
+            slice.to_vec()
+        };
+        self.release_staging_buffer(staging_buf, staging_raw);
+        data_vec
+    }
+
+    /// Вспомогательный метод: по идентификатору persistent буфера возвращает Subbuffer.
+    fn resolve_persistent_to_subbuffer(
+        &self,
+        buffer: &DeviceBuffer,
+    ) -> Subbuffer<[f32]> {
+        match &buffer.id {
+            DeviceBufferId::Gpu(raw_id) => {
+                // Получаем доступ к raw буферу через MemoryExecutor.
+                // Нам нужен Subbuffer, но raw_registry только хранит метаданные.
+                // Поэтому мы создаём временный "псевдо"-Subbuffer, используя тот же raw_id?
+                // На самом деле Subbuffer – это вулкановский буфер с known size.
+                // Мы не можем извлечь его напрямую из raw_registry, так как там нет Subbuffer.
+                // Вместо этого, мы должны хранить Subbuffer где-то вместе с persistent буфером.
+                // Это ограничение текущей архитектуры. Нужно дополнить DeviceBuffer хранением Subbuffer.
+                // Пока оставим заглушку: будем требовать, чтобы DeviceBuffer хранил сам Subbuffer,
+                // либо передавать Subbuffer вместе с буфером.
+                // Для простоты сейчас добавим метод `buffer()` в DeviceBuffer.
+                // Но т.к. DeviceBuffer определён в persistent_buffer.rs, мы должны его изменить.
+                // Временно вызовем панику, а реальная реализация потребует рефакторинга DeviceBuffer.
+                panic!("resolve_persistent_to_subbuffer needs refactoring: DeviceBuffer must store Subbuffer");
+            },
+            _ => panic!("Persistent buffer is not on GPU"),
+        }
+    }
+
+    // --- Копирование между двумя Subbuffer'ами (синхронно) ---
     pub fn copy_buffer_sync(&self, src: Subbuffer<[f32]>, dst: Subbuffer<[f32]>) {
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),

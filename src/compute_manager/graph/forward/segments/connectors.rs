@@ -1,8 +1,10 @@
 // src/compute_manager/graph/forward/segments/connectors.rs
 
+use std::time::Instant;
 use faer::Mat;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::device_plan::plan::ComputeDevice;
 use crate::layers::splitter_connector::SplitterConnector;
 use crate::layers::combiner_connector::CombinerConnector;
 use crate::layers::splitter::Splitter;
@@ -14,13 +16,20 @@ impl MixedModel {
     // SplitterConnector (активный, два входа → два выхода)
     // ---------------------------------------------------------------
     pub(crate) fn process_splitter_connector_forward(
-        &self,
+        &mut self,
         dim_a: usize,
         dim_b: usize,
         batch_size: usize,
         stream_matrices: &mut Vec<Mat<f32>>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
+        seg_index: usize,
     ) {
+        let start = Instant::now();
+        let device = self.segment_placement
+            .get(seg_index)
+            .map(|p| p.compute_device.clone())
+            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+
         assert_eq!(
             stream_matrices.len(),
             2,
@@ -39,18 +48,28 @@ impl MixedModel {
         }
 
         *stream_matrices = vec![out_a_mat, out_b_mat];
+
+        let duration = start.elapsed().as_nanos() as f64;
+        self.record_segment_timing(seg_index, &device, duration);
     }
 
     // ---------------------------------------------------------------
     // CombinerConnector (активный, N входов → N выходов, прозрачный)
     // ---------------------------------------------------------------
     pub(crate) fn process_combiner_connector_forward(
-        &self,
+        &mut self,
         input_dims: Vec<usize>,
         batch_size: usize,
         stream_matrices: &mut Vec<Mat<f32>>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
+        seg_index: usize,
     ) {
+        let start = Instant::now();
+        let device = self.segment_placement
+            .get(seg_index)
+            .map(|p| p.compute_device.clone())
+            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+
         let n = input_dims.len();
         assert_eq!(
             stream_matrices.len(),
@@ -73,20 +92,30 @@ impl MixedModel {
             }
         }
         // stream_matrices остаются без изменений
+
+        let duration = start.elapsed().as_nanos() as f64;
+        self.record_segment_timing(seg_index, &device, duration);
     }
 
     // ---------------------------------------------------------------
     // Обучаемый Splitter (GPU + CPU)
     // ---------------------------------------------------------------
     pub(crate) fn process_splitter_forward(
-        &self,
+        &mut self,
         input_dim: usize,
         output_dims: Vec<usize>,
         slice: crate::model_plan::param_store::ParamSlice,
         batch_size: usize,
         stream_matrices: &mut Vec<Mat<f32>>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
+        seg_index: usize,
     ) {
+        let start = Instant::now();
+        let device = self.segment_placement
+            .get(seg_index)
+            .map(|p| p.compute_device.clone())
+            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+
         assert_eq!(
             stream_matrices.len(),
             1,
@@ -132,20 +161,30 @@ impl MixedModel {
 
             *stream_matrices = vec![a_mat, b_mat];
         }
+
+        let duration = start.elapsed().as_nanos() as f64;
+        self.record_segment_timing(seg_index, &device, duration);
     }
 
     // ---------------------------------------------------------------
     // Обучаемый Combiner (GPU + CPU)
     // ---------------------------------------------------------------
     pub(crate) fn process_combiner_forward(
-        &self,
+        &mut self,
         input_dim: usize,
         output_dim: usize,
         slice: crate::model_plan::param_store::ParamSlice,
         batch_size: usize,
         stream_matrices: &mut Vec<Mat<f32>>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
+        seg_index: usize,
     ) {
+        let start = Instant::now();
+        let device = self.segment_placement
+            .get(seg_index)
+            .map(|p| p.compute_device.clone())
+            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+
         assert_eq!(
             stream_matrices.len(),
             2,
@@ -191,5 +230,8 @@ impl MixedModel {
 
             *stream_matrices = vec![out_mat];
         }
+
+        let duration = start.elapsed().as_nanos() as f64;
+        self.record_segment_timing(seg_index, &device, duration);
     }
 }

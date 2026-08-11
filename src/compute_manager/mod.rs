@@ -8,12 +8,14 @@ pub mod cpu;
 pub mod gpu;
 pub mod memory_executor;
 pub mod device_spec;
-pub mod device_assignment;   // назначение устройств для сегментов
-pub mod device_tensor;       // абстракция тензора над устройствами
+pub mod device_assignment;
+pub mod device_tensor;
+pub mod persistent_buffer;
+pub mod adaptive_planner;
 
 // Публичные реэкспорты
 pub use device::{Device, DeviceDetector, ComputeManager};
 pub use executor::Executor;
-pub use graph::types::DynamicContext;  // DynamicBatchTensor удалён, больше не используется
+pub use graph::types::DynamicContext;
 pub use dim_change::DynamicTensor;
 pub use gpu::GpuExecutor;

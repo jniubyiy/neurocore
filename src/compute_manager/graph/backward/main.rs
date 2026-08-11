@@ -1,14 +1,22 @@
 // src/compute_manager/graph/backward/main.rs
 
+use std::time::Instant;
 use faer::Mat;
+use crate::compute_manager::dim_change;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
+use crate::device_plan::plan::ComputeDevice;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
 
 impl MixedModel {
+    /// Обратный матричный проход с множественными выходами (градиентами по выходам) и входами.
+    /// Возвращает градиенты по входам модели и накопленные градиенты параметров.
+    ///
+    /// Для каждого сегмента фиксируется время выполнения и записывается
+    /// в профилировочные данные адаптивного планировщика.
     pub fn backward_mat_multi(
-        &self,
+        &mut self,
         contexts: &[Vec<DynamicContext>],
         deltas: &[Mat<f32>],
     ) -> (Vec<Mat<f32>>, Vec<Vec<f32>>) {
@@ -30,16 +38,21 @@ impl MixedModel {
         let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
         let mut ctx_pos = total_context_len;
 
-        for (_seg_idx, seg) in self.segments.iter().enumerate().rev() {
+        // Клонируем сегменты, чтобы не удерживать неизменяемую ссылку на self.segments
+        let segments = self.segments.clone();
+
+        for (seg_index, seg) in segments.iter().enumerate().rev() {
+            let start = Instant::now();
+
             match seg {
                 Segment::Unsqueeze(target_dims) => {
                     for mat in &mut stream_gradients {
-                        *mat = crate::compute_manager::dim_change::reduce_mat(mat, target_dims);
+                        *mat = dim_change::reduce_mat(mat, target_dims);
                     }
                 }
                 Segment::ReduceMean(target_dims) => {
                     for mat in &mut stream_gradients {
-                        *mat = crate::compute_manager::dim_change::unsqueeze_mat(mat, target_dims);
+                        *mat = dim_change::unsqueeze_mat(mat, target_dims);
                     }
                 }
                 Segment::UniversalProcessor(proc, slices, stream_indices) => {
@@ -60,21 +73,33 @@ impl MixedModel {
                             .iter()
                             .collect();
 
-                        // Преобразуем Vec<&DynamicContext> в &[DynamicContext] с помощью временного вектора значений
                         let ctxs_owned: Vec<DynamicContext> = layer_ctxs.iter().map(|&c| c.clone()).collect();
                         let ctxs_slice: &[DynamicContext] = &ctxs_owned;
 
                         let in_delta_mat = if self.gpu_compute.is_some() {
                             let gpu = self.gpu_compute.as_ref().unwrap().lock().unwrap();
-                            crate::compute_manager::gpu::processor::process_backward_gpu(
-                                &gpu,
-                                proc,
-                                slices,
-                                ctxs_slice,
-                                &params,
-                                &delta_mat,
-                                &mut total_grad,
-                            )
+                            let segment_buffers = self.get_segment_buffers(seg_index);
+                            if let Some(ref buffers) = segment_buffers {
+                                crate::compute_manager::gpu::processor::process_backward_gpu(
+                                    &gpu,
+                                    buffers,               // &SegmentPersistentBuffers
+                                    proc,                  // &[Box<dyn UniversalLayer>]
+                                    slices,                // &[ParamSlice]
+                                    ctxs_slice,            // &[DynamicContext]
+                                    &params,
+                                    &delta_mat,
+                                    &mut total_grad,
+                                )
+                            } else {
+                                Self::backward_universal_batch_mat(
+                                    proc,
+                                    slices,
+                                    &layer_ctxs,
+                                    &delta_mat,
+                                    &params,
+                                    &mut total_grad,
+                                )
+                            }
                         } else {
                             Self::backward_universal_batch_mat(
                                 proc,
@@ -227,6 +252,14 @@ impl MixedModel {
                     ctx_pos -= 1;
                 }
             }
+
+            // Запись времени выполнения сегмента
+            let duration = start.elapsed().as_nanos() as f64;
+            let device = self.segment_placement
+                .get(seg_index)
+                .map(|p| p.compute_device.clone())
+                .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+            self.record_segment_timing(seg_index, &device, duration);
         }
 
         assert_eq!(
@@ -238,8 +271,10 @@ impl MixedModel {
         (stream_gradients, vec![total_grad])
     }
 
+    /// Обратный матричный проход (один выход – один вход).
+    /// Оставлен для обратной совместимости.
     pub fn backward_mat(
-        &self,
+        &mut self,
         contexts: &[Vec<DynamicContext>],
         delta: &Mat<f32>,
     ) -> (Mat<f32>, Vec<Vec<f32>>) {

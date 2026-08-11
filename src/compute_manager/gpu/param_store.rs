@@ -178,7 +178,6 @@ impl GpuParamStore {
                 host_memory,
             );
             let raw_state = opt_state_buf.as_ref().map(|buf| {
-                // buf.len() is u64, size_of::<f32>() is usize; cast size_of to u64 before multiplying
                 let size_bytes = buf.len() * (std::mem::size_of::<f32>() as u64);
                 exec.register_raw_buffer(
                     device_id,
@@ -218,6 +217,56 @@ impl GpuParamStore {
             &data[..data.len().min(4)]
         );
         io::stderr().flush().unwrap();
+        data
+    }
+
+    /// Загружает подмножество параметров с хоста в GPU-буфер.
+    /// `offset` – глобальный индекс (не байтовый, а в количестве f32) от начала всех параметров GPU.
+    /// `data` – значения, которые нужно записать.
+    pub fn upload_subset(
+        &self,
+        offset: usize,
+        data: &[f32],
+        gpu_compute: &GpuCompute,
+    ) {
+        let len = data.len();
+        if len == 0 {
+            return;
+        }
+        // Создаём временный staging-буфер
+        let (staging_buf, staging_raw) = gpu_compute.acquire_staging_buffer(len);
+        {
+            let mut write_guard = staging_buf.write().expect("write staging buffer");
+            write_guard[..len].copy_from_slice(data);
+        }
+        // Копируем staging -> params со смещением
+        let elem_size = std::mem::size_of::<f32>() as u64;
+        let start_byte = offset as u64 * elem_size;
+        let params_slice = self.params.clone().slice(start_byte..start_byte + len as u64 * elem_size);
+        gpu_compute.copy_buffer_sync(staging_buf.clone(), params_slice);
+        gpu_compute.release_staging_buffer(staging_buf, staging_raw);
+    }
+
+    /// Выгружает подмножество параметров с GPU на хост.
+    pub fn download_subset(
+        &self,
+        offset: usize,
+        len: usize,
+        gpu_compute: &GpuCompute,
+    ) -> Vec<f32> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let (staging_buf, staging_raw) = gpu_compute.acquire_staging_buffer(len);
+        let elem_size = std::mem::size_of::<f32>() as u64;
+        let start_byte = offset as u64 * elem_size;
+        let params_slice = self.params.clone().slice(start_byte..start_byte + len as u64 * elem_size);
+        gpu_compute.copy_buffer_sync(params_slice, staging_buf.clone());
+        let data = {
+            let guard = staging_buf.read().expect("read staging buffer");
+            guard[..len].to_vec()
+        };
+        gpu_compute.release_staging_buffer(staging_buf, staging_raw);
         data
     }
 }

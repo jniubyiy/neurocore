@@ -69,10 +69,13 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         );
     }
 
-    // --- построение модели ---
+    // --- построение модели (теперь mut) ---
     let model_desc = (plan.model_fn)();
     let _ = Plan::from_layer_descs(model_desc.clone())?;
-    let model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
+    let mut model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
+
+    // --- первоначальное выделение persistent‑буферов и адаптивное размещение ---
+    model.maybe_reassign_devices(device_plan, plan.batch_size);
 
     // --- инициализация весов ---
     {
@@ -155,6 +158,9 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     let mut zero_loss_epoch: Option<usize> = None;
 
     for epoch in 0..plan.epochs {
+        // Адаптивная реаллокация перед каждой эпохой (внутри сама решит, нужно ли)
+        model.maybe_reassign_devices(device_plan, plan.batch_size);
+
         let mut epoch_loss = 0.0f32;
 
         for start in (0..num_samples).step_by(batch_size) {
@@ -180,7 +186,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
             );
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
-            // backward
+            // backward (теперь требует &mut self)
             let t2 = Instant::now();
             let (_, grads) = model.backward(&ctxs, delta);
             let backward_dt = t2.elapsed().as_nanos() as u64;

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use faer::Mat;
 use crate::compute_manager::cpu::worker_pool::WorkerPool;
-use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::gpu::processor::process_forward_gpu;
@@ -16,31 +16,24 @@ impl MixedModel {
         &self,
         proc: &Arc<Vec<Box<dyn UniversalLayer>>>,
         slices: &[ParamSlice],
-        seg_index: usize,
+        _seg_index: usize,
         params: &[f32],
-        streams: &mut Vec<Vec<DynamicTensor>>,
+        stream_matrices: &mut Vec<Mat<f32>>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
         stream_indices: &Option<Vec<usize>>,
     ) {
-        // Получаем информацию о размещении сегмента
-        let placement = &self.segment_placement[seg_index];
-        let _compute_device = &placement.compute_device;
-
-        // Определяем активные потоки
+        // Определяем, какие входные потоки обрабатывать
         let active_indices: Vec<usize> = match stream_indices {
             Some(indices) => indices.clone(),
-            None => (0..streams.len()).collect(),
+            None => (0..stream_matrices.len()).collect(),
         };
 
         // --- GPU‑путь ---
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+            eprintln!("[PROCESSOR] GPU path selected");
             let gpu_compute = gpu_compute_mutex.lock().unwrap();
-            let num_output_streams = streams.len();
-            let mut new_streams: Vec<Option<Vec<DynamicTensor>>> = vec![None; num_output_streams];
-
             for &stream_idx in &active_indices {
-                let batch_samples = &streams[stream_idx];
-                let input_mat = MixedModel::samples_to_mat(batch_samples);
+                let input_mat = stream_matrices[stream_idx].clone();
                 let (out_mat, layer_ctxs) = process_forward_gpu(
                     &gpu_compute,
                     proc,
@@ -48,26 +41,19 @@ impl MixedModel {
                     params,
                     &input_mat,
                 );
-                let samples = MixedModel::mat_to_samples(&out_mat);
-                new_streams[stream_idx] = Some(samples);
+                stream_matrices[stream_idx] = out_mat;
 
-                for ctx_sample in all_ctxs.iter_mut() {
-                    ctx_sample.extend(layer_ctxs.clone());
+                // Добавляем контексты для каждого сэмпла батча
+                for sample_ctxs in all_ctxs.iter_mut() {
+                    sample_ctxs.extend(layer_ctxs.clone());
                 }
             }
-
-            for (i, opt) in new_streams.iter_mut().enumerate() {
-                if opt.is_none() {
-                    *opt = Some(streams[i].clone());
-                }
-            }
-            *streams = new_streams.into_iter().map(|o| o.unwrap()).collect();
             return;
         }
 
-        // --- CPU‑путь (многопоточный) ---
-        let num_output_streams = streams.len();
-        let mut new_streams: Vec<Option<Vec<DynamicTensor>>> = vec![None; num_output_streams];
+        eprintln!("[PROCESSOR] CPU path selected (no gpu_compute)");
+
+        // --- CPU‑путь (многопоточный, работает с подматрицами) ---
 
         let layers_arc = Arc::clone(proc);
         let slices_arc = Arc::new(slices.to_vec());
@@ -78,9 +64,8 @@ impl MixedModel {
         let (time_tx, time_rx) = std::sync::mpsc::channel();
 
         for &stream_idx in &active_indices {
-            let batch = streams[stream_idx].clone();
-            let batch_len = batch.len();
-
+            let full_matrix = stream_matrices[stream_idx].clone();
+            let batch_len = full_matrix.nrows();
             let assignment = self.executor.plan_chunks_assignment(batch_len);
 
             let layers = Arc::clone(&layers_arc);
@@ -91,9 +76,11 @@ impl MixedModel {
             let time_tx = time_tx.clone();
 
             for (_worker_id, ranges) in assignment.iter().enumerate() {
-                if ranges.is_empty() { continue; }
+                if ranges.is_empty() {
+                    continue;
+                }
                 let ranges = ranges.clone();
-                let batch = batch.clone();
+                let matrix_chunk = full_matrix.clone();
                 let layers = Arc::clone(&layers);
                 let slices = Arc::clone(&slices);
                 let params = params.clone();
@@ -102,37 +89,35 @@ impl MixedModel {
                 let executor = self.executor.clone_executor();
 
                 executor.execute_dyn(Box::new(move || {
-                    // Получаем индекс текущего CPU (воркера)
                     let cpu_idx = WorkerPool::current_worker_index();
 
-                    let mut results: Vec<(usize, DynamicTensor)> = Vec::new();
+                    let mut results: Vec<(usize, Mat<f32>)> = Vec::new();
                     let mut ctxs: Vec<(usize, Vec<DynamicContext>)> = Vec::new();
 
                     for (range_start, range_size) in &ranges {
-                        // Замеряем время выполнения этого чанка
                         let start = Instant::now();
 
-                        let chunk_mat = MixedModel::samples_to_mat(
-                            &batch[*range_start..*range_start + *range_size]
-                        );
+                        // Извлекаем срез строк как независимую матрицу
+                        let chunk_mat = matrix_chunk
+                            .submatrix(*range_start, 0, *range_size, matrix_chunk.ncols())
+                            .to_owned();
                         let (chunk_out_mat, chunk_ctxs) =
                             MixedModel::forward_universal_batch_mat(
-                                &layers, &slices, &chunk_mat, &params,
+                                &layers,
+                                &slices,
+                                &chunk_mat,
+                                &params,
                             );
-                        let samples = MixedModel::mat_to_samples(&chunk_out_mat);
 
                         let duration = start.elapsed().as_nanos() as f64;
-
-                        // Отправляем информацию о времени выполнения
                         let _ = time_tx.send((cpu_idx, *range_size, duration));
 
-                        for (i, sample) in samples.into_iter().enumerate() {
-                            results.push((*range_start + i, sample));
-                        }
+                        results.push((*range_start, chunk_out_mat));
                         for i in 0..*range_size {
                             ctxs.push((*range_start + i, chunk_ctxs.clone()));
                         }
                     }
+
                     let _ = tx.send((results, ctxs));
                 }));
             }
@@ -141,30 +126,57 @@ impl MixedModel {
 
         self.executor.wait_all();
 
-        // Собираем и обрабатываем все времена выполнения
+        // Собираем все времена выполнения
         while let Ok((cpu_idx, chunk_size, duration_ns)) = time_rx.try_recv() {
-            self.scheduler.lock().unwrap().report_execution_time(cpu_idx, chunk_size, duration_ns);
+            self.scheduler
+                .lock()
+                .unwrap()
+                .report_execution_time(cpu_idx, chunk_size, duration_ns);
         }
 
+        // Объединяем результаты чанков для каждого потока
         for (stream_idx, rx) in receivers {
-            let batch_len = streams[stream_idx].len();
-            let mut stream_outputs: Vec<Option<DynamicTensor>> = vec![None; batch_len];
+            let batch_len = stream_matrices[stream_idx].nrows(); // исходное число строк (не меняется)
+
+            // Временные хранилища для результатов и контекстов
+            let mut chunk_results_list: Vec<(usize, Mat<f32>)> = Vec::new();
             let mut stream_ctxs: Vec<Vec<DynamicContext>> = vec![Vec::new(); batch_len];
 
-            while let Ok((results, ctxs)) = rx.recv() {
-                for (idx, out) in results { stream_outputs[idx] = Some(out); }
-                for (idx, sample_ctxs) in ctxs { stream_ctxs[idx].extend(sample_ctxs); }
+            while let Ok((chunk_results, chunk_ctxs)) = rx.recv() {
+                for (row_offset, chunk_mat) in chunk_results {
+                    chunk_results_list.push((row_offset, chunk_mat));
+                }
+                for (sample_idx, sample_ctxs) in chunk_ctxs {
+                    stream_ctxs[sample_idx].extend(sample_ctxs);
+                }
             }
 
-            new_streams[stream_idx] = Some(stream_outputs.into_iter().map(|o| o.unwrap()).collect());
-            for (_i, ctxs_sample) in stream_ctxs.into_iter().enumerate() {
-                all_ctxs[_i].extend(ctxs_sample);
+            // Определяем новое количество признаков по первому чанку
+            let new_features = chunk_results_list
+                .first()
+                .map(|(_, m)| m.ncols())
+                .unwrap_or(0);
+
+            // Создаём результирующую матрицу правильного размера
+            let mut result_matrix = Mat::zeros(batch_len, new_features);
+            for (row_offset, chunk_mat) in chunk_results_list {
+                let rows = chunk_mat.nrows();
+                let cols = chunk_mat.ncols();
+                assert_eq!(cols, new_features, "Chunk column count mismatch");
+                for r in 0..rows {
+                    for c in 0..cols {
+                        result_matrix[(row_offset + r, c)] = chunk_mat[(r, c)];
+                    }
+                }
+            }
+
+            // Обновляем матрицу потока
+            stream_matrices[stream_idx] = result_matrix;
+
+            // Добавляем контексты в общий вектор
+            for (sample_idx, ctxs) in stream_ctxs.into_iter().enumerate() {
+                all_ctxs[sample_idx].extend(ctxs);
             }
         }
-
-        for (i, opt) in new_streams.iter_mut().enumerate() {
-            if opt.is_none() { *opt = Some(streams[i].clone()); }
-        }
-        *streams = new_streams.into_iter().map(|o| o.unwrap()).collect();
     }
 }

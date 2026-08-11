@@ -161,13 +161,16 @@ impl MixedModel {
         }
     }
 
+    // ── Тензорные обёртки для обратной совместимости ──
+
     pub fn forward(
         &self,
         input: DynamicTensor,
     ) -> (DynamicTensor, Vec<Vec<DynamicContext>>) {
-        let (outs, ctxs) = self.forward_multi(vec![input]);
-        assert_eq!(outs.len(), 1);
-        (outs.into_iter().next().unwrap(), ctxs)
+        let mat = self.dynamic_tensor_to_mat(input);
+        let (out_mats, ctxs) = self.forward_mat_multi(&[mat]);
+        let out_tensor = self.mat_to_dynamic_tensor(out_mats.into_iter().next().unwrap(), &self.output_shapes[0]);
+        (out_tensor, ctxs)
     }
 
     pub fn backward(
@@ -175,9 +178,10 @@ impl MixedModel {
         contexts: &[Vec<DynamicContext>],
         delta: DynamicTensor,
     ) -> (DynamicTensor, Vec<Vec<f32>>) {
-        let (ins, grads) = self.backward_multi(contexts, vec![delta]);
-        assert_eq!(ins.len(), 1);
-        (ins.into_iter().next().unwrap(), grads)
+        let delta_mat = self.dynamic_tensor_to_mat(delta);
+        let (in_mats, grads) = self.backward_mat_multi(contexts, &[delta_mat]);
+        let in_tensor = self.mat_to_dynamic_tensor(in_mats.into_iter().next().unwrap(), &self.input_shapes[0]);
+        (in_tensor, grads)
     }
 
     pub fn forward_multi(
@@ -187,27 +191,15 @@ impl MixedModel {
         assert_eq!(inputs.len(), self.input_stream_count,
             "forward_multi: expected {} inputs, got {}", self.input_stream_count, inputs.len());
 
-        let mats: Vec<Mat<f32>> = inputs.iter().map(|t| match t {
-            DynamicTensor::Dim1(t) => linalg::tensor2d_to_faer(t),
-            DynamicTensor::Dim2(t) => linalg::tensor3d_to_faer(t),
-            DynamicTensor::Dim3(t) => linalg::tensor4d_to_faer(t),
-            DynamicTensor::Dim4(t) => linalg::tensor5d_to_faer(t),
-        }).collect();
+        let mats: Vec<Mat<f32>> = inputs.into_iter()
+            .map(|t| self.dynamic_tensor_to_mat(t))
+            .collect();
 
         let (out_mats, ctxs) = self.forward_mat_multi(&mats);
 
         let out_tensors = out_mats.into_iter()
             .zip(self.output_shapes.iter())
-            .map(|(mat, shape)| {
-                let batch = mat.nrows();
-                match shape.len() {
-                    1 => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
-                    2 => DynamicTensor::Dim2(linalg::faer_to_tensor3d(&mat, batch, shape[0], shape[1])),
-                    3 => DynamicTensor::Dim3(linalg::faer_to_tensor4d(&mat, batch, shape[0], shape[1], shape[2])),
-                    4 => DynamicTensor::Dim4(linalg::faer_to_tensor5d(&mat, batch, shape[0], shape[1], shape[2], shape[3])),
-                    _ => panic!("Unsupported output tensor dimensionality: {} spatial dims", shape.len()),
-                }
-            })
+            .map(|(mat, shape)| self.mat_to_dynamic_tensor(mat, shape))
             .collect();
 
         // После завершения forward можно очистить давно неиспользуемые временные буферы
@@ -226,27 +218,15 @@ impl MixedModel {
         assert_eq!(deltas.len(), self.output_stream_count,
             "backward_multi: expected {} deltas, got {}", self.output_stream_count, deltas.len());
 
-        let delta_mats: Vec<Mat<f32>> = deltas.iter().map(|d| match d {
-            DynamicTensor::Dim1(t) => linalg::tensor2d_to_faer(t),
-            DynamicTensor::Dim2(t) => linalg::tensor3d_to_faer(t),
-            DynamicTensor::Dim3(t) => linalg::tensor4d_to_faer(t),
-            DynamicTensor::Dim4(t) => linalg::tensor5d_to_faer(t),
-        }).collect();
+        let delta_mats: Vec<Mat<f32>> = deltas.into_iter()
+            .map(|d| self.dynamic_tensor_to_mat(d))
+            .collect();
 
         let (in_mats, grads) = self.backward_mat_multi(contexts, &delta_mats);
 
         let in_tensors = in_mats.into_iter()
             .zip(self.input_shapes.iter())
-            .map(|(mat, shape)| {
-                let batch = mat.nrows();
-                match shape.len() {
-                    1 => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
-                    2 => DynamicTensor::Dim2(linalg::faer_to_tensor3d(&mat, batch, shape[0], shape[1])),
-                    3 => DynamicTensor::Dim3(linalg::faer_to_tensor4d(&mat, batch, shape[0], shape[1], shape[2])),
-                    4 => DynamicTensor::Dim4(linalg::faer_to_tensor5d(&mat, batch, shape[0], shape[1], shape[2], shape[3])),
-                    _ => panic!("Unsupported input tensor dimensionality: {} spatial dims", shape.len()),
-                }
-            })
+            .map(|(mat, shape)| self.mat_to_dynamic_tensor(mat, shape))
             .collect();
 
         (in_tensors, grads)
@@ -258,22 +238,10 @@ impl MixedModel {
         pred: &DynamicTensor,
         target: &DynamicTensor,
     ) -> (f32, DynamicTensor) {
-        let expr = desc.build();
-        let pred_mat = match pred {
-            DynamicTensor::Dim1(t) => linalg::tensor2d_to_faer(t),
-            DynamicTensor::Dim2(t) => linalg::tensor3d_to_faer(t),
-            DynamicTensor::Dim3(t) => linalg::tensor4d_to_faer(t),
-            DynamicTensor::Dim4(t) => linalg::tensor5d_to_faer(t),
-        };
-        let target_mat = match target {
-            DynamicTensor::Dim1(t) => linalg::tensor2d_to_faer(t),
-            DynamicTensor::Dim2(t) => linalg::tensor3d_to_faer(t),
-            DynamicTensor::Dim3(t) => linalg::tensor4d_to_faer(t),
-            DynamicTensor::Dim4(t) => linalg::tensor5d_to_faer(t),
-        };
-        let (loss, grad_mat) = self.compute_loss_mat(expr, &pred_mat, &target_mat);
-        let grad_tensor = DynamicTensor::Dim1(linalg::faer_to_tensor2d(&grad_mat));
-
+        let pred_mat = self.dynamic_tensor_to_mat(pred.clone());
+        let target_mat = self.dynamic_tensor_to_mat(target.clone());
+        let (loss, grad_mat) = self.compute_loss_mat(desc.build(), &pred_mat, &target_mat);
+        let grad_tensor = self.mat_to_dynamic_tensor(grad_mat, &self.output_shapes[0]);
         (loss, grad_tensor)
     }
 
@@ -284,7 +252,7 @@ impl MixedModel {
         target: &Mat<f32>,
     ) -> (f32, Mat<f32>) {
         let use_gpu = self.gpu_compute.is_some() && (expr.num_tasks() == pred.nrows());
-        let result = if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+        if let Some(ref gpu_compute_mutex) = self.gpu_compute {
             if use_gpu {
                 let gpu_compute = gpu_compute_mutex.lock().unwrap();
                 crate::loss_plan::compute_loss_gpu(&gpu_compute, &expr, pred, target)
@@ -295,46 +263,32 @@ impl MixedModel {
         } else {
             let mut scheduler = self.scheduler.lock().unwrap();
             crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
-        };
-
-        result
+        }
     }
 
-    // ── Вспомогательные ──
-    pub fn samples_to_mat(samples: &[DynamicTensor]) -> Mat<f32> {
-        if samples.is_empty() {
-            panic!("samples_to_mat: empty slice");
+    // ── Вспомогательные методы преобразования тензор ↔ матрица ──
+
+    fn dynamic_tensor_to_mat(&self, tensor: DynamicTensor) -> Mat<f32> {
+        match tensor {
+            DynamicTensor::Dim1(t) => linalg::tensor2d_to_faer(&t),
+            DynamicTensor::Dim2(t) => linalg::tensor3d_to_faer(&t),
+            DynamicTensor::Dim3(t) => linalg::tensor4d_to_faer(&t),
+            DynamicTensor::Dim4(t) => linalg::tensor5d_to_faer(&t),
         }
-        let first = &samples[0];
-        let features = match first {
-            DynamicTensor::Dim1(t) => t.dim2,
-            _ => panic!("samples_to_mat: only Dim1 supported"),
-        };
-        let batch = samples.len();
-        let mut mat = Mat::zeros(batch, features);
-        for (i, sample) in samples.iter().enumerate() {
-            match sample {
-                DynamicTensor::Dim1(t) => {
-                    for (j, &val) in t.data[0].iter().enumerate() {
-                        mat[(i, j)] = val;
-                    }
-                }
-                _ => panic!("Inconsistent sample dimensions in samples_to_mat"),
-            }
-        }
-        mat
     }
 
-    pub fn mat_to_samples(mat: &Mat<f32>) -> Vec<DynamicTensor> {
+    fn mat_to_dynamic_tensor(&self, mat: Mat<f32>, shape: &[usize]) -> DynamicTensor {
         let batch = mat.nrows();
-        let features = mat.ncols();
-        let mut samples = Vec::with_capacity(batch);
-        for i in 0..batch {
-            let row: Vec<f32> = (0..features).map(|j| mat[(i, j)]).collect();
-            samples.push(DynamicTensor::Dim1(crate::tensor::Tensor2D::new(vec![row])));
+        match shape.len() {
+            1 => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
+            2 => DynamicTensor::Dim2(linalg::faer_to_tensor3d(&mat, batch, shape[0], shape[1])),
+            3 => DynamicTensor::Dim3(linalg::faer_to_tensor4d(&mat, batch, shape[0], shape[1], shape[2])),
+            4 => DynamicTensor::Dim4(linalg::faer_to_tensor5d(&mat, batch, shape[0], shape[1], shape[2], shape[3])),
+            _ => panic!("Unsupported tensor dimensionality: {} spatial dims", shape.len()),
         }
-        samples
     }
+
+    // ── Статический метод для CPU-проходов ──
 
     pub fn forward_universal_batch_mat(
         layers: &[Box<dyn crate::layers::UniversalLayer>],

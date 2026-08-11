@@ -1,4 +1,9 @@
 // src/compute_manager/graph/builder.rs
+//
+// Построитель вычислительного графа MixedModel.
+// Все внутренние операции используют только матрицы faer::Mat<f32>.
+// Тензоры (DynamicTensor) применяются исключительно на публичных границах
+// (методы forward/backward обёртки), которые реализованы в model.rs.
 
 use std::sync::{Arc, Mutex};
 
@@ -83,6 +88,9 @@ impl MixedModel {
         // 1. Создаём MemoryExecutor и получаем GPU-контекст
         // -----------------------------------------------------------
         let (memory_executor, gpu_context) = device_plan.build_memory_executor();
+
+        eprintln!("[BUILDER] gpu_context is_some = {}", gpu_context.is_some());
+
         let mut mem_exec = memory_executor.lock().unwrap();
 
         // -----------------------------------------------------------
@@ -123,15 +131,22 @@ impl MixedModel {
                 .unwrap_or(0);
             let gpu_executor = crate::compute_manager::gpu::GpuExecutor::new(gpu_ctx.as_ref().clone());
             let pipeline_cache = Arc::new(PipelineCache::new(gpu_ctx.device.clone()));
+
+            eprintln!("[BUILDER] PipelineCache created successfully");
+
             let gpu_compute_instance = GpuCompute::new(
                 gpu_ctx,
                 pipeline_cache,
                 memory_executor.clone(),
                 DeviceId(gpu_id),
             );
+
+            eprintln!("[BUILDER] GpuCompute created successfully");
+
             gpu_compute = Some(Mutex::new(gpu_compute_instance));
             Box::new(gpu_executor)
         } else {
+            eprintln!("[BUILDER] No GPU context, falling back to CPU");
             cpu_executor.clone_executor()
         };
 
@@ -174,7 +189,6 @@ impl MixedModel {
             match &desc.kind {
                 LayerKind::SplitterConnector => {
                     finalize_universal!();
-                    // Для SplitterConnector выходные потоки задают dim_a и dim_b
                     let dims = &desc.output_shape.streams;
                     assert_eq!(dims.len(), 2);
                     segments.push(Segment::SplitterConnector {
@@ -199,7 +213,6 @@ impl MixedModel {
                     finalize_universal!();
                     let input_dim = desc.input_shape.streams[0];
                     let output_dims = desc.output_shape.streams.clone();
-                    // Сначала сохраняем для active_ports, чтобы не перемещать
                     active_ports = Some(output_dims.clone());
                     let mut store_lock = store.lock().unwrap();
                     let slice = store_lock.allocate(desc.param_len());
@@ -228,7 +241,6 @@ impl MixedModel {
                 }
                 LayerKind::Unsqueeze => {
                     finalize_universal!();
-                    // target_dims — это выходная форма (новые размеры)
                     let target_dims = desc.output_shape.streams.clone();
                     segments.push(Segment::Unsqueeze(target_dims));
                 }
@@ -284,7 +296,6 @@ impl MixedModel {
         let segment_placement = assign_devices(&segments, &device_plan, &mut mem_exec, batch_size)
             .map_err(|e| format!("Ошибка распределения устройств с учётом памяти: {}", e))?;
 
-        // Завершаем заимствование memory_executor, чтобы можно было переместить его в структуру
         drop(mem_exec);
 
         // -----------------------------------------------------------
@@ -299,40 +310,36 @@ impl MixedModel {
                 0,
             );
             gpu_param_store = Some(Mutex::new(gpu_store));
+            eprintln!("[BUILDER] GpuParamStore initialized");
         }
 
         // -----------------------------------------------------------
         // 7. Вычисляем ожидаемые формы входных и выходных тензоров
+        //    (используются только для восстановления формы при тензорных обёртках)
         // -----------------------------------------------------------
         let input_shapes: Vec<Vec<usize>> = vec![layers.first().unwrap().input_shape.streams.clone()];
         let output_shapes: Vec<Vec<usize>> = if output_stream_count == 1 {
             vec![layers.last().unwrap().output_shape.streams.clone()]
         } else {
-            // Для моделей с несколькими выходами (например, Splitter) нужно разбить
-            // общий список выходных размеров на части для каждой ветви.
-            // Пока используем простую логику: если последний слой Splitter,
-            // то его output_shape.streams содержит размеры всех выходов подряд,
-            // а output_dims известны из сегмента. Но для универсальности
-            // мы можем извлечь их из последнего сегмента.
             let last_segment = segments.last().unwrap();
             match last_segment {
                 Segment::Splitter { output_dims, .. } => {
-                    // Предполагаем, что каждый выходной поток одномерный (dim),
-                    // но для многомерных нужно знать полную форму.
-                    // В будущем можно расширить.
                     output_dims.iter().map(|&d| vec![d]).collect()
                 }
                 Segment::SplitterConnector { dim_a, dim_b } => {
                     vec![vec![*dim_a], vec![*dim_b]]
                 }
                 _ => {
-                    // fallback: если не Splitter, но несколько выходов, 
-                    // собираем из output_shape последнего слоя? 
-                    // Такой случай пока не поддерживается.
                     vec![]
                 }
             }
         };
+
+        eprintln!(
+            "[BUILDER] gpu_compute.is_some() = {}, gpu_param_store.is_some() = {}",
+            gpu_compute.is_some(),
+            gpu_param_store.is_some()
+        );
 
         // -----------------------------------------------------------
         // 8. Собираем MixedModel
@@ -363,7 +370,7 @@ impl MixedModel {
         Self::from_plan_with_device_plan_and_batch(layers, device_plan, 1)
     }
 
-    /// Сборка модели с планом устройств (вызывается из макроса create_models!).
+    /// Сборка модели с планом устройств (вызывается из публичного API).
     pub(crate) fn build_with_device_plan(
         plan: crate::model_plan::plan::Plan,
         device_plan: DevicePlan,
@@ -372,7 +379,6 @@ impl MixedModel {
     }
 
     /// Сборка модели с планом устройств и указанием размера батча.
-    /// Используется для точного учёта памяти.
     pub(crate) fn build_with_device_plan_and_batch(
         plan: crate::model_plan::plan::Plan,
         device_plan: DevicePlan,

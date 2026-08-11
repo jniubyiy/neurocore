@@ -11,10 +11,9 @@ pub mod device_spec;
 pub mod device_assignment;   // назначение устройств для сегментов
 pub mod device_tensor;       // абстракция тензора над устройствами
 
-// Публичные реэкспорты для удобства пользователей.
-// MixedModel больше не экспортируется – модель создаётся только через TrainingPlan.
+// Публичные реэкспорты
 pub use device::{Device, DeviceDetector, ComputeManager};
 pub use executor::Executor;
-pub use graph::types::{DynamicContext, DynamicBatchTensor};
+pub use graph::types::DynamicContext;  // DynamicBatchTensor удалён, больше не используется
 pub use dim_change::DynamicTensor;
 pub use gpu::GpuExecutor;

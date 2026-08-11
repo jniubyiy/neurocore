@@ -20,9 +20,11 @@ pub fn process_forward_gpu(
     for (layer, slice) in layers.iter().zip(slices.iter()) {
         if let Some(linear) = layer.as_linear() {
             let (weight, bias) = linear.get_weight_matrix_and_bias(params, slice);
+            // Сохраняем вход ДО линейного преобразования
+            let input_for_ctx = current.clone();
             current = gpu_compute.run_linear_forward(&current, &weight, &bias);
             ctxs.push(DynamicContext::Mat(MatContext::Linear {
-                input: current.clone(), // сохраняем вход (до линейного преобразования)
+                input: input_for_ctx,
             }));
         } else if let Some(_) = layer.as_relu() {
             let input_for_ctx = current.clone();

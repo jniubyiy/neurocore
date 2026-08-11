@@ -3,10 +3,14 @@
 use std::time::Instant;
 use faer::Mat;
 use crate::compute_manager::dim_change;
+use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::device_plan::plan::ComputeDevice;
-use crate::layers::UniversalLayer;
+use crate::layers::{
+    UniversalLayer, UniversalLayerBuffered,
+    Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
+};
 use crate::model_plan::param_store::ParamSlice;
 
 impl MixedModel {
@@ -32,13 +36,11 @@ impl MixedModel {
         let param_len = params.len();
         let mut total_grad = vec![0.0f32; param_len];
 
-        // Потоки градиентов: каждый элемент — матрица градиентов для одного потока
         let mut stream_gradients: Vec<Mat<f32>> = deltas.to_vec();
 
         let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
         let mut ctx_pos = total_context_len;
 
-        // Клонируем сегменты, чтобы не удерживать неизменяемую ссылку на self.segments
         let segments = self.segments.clone();
 
         for (seg_index, seg) in segments.iter().enumerate().rev() {
@@ -82,10 +84,10 @@ impl MixedModel {
                             if let Some(ref buffers) = segment_buffers {
                                 crate::compute_manager::gpu::processor::process_backward_gpu(
                                     &gpu,
-                                    buffers,               // &SegmentPersistentBuffers
-                                    proc,                  // &[Box<dyn UniversalLayer>]
-                                    slices,                // &[ParamSlice]
-                                    ctxs_slice,            // &[DynamicContext]
+                                    buffers,
+                                    proc,
+                                    slices,
+                                    ctxs_slice,
                                     &params,
                                     &delta_mat,
                                     &mut total_grad,
@@ -138,7 +140,7 @@ impl MixedModel {
                     stream_gradients = vec![in_a, in_b];
                     ctx_pos -= 1;
                 }
-                Segment::CombinerConnector { input_dims, .. } => {
+                Segment::CombinerConnector { input_dims: _, .. } => {
                     for mat in &mut stream_gradients {
                         let connector = crate::layers::CombinerConnector::new(vec![]);
                         let dummy_ctx = DynamicContext::Mat(
@@ -253,7 +255,6 @@ impl MixedModel {
                 }
             }
 
-            // Запись времени выполнения сегмента
             let duration = start.elapsed().as_nanos() as f64;
             let device = self.segment_placement
                 .get(seg_index)
@@ -271,8 +272,6 @@ impl MixedModel {
         (stream_gradients, vec![total_grad])
     }
 
-    /// Обратный матричный проход (один выход – один вход).
-    /// Оставлен для обратной совместимости.
     pub fn backward_mat(
         &mut self,
         contexts: &[Vec<DynamicContext>],
@@ -301,5 +300,318 @@ impl MixedModel {
             }
         }
         current_delta
+    }
+
+    // ===================================================================
+    // Буферизованная версия обратного прохода (MatrixBuffer + TempMatrixPool)
+    // ===================================================================
+
+    /// Обратный проход с использованием пула временных матриц.
+    /// Принимает контексты (пока `DynamicContext` с `Mat<f32>`),
+    /// градиенты выходов как `Vec<MatrixBuffer>` и возвращает градиенты входов и накопленные градиенты параметров.
+    pub fn backward_mat_multi_buffered(
+        &mut self,
+        pool: &mut TempMatrixPool,
+        contexts: &[Vec<DynamicContext>],
+        deltas: Vec<MatrixBuffer>,
+    ) -> (Vec<MatrixBuffer>, Vec<Vec<f32>>) {
+        assert_eq!(deltas.len(), self.output_stream_count,
+            "backward_mat_multi_buffered: expected {} deltas, got {}",
+            self.output_stream_count, deltas.len());
+
+        let params = self.store.lock().unwrap().all_params().to_vec();
+        let param_len = params.len();
+        let mut total_grad = vec![0.0f32; param_len];
+
+        let mut stream_gradients = deltas;
+        let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
+        let mut ctx_pos = total_context_len;
+
+        let segments = self.segments.clone();
+
+        for (seg_index, seg) in segments.iter().enumerate().rev() {
+            let start = Instant::now();
+
+            match seg {
+                Segment::Unsqueeze(target_dims) => {
+                    let mut new_stream = Vec::with_capacity(stream_gradients.len());
+                    for buf in stream_gradients {
+                        new_stream.push(dim_change::reduce_mat_buffered(pool, buf, target_dims));
+                    }
+                    stream_gradients = new_stream;
+                }
+                Segment::ReduceMean(target_dims) => {
+                    let mut new_stream = Vec::with_capacity(stream_gradients.len());
+                    for buf in stream_gradients {
+                        new_stream.push(dim_change::unsqueeze_mat_buffered(pool, buf, target_dims));
+                    }
+                    stream_gradients = new_stream;
+                }
+                Segment::UniversalProcessor(proc, slices, stream_indices) => {
+                    let num_layers = proc.len();
+                    let active_indices: Vec<usize> = match stream_indices {
+                        Some(indices) => indices.clone(),
+                        None => (0..stream_gradients.len()).collect(),
+                    };
+
+                    let mut new_gradients: Vec<Option<MatrixBuffer>> =
+                        (0..stream_gradients.len()).map(|_| None).collect();
+
+                    for &stream_idx in &active_indices {
+                        let delta_buf = std::mem::replace(
+                            &mut stream_gradients[stream_idx],
+                            MatrixBuffer::dummy(pool),
+                        );
+                        let pos_in_sorted = active_indices.iter().position(|&x| x == stream_idx).unwrap();
+                        let stream_ctx_start = ctx_pos - (active_indices.len() - pos_in_sorted) * num_layers;
+                        let layer_ctxs: Vec<&DynamicContext> = contexts[0]
+                            [stream_ctx_start..stream_ctx_start + num_layers]
+                            .iter()
+                            .collect();
+
+                        let ctxs_owned: Vec<DynamicContext> = layer_ctxs.iter().map(|&c| c.clone()).collect();
+                        let ctxs_slice: &[DynamicContext] = &ctxs_owned;
+
+                        let in_delta_buf = self.backward_universal_batch_buffered(
+                            pool,
+                            proc,
+                            slices,
+                            &layer_ctxs,
+                            delta_buf,
+                            &params,
+                            &mut total_grad,
+                        );
+
+                        new_gradients[stream_idx] = Some(in_delta_buf);
+                    }
+
+                    // Подставляем результаты в stream_gradients
+                    let mut final_grads = Vec::with_capacity(stream_gradients.len());
+                    for i in 0..stream_gradients.len() {
+                        if let Some(buf) = new_gradients[i].take() {
+                            final_grads.push(buf);
+                        } else {
+                            final_grads.push(std::mem::replace(
+                                &mut stream_gradients[i],
+                                MatrixBuffer::dummy(pool),
+                            ));
+                        }
+                    }
+                    stream_gradients = final_grads;
+
+                    ctx_pos -= num_layers * active_indices.len();
+                }
+                Segment::SplitterConnector { .. } |
+                Segment::CombinerConnector { .. } |
+                Segment::Splitter { .. } |
+                Segment::Combiner { .. } => {
+                    let mut mat_streams: Vec<Mat<f32>> = stream_gradients.iter()
+                        .map(|b| b.to_mat())
+                        .collect();
+                    let (new_mat_streams, _) = self.backward_mat_multi_segment(
+                        contexts,
+                        &mat_streams,
+                        seg_index,
+                        seg,
+                        &params,
+                        &mut total_grad,
+                        &mut ctx_pos,
+                    );
+                    for buf in stream_gradients {
+                        pool.release(buf);
+                    }
+                    stream_gradients = new_mat_streams.into_iter()
+                        .map(|m| {
+                            let mut buf = pool.acquire(m.nrows(), m.ncols());
+                            buf.copy_from_mat(&m);
+                            buf
+                        })
+                        .collect();
+                }
+            }
+
+            let duration = start.elapsed().as_nanos() as f64;
+            let device = self.segment_placement
+                .get(seg_index)
+                .map(|p| p.compute_device.clone())
+                .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+            self.record_segment_timing(seg_index, &device, duration);
+        }
+
+        assert_eq!(stream_gradients.len(), self.input_stream_count);
+        (stream_gradients, vec![total_grad])
+    }
+
+    /// Обработка одного сегмента в старом стиле (для Splitter/Combiner/коннекторов)
+    fn backward_mat_multi_segment(
+        &mut self,
+        contexts: &[Vec<DynamicContext>],
+        stream_gradients: &[Mat<f32>],
+        seg_index: usize,
+        seg: &Segment,
+        params: &[f32],
+        total_grad: &mut Vec<f32>,
+        ctx_pos: &mut usize,
+    ) -> (Vec<Mat<f32>>, ()) {
+        let mut new_gradients = stream_gradients.to_vec();
+        match seg {
+            Segment::SplitterConnector { dim_a, dim_b } => {
+                assert_eq!(new_gradients.len(), 2);
+                let connector = crate::layers::SplitterConnector::new(*dim_a, *dim_b);
+                let dummy_ctx = DynamicContext::Mat(
+                    crate::layers::mat_context::MatContext::SplitterConnector {
+                        input: Mat::zeros(0, 0),
+                    },
+                );
+                let (in_a, in_b, _) = connector.backward_mat(
+                    &dummy_ctx,
+                    &new_gradients[0],
+                    &new_gradients[1],
+                );
+                new_gradients = vec![in_a, in_b];
+                *ctx_pos -= 1;
+            }
+            Segment::CombinerConnector { .. } => {
+                for mat in new_gradients.iter_mut() {
+                    let connector = crate::layers::CombinerConnector::new(vec![]);
+                    let dummy_ctx = DynamicContext::Mat(
+                        crate::layers::mat_context::MatContext::CombinerConnector {
+                            inputs: vec![Mat::zeros(0, 0)],
+                        },
+                    );
+                    let (in_mat, _) = connector.backward_mat(&dummy_ctx, mat);
+                    *mat = in_mat;
+                }
+                *ctx_pos -= 1;
+            }
+            Segment::Splitter { input_dim, output_dims, slice } => {
+                let ctx = &contexts[0][*ctx_pos - 1];
+                let (x_mat, pre_a_mat, pre_b_mat) = match ctx {
+                    DynamicContext::Mat(
+                        crate::layers::mat_context::MatContext::Splitter { input, pre_a, pre_b }
+                    ) => (input.clone(), pre_a.clone(), pre_b.clone()),
+                    _ => panic!("Expected Splitter context"),
+                };
+                let da = new_gradients[0].clone();
+                let db = new_gradients[1].clone();
+                let (wa, wb, _, _) = crate::layers::Splitter::new(*input_dim, output_dims.clone())
+                    .get_weights_and_biases(params, slice);
+                let (dx, grad) = crate::layers::Splitter::new(*input_dim, output_dims.clone())
+                    .backward_mat(&x_mat, &da, &db, &pre_a_mat, &pre_b_mat, &wa, &wb);
+                for (idx, &g) in grad.iter().enumerate() {
+                    total_grad[slice.start + idx] += g;
+                }
+                new_gradients = vec![dx];
+                *ctx_pos -= 1;
+            }
+            Segment::Combiner { input_dim, output_dim, slice } => {
+                let ctx = &contexts[0][*ctx_pos - 1];
+                let (a_mat, b_mat, pre_mat) = match ctx {
+                    DynamicContext::Mat(
+                        crate::layers::mat_context::MatContext::Combiner { input_a, input_b, pre_act }
+                    ) => (input_a.clone(), input_b.clone(), pre_act.clone()),
+                    _ => panic!("Expected Combiner context"),
+                };
+                let dout = new_gradients[0].clone();
+                let combiner = crate::layers::Combiner::new(vec![*input_dim, *input_dim], *output_dim);
+                let (wa, wb, _) = combiner.get_weights_and_bias(params, slice);
+                let (da, db, grad) = combiner.backward_mat(&a_mat, &b_mat, &dout, params, slice);
+                for (idx, &g) in grad.iter().enumerate() {
+                    total_grad[slice.start + idx] += g;
+                }
+                new_gradients = vec![da, db];
+                *ctx_pos -= 1;
+            }
+            _ => {}
+        }
+        (new_gradients, ())
+    }
+
+    /// Универсальный обратный проход через слои с использованием MatrixBuffer
+    fn backward_universal_batch_buffered(
+        &mut self,
+        pool: &mut TempMatrixPool,
+        layers: &[Box<dyn UniversalLayer>],
+        slices: &[ParamSlice],
+        ctxs: &[&DynamicContext],
+        grad_out: MatrixBuffer,
+        params: &[f32],
+        total_grad: &mut Vec<f32>,
+    ) -> MatrixBuffer {
+        let mut current_grad = grad_out;
+        for i in (0..layers.len()).rev() {
+            let layer = &layers[i];
+            let slice = &slices[i];
+            let ctx = ctxs[i];
+
+            // Явно разрешаем неоднозначность input_features через трейт UniversalLayer
+            let in_features = if let Some(l) = layer.as_linear() {
+                <dyn UniversalLayer>::input_features(l)
+            } else if let Some(l) = layer.as_relu() {
+                <dyn UniversalLayer>::input_features(l)
+            } else if let Some(l) = layer.as_sigmoid() {
+                <dyn UniversalLayer>::input_features(l)
+            } else if let Some(l) = layer.as_tanh() {
+                <dyn UniversalLayer>::input_features(l)
+            } else if let Some(l) = layer.as_leaky_relu() {
+                <dyn UniversalLayer>::input_features(l)
+            } else if let Some(l) = layer.as_identity() {
+                <dyn UniversalLayer>::input_features(l)
+            } else if let Some(l) = layer.as_softmax() {
+                <dyn UniversalLayer>::input_features(l)
+            } else {
+                // fallback – используем число столбцов текущего градиента
+                current_grad.cols()
+            };
+
+            // Для слоёв без параметров (ReLU и т.п.) input_features возвращает 0,
+            // но реальная размерность определяется current_grad. Поэтому подменяем.
+            let real_in_features = if in_features == 0 { current_grad.cols() } else { in_features };
+            let batch = current_grad.rows();
+            let mut grad_input = pool.acquire(batch, real_in_features);
+
+            let grad_params = if let Some(linear) = layer.as_linear() {
+                <Linear as UniversalLayerBuffered>::backward_buffered(
+                    linear, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(relu) = layer.as_relu() {
+                <ReLU as UniversalLayerBuffered>::backward_buffered(
+                    relu, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(sigmoid) = layer.as_sigmoid() {
+                <Sigmoid as UniversalLayerBuffered>::backward_buffered(
+                    sigmoid, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(tanh) = layer.as_tanh() {
+                <Tanh as UniversalLayerBuffered>::backward_buffered(
+                    tanh, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(leaky) = layer.as_leaky_relu() {
+                <LeakyReLU as UniversalLayerBuffered>::backward_buffered(
+                    leaky, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(identity) = layer.as_identity() {
+                <Identity as UniversalLayerBuffered>::backward_buffered(
+                    identity, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(softmax) = layer.as_softmax() {
+                <Softmax as UniversalLayerBuffered>::backward_buffered(
+                    softmax, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else {
+                // fallback на старый метод
+                let (dx, grad) = layer.backward_mat(ctx, &current_grad.to_mat(), params, slice);
+                grad_input.copy_from_mat(&dx);
+                grad
+            };
+
+            for (idx, &g) in grad_params.iter().enumerate() {
+                total_grad[slice.start + idx] += g;
+            }
+
+            pool.release(current_grad);
+            current_grad = grad_input;
+        }
+        current_grad
     }
 }

@@ -18,6 +18,7 @@ use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::gpu::GpuCompute;
 use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::compute_manager::graph::model::{DevicePlacementState, MixedModel};
+use crate::compute_manager::matrix_buffer::TempMatrixPool;
 use crate::device_plan::{ComputeDevice, DevicePlan};
 use crate::layers::UniversalLayer;
 use crate::model_plan::layer_desc::LayerDesc;
@@ -327,6 +328,11 @@ impl MixedModel {
             }
         };
 
+        // -----------------------------------------------------------
+        // 8. Создаём пул временных матриц
+        // -----------------------------------------------------------
+        let temp_matrix_pool = Arc::new(Mutex::new(TempMatrixPool::new(memory_executor.clone())));
+
         eprintln!(
             "[BUILDER] gpu_compute.is_some() = {}, gpu_param_store.is_some() = {}",
             gpu_compute.is_some(),
@@ -334,7 +340,7 @@ impl MixedModel {
         );
 
         // -----------------------------------------------------------
-        // 8. Собираем MixedModel с начальным состоянием размещения
+        // 9. Собираем MixedModel с начальным состоянием размещения
         // -----------------------------------------------------------
         let mut model = MixedModel {
             segments,
@@ -356,10 +362,11 @@ impl MixedModel {
                 profiling_data: crate::compute_manager::adaptive_planner::ProfilingData::new(),
                 placements: vec![],
             })),
+            temp_matrix_pool,
         };
 
         // -----------------------------------------------------------
-        // 9. Выделяем постоянные буферы для начального размещения
+        // 10. Выделяем постоянные буферы для начального размещения
         // -----------------------------------------------------------
         model.maybe_reassign_devices(&device_plan, batch_size);
 

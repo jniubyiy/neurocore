@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -31,6 +33,10 @@ impl Linear {
         (weight, bias)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для GPU и обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for Linear {
     fn forward_mat(
@@ -70,7 +76,8 @@ impl UniversalLayer for Linear {
             }
         }
 
-        let mut grad = Vec::with_capacity(self.param_len());
+        // Явное разрешение конфликта имён
+        let mut grad = Vec::with_capacity(<Self as UniversalLayer>::param_len(self));
         for r in 0..self.out_features {
             for c in 0..self.in_features {
                 grad.push(dw[(r, c)]);
@@ -124,4 +131,76 @@ impl UniversalLayer for Linear {
     fn as_linear(&self) -> Option<&Linear> {
         Some(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for Linear {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) {
+        let (weight, bias) = self.get_weight_matrix_and_bias(params, slice);
+        let inp = input.as_mat();
+        let mut out = output.as_mat_mut();
+
+        let result = &inp * &weight.transpose();
+        let batch = input.rows();
+        // Создаём матрицу bias как Mat и прибавляем
+        let bias_mat = Mat::from_fn(batch, self.out_features, |_, j| bias[j]);
+        let out_mat = result + bias_mat;
+        out.copy_from(&out_mat);
+    }
+
+    fn backward_buffered(
+        &self,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> Vec<f32> {
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::Linear { input }) => input.clone(),
+            _ => panic!("Expected Linear context"),
+        };
+        let (weight, _) = self.get_weight_matrix_and_bias(params, slice);
+
+        let go = grad_output.as_mat();
+        let mut gi = grad_input.as_mat_mut();
+
+        let dx = &go * &weight;
+        gi.copy_from(&dx);
+
+        let dw = go.transpose() * &x_mat;
+        let batch = go.nrows();
+        let mut db = vec![0.0f32; self.out_features];
+        for r in 0..batch {
+            for c in 0..self.out_features {
+                db[c] += go[(r, c)];
+            }
+        }
+
+        let mut grad = Vec::with_capacity(<Self as UniversalLayerBuffered>::param_len(self));
+        for r in 0..self.out_features {
+            for c in 0..self.in_features {
+                grad.push(dw[(r, c)]);
+            }
+        }
+        grad.extend_from_slice(&db);
+        grad
+    }
+
+    fn param_len(&self) -> usize {
+        self.in_features * self.out_features + self.out_features
+    }
+
+    fn input_features(&self) -> usize { self.in_features }
+
+    fn output_features(&self) -> usize { self.out_features }
 }

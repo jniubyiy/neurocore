@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -11,6 +13,10 @@ pub struct LeakyReLU {
 impl LeakyReLU {
     pub fn new(alpha: f32) -> Self { Self { alpha } }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для GPU и обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for LeakyReLU {
     fn forward_mat(
@@ -81,4 +87,55 @@ impl UniversalLayer for LeakyReLU {
     fn as_leaky_relu(&self) -> Option<&LeakyReLU> {
         Some(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for LeakyReLU {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) {
+        let inp = input.as_mat();
+        let mut out = output.as_mat_mut();
+
+        // Поэлементно применяем LeakyReLU и записываем результат в выходной буфер
+        let temp = Mat::from_fn(inp.nrows(), inp.ncols(), |r, c| {
+            let x = inp[(r, c)];
+            if x > 0.0 { x } else { self.alpha * x }
+        });
+        out.copy_from(&temp);
+    }
+
+    fn backward_buffered(
+        &self,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> Vec<f32> {
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::LeakyReLU { input }) => input.clone(),
+            _ => panic!("Expected LeakyReLU context"),
+        };
+        let go = grad_output.as_mat();
+        let mut gi = grad_input.as_mat_mut();
+
+        let dx = Mat::from_fn(x_mat.nrows(), x_mat.ncols(), |r, c| {
+            let grad = if x_mat[(r, c)] > 0.0 { 1.0 } else { self.alpha };
+            go[(r, c)] * grad
+        });
+        gi.copy_from(&dx);
+        Vec::new()
+    }
+
+    fn param_len(&self) -> usize { 0 }
+    fn input_features(&self) -> usize { 0 }
+    fn output_features(&self) -> usize { 0 }
 }

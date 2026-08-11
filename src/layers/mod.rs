@@ -21,7 +21,12 @@ pub mod layers_special;
 
 use crate::model_plan::param_store::ParamSlice;
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use faer::Mat;
+
+// ---------------------------------------------------------------------------
+// Старый трейт UniversalLayer (оставлен для обратной совместимости)
+// ---------------------------------------------------------------------------
 
 pub trait UniversalLayer: Send + Sync + 'static {
     fn forward_mat(
@@ -81,7 +86,66 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_memory(&self) -> Option<&Memory> { None }
 }
 
+// ---------------------------------------------------------------------------
+// Новый трейт UniversalLayerBuffered – основа для работы с буферами
+// ---------------------------------------------------------------------------
+
+/// Версия слоя, работающая с управляемыми буферами [`MatrixBuffer`].
+///
+/// Входные и выходные данные передаются через пул временных матриц,
+/// что позволяет `MemoryExecutor` отслеживать и переиспользовать память.
+pub trait UniversalLayerBuffered: Send + Sync + 'static {
+    /// Прямой проход.
+    ///
+    /// # Аргументы
+    /// * `input` – входная матрица (доступна только для чтения).
+    /// * `output` – матрица, в которую будет записан результат.
+    ///   Должна иметь размер `(batch_size, output_features())`.
+    /// * `params` – плоский срез всех параметров модели.
+    /// * `slice` – границы параметров, принадлежащих данному слою.
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    );
+
+    /// Обратный проход.
+    ///
+    /// # Аргументы
+    /// * `ctx` – контекст, сохранённый прямым проходом (пока старая версия,
+    ///   в будущем будет заменён на хранение [`MatrixBuffer`]).
+    /// * `grad_output` – градиент по выходу слоя.
+    /// * `grad_input` – буфер, куда будет записан градиент по входу.
+    /// * `params` – плоский срез всех параметров модели.
+    /// * `slice` – границы параметров, принадлежащих данному слою.
+    ///
+    /// # Возвращает
+    /// Вектор градиентов по параметрам слоя.
+    fn backward_buffered(
+        &self,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> Vec<f32>;
+
+    /// Количество обучаемых параметров слоя.
+    fn param_len(&self) -> usize;
+
+    /// Количество входных признаков.
+    fn input_features(&self) -> usize;
+
+    /// Количество выходных признаков.
+    fn output_features(&self) -> usize;
+}
+
+// ---------------------------------------------------------------------------
 // Публичные реэкспорты
+// ---------------------------------------------------------------------------
+
 pub use linear::Linear;
 pub use relu::ReLU;
 pub use sigmoid::Sigmoid;

@@ -8,8 +8,10 @@ use crate::compute_manager::cpu::worker_pool::WorkerPool;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::gpu::processor::process_forward_gpu;
+use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
 use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
-use crate::layers::UniversalLayer;
+use crate::layers::{UniversalLayer, UniversalLayerBuffered};
+use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
 
 impl MixedModel {
@@ -28,7 +30,6 @@ impl MixedModel {
             None => (0..stream_matrices.len()).collect(),
         };
 
-        // --- GPU‑путь ---
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
             let buffers = self.get_segment_buffers(seg_index);
             let gpu_compute = gpu_compute_mutex.lock().unwrap();
@@ -45,7 +46,6 @@ impl MixedModel {
                         &input_mat,
                     )
                 } else {
-                    // fallback – создаём временные буферы
                     let temp_buffers = SegmentPersistentBuffers::for_segment(
                         &self.segments[seg_index],
                         &self.segment_placement[seg_index].compute_device,
@@ -70,7 +70,6 @@ impl MixedModel {
             return;
         }
 
-        // --- CPU‑путь (многопоточный) ---
         let layers_arc = Arc::clone(proc);
         let slices_arc = Arc::new(slices.to_vec());
         let mut receivers = Vec::with_capacity(active_indices.len());
@@ -168,5 +167,147 @@ impl MixedModel {
                 all_ctxs[sample_idx].extend(ctxs);
             }
         }
+    }
+
+    pub(crate) fn process_universal_processor_forward_buffered(
+        &mut self,
+        pool: &mut TempMatrixPool,
+        proc: &Arc<Vec<Box<dyn UniversalLayer>>>,
+        slices: &[ParamSlice],
+        _seg_index: usize,
+        params: &[f32],
+        stream_buffers: &mut Vec<MatrixBuffer>,
+        all_ctxs: &mut Vec<Vec<DynamicContext>>,
+        stream_indices: &Option<Vec<usize>>,
+    ) {
+        let active_indices: Vec<usize> = match stream_indices {
+            Some(indices) => indices.clone(),
+            None => (0..stream_buffers.len()).collect(),
+        };
+
+        let layers = proc.as_ref();
+        let num_layers = layers.len();
+
+        let mut stream_opt: Vec<Option<MatrixBuffer>> = std::mem::take(stream_buffers)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let total_streams = stream_opt.len();
+
+        let mut new_stream: Vec<MatrixBuffer> = Vec::with_capacity(active_indices.len());
+
+        for &stream_idx in &active_indices {
+            let mut current_input = stream_opt[stream_idx].take().unwrap();
+            let batch_size = current_input.rows();
+            let mut layer_ctxs: Vec<DynamicContext> = Vec::with_capacity(num_layers);
+
+            for i in 0..num_layers {
+                let layer = &layers[i];
+                let slice = &slices[i];
+
+                let out_features = get_buffered_output_features(layer, &current_input);
+
+                let mut output_buf = pool.acquire(batch_size, out_features);
+
+                call_forward_buffered(layer, &current_input, &mut output_buf, params, slice);
+
+                let mat_ctx = build_mat_context(layer, &current_input, &output_buf);
+                layer_ctxs.push(DynamicContext::Mat(mat_ctx));
+
+                current_input = output_buf;
+            }
+
+            new_stream.push(current_input);
+
+            for sample_ctxs in all_ctxs.iter_mut() {
+                sample_ctxs.extend(layer_ctxs.clone());
+            }
+        }
+
+        let mut final_buffers = Vec::with_capacity(total_streams);
+        for i in 0..total_streams {
+            if active_indices.contains(&i) {
+                final_buffers.push(new_stream.remove(0));
+            } else {
+                final_buffers.push(stream_opt[i].take().unwrap());
+            }
+        }
+        *stream_buffers = final_buffers;
+    }
+}
+
+/// Возвращает количество выходных признаков слоя, используя UniversalLayerBuffered,
+/// а для не-буферизованных слоёв — размерность входа.
+fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBuffer) -> usize {
+    if let Some(l) = layer.as_linear() {
+        <dyn UniversalLayerBuffered>::output_features(l)
+    } else if layer.as_relu().is_some()
+        || layer.as_sigmoid().is_some()
+        || layer.as_tanh().is_some()
+        || layer.as_leaky_relu().is_some()
+        || layer.as_identity().is_some()
+        || layer.as_softmax().is_some()
+        || layer.as_memory().is_some()
+        || layer.as_soft_sparse_gate().is_some()
+        || layer.as_soft_keep_gate().is_some()
+        || layer.as_dual_anchor().is_some()
+    {
+        // Для этих слоёв выходная размерность равна входной
+        input.cols()
+    } else {
+        // Fallback
+        input.cols()
+    }
+}
+
+fn call_forward_buffered(
+    layer: &Box<dyn UniversalLayer>,
+    input: &MatrixBuffer,
+    output: &mut MatrixBuffer,
+    params: &[f32],
+    slice: &ParamSlice,
+) {
+    if let Some(l) = layer.as_linear() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_relu() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_sigmoid() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_tanh() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_leaky_relu() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_identity() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_softmax() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else {
+        let mat_in = input.to_mat();
+        let (mat_out, _ctx) = layer.forward_mat(&mat_in, params, slice);
+        output.copy_from_mat(&mat_out);
+    }
+}
+
+fn build_mat_context(
+    layer: &Box<dyn UniversalLayer>,
+    input: &MatrixBuffer,
+    output: &MatrixBuffer,
+) -> MatContext {
+    if layer.as_linear().is_some() {
+        MatContext::Linear { input: input.to_mat() }
+    } else if layer.as_relu().is_some() {
+        MatContext::ReLU { input: input.to_mat() }
+    } else if layer.as_sigmoid().is_some() {
+        MatContext::Sigmoid { output: output.to_mat() }
+    } else if layer.as_tanh().is_some() {
+        MatContext::Tanh { output: output.to_mat() }
+    } else if layer.as_leaky_relu().is_some() {
+        MatContext::LeakyReLU { input: input.to_mat() }
+    } else if layer.as_identity().is_some() {
+        MatContext::Identity { input: input.to_mat() }
+    } else if layer.as_softmax().is_some() {
+        MatContext::Softmax { output: output.to_mat() }
+    } else {
+        MatContext::Identity { input: input.to_mat() }
     }
 }

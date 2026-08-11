@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -9,6 +11,10 @@ pub struct Identity;
 impl Identity {
     pub fn new() -> Self { Self }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для GPU и обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for Identity {
     fn forward_mat(
@@ -69,4 +75,40 @@ impl UniversalLayer for Identity {
     fn as_identity(&self) -> Option<&Identity> {
         Some(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for Identity {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) {
+        let inp = input.as_mat();
+        let mut out = output.as_mat_mut();
+        out.copy_from(&inp);
+    }
+
+    fn backward_buffered(
+        &self,
+        _ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> Vec<f32> {
+        let go = grad_output.as_mat();
+        let mut gi = grad_input.as_mat_mut();
+        gi.copy_from(&go);
+        Vec::new()
+    }
+
+    fn param_len(&self) -> usize { 0 }
+    fn input_features(&self) -> usize { 0 }
+    fn output_features(&self) -> usize { 0 }
 }

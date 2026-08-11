@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -9,6 +11,10 @@ pub struct Tanh;
 impl Tanh {
     pub fn new() -> Self { Self }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для GPU и обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for Tanh {
     fn forward_mat(
@@ -79,4 +85,53 @@ impl UniversalLayer for Tanh {
     fn as_tanh(&self) -> Option<&Tanh> {
         Some(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for Tanh {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) {
+        let inp = input.as_mat();
+        let mut out = output.as_mat_mut();
+
+        // Вычисляем tanh во временную матрицу и копируем в выходной буфер
+        let temp = inp.map(|x| x.tanh());
+        out.copy_from(&temp);
+    }
+
+    fn backward_buffered(
+        &self,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> Vec<f32> {
+        // Извлекаем выход tanh, сохранённый в контексте (пока Mat<f32>)
+        let y_mat = match ctx {
+            DynamicContext::Mat(MatContext::Tanh { output }) => output.clone(),
+            _ => panic!("Expected Tanh context"),
+        };
+        let go = grad_output.as_mat();
+        let mut gi = grad_input.as_mat_mut();
+
+        let dx = Mat::from_fn(y_mat.nrows(), y_mat.ncols(), |r, c| {
+            let val = y_mat[(r, c)];
+            go[(r, c)] * (1.0 - val * val)
+        });
+        gi.copy_from(&dx);
+        Vec::new()
+    }
+
+    fn param_len(&self) -> usize { 0 }
+    fn input_features(&self) -> usize { 0 }
+    fn output_features(&self) -> usize { 0 }
 }

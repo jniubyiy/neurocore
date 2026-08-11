@@ -3,6 +3,9 @@
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 use faer::Mat;
 
+use crate::compute_manager::MatrixBuffer;
+use crate::compute_manager::TempMatrixPool;
+
 #[derive(Clone, Debug)]
 pub enum DynamicTensor {
     Dim1(Tensor2D),
@@ -180,4 +183,77 @@ pub fn reduce_mat(
 
     assert_eq!(total, new_rows * new_cols, "reduce_mat: element count mismatch");
     reshape_matrix(mat, new_rows, new_cols)
+}
+
+// ------------------ Буферизованные версии (под управлением MemoryExecutor) ------------------
+
+/// Версия `unsqueeze_mat` с использованием [`MatrixBuffer`] и пула [`TempMatrixPool`].
+pub fn unsqueeze_mat_buffered(
+    pool: &mut TempMatrixPool,
+    input: MatrixBuffer,
+    target_dims: &[usize],
+) -> MatrixBuffer {
+    let batch = input.rows();
+    let features = input.cols();
+    let total_new: usize = target_dims.iter().product();
+    assert_eq!(features, total_new, "unsqueeze_mat_buffered: features mismatch");
+
+    let last_dim = target_dims[target_dims.len() - 1];
+    let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
+    let new_rows = batch * remaining_product;
+    let new_cols = last_dim;
+
+    let mut output = pool.acquire(new_rows, new_cols);
+
+    // Ограничиваем область действия guard, чтобы output можно было переместить
+    {
+        let src = input.to_mat();
+        let mut dst = output.as_mat_mut();  // guard начинает заимствование output
+        let mut idx = 0;
+        for c in 0..src.ncols() {
+            for r in 0..src.nrows() {
+                let dst_r = idx / new_cols;
+                let dst_c = idx % new_cols;
+                dst[(dst_r, dst_c)] = src[(r, c)];
+                idx += 1;
+            }
+        }
+        // Здесь guard дропается, освобождая заимствование output
+    }
+
+    output
+}
+
+/// Версия `reduce_mat` с использованием [`MatrixBuffer`] и пула [`TempMatrixPool`].
+pub fn reduce_mat_buffered(
+    pool: &mut TempMatrixPool,
+    input: MatrixBuffer,
+    target_dims: &[usize],
+) -> MatrixBuffer {
+    let total = input.rows() * input.cols();
+    let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
+    let batch = input.rows() / remaining_product;
+    let new_rows = batch;
+    let new_cols = total / new_rows;
+
+    assert_eq!(total, new_rows * new_cols, "reduce_mat_buffered: element count mismatch");
+
+    let mut output = pool.acquire(new_rows, new_cols);
+
+    {
+        let src = input.to_mat();
+        let mut dst = output.as_mat_mut();
+        let mut idx = 0;
+        for c in 0..src.ncols() {
+            for r in 0..src.nrows() {
+                let dst_r = idx / new_cols;
+                let dst_c = idx % new_cols;
+                dst[(dst_r, dst_c)] = src[(r, c)];
+                idx += 1;
+            }
+        }
+        // guard дропается
+    }
+
+    output
 }

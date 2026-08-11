@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -57,6 +59,10 @@ impl Memory {
         output
     }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for Memory {
     fn forward_mat(
@@ -121,4 +127,47 @@ impl UniversalLayer for Memory {
     fn as_memory(&self) -> Option<&Memory> {
         Some(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for Memory {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) {
+        let inp = input.as_mat();
+        let mut out = output.as_mat_mut();
+
+        // Memory слой модифицирует внутреннее состояние, поэтому используем forward_mat_impl
+        let result = self.forward_mat_impl(&inp.to_owned()); // передача Mat<f32>
+        out.copy_from(&result);
+    }
+
+    fn backward_buffered(
+        &self,
+        _ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> Vec<f32> {
+        let go = grad_output.as_mat();
+        let mut gi = grad_input.as_mat_mut();
+
+        let factor = 1.0 - self.alpha;
+        // Копируем градиент, умноженный на factor
+        let dx = go.map(|v| v * factor);
+        gi.copy_from(&dx);
+        Vec::new()
+    }
+
+    fn param_len(&self) -> usize { 0 }
+    fn input_features(&self) -> usize { self.features }
+    fn output_features(&self) -> usize { self.features }
 }

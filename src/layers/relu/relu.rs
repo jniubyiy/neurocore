@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -9,6 +11,10 @@ pub struct ReLU;
 impl ReLU {
     pub fn new() -> Self { Self }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для GPU и обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for ReLU {
     fn forward_mat(
@@ -78,4 +84,56 @@ impl UniversalLayer for ReLU {
     fn as_relu(&self) -> Option<&ReLU> {
         Some(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for ReLU {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) {
+        let inp = input.as_mat();
+        let mut out = output.as_mat_mut();
+
+        // Поэлементно применяем ReLU с записью в выходной буфер.
+        // Можно скопировать результат из временного Mat, но чтобы избежать лишнего выделения,
+        // используем faer-операцию map над MatRef? Однако map возвращает новый Mat.
+        // Поэтому создадим временный Mat через Mat::from_fn, но затем скопируем в out.
+        let temp = Mat::from_fn(inp.nrows(), inp.ncols(), |r, c| inp[(r, c)].max(0.0));
+        out.copy_from(&temp);
+    }
+
+    fn backward_buffered(
+        &self,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        _params: &[f32],
+        _slice: &ParamSlice,
+    ) -> Vec<f32> {
+        // На данном этапе контекст всё ещё хранит Mat<f32>, извлекаем его
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::ReLU { input }) => input.clone(),
+            _ => panic!("Expected ReLU context"),
+        };
+        let go = grad_output.as_mat();
+        let mut gi = grad_input.as_mat_mut();
+
+        let dx = Mat::from_fn(x_mat.nrows(), x_mat.ncols(), |r, c| {
+            if x_mat[(r, c)] > 0.0 { go[(r, c)] } else { 0.0 }
+        });
+        gi.copy_from(&dx);
+        // ReLU не имеет параметров, возвращаем пустой градиент
+        Vec::new()
+    }
+
+    fn param_len(&self) -> usize { 0 }
+    fn input_features(&self) -> usize { 0 }
+    fn output_features(&self) -> usize { 0 }
 }

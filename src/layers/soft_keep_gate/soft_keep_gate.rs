@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -15,6 +17,10 @@ impl SoftKeepGate {
         Self { in_features, temperature }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для GPU и обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for SoftKeepGate {
     fn forward_mat(
@@ -100,6 +106,93 @@ impl UniversalLayer for SoftKeepGate {
     fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> {
         Some(self)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for SoftKeepGate {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) {
+        let rows = input.rows();
+        let cols = input.cols();
+        debug_assert_eq!(cols, self.in_features);
+
+        let thresholds = &params[slice.start..slice.start + self.in_features];
+        let tmp = self.temperature;
+
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        debug_assert_eq!(src.len(), dst.len());
+
+        for idx in 0..src.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+
+            let x = src[idx];
+            let abs_x = x.abs();
+            let z = (thresholds[c] - abs_x) / tmp;
+            let s = 1.0 / (1.0 + (-z).exp());
+            dst[idx] = x * s;
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> Vec<f32> {
+        // Извлекаем входную матрицу из контекста без копирования
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::SoftKeepGate { input }) => input,
+            _ => panic!("Expected SoftKeepGate context"),
+        };
+
+        let rows = grad_output.rows();
+        let cols = grad_output.cols();
+        debug_assert_eq!(cols, self.in_features);
+
+        let thresholds = &params[slice.start..slice.start + self.in_features];
+        let tmp = self.temperature;
+
+        let go = grad_output.as_slice();
+        let gi = grad_input.as_slice_mut();
+        debug_assert_eq!(go.len(), gi.len());
+
+        let mut d_thr = vec![0.0f32; self.in_features];
+
+        for idx in 0..go.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+
+            let x_val = x_mat[(r, c)];
+            let abs_x = x_val.abs();
+            let z = (thresholds[c] - abs_x) / tmp;
+            let s = 1.0 / (1.0 + (-z).exp());
+            let ds = s * (1.0 - s) / tmp;
+            let df_dx = s - abs_x * ds; // производная по x для SoftKeepGate
+
+            gi[idx] = go[idx] * df_dx;
+
+            // Градиент по порогам: d_s_dthr = ds
+            d_thr[c] += go[idx] * x_val * ds;
+        }
+
+        d_thr
+    }
+
+    fn param_len(&self) -> usize { self.in_features }
+    fn input_features(&self) -> usize { self.in_features }
+    fn output_features(&self) -> usize { self.in_features }
 }
 
 fn soft_keep_gate_backward_mat(

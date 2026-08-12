@@ -415,15 +415,44 @@ impl MixedModel {
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
             if use_gpu {
                 let gpu_compute = gpu_compute_mutex.lock().unwrap();
-                crate::loss_plan::compute_loss_gpu(&gpu_compute, &expr, pred, target)
+                // Конвертируем Mat в GPU MatrixBuffer
+                let pred_gpu = gpu_compute.upload_mat_to_gpu_matrix(pred);
+                let target_gpu = gpu_compute.upload_mat_to_gpu_matrix(target);
+                let (loss, grad_pred_gpu) = crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered(
+                    &gpu_compute,
+                    &expr,
+                    &pred_gpu,
+                    &target_gpu,
+                );
+                let grad_pred = gpu_compute.download_gpu_matrix_to_mat(&grad_pred_gpu);
+                (loss, grad_pred)
             } else {
-                let mut scheduler = self.scheduler.lock().unwrap();
-                crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
+                self.compute_loss_mat_cpu_buffered(expr, pred, target)
             }
         } else {
-            let mut scheduler = self.scheduler.lock().unwrap();
-            crate::loss_plan::compute_loss_mat(&expr, pred, target, &mut scheduler, &self.pool)
+            self.compute_loss_mat_cpu_buffered(expr, pred, target)
         }
+    }
+
+    fn compute_loss_mat_cpu_buffered(
+        &self,
+        expr: Arc<LossExpr>,
+        pred: &Mat<f32>,
+        target: &Mat<f32>,
+    ) -> (f32, Mat<f32>) {
+        let pool_arc = self.temp_matrix_pool.clone();
+        let mut pool = pool_arc.lock().unwrap();
+        let pred_buf = self.mat_to_matrix_buffer(pred, &mut pool);
+        let target_buf = self.mat_to_matrix_buffer(target, &mut pool);
+        let (loss, grad_buf) = crate::plans::loss_plan::execution::compute_loss_mat_buffered(
+            &expr,
+            &pred_buf,
+            &target_buf,
+            &mut pool,
+        );
+        let grad_mat = grad_buf.to_mat();
+        // pred_buf и target_buf будут освобождены при выходе из области видимости
+        (loss, grad_mat)
     }
 
     // ===================================================================

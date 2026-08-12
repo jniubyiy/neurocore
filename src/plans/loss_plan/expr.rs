@@ -3,6 +3,7 @@
 use faer::Mat;
 use std::sync::Arc;
 use super::chain::ElementChain;
+use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
 
 /// Способ агрегирования значений потерь по задачам.
 #[derive(Debug, Clone, Copy)]
@@ -86,7 +87,7 @@ impl LossExpr {
         self.aggregation
     }
 
-    /// Выполняет прямой проход для всего батча.
+    /// Выполняет прямой проход для всего батча (матричная версия).
     ///
     /// # Аргументы
     /// * `chunk_input` – матрица размера `(batch, pred_features + target_features)`,
@@ -106,7 +107,7 @@ impl LossExpr {
         (loss_vec, intermediates)
     }
 
-    /// Выполняет обратный проход для всего батча.
+    /// Выполняет обратный проход для всего батча (матричная версия).
     ///
     /// # Аргументы
     /// * `intermediates` – промежуточные результаты прямого прохода.
@@ -149,5 +150,68 @@ impl LossExpr {
             Aggregation::Sum => grad_parts.to_vec(),
             Aggregation::Mean => grad_parts.iter().map(|g| g / n).collect(),
         }
+    }
+
+    // ===================================================================
+    // БУФЕРИЗОВАННЫЕ МЕТОДЫ (MatrixBuffer + TempMatrixPool)
+    // ===================================================================
+
+    /// Прямой проход для всего батча с использованием управляемых буферов.
+    ///
+    /// # Аргументы
+    /// * `chunk_input` – входной `MatrixBuffer` размера `(batch, pred_features + target_features)`.
+    /// * `pool` – пул временных матриц для выделения промежуточных буферов.
+    ///
+    /// # Возвращает
+    /// * вектор значений потерь (длина `batch`),
+    /// * вектор промежуточных результатов `(вход, выход)` для обратного прохода.
+    pub fn forward_chunk_buffered(
+        &self,
+        chunk_input: &MatrixBuffer,
+        pool: &mut TempMatrixPool,
+    ) -> (Vec<f32>, Vec<(MatrixBuffer, MatrixBuffer)>) {
+        let (out_mat, intermediates) = self.chain.forward_batch_buffered(chunk_input, pool);
+        let batch = out_mat.rows();
+        let loss_vec: Vec<f32> = (0..batch).map(|i| out_mat.get(i, 0)).collect();
+
+        // Финальный выход не нужен после извлечения loss – возвращаем в пул
+        pool.release(out_mat);
+
+        (loss_vec, intermediates)
+    }
+
+    /// Обратный проход для всего батча с использованием управляемых буферов.
+    ///
+    /// # Аргументы
+    /// * `intermediates` – промежуточные результаты прямого прохода (из `forward_chunk_buffered`).
+    /// * `grad_loss` – градиент по значениям потерь (вектор длины `batch`).
+    /// * `pool` – пул временных матриц.
+    ///
+    /// # Возвращает
+    /// `MatrixBuffer` размера `(batch, pred_features + target_features)` с градиентами по входу.
+    pub fn backward_chunk_buffered(
+        &self,
+        intermediates: &[(MatrixBuffer, MatrixBuffer)],
+        grad_loss: &[f32],
+        pool: &mut TempMatrixPool,
+    ) -> MatrixBuffer {
+        let batch = intermediates.first()
+            .map(|(inp, _)| inp.rows())
+            .unwrap_or(0);
+        assert_eq!(batch, grad_loss.len(),
+            "backward_chunk_buffered: длина grad_loss должна совпадать с размером батча");
+
+        // Создаём буфер градиента по выходу цепочки (batch, 1)
+        let mut grad_out = pool.acquire(batch, 1);
+        for i in 0..batch {
+            grad_out.set(i, 0, grad_loss[i]);
+        }
+
+        let grad_in = self.chain.backward_batch_buffered(intermediates, &grad_out, pool);
+
+        // Возвращаем временный grad_out в пул
+        pool.release(grad_out);
+
+        grad_in
     }
 }

@@ -101,15 +101,14 @@ impl UniversalLayerBuffered for LeakyReLU {
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let inp = input.as_mat();
-        let mut out = output.as_mat_mut();
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
 
-        // Поэлементно применяем LeakyReLU и записываем результат в выходной буфер
-        let temp = Mat::from_fn(inp.nrows(), inp.ncols(), |r, c| {
-            let x = inp[(r, c)];
-            if x > 0.0 { x } else { self.alpha * x }
-        });
-        out.copy_from(&temp);
+        debug_assert_eq!(src.len(), dst.len());
+
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = if x > 0.0 { x } else { self.alpha * x };
+        }
     }
 
     fn backward_buffered(
@@ -120,18 +119,27 @@ impl UniversalLayerBuffered for LeakyReLU {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
+        // Извлекаем входную матрицу из контекста без копирования
         let x_mat = match ctx {
-            DynamicContext::Mat(MatContext::LeakyReLU { input }) => input.clone(),
+            DynamicContext::Mat(MatContext::LeakyReLU { input }) => input,
             _ => panic!("Expected LeakyReLU context"),
         };
-        let go = grad_output.as_mat();
-        let mut gi = grad_input.as_mat_mut();
 
-        let dx = Mat::from_fn(x_mat.nrows(), x_mat.ncols(), |r, c| {
-            let grad = if x_mat[(r, c)] > 0.0 { 1.0 } else { self.alpha };
-            go[(r, c)] * grad
-        });
-        gi.copy_from(&dx);
+        let rows = grad_output.rows();
+        let cols = grad_output.cols();
+        let go = grad_output.as_slice();
+        let gi = grad_input.as_slice_mut();
+
+        debug_assert_eq!(go.len(), gi.len());
+
+        for idx in 0..go.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+            let x_val = x_mat[(r, c)];
+            let derivative = if x_val > 0.0 { 1.0 } else { self.alpha };
+            gi[idx] = go[idx] * derivative;
+        }
+
         Vec::new()
     }
 

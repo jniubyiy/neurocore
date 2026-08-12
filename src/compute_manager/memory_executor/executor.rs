@@ -172,6 +172,12 @@ impl MemoryExecutor {
             .unwrap_or(0)
     }
 
+    /// Предоставляет доступ к GPU-контексту по идентификатору устройства.
+    /// Полезно для создания GPU-буферов извне (например, в MatrixBuffer).
+    pub fn gpu_context(&self, device_id: DeviceId) -> Option<&Arc<GpuContext>> {
+        self.gpu_contexts.get(&device_id)
+    }
+
     fn get_usage_ratios(&self) -> (f32, f32) {
         let vram_used = self.pools
             .iter()

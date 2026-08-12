@@ -141,12 +141,41 @@ impl UniversalLayerBuffered for Memory {
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let inp = input.as_mat();
-        let mut out = output.as_mat_mut();
+        let rows = input.rows();
+        let cols = input.cols();
+        debug_assert_eq!(cols, self.features);
 
-        // Memory слой модифицирует внутреннее состояние, поэтому используем forward_mat_impl
-        let result = self.forward_mat_impl(&inp.to_owned()); // передача Mat<f32>
-        out.copy_from(&result);
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        debug_assert_eq!(src.len(), dst.len());
+
+        let mut cells = self.cells.lock().unwrap();
+        let features = self.features;
+
+        for idx in 0..src.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+
+            let x = src[idx];
+            let min_idx = c;
+            let max_idx = features + c;
+            let min_val = cells[min_idx];
+            let max_val = cells[max_idx];
+
+            let d_min = (x - min_val).abs();
+            let d_max = (x - max_val).abs();
+            let closest = if d_min <= d_max { min_val } else { max_val };
+            dst[idx] = x + self.alpha * (closest - x);
+
+            if x > max_val {
+                cells[max_idx] += self.alpha * (x - max_val);
+            } else if x < min_val {
+                cells[min_idx] += self.alpha * (x - min_val);
+            } else {
+                cells[min_idx] += self.alpha * (x - min_val);
+                cells[max_idx] += self.alpha * (x - max_val);
+            }
+        }
     }
 
     fn backward_buffered(
@@ -157,13 +186,15 @@ impl UniversalLayerBuffered for Memory {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        let go = grad_output.as_mat();
-        let mut gi = grad_input.as_mat_mut();
-
         let factor = 1.0 - self.alpha;
-        // Копируем градиент, умноженный на factor
-        let dx = go.map(|v| v * factor);
-        gi.copy_from(&dx);
+        let go = grad_output.as_slice();
+        let gi = grad_input.as_slice_mut();
+        debug_assert_eq!(go.len(), gi.len());
+
+        for (out, &in_val) in gi.iter_mut().zip(go.iter()) {
+            *out = in_val * factor;
+        }
+
         Vec::new()
     }
 

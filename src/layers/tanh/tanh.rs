@@ -99,12 +99,14 @@ impl UniversalLayerBuffered for Tanh {
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let inp = input.as_mat();
-        let mut out = output.as_mat_mut();
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
 
-        // Вычисляем tanh во временную матрицу и копируем в выходной буфер
-        let temp = inp.map(|x| x.tanh());
-        out.copy_from(&temp);
+        debug_assert_eq!(src.len(), dst.len());
+
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = x.tanh();
+        }
     }
 
     fn backward_buffered(
@@ -115,19 +117,26 @@ impl UniversalLayerBuffered for Tanh {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Извлекаем выход tanh, сохранённый в контексте (пока Mat<f32>)
+        // Извлекаем выход tanh из контекста без копирования
         let y_mat = match ctx {
-            DynamicContext::Mat(MatContext::Tanh { output }) => output.clone(),
+            DynamicContext::Mat(MatContext::Tanh { output }) => output,
             _ => panic!("Expected Tanh context"),
         };
-        let go = grad_output.as_mat();
-        let mut gi = grad_input.as_mat_mut();
 
-        let dx = Mat::from_fn(y_mat.nrows(), y_mat.ncols(), |r, c| {
-            let val = y_mat[(r, c)];
-            go[(r, c)] * (1.0 - val * val)
-        });
-        gi.copy_from(&dx);
+        let rows = grad_output.rows();
+        let cols = grad_output.cols();
+        let go = grad_output.as_slice();
+        let gi = grad_input.as_slice_mut();
+
+        debug_assert_eq!(go.len(), gi.len());
+
+        for idx in 0..go.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+            let y_val = y_mat[(r, c)];
+            gi[idx] = go[idx] * (1.0 - y_val * y_val);
+        }
+
         Vec::new()
     }
 

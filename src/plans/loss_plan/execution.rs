@@ -3,9 +3,10 @@
 use std::sync::Arc;
 use faer::Mat;
 use crate::compute_manager::cpu::{Scheduler, WorkerPool};
+use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
 use super::expr::LossExpr;
 
-/// Вычисляет значение функции потерь и градиент по предсказанию на CPU.
+/// Вычисляет значение функции потерь и градиент по предсказанию на CPU (матричная версия).
 ///
 /// # Аргументы
 /// * `expr` – выражение потерь (цепочка кубиков + агрегация).
@@ -56,6 +57,89 @@ pub fn compute_loss_mat(
         for j in 0..pred_feat {
             grad_pred[(i, j)] = grad_full[(i, j)];
         }
+    }
+
+    (loss, grad_pred)
+}
+
+/// Вычисляет значение функции потерь и градиент по предсказанию на CPU с использованием
+/// управляемых буферов `MatrixBuffer` и пула `TempMatrixPool`.
+///
+/// # Аргументы
+/// * `expr` – выражение потерь.
+/// * `pred` – буфер предсказаний `(batch, pred_features)` (CPU).
+/// * `target` – буфер целей `(batch, target_features)` (CPU).
+/// * `pool` – пул временных матриц для выделения промежуточных буферов.
+///
+/// # Возвращает
+/// * `loss` – агрегированное значение потерь.
+/// * `grad_pred` – буфер градиентов по pred размерности `(batch, pred_features)`.
+///
+/// # Паника
+/// Паникует, если `pred` или `target` являются GPU-буферами.
+pub fn compute_loss_mat_buffered(
+    expr: &Arc<LossExpr>,
+    pred: &MatrixBuffer,
+    target: &MatrixBuffer,
+    pool: &mut TempMatrixPool,
+) -> (f32, MatrixBuffer) {
+    assert!(!pred.is_gpu() && !target.is_gpu(),
+        "compute_loss_mat_buffered supports only CPU buffers");
+
+    let pred_feat = expr.pred_features();
+    let target_feat = expr.target_features();
+    let batch = pred.rows();
+    assert_eq!(batch, target.rows(), "Pred and target must have the same batch size");
+    assert_eq!(pred.cols(), pred_feat, "Pred cols mismatch");
+    assert_eq!(target.cols(), target_feat, "Target cols mismatch");
+
+    let in_features = pred_feat + target_feat;
+
+    // Формируем полный вход [pred | target]
+    let mut full_input = pool.acquire(batch, in_features);
+    // Копируем pred в первые столбцы, target в следующие
+    let src_pred = pred.as_slice();
+    let src_target = target.as_slice();
+    let dst_full = full_input.as_slice_mut();
+
+    for c in 0..pred_feat {
+        for r in 0..batch {
+            dst_full[c * batch + r] = src_pred[c * batch + r];
+        }
+    }
+    for c in 0..target_feat {
+        for r in 0..batch {
+            dst_full[(c + pred_feat) * batch + r] = src_target[c * batch + r];
+        }
+    }
+
+    // Прямой проход
+    let (loss_vec, intermediates) = expr.forward_chunk_buffered(&full_input, pool);
+    let loss = expr.aggregate_loss(&loss_vec);
+
+    // Освобождаем full_input, так как он больше не нужен
+    pool.release(full_input);
+
+    // Градиент по агрегированному loss (вектор единиц)
+    let grad_loss = vec![1.0f32; batch];
+    let grad_full = expr.backward_chunk_buffered(&intermediates, &grad_loss, pool);
+
+    // Извлекаем градиент только по pred (первые pred_feat столбцов)
+    let mut grad_pred = pool.acquire(batch, pred_feat);
+    let src_grad = grad_full.as_slice();
+    let dst_grad = grad_pred.as_slice_mut();
+
+    for c in 0..pred_feat {
+        for r in 0..batch {
+            dst_grad[c * batch + r] = src_grad[c * batch + r];
+        }
+    }
+
+    // Освобождаем grad_full и все промежуточные буферы
+    pool.release(grad_full);
+    for (inp, outp) in intermediates {
+        pool.release(inp);
+        pool.release(outp);
     }
 
     (loss, grad_pred)

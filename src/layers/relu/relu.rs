@@ -98,15 +98,14 @@ impl UniversalLayerBuffered for ReLU {
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let inp = input.as_mat();
-        let mut out = output.as_mat_mut();
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
 
-        // Поэлементно применяем ReLU с записью в выходной буфер.
-        // Можно скопировать результат из временного Mat, но чтобы избежать лишнего выделения,
-        // используем faer-операцию map над MatRef? Однако map возвращает новый Mat.
-        // Поэтому создадим временный Mat через Mat::from_fn, но затем скопируем в out.
-        let temp = Mat::from_fn(inp.nrows(), inp.ncols(), |r, c| inp[(r, c)].max(0.0));
-        out.copy_from(&temp);
+        debug_assert_eq!(src.len(), dst.len());
+
+        for (o, &i) in dst.iter_mut().zip(src.iter()) {
+            *o = i.max(0.0);
+        }
     }
 
     fn backward_buffered(
@@ -117,18 +116,27 @@ impl UniversalLayerBuffered for ReLU {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        // На данном этапе контекст всё ещё хранит Mat<f32>, извлекаем его
+        // Берём входную матрицу из контекста без копирования
         let x_mat = match ctx {
-            DynamicContext::Mat(MatContext::ReLU { input }) => input.clone(),
+            DynamicContext::Mat(MatContext::ReLU { input }) => input,
             _ => panic!("Expected ReLU context"),
         };
-        let go = grad_output.as_mat();
-        let mut gi = grad_input.as_mat_mut();
 
-        let dx = Mat::from_fn(x_mat.nrows(), x_mat.ncols(), |r, c| {
-            if x_mat[(r, c)] > 0.0 { go[(r, c)] } else { 0.0 }
-        });
-        gi.copy_from(&dx);
+        let rows = grad_output.rows();
+        let cols = grad_output.cols();
+        let go = grad_output.as_slice();
+        let gi = grad_input.as_slice_mut();
+
+        debug_assert_eq!(go.len(), gi.len());
+
+        // Проходим по элементам в column-major порядке
+        for idx in 0..go.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+            let x_val = x_mat[(r, c)];
+            gi[idx] = if x_val > 0.0 { go[idx] } else { 0.0 };
+        }
+
         // ReLU не имеет параметров, возвращаем пустой градиент
         Vec::new()
     }

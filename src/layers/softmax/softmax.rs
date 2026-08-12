@@ -96,13 +96,39 @@ impl UniversalLayerBuffered for Softmax {
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let inp = input.as_mat();
-        let mut out = output.as_mat_mut();
+        let rows = input.rows();
+        let cols = input.cols();
 
-        // Преобразуем MatRef в Mat, чтобы передать в существующую функцию
-        let inp_owned = inp.to_owned();
-        let temp = softmax_forward_mat_inner(&inp_owned);
-        out.copy_from(&temp);
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+
+        debug_assert_eq!(src.len(), rows * cols);
+        debug_assert_eq!(dst.len(), rows * cols);
+
+        // Для каждой строки (batch) вычисляем stable softmax
+        for r in 0..rows {
+            // 1. Находим максимум
+            let mut max_val = f32::NEG_INFINITY;
+            for c in 0..cols {
+                let idx = c * rows + r;
+                if src[idx] > max_val {
+                    max_val = src[idx];
+                }
+            }
+
+            // 2. Считаем сумму экспонент
+            let mut sum_exp = 0.0f32;
+            for c in 0..cols {
+                let idx = c * rows + r;
+                sum_exp += (src[idx] - max_val).exp();
+            }
+
+            // 3. Записываем нормализованные значения
+            for c in 0..cols {
+                let idx = c * rows + r;
+                dst[idx] = (src[idx] - max_val).exp() / sum_exp;
+            }
+        }
     }
 
     fn backward_buffered(
@@ -113,16 +139,38 @@ impl UniversalLayerBuffered for Softmax {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
+        // Извлекаем выход softmax из контекста (row‑major Mat)
         let y_mat = match ctx {
-            DynamicContext::Mat(MatContext::Softmax { output }) => output.clone(),
+            DynamicContext::Mat(MatContext::Softmax { output }) => output,
             _ => panic!("Expected Softmax context"),
         };
-        let go = grad_output.as_mat();
-        let go_owned = go.to_owned();
-        let mut gi = grad_input.as_mat_mut();
 
-        let dx = softmax_backward_mat(&y_mat, &go_owned);
-        gi.copy_from(&dx);
+        let rows = grad_output.rows();
+        let cols = grad_output.cols();
+
+        let go = grad_output.as_slice();
+        let gi = grad_input.as_slice_mut();
+
+        debug_assert_eq!(go.len(), rows * cols);
+        debug_assert_eq!(gi.len(), rows * cols);
+
+        // Для каждой строки
+        for r in 0..rows {
+            // Вычисляем dot = sum(y * grad_output) по строке
+            let mut dot = 0.0f32;
+            for c in 0..cols {
+                let idx = c * rows + r;
+                dot += y_mat[(r, c)] * go[idx];
+            }
+
+            // Вычисляем градиент
+            for c in 0..cols {
+                let idx = c * rows + r;
+                let y_val = y_mat[(r, c)];
+                gi[idx] = y_val * (go[idx] - dot);
+            }
+        }
+
         Vec::new()
     }
 

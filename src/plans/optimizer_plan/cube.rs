@@ -1,6 +1,7 @@
-// src/optimizer_plan/cube.rs
+// src/plans/optimizer_plan/cube.rs
 
 use std::any::Any;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 
 /// Атомарный блок оптимизации.
 ///
@@ -35,6 +36,20 @@ pub trait OptimizerCube: Send + Sync + Any {
     /// * `state`  - мутабельный срез состояния кубика.
     ///   Его длина равна `N * state_size_per_param()`, где `N` — число параметров.
     fn apply(&self, params: &mut [f32], grads: &mut [f32], state: &mut [f32]);
+
+    /// То же, что и `apply`, но принимает управляемые буферы `MatrixBuffer`.
+    ///
+    /// По умолчанию паникует, если конкретный кубик не переопределил этот метод.
+    /// Буферизованная версия должна использоваться для полной интеграции
+    /// с `MemoryExecutor` и пулом временных матриц.
+    fn apply_buffered(
+        &self,
+        _params: &mut MatrixBuffer,
+        _grads: &mut MatrixBuffer,
+        _state: &mut MatrixBuffer,
+    ) {
+        panic!("apply_buffered not implemented for this cube");
+    }
 
     /// Позволяет downcasting к конкретному типу кубика.
     fn as_any(&self) -> &dyn Any;

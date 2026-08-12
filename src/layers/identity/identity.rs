@@ -89,9 +89,8 @@ impl UniversalLayerBuffered for Identity {
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let inp = input.as_mat();
-        let mut out = output.as_mat_mut();
-        out.copy_from(&inp);
+        // Прямое копирование данных без создания Mat
+        output.copy_from_slice(input.as_slice());
     }
 
     fn backward_buffered(
@@ -102,9 +101,8 @@ impl UniversalLayerBuffered for Identity {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        let go = grad_output.as_mat();
-        let mut gi = grad_input.as_mat_mut();
-        gi.copy_from(&go);
+        // Градиент проходит насквозь: копируем из grad_output в grad_input
+        grad_input.copy_from_slice(grad_output.as_slice());
         Vec::new()
     }
 

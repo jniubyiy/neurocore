@@ -7,6 +7,8 @@ use crate::compute_manager::dim_change;
 use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
+use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
+use crate::compute_manager::gpu::processor::process_forward_gpu_buffered;
 use crate::device_plan::plan::ComputeDevice;
 
 impl MixedModel {
@@ -192,20 +194,6 @@ impl MixedModel {
 
             match seg {
                 Segment::Unsqueeze(target_dims) => {
-                    for buf in stream_buffers.iter_mut() {
-                        let new_buf = dim_change::unsqueeze_mat_buffered(
-                            pool,
-                            std::mem::replace(buf, unsafe { std::mem::zeroed() }), // unsafe, лучше реализовать перемещение
-                            target_dims,
-                        );
-                        // Проще: взять старый буфер по владению, передать в функцию, получить новый
-                        // Здесь мы перебираем stream_buffers по мутабельной ссылке, но нужно заменить элемент.
-                        // Более безопасный способ: создать новый вектор.
-                        // Поэтому переделаем: собираем новые буферы в новый вектор.
-                        // Для простоты пока предположим, что unsqueeze_mat_buffered принимает &mut MatrixBuffer? 
-                        // Но реализация требует владения. Поэтому здесь нужно перестроить логику.
-                    }
-                    // Упростим: соберём новый Vec<MatrixBuffer>, заменяя каждый элемент.
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
                         new_stream.push(dim_change::unsqueeze_mat_buffered(pool, buf, target_dims));
@@ -220,17 +208,75 @@ impl MixedModel {
                     stream_buffers = new_stream;
                 }
                 Segment::UniversalProcessor(proc, slices, stream_indices) => {
+                    let active_indices: Vec<usize> = match stream_indices {
+                        Some(indices) => indices.clone(),
+                        None => (0..stream_buffers.len()).collect(),
+                    };
                     let params = self.store.lock().unwrap().all_params();
-                    self.process_universal_processor_forward_buffered(
-                        pool,
-                        proc,
-                        slices,
-                        seg_index,
-                        &params,
-                        &mut stream_buffers,
-                        &mut all_ctxs,
-                        stream_indices,
-                    );
+
+                    if let Some(ref gpu_compute_mutex) = self.gpu_compute {
+                        let gpu = gpu_compute_mutex.lock().unwrap();
+
+                        // Получаем или создаём persistent buffers для сегмента
+                        let segment_buffers_opt = self.get_segment_buffers(seg_index);
+                        let temp_buffers;
+                        let segment_buffers = if let Some(b) = segment_buffers_opt {
+                            b
+                        } else {
+                            temp_buffers = SegmentPersistentBuffers::for_segment(
+                                seg,
+                                &self.segment_placement[seg_index].compute_device,
+                                batch_size,
+                                &mut self.memory_executor.lock().unwrap(),
+                            );
+                            temp_buffers
+                        };
+
+                        for &stream_idx in &active_indices {
+                            let input_buf = std::mem::replace(
+                                &mut stream_buffers[stream_idx],
+                                MatrixBuffer::dummy(pool),
+                            );
+
+                            // Если входной буфер CPU, загружаем его на GPU
+                            let input_gpu = if input_buf.is_gpu() {
+                                input_buf
+                            } else {
+                                let mut gpu_buf = gpu.allocate_gpu_matrix(input_buf.rows(), input_buf.cols());
+                                gpu.copy_cpu_to_gpu(&input_buf, &mut gpu_buf);
+                                gpu_buf
+                            };
+
+                            let (out_gpu, layer_ctxs) = process_forward_gpu_buffered(
+                                &gpu,
+                                &segment_buffers,
+                                proc,
+                                slices,
+                                &params,
+                                input_gpu,
+                            );
+
+                            // Обновляем stream_buffers
+                            stream_buffers[stream_idx] = out_gpu;
+
+                            // Добавляем контексты для всех сэмплов
+                            for sample_ctxs in all_ctxs.iter_mut() {
+                                sample_ctxs.extend(layer_ctxs.clone());
+                            }
+                        }
+                    } else {
+                        // CPU-путь
+                        self.process_universal_processor_forward_buffered(
+                            pool,
+                            proc,
+                            slices,
+                            seg_index,
+                            &params,
+                            &mut stream_buffers,
+                            &mut all_ctxs,
+                            stream_indices,
+                        );
+                    }
                 }
                 Segment::SplitterConnector { dim_a, dim_b } => {
                     self.process_splitter_connector_forward_buffered(

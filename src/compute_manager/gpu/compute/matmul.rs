@@ -4,9 +4,11 @@ use faer::Mat;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::pipeline::{Pipeline, PipelineBindPoint};
 use super::base::GpuCompute;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 
 impl GpuCompute {
     /// Умножение матриц A (M×K) и B (K×N) → C (M×N) на GPU с тайловым шейдером.
+    /// Старая версия для обратной совместимости: принимает `Mat`, загружает на GPU, возвращает `Mat`.
     pub fn run_mat_mul(&self, a: &Mat<f32>, b: &Mat<f32>) -> Mat<f32> {
         let m = a.nrows();
         let n = b.ncols();
@@ -51,7 +53,41 @@ impl GpuCompute {
         result
     }
 
+    /// Умножение матриц A (M×K) и B (K×N) → C (M×N) на GPU.
+    /// Новая буферизованная версия: принимает `MatrixBuffer` (GPU) и возвращает `MatrixBuffer` (GPU).
+    pub fn run_mat_mul_buffered(&self, a: &MatrixBuffer, b: &MatrixBuffer) -> MatrixBuffer {
+        let m = a.rows();
+        let n = b.cols();
+        let k = a.cols();
+        assert_eq!(k, b.rows(), "MatMul dimensions mismatch");
+        assert!(a.is_gpu() && b.is_gpu(), "Input buffers must be GPU");
+
+        let a_buf = a.as_gpu_buffer().expect("a must be GPU");
+        let b_buf = b.as_gpu_buffer().expect("b must be GPU");
+
+        let out = self.allocate_gpu_matrix(m, n);
+        let out_buf = out.as_gpu_buffer().expect("out must be GPU");
+
+        let pipeline = self.pipeline_cache.mat_mul_pipeline();
+        let push: [u32; 3] = [m as u32, n as u32, k as u32];
+        let dispatch_dim = [
+            ((m + 15) / 16) as u32,
+            ((n + 15) / 16) as u32,
+            1u32,
+        ];
+
+        self.run_compute_shader_with_dispatch(
+            pipeline,
+            &[(0, a_buf.clone()), (1, b_buf.clone()), (2, out_buf.clone())],
+            &push,
+            dispatch_dim,
+        );
+
+        out
+    }
+
     /// Суммирование строк матрицы → вектор длиной `cols`.
+    /// Старая версия для обратной совместимости.
     pub fn run_reduce_sum_cols(&self, mat: &Mat<f32>) -> Vec<f32> {
         let rows = mat.nrows();
         let cols = mat.ncols();

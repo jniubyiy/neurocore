@@ -76,7 +76,6 @@ impl UniversalLayer for Linear {
             }
         }
 
-        // Явное разрешение конфликта имён
         let mut grad = Vec::with_capacity(<Self as UniversalLayer>::param_len(self));
         for r in 0..self.out_features {
             for c in 0..self.in_features {
@@ -146,15 +145,29 @@ impl UniversalLayerBuffered for Linear {
         slice: &ParamSlice,
     ) {
         let (weight, bias) = self.get_weight_matrix_and_bias(params, slice);
-        let inp = input.as_mat();
-        let mut out = output.as_mat_mut();
+        let in_rows = input.rows();
+        let in_cols = input.cols();
+        let out_cols = self.out_features;
 
-        let result = &inp * &weight.transpose();
-        let batch = input.rows();
-        // Создаём матрицу bias как Mat и прибавляем
-        let bias_mat = Mat::from_fn(batch, self.out_features, |_, j| bias[j]);
-        let out_mat = result + bias_mat;
-        out.copy_from(&out_mat);
+        let input_slice = input.as_slice();
+        let output_slice = output.as_slice_mut();
+
+        // Проверка размеров
+        debug_assert_eq!(input_slice.len(), in_rows * in_cols);
+        debug_assert_eq!(output_slice.len(), in_rows * out_cols);
+
+        // Прямое матричное умножение: output = input * weight^T + bias
+        // weight имеет размер (out_cols, in_cols), weight^T не требуется,
+        // так как мы вычисляем скалярное произведение строки входа и строки весов.
+        for r in 0..in_rows {
+            for c in 0..out_cols {
+                let mut sum = bias[c];
+                for k in 0..in_cols {
+                    sum += input_slice[k * in_rows + r] * weight[(c, k)];
+                }
+                output_slice[c * in_rows + r] = sum;
+            }
+        }
     }
 
     fn backward_buffered(
@@ -165,33 +178,59 @@ impl UniversalLayerBuffered for Linear {
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
+        // Получаем входную матрицу из контекста без копирования
         let x_mat = match ctx {
-            DynamicContext::Mat(MatContext::Linear { input }) => input.clone(),
+            DynamicContext::Mat(MatContext::Linear { input }) => input,
             _ => panic!("Expected Linear context"),
         };
         let (weight, _) = self.get_weight_matrix_and_bias(params, slice);
 
-        let go = grad_output.as_mat();
-        let mut gi = grad_input.as_mat_mut();
+        let in_rows = grad_input.rows();
+        let in_cols = grad_input.cols();
+        let out_cols = grad_output.cols();
 
-        let dx = &go * &weight;
-        gi.copy_from(&dx);
+        let go_slice = grad_output.as_slice();
+        let gi_slice = grad_input.as_slice_mut();
 
-        let dw = go.transpose() * &x_mat;
-        let batch = go.nrows();
-        let mut db = vec![0.0f32; self.out_features];
-        for r in 0..batch {
-            for c in 0..self.out_features {
-                db[c] += go[(r, c)];
+        debug_assert_eq!(go_slice.len(), in_rows * out_cols);
+        debug_assert_eq!(gi_slice.len(), in_rows * in_cols);
+
+        // Вычисляем dx = grad_output * weight (weight размера out_cols x in_cols)
+        for r in 0..in_rows {
+            for c in 0..in_cols {
+                let mut sum = 0.0;
+                for k in 0..out_cols {
+                    sum += go_slice[k * in_rows + r] * weight[(k, c)];
+                }
+                gi_slice[c * in_rows + r] = sum;
             }
         }
 
+        // Градиенты весов: dw = grad_output^T * x
+        let mut dw = vec![0.0f32; self.in_features * self.out_features];
+        for out_idx in 0..out_cols {
+            for in_idx in 0..in_cols {
+                let mut sum = 0.0;
+                for r in 0..in_rows {
+                    sum += go_slice[out_idx * in_rows + r] * x_mat[(r, in_idx)];
+                }
+                dw[out_idx * in_cols + in_idx] = sum;
+            }
+        }
+
+        // Градиенты смещений: db = сумма по строкам grad_output
+        let mut db = vec![0.0f32; out_cols];
+        for c in 0..out_cols {
+            let mut sum = 0.0;
+            for r in 0..in_rows {
+                sum += go_slice[c * in_rows + r];
+            }
+            db[c] = sum;
+        }
+
+        // Собираем градиенты параметров
         let mut grad = Vec::with_capacity(<Self as UniversalLayerBuffered>::param_len(self));
-        for r in 0..self.out_features {
-            for c in 0..self.in_features {
-                grad.push(dw[(r, c)]);
-            }
-        }
+        grad.extend_from_slice(&dw);
         grad.extend_from_slice(&db);
         grad
     }

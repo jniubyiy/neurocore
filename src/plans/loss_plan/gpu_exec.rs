@@ -2,6 +2,7 @@
 
 use faer::Mat;
 use crate::compute_manager::gpu::compute::GpuCompute;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::loss_plan::CrossEntropyWithLogits;
 use super::cubes::*;
 use super::expr::LossExpr;
@@ -205,4 +206,32 @@ fn run_cube_backward_gpu(
         return grad;
     }
     panic!("Unknown loss cube for GPU backward");
+}
+
+/// Выполняет вычисление потерь и градиентов на GPU с использованием управляемых буферов `MatrixBuffer`.
+///
+/// Принимает GPU‑буферы `pred` и `target` размера `(batch, features)`.
+/// Возвращает скалярное значение потерь и GPU‑буфер градиентов по `pred`.
+///
+/// На текущем этапе реализация использует временное копирование на CPU для совместимости
+/// с существующей матричной версией. В дальнейшем будет заменена на полностью GPU‑вариант
+/// без промежуточных загрузок/выгрузок.
+pub fn compute_loss_gpu_buffered(
+    gpu: &GpuCompute,
+    expr: &LossExpr,
+    pred: &MatrixBuffer,
+    target: &MatrixBuffer,
+) -> (f32, MatrixBuffer) {
+    assert!(pred.is_gpu() && target.is_gpu(), "compute_loss_gpu_buffered requires GPU buffers");
+
+    // Временная выгрузка на CPU для выполнения через матричную версию
+    let pred_mat = gpu.download_gpu_matrix_to_mat(pred);
+    let target_mat = gpu.download_gpu_matrix_to_mat(target);
+
+    let (loss, grad_pred_mat) = compute_loss_gpu(gpu, expr, &pred_mat, &target_mat);
+
+    // Загружаем градиент обратно на GPU
+    let grad_pred_gpu = gpu.upload_mat_to_gpu_matrix(&grad_pred_mat);
+
+    (loss, grad_pred_gpu)
 }

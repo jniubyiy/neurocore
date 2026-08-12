@@ -1,5 +1,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
+use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::mat_context::MatContext;
 use faer::Mat;
@@ -23,6 +25,10 @@ impl DualAnchor {
         (min_vals, max_vals, alpha)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Старая реализация UniversalLayer (оставлена для GPU и обратной совместимости)
+// ---------------------------------------------------------------------------
 
 impl UniversalLayer for DualAnchor {
     fn forward_mat(
@@ -118,6 +124,117 @@ impl UniversalLayer for DualAnchor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Новая реализация UniversalLayerBuffered (CPU‑путь с управляемыми буферами)
+// ---------------------------------------------------------------------------
+
+impl UniversalLayerBuffered for DualAnchor {
+    fn forward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) {
+        let rows = input.rows();
+        let cols = input.cols();
+        debug_assert_eq!(cols, self.features);
+
+        // Прямой доступ к параметрам, без выделения Vec
+        let base = slice.start;
+        let min_vals = &params[base..base + self.features];
+        let max_vals = &params[base + self.features..base + 2 * self.features];
+        let alpha = params[base + 2 * self.features];
+
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        debug_assert_eq!(src.len(), dst.len());
+
+        for idx in 0..src.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+
+            let x = src[idx];
+            let min_v = min_vals[c];
+            let max_v = max_vals[c];
+            let d_min = (x - min_v).abs();
+            let d_max = (x - max_v).abs();
+            let closest = if d_min <= d_max { min_v } else { max_v };
+            dst[idx] = x + alpha * (closest - x);
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBuffer,
+        grad_input: &mut MatrixBuffer,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> Vec<f32> {
+        // Извлекаем входную матрицу из контекста без копирования
+        let x_mat = match ctx {
+            DynamicContext::Mat(MatContext::DualAnchor1D { input }) => input,
+            _ => panic!("Expected DualAnchor1D context"),
+        };
+
+        let rows = grad_output.rows();
+        let cols = grad_output.cols();
+        debug_assert_eq!(cols, self.features);
+
+        let base = slice.start;
+        let min_vals = &params[base..base + self.features];
+        let max_vals = &params[base + self.features..base + 2 * self.features];
+        let alpha = params[base + 2 * self.features];
+
+        let go = grad_output.as_slice();
+        let gi = grad_input.as_slice_mut();
+        debug_assert_eq!(go.len(), gi.len());
+
+        let mut d_min = vec![0.0f32; self.features];
+        let mut d_max = vec![0.0f32; self.features];
+        let mut d_alpha = 0.0f32;
+
+        for idx in 0..go.len() {
+            let r = idx % rows;
+            let c = idx / rows;
+
+            let x_val = x_mat[(r, c)];
+            let min_v = min_vals[c];
+            let max_v = max_vals[c];
+            let d_min_abs = (x_val - min_v).abs();
+            let d_max_abs = (x_val - max_v).abs();
+            let is_min = d_min_abs <= d_max_abs;
+            let gout = go[idx];
+
+            // Градиент по входу
+            gi[idx] = gout * (1.0 - alpha);
+
+            // Градиенты по параметрам
+            if is_min {
+                d_min[c] += gout * alpha;
+                d_alpha += gout * (min_v - x_val);
+            } else {
+                d_max[c] += gout * alpha;
+                d_alpha += gout * (max_v - x_val);
+            }
+        }
+
+        let mut grad = Vec::with_capacity(2 * self.features + 1);
+        grad.extend_from_slice(&d_min);
+        grad.extend_from_slice(&d_max);
+        grad.push(d_alpha);
+        grad
+    }
+
+    fn param_len(&self) -> usize {
+        2 * self.features + 1
+    }
+    fn input_features(&self) -> usize { self.features }
+    fn output_features(&self) -> usize { self.features }
+}
+
+// Вспомогательная функция для старой матричной реализации
 fn dual_anchor_backward_mat(
     x: &Mat<f32>,
     dout: &Mat<f32>,

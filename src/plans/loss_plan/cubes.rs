@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::fmt::Debug;
 use faer::Mat;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 
 /// Элементарный кубик функции потерь (матричная версия).
 pub trait ElemCube: Any + Send + Sync + Debug {
@@ -18,8 +19,23 @@ pub trait ElemCube: Any + Send + Sync + Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Буферизованный элементарный кубик функции потерь.
+/// Работает с управляемыми буферами `MatrixBuffer` (CPU).
+pub trait BufferedElemCube: Send + Sync + Debug {
+    fn in_features(&self) -> usize;
+    fn out_features(&self) -> usize;
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer);
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    );
+}
+
 // ----------------------------------------------------------------
-// Простейшие кубики, поддерживающие векторные признаки
+// Sub
 // ----------------------------------------------------------------
 
 #[derive(Debug)]
@@ -75,6 +91,54 @@ impl ElemCube for Sub {
     fn as_any(&self) -> &dyn Any { self }
 }
 
+impl BufferedElemCube for Sub {
+    fn in_features(&self) -> usize {
+        2 * self.features
+    }
+
+    fn out_features(&self) -> usize {
+        self.features
+    }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let rows = input.rows();
+        let f = self.features;
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+
+        for r in 0..rows {
+            for c in 0..f {
+                dst[c * rows + r] = src[c * rows + r] - src[(c + f) * rows + r];
+            }
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        _input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let rows = grad_out.rows();
+        let f = self.features;
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+
+        for r in 0..rows {
+            for c in 0..f {
+                let g = go[c * rows + r];
+                gi[c * rows + r] = g;
+                gi[(c + f) * rows + r] = -g;
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Square
+// ----------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct Square;
 
@@ -102,7 +166,38 @@ impl ElemCube for Square {
     fn as_any(&self) -> &dyn Any { self }
 }
 
-/// Суммирует все столбцы в каждой строке, превращая (batch, features) в (batch, 1)
+impl BufferedElemCube for Square {
+    fn in_features(&self) -> usize { 1 }
+    fn out_features(&self) -> usize { 1 }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = x * x;
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let x = input.as_slice();
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+        for i in 0..x.len() {
+            gi[i] = 2.0 * x[i] * go[i];
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// SumColumns
+// ----------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct SumColumns;
 
@@ -143,11 +238,53 @@ impl ElemCube for SumColumns {
     fn as_any(&self) -> &dyn Any { self }
 }
 
-// Остальные кубики оставлены без изменений, так как они работают с матрицами
-// и будут применяться после SumColumns, когда матрица уже стала (batch,1).
+impl BufferedElemCube for SumColumns {
+    fn in_features(&self) -> usize { 0 }
+    fn out_features(&self) -> usize { 1 }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let rows = input.rows();
+        let cols = input.cols();
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+
+        for r in 0..rows {
+            let mut sum = 0.0;
+            for c in 0..cols {
+                sum += src[c * rows + r];
+            }
+            dst[r] = sum;
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let rows = grad_out.rows();
+        let cols = input.cols();
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+
+        for r in 0..rows {
+            let g = go[r];
+            for c in 0..cols {
+                gi[c * rows + r] = g;
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Log
+// ----------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct Log;
+
 impl ElemCube for Log {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
@@ -167,11 +304,45 @@ impl ElemCube for Log {
             grad_out[(i, 0)] / input[(i, 0)]
         })
     }
+
     fn as_any(&self) -> &dyn Any { self }
 }
 
+impl BufferedElemCube for Log {
+    fn in_features(&self) -> usize { 1 }
+    fn out_features(&self) -> usize { 1 }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = x.ln();
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let x = input.as_slice();
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+        for i in 0..x.len() {
+            gi[i] = go[i] / x[i];
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Neg
+// ----------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct Neg;
+
 impl ElemCube for Neg {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
@@ -188,12 +359,43 @@ impl ElemCube for Neg {
     ) -> Mat<f32> {
         -grad_out
     }
+
     fn as_any(&self) -> &dyn Any { self }
 }
 
+impl BufferedElemCube for Neg {
+    fn in_features(&self) -> usize { 1 }
+    fn out_features(&self) -> usize { 1 }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = -x;
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        _input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+        for (o, &g) in gi.iter_mut().zip(go.iter()) {
+            *o = -g;
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Mul
+// ----------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct Mul {
-    /// Количество признаков предсказания (равно количеству признаков цели)
     features: usize,
 }
 
@@ -248,8 +450,58 @@ impl ElemCube for Mul {
     fn as_any(&self) -> &dyn Any { self }
 }
 
+impl BufferedElemCube for Mul {
+    fn in_features(&self) -> usize {
+        2 * self.features
+    }
+
+    fn out_features(&self) -> usize {
+        self.features
+    }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let rows = input.rows();
+        let f = self.features;
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+
+        for r in 0..rows {
+            for c in 0..f {
+                dst[c * rows + r] = src[c * rows + r] * src[(c + f) * rows + r];
+            }
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let rows = grad_out.rows();
+        let f = self.features;
+        let src = input.as_slice();
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+
+        for r in 0..rows {
+            for c in 0..f {
+                let g = go[c * rows + r];
+                gi[c * rows + r] = g * src[(c + f) * rows + r];
+                gi[(c + f) * rows + r] = g * src[c * rows + r];
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// Abs
+// ----------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct Abs;
+
 impl ElemCube for Abs {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
@@ -272,11 +524,51 @@ impl ElemCube for Abs {
             if x > 0.0 { g } else if x < 0.0 { -g } else { 0.0 }
         })
     }
+
     fn as_any(&self) -> &dyn Any { self }
 }
 
+impl BufferedElemCube for Abs {
+    fn in_features(&self) -> usize { 1 }
+    fn out_features(&self) -> usize { 1 }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = x.abs();
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let x = input.as_slice();
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+        for i in 0..x.len() {
+            if x[i] > 0.0 {
+                gi[i] = go[i];
+            } else if x[i] < 0.0 {
+                gi[i] = -go[i];
+            } else {
+                gi[i] = 0.0;
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// AddScalar
+// ----------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct AddScalar(pub f32);
+
 impl ElemCube for AddScalar {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
@@ -293,11 +585,43 @@ impl ElemCube for AddScalar {
     ) -> Mat<f32> {
         grad_out.to_owned()
     }
+
     fn as_any(&self) -> &dyn Any { self }
 }
 
+impl BufferedElemCube for AddScalar {
+    fn in_features(&self) -> usize { 1 }
+    fn out_features(&self) -> usize { 1 }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let scalar = self.0;
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = x + scalar;
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        _input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+        gi.copy_from_slice(go);
+    }
+}
+
+// ----------------------------------------------------------------
+// Log1p
+// ----------------------------------------------------------------
+
 #[derive(Debug)]
 pub struct Log1p;
+
 impl ElemCube for Log1p {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
@@ -318,8 +642,41 @@ impl ElemCube for Log1p {
             grad_out[(i, j)] / (1.0 + input[(i, j)])
         })
     }
+
     fn as_any(&self) -> &dyn Any { self }
 }
+
+impl BufferedElemCube for Log1p {
+    fn in_features(&self) -> usize { 1 }
+    fn out_features(&self) -> usize { 1 }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+        for (o, &x) in dst.iter_mut().zip(src.iter()) {
+            *o = (x + 1.0).ln();
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let x = input.as_slice();
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+        for i in 0..x.len() {
+            gi[i] = go[i] / (1.0 + x[i]);
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// AbsDiff
+// ----------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct AbsDiff {
@@ -374,3 +731,59 @@ impl ElemCube for AbsDiff {
 
     fn as_any(&self) -> &dyn Any { self }
 }
+
+impl BufferedElemCube for AbsDiff {
+    fn in_features(&self) -> usize {
+        2 * self.features
+    }
+
+    fn out_features(&self) -> usize {
+        self.features
+    }
+
+    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+        let rows = input.rows();
+        let f = self.features;
+        let src = input.as_slice();
+        let dst = output.as_slice_mut();
+
+        for r in 0..rows {
+            for c in 0..f {
+                dst[c * rows + r] = (src[c * rows + r] - src[(c + f) * rows + r]).abs();
+            }
+        }
+    }
+
+    fn backward_buffered(
+        &self,
+        input: &MatrixBuffer,
+        _output_cache: &MatrixBuffer,
+        grad_out: &MatrixBuffer,
+        grad_in: &mut MatrixBuffer,
+    ) {
+        let rows = grad_out.rows();
+        let f = self.features;
+        let src = input.as_slice();
+        let go = grad_out.as_slice();
+        let gi = grad_in.as_slice_mut();
+
+        for r in 0..rows {
+            for c in 0..f {
+                let diff = src[c * rows + r] - src[(c + f) * rows + r];
+                let g = go[c * rows + r];
+                let grad = if diff > 0.0 { g } else if diff < 0.0 { -g } else { 0.0 };
+                gi[c * rows + r] = grad;
+                gi[(c + f) * rows + r] = -grad;
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// CrossEntropyWithLogits (буферизованная реализация перенесена сюда,
+// хотя сам struct объявлен в cross_entropy.rs)
+// ----------------------------------------------------------------
+
+// Внимание: чтобы не создавать циклическую зависимость, реализация для
+// CrossEntropyWithLogits находится в файле cross_entropy.rs (будет добавлена позже).
+// В этом файле мы оставляем только те кубики, которые определены здесь.

@@ -25,6 +25,7 @@ use crate::compute_manager::memory_executor::{
     BufferPriority,
 };
 use crate::compute_manager::persistent_buffer::{DeviceBuffer, DeviceBufferId};
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use super::super::init::GpuContext;
 use super::super::pipeline::PipelineCache;
 
@@ -345,5 +346,94 @@ impl GpuCompute {
             }
         }
         flat
+    }
+
+    // ===================================================================
+    // НОВЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С MatrixBuffer (GPU)
+    // ===================================================================
+
+    /// Создаёт GPU MatrixBuffer нужного размера.
+    pub fn allocate_gpu_matrix(&self, rows: usize, cols: usize) -> MatrixBuffer {
+        MatrixBuffer::new_gpu(&self.memory_executor, self.gpu_device_id, rows, cols)
+            .expect("Failed to allocate GPU MatrixBuffer")
+    }
+
+    /// Копирует данные из CPU MatrixBuffer в GPU MatrixBuffer.
+    /// Предполагается, что `src` – CPU, `dst` – GPU.
+    pub fn copy_cpu_to_gpu(&self, src: &MatrixBuffer, dst: &mut MatrixBuffer) {
+        assert!(!src.is_gpu(), "Source must be CPU");
+        assert!(dst.is_gpu(), "Destination must be GPU");
+        let elements = src.size();
+        assert_eq!(elements, dst.size(), "Buffer sizes must match");
+
+        let src_slice = src.as_slice();
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        {
+            let mut write_guard = staging_buf.write().expect("write staging buffer");
+            write_guard[..elements].copy_from_slice(src_slice);
+        }
+        let dst_gpu = dst.as_gpu_buffer().expect("Destination is GPU");
+        self.copy_buffer_sync(staging_buf.clone(), dst_gpu.clone());
+        self.release_staging_buffer(staging_buf, staging_raw);
+    }
+
+    /// Копирует данные из GPU MatrixBuffer в CPU MatrixBuffer.
+    /// Предполагается, что `src` – GPU, `dst` – CPU.
+    pub fn copy_gpu_to_cpu(&self, src: &MatrixBuffer, dst: &mut MatrixBuffer) {
+        assert!(src.is_gpu(), "Source must be GPU");
+        assert!(!dst.is_gpu(), "Destination must be CPU");
+        let elements = src.size();
+        assert_eq!(elements, dst.size(), "Buffer sizes must match");
+
+        let src_gpu = src.as_gpu_buffer().expect("Source is GPU");
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        self.copy_buffer_sync(src_gpu.clone(), staging_buf.clone());
+
+        let data_vec = {
+            let guard = staging_buf.read().expect("read staging buffer");
+            guard[..elements].to_vec()
+        };
+        self.release_staging_buffer(staging_buf, staging_raw);
+
+        dst.copy_from_slice(&data_vec);
+    }
+
+    /// Удобный метод: загружает Mat в GPU MatrixBuffer.
+    pub fn upload_mat_to_gpu_matrix(&self, mat: &Mat<f32>) -> MatrixBuffer {
+        let rows = mat.nrows();
+        let cols = mat.ncols();
+        let mut gpu_buf = self.allocate_gpu_matrix(rows, cols);
+
+        let flat = Self::mat_to_flat(mat);
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(flat.len());
+        {
+            let mut write_guard = staging_buf.write().expect("write staging buffer");
+            write_guard[..flat.len()].copy_from_slice(&flat);
+        }
+        let dst_gpu = gpu_buf.as_gpu_buffer().expect("GPU buffer");
+        self.copy_buffer_sync(staging_buf.clone(), dst_gpu.clone());
+        self.release_staging_buffer(staging_buf, staging_raw);
+
+        gpu_buf
+    }
+
+    /// Удобный метод: выгружает GPU MatrixBuffer в Mat.
+    pub fn download_gpu_matrix_to_mat(&self, buf: &MatrixBuffer) -> Mat<f32> {
+        assert!(buf.is_gpu(), "Buffer must be GPU");
+        let rows = buf.rows();
+        let cols = buf.cols();
+        let elements = buf.size();
+
+        let src_gpu = buf.as_gpu_buffer().expect("GPU buffer");
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        self.copy_buffer_sync(src_gpu.clone(), staging_buf.clone());
+
+        let data_vec = {
+            let guard = staging_buf.read().expect("read staging buffer");
+            guard[..elements].to_vec()
+        };
+        self.release_staging_buffer(staging_buf, staging_raw);
+
+        Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
     }
 }

@@ -74,7 +74,7 @@ pub fn move_buffer_data(
 
     // Вспомогательная функция для получения staging‑буфера из пула
     let acquire_staging = |temp_pool: &mut TempBufferPool,
-                          dev_id: DeviceId,
+                          _dev_id: DeviceId,
                           size_bytes: u64,
                           pools: &mut HashMap<MemoryDeviceKind, MemoryPool>,
                           raw_registry: &mut RawBufferRegistry,
@@ -342,7 +342,9 @@ fn location_to_kind(loc: &BufferLocation) -> MemoryDeviceKind {
     }
 }
 
-fn copy_buffer_sync(
+/// Синхронно копирует данные между двумя Vulkan-буферами.
+/// Используется как внутри `data_mover`, так и другими модулями `MemoryExecutor`.
+pub(crate) fn copy_buffer_sync(
     ctx: Arc<GpuContext>,
     src: Subbuffer<[f32]>,
     dst: Subbuffer<[f32]>,

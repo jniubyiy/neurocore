@@ -363,6 +363,7 @@ impl MixedModel {
                 placements: vec![],
             })),
             temp_matrix_pool,
+            buffered_param_store: None,
         };
 
         // -----------------------------------------------------------

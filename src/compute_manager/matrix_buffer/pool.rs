@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::memory_executor::policy::BufferPriority;
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
 use super::buffer::MatrixBuffer;
@@ -93,6 +94,54 @@ impl TempMatrixPool {
         self.acquire_kind(MemoryDeviceKind::DeviceVram(device_id), rows, cols)
     }
 
+    /// Извлекает из пула или создаёт новый управляемый `MatrixBuffer`
+    /// в указанной памяти с приоритетом `Medium`.
+    ///
+    /// Буфер регистрируется в `MemoryExecutor` и получает `MatrixBufferId`.
+    pub fn acquire_matrix(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        location: MemoryDeviceKind,
+    ) -> MatrixBuffer {
+        let key = (location, rows, cols);
+        if let Some(list) = self.free.get_mut(&key) {
+            if let Some(mut buf) = list.pop() {
+                buf.mark_used();
+                self.stats.reused += 1;
+                return buf;
+            }
+        }
+
+        // Создаём через MemoryExecutor с регистрацией
+        let mut mem = self.memory.lock().unwrap();
+        let buf = mem
+            .acquire_matrix(rows, cols, location, BufferPriority::Medium)
+            .expect("TempMatrixPool: failed to acquire MatrixBuffer via MemoryExecutor");
+        drop(mem);
+
+        self.stats.created += 1;
+        buf
+    }
+
+    /// Извлекает из пула или создаёт новый управляемый `MatrixBuffer`
+    /// с автоматическим выбором памяти на основе политики MemoryExecutor.
+    ///
+    /// Сначала пытается разместить в `preferred`, затем в RAM, затем в SSD (если доступен).
+    pub fn acquire_matrix_auto(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        preferred: MemoryDeviceKind,
+    ) -> MatrixBuffer {
+        let elements = rows * cols;
+        let target = {
+            let mem = self.memory.lock().unwrap();
+            mem.select_matrix_location(elements, preferred, BufferPriority::Medium)
+        };
+        self.acquire_matrix(rows, cols, target)
+    }
+
     /// Внутренний метод для получения буфера определённого типа памяти.
     fn acquire_kind(&mut self, kind: MemoryDeviceKind, rows: usize, cols: usize) -> MatrixBuffer {
         // Сначала очищаем устаревшие буферы
@@ -125,6 +174,12 @@ impl TempMatrixPool {
     /// записаны поверх старых при следующем использовании.
     pub fn release(&mut self, mut buf: MatrixBuffer) {
         buf.mark_used(); // обновляем время последнего использования
+        // Обновляем время в реестре MemoryExecutor, если буфер управляется
+        if let Some(id) = buf.matrix_id() {
+            if let Ok(mut mem) = self.memory.lock() {
+                mem.touch_matrix(id);
+            }
+        }
         let kind = buf.device_kind();
         let key = (kind, buf.rows(), buf.cols());
         self.free.entry(key).or_insert_with(Vec::new).push(buf);
@@ -304,5 +359,26 @@ mod tests {
         let b = pool.acquire_gpu(device_id, 3, 4);
         assert_eq!(pool.free_count(), 0);
         assert!(b.is_gpu());
+    }
+
+    // Новый тест: acquire_matrix через MemoryExecutor
+    #[test]
+    fn test_acquire_matrix_cpu() {
+        let (mut mem, mut pool) = create_pool();
+        // Регистрируем CPU устройство, чтобы MemoryExecutor мог выделять HostRam
+        mem.lock().unwrap().register_compute_device(
+            crate::compute_manager::device_spec::DeviceSpec::cpu(0, 1024, 1),
+            None,
+        );
+        let buf = pool.acquire_matrix(2, 3, MemoryDeviceKind::HostRam);
+        assert_eq!(buf.rows(), 2);
+        assert_eq!(buf.cols(), 3);
+        assert!(buf.matrix_id().is_some());
+        let id = buf.matrix_id().unwrap();
+        assert!(mem.lock().unwrap().get_matrix_info(id).is_some());
+        pool.release(buf);
+        // После release, если буфер возвращён в пул, он остаётся в реестре,
+        // так как он не деаллоцирован. Проверим, что реестр всё ещё содержит id.
+        assert!(mem.lock().unwrap().get_matrix_info(id).is_some());
     }
 }

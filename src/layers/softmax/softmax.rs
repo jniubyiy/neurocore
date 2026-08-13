@@ -1,5 +1,8 @@
+// src/layers/softmax/softmax.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -9,7 +12,9 @@ use faer::Mat;
 pub struct Softmax;
 
 impl Softmax {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -24,7 +29,9 @@ impl UniversalLayer for Softmax {
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
         let output = softmax_forward_mat(input);
-        let ctx = DynamicContext::Mat(MatContext::Softmax { output: output.clone() });
+        let ctx = DynamicContext::Mat(MatContext::Softmax {
+            output: output.clone(),
+        });
         (output, ctx)
     }
 
@@ -43,11 +50,21 @@ impl UniversalLayer for Softmax {
         (dx, vec![])
     }
 
-    fn param_len(&self) -> usize { 0 }
-    fn input_features(&self) -> usize { 0 }
-    fn output_features(&self) -> usize { 0 }
+    fn param_len(&self) -> usize {
+        0
+    }
 
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
+    fn input_features(&self) -> usize {
+        0
+    }
+
+    fn output_features(&self) -> usize {
+        0
+    }
+
+    fn total_tasks(&self, batch_size: usize) -> usize {
+        batch_size
+    }
 
     fn execute_tasks(
         &self,
@@ -72,7 +89,9 @@ impl UniversalLayer for Softmax {
         _input_sample: &Mat<f32>,
         output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        DynamicContext::Mat(MatContext::Softmax { output: output_sample.clone() })
+        DynamicContext::Mat(MatContext::Softmax {
+            output: output_sample.clone(),
+        })
     }
 
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {
@@ -139,17 +158,23 @@ impl UniversalLayerBuffered for Softmax {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Извлекаем выход softmax из контекста (row‑major Mat)
-        let y_mat = match ctx {
-            DynamicContext::Mat(MatContext::Softmax { output }) => output,
+        // Извлекаем буферизованный контекст
+        let bc = match ctx {
+            DynamicContext::Buffered(bc) => bc,
+            _ => panic!("Expected Buffered context"),
+        };
+        let output_arc = match bc {
+            BufferedContext::Softmax { output } => output,
             _ => panic!("Expected Softmax context"),
         };
+        let output = output_arc.as_ref();
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
 
         let go = grad_output.as_slice();
         let gi = grad_input.as_slice_mut();
+        let y_slice = output.as_slice();
 
         debug_assert_eq!(go.len(), rows * cols);
         debug_assert_eq!(gi.len(), rows * cols);
@@ -160,13 +185,13 @@ impl UniversalLayerBuffered for Softmax {
             let mut dot = 0.0f32;
             for c in 0..cols {
                 let idx = c * rows + r;
-                dot += y_mat[(r, c)] * go[idx];
+                dot += y_slice[idx] * go[idx];
             }
 
             // Вычисляем градиент
             for c in 0..cols {
                 let idx = c * rows + r;
-                let y_val = y_mat[(r, c)];
+                let y_val = y_slice[idx];
                 gi[idx] = y_val * (go[idx] - dot);
             }
         }
@@ -174,9 +199,17 @@ impl UniversalLayerBuffered for Softmax {
         Vec::new()
     }
 
-    fn param_len(&self) -> usize { 0 }
-    fn input_features(&self) -> usize { 0 }
-    fn output_features(&self) -> usize { 0 }
+    fn param_len(&self) -> usize {
+        0
+    }
+
+    fn input_features(&self) -> usize {
+        0
+    }
+
+    fn output_features(&self) -> usize {
+        0
+    }
 }
 
 // Вспомогательные матричные функции (общие для обеих реализаций)

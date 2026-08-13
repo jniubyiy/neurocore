@@ -11,6 +11,7 @@ use crate::compute_manager::gpu::processor::process_forward_gpu;
 use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
 use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::layers::{UniversalLayer, UniversalLayerBuffered};
+use crate::layers::buffered_context::BufferedContext;
 use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
 
@@ -197,7 +198,9 @@ impl MixedModel {
         let mut new_stream: Vec<MatrixBuffer> = Vec::with_capacity(active_indices.len());
 
         for &stream_idx in &active_indices {
-            let mut current_input = stream_opt[stream_idx].take().unwrap();
+            // Забираем входной буфер и оборачиваем в Arc
+            let initial_buf = stream_opt[stream_idx].take().unwrap();
+            let mut current_input: Arc<MatrixBuffer> = Arc::new(initial_buf);
             let batch_size = current_input.rows();
             let mut layer_ctxs: Vec<DynamicContext> = Vec::with_capacity(num_layers);
 
@@ -205,19 +208,26 @@ impl MixedModel {
                 let layer = &layers[i];
                 let slice = &slices[i];
 
-                let out_features = get_buffered_output_features(layer, &current_input);
+                let out_features = get_buffered_output_features(layer, current_input.as_ref());
 
                 let mut output_buf = pool.acquire(batch_size, out_features);
+                call_forward_buffered(
+                    layer,
+                    current_input.as_ref(),
+                    &mut output_buf,
+                    params,
+                    slice,
+                );
 
-                call_forward_buffered(layer, &current_input, &mut output_buf, params, slice);
+                // Оборачиваем выходной буфер в Arc и сохраняем в контексте
+                let output_arc = Arc::new(output_buf);
+                let buffered_ctx = build_buffered_context(layer, &current_input, &output_arc);
+                layer_ctxs.push(DynamicContext::Buffered(buffered_ctx));
 
-                let mat_ctx = build_mat_context(layer, &current_input, &output_buf);
-                layer_ctxs.push(DynamicContext::Mat(mat_ctx));
-
-                current_input = output_buf;
+                current_input = output_arc;
             }
 
-            new_stream.push(current_input);
+            new_stream.push(Arc::try_unwrap(current_input).unwrap_or_else(|arc| (*arc).clone()));
 
             for sample_ctxs in all_ctxs.iter_mut() {
                 sample_ctxs.extend(layer_ctxs.clone());
@@ -260,6 +270,7 @@ fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixB
     }
 }
 
+/// Вызывает буферизованный прямой проход для слоя.
 fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBuffer,
@@ -288,26 +299,39 @@ fn call_forward_buffered(
     }
 }
 
-fn build_mat_context(
+/// Создаёт буферизованный контекст для слоя.
+///
+/// В зависимости от типа слоя возвращает соответствующий вариант `BufferedContext`,
+/// сохраняя `Arc<MatrixBuffer>` на входные или выходные данные.
+fn build_buffered_context(
     layer: &Box<dyn UniversalLayer>,
-    input: &MatrixBuffer,
-    output: &MatrixBuffer,
-) -> MatContext {
+    input: &Arc<MatrixBuffer>,
+    output: &Arc<MatrixBuffer>,
+) -> BufferedContext {
     if layer.as_linear().is_some() {
-        MatContext::Linear { input: input.to_mat() }
+        BufferedContext::Linear { input: input.clone() }
     } else if layer.as_relu().is_some() {
-        MatContext::ReLU { input: input.to_mat() }
+        BufferedContext::ReLU { input: input.clone() }
     } else if layer.as_sigmoid().is_some() {
-        MatContext::Sigmoid { output: output.to_mat() }
+        BufferedContext::Sigmoid { output: output.clone() }
     } else if layer.as_tanh().is_some() {
-        MatContext::Tanh { output: output.to_mat() }
-    } else if layer.as_leaky_relu().is_some() {
-        MatContext::LeakyReLU { input: input.to_mat() }
-    } else if layer.as_identity().is_some() {
-        MatContext::Identity { input: input.to_mat() }
+        BufferedContext::Tanh { output: output.clone() }
     } else if layer.as_softmax().is_some() {
-        MatContext::Softmax { output: output.to_mat() }
+        BufferedContext::Softmax { output: output.clone() }
+    } else if layer.as_leaky_relu().is_some() {
+        BufferedContext::LeakyReLU { input: input.clone() }
+    } else if layer.as_identity().is_some() {
+        BufferedContext::Identity { input: input.clone() }
+    } else if layer.as_memory().is_some() {
+        BufferedContext::Memory { input: input.clone() }
+    } else if layer.as_soft_sparse_gate().is_some() {
+        BufferedContext::SoftSparseGate { input: input.clone() }
+    } else if layer.as_soft_keep_gate().is_some() {
+        BufferedContext::SoftKeepGate { input: input.clone() }
+    } else if layer.as_dual_anchor().is_some() {
+        BufferedContext::DualAnchor1D { input: input.clone() }
     } else {
-        MatContext::Identity { input: input.to_mat() }
+        // Fallback: Identity
+        BufferedContext::Identity { input: input.clone() }
     }
 }

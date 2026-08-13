@@ -2,8 +2,13 @@
 
 use faer::Mat;
 use super::base::GpuCompute;
+use crate::compute_manager::matrix_buffer::MatrixBuffer;
 
 impl GpuCompute {
+    // ===================================================================
+    // Старые Mat-версии (оставлены для обратной совместимости)
+    // ===================================================================
+
     /// Прямой проход Splitter: возвращает (a, b, pre_a, pre_b)
     pub fn run_splitter_forward(
         &self,
@@ -124,8 +129,163 @@ impl GpuCompute {
         grad.extend_from_slice(&d_bias);
         (da, db, grad)
     }
+
+    // ===================================================================
+    // НОВЫЕ BUFFERED-ВЕРСИИ ДЛЯ MatrixBuffer (БЕЗ faer::Mat)
+    // ===================================================================
+
+    /// Прямой проход Splitter на GPU с использованием MatrixBuffer.
+    pub fn run_splitter_forward_buffered(
+        &self,
+        x: &MatrixBuffer,
+        wa: &MatrixBuffer,
+        bias_a: &[f32],
+        wb: &MatrixBuffer,
+        bias_b: &[f32],
+    ) -> (MatrixBuffer, MatrixBuffer, MatrixBuffer, MatrixBuffer) {
+        assert!(x.is_gpu() && wa.is_gpu() && wb.is_gpu(), "Buffers must be GPU");
+        let pre_a = self.run_linear_forward_buffered(x, wa, bias_a);
+        let a = self.run_relu_forward_buffered(&pre_a);
+        let pre_b = self.run_linear_forward_buffered(x, wb, bias_b);
+        let b = self.run_relu_forward_buffered(&pre_b);
+        (a, b, pre_a, pre_b)
+    }
+
+    /// Обратный проход Splitter на GPU с использованием MatrixBuffer.
+    pub fn run_splitter_backward_buffered(
+        &self,
+        x: &MatrixBuffer,
+        da: &MatrixBuffer,
+        db: &MatrixBuffer,
+        pre_a: &MatrixBuffer,
+        pre_b: &MatrixBuffer,
+        wa: &MatrixBuffer,
+        wb: &MatrixBuffer,
+    ) -> (MatrixBuffer, Vec<f32>) {
+        assert!(
+            x.is_gpu() && da.is_gpu() && db.is_gpu() && pre_a.is_gpu() && pre_b.is_gpu() && wa.is_gpu() && wb.is_gpu(),
+            "Buffers must be GPU"
+        );
+
+        let d_pre_a = self.run_relu_backward_buffered(pre_a, da);
+        let d_pre_b = self.run_relu_backward_buffered(pre_b, db);
+
+        // dx = d_pre_a * wa + d_pre_b * wb
+        let dx_a = self.run_mat_mul_buffered(&d_pre_a, wa);
+        let dx_b = self.run_mat_mul_buffered(&d_pre_b, wb);
+
+        // Складываем два GPU-буфера через CPU-стагинг
+        let dx_a_vec = self.download_gpu_matrix_to_vec(&dx_a);
+        let dx_b_vec = self.download_gpu_matrix_to_vec(&dx_b);
+        let batch = x.rows();
+        let n = x.cols();
+        let mut dx_vec = vec![0.0f32; batch * n];
+        for i in 0..dx_vec.len() {
+            dx_vec[i] = dx_a_vec[i] + dx_b_vec[i];
+        }
+        let dx = self.upload_vec_to_gpu_buffer(&dx_vec, batch, n);
+
+        // Градиенты весов и смещений через Linear backward
+        let (_, d_wa, d_bias_a) = self.run_linear_backward_buffered(x, wa, &d_pre_a);
+        let (_, d_wb, d_bias_b) = self.run_linear_backward_buffered(x, wb, &d_pre_b);
+
+        let p = wa.rows();
+        let q = wb.rows();
+        // Собираем градиенты параметров в том же порядке, что и раньше
+        let mut grad = Vec::with_capacity(p * n + q * n + p + q);
+        let d_wa_vec = self.download_gpu_matrix_to_vec(&d_wa);
+        grad.extend_from_slice(&d_wa_vec);
+        let d_wb_vec = self.download_gpu_matrix_to_vec(&d_wb);
+        grad.extend_from_slice(&d_wb_vec);
+        grad.extend_from_slice(&d_bias_a);
+        grad.extend_from_slice(&d_bias_b);
+
+        (dx, grad)
+    }
+
+    /// Прямой проход Combiner на GPU с использованием MatrixBuffer.
+    pub fn run_combiner_forward_buffered(
+        &self,
+        a: &MatrixBuffer,
+        b: &MatrixBuffer,
+        wa: &MatrixBuffer,
+        wb: &MatrixBuffer,
+        bias: &[f32],
+    ) -> (MatrixBuffer, MatrixBuffer) {
+        assert!(
+            a.is_gpu() && b.is_gpu() && wa.is_gpu() && wb.is_gpu(),
+            "Buffers must be GPU"
+        );
+
+        let batch = a.rows();
+        let out_dim = wa.rows();
+        let zero_bias = vec![0.0f32; out_dim];
+
+        let part_a = self.run_linear_forward_buffered(a, wa, &zero_bias);
+        let part_b = self.run_linear_forward_buffered(b, wb, &zero_bias);
+
+        // Складываем part_a, part_b и добавляем bias через CPU-стагинг
+        let part_a_vec = self.download_gpu_matrix_to_vec(&part_a);
+        let part_b_vec = self.download_gpu_matrix_to_vec(&part_b);
+        let mut pre_vec = vec![0.0f32; batch * out_dim];
+        for c in 0..out_dim {
+            for r in 0..batch {
+                pre_vec[c * batch + r] = part_a_vec[c * batch + r] + part_b_vec[c * batch + r] + bias[c];
+            }
+        }
+        let pre = self.upload_vec_to_gpu_buffer(&pre_vec, batch, out_dim);
+        let out = self.run_relu_forward_buffered(&pre);
+
+        (out, pre)
+    }
+
+    /// Обратный проход Combiner на GPU с использованием MatrixBuffer.
+    pub fn run_combiner_backward_buffered(
+        &self,
+        a: &MatrixBuffer,
+        b: &MatrixBuffer,
+        d_out: &MatrixBuffer,
+        pre: &MatrixBuffer,
+        wa: &MatrixBuffer,
+        wb: &MatrixBuffer,
+    ) -> (MatrixBuffer, MatrixBuffer, Vec<f32>) {
+        assert!(
+            a.is_gpu() && b.is_gpu() && d_out.is_gpu() && pre.is_gpu() && wa.is_gpu() && wb.is_gpu(),
+            "Buffers must be GPU"
+        );
+
+        let d_pre = self.run_relu_backward_buffered(pre, d_out);
+
+        // da = d_pre * wa, db = d_pre * wb
+        let da = self.run_mat_mul_buffered(&d_pre, wa);
+        let db = self.run_mat_mul_buffered(&d_pre, wb);
+
+        // Градиенты весов через Linear backward (используем нулевые bias)
+        let batch = a.rows();
+        let out_dim = wa.rows();
+        let zero_bias = vec![0.0f32; out_dim];
+        let (_, d_wa, _d_bias_a) = self.run_linear_backward_buffered(a, wa, &d_pre);
+        let (_, d_wb, _d_bias_b) = self.run_linear_backward_buffered(b, wb, &d_pre);
+
+        // d_bias = сумма по строкам d_pre
+        let d_pre_vec = self.download_gpu_matrix_to_vec(&d_pre);
+        let d_bias: Vec<f32> = (0..out_dim)
+            .map(|c| (0..batch).map(|r| d_pre_vec[c * batch + r]).sum())
+            .collect();
+
+        let n = a.cols();
+        let mut grad = Vec::with_capacity(2 * out_dim * n + out_dim);
+        let d_wa_vec = self.download_gpu_matrix_to_vec(&d_wa);
+        grad.extend_from_slice(&d_wa_vec);
+        let d_wb_vec = self.download_gpu_matrix_to_vec(&d_wb);
+        grad.extend_from_slice(&d_wb_vec);
+        grad.extend_from_slice(&d_bias);
+
+        (da, db, grad)
+    }
 }
 
+// Вспомогательная функция для старых Mat-версий
 fn transpose_mat(mat: &Mat<f32>) -> Mat<f32> {
     Mat::from_fn(mat.ncols(), mat.nrows(), |r, c| mat[(c, r)])
 }

@@ -1,5 +1,8 @@
+// src/layers/soft_keep_gate/soft_keep_gate.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -103,6 +106,11 @@ impl UniversalLayer for SoftKeepGate {
         Mat::zeros(batch_size, self.in_features)
     }
 
+    // Исправлено: возвращаем None для as_soft_sparse_gate и Some(self) для as_soft_keep_gate
+    fn as_soft_sparse_gate(&self) -> Option<&crate::layers::SoftSparseGate> {
+        None
+    }
+
     fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> {
         Some(self)
     }
@@ -131,15 +139,17 @@ impl UniversalLayerBuffered for SoftKeepGate {
         let dst = output.as_slice_mut();
         debug_assert_eq!(src.len(), dst.len());
 
-        for idx in 0..src.len() {
-            let r = idx % rows;
-            let c = idx / rows;
-
-            let x = src[idx];
-            let abs_x = x.abs();
-            let z = (thresholds[c] - abs_x) / tmp;
-            let s = 1.0 / (1.0 + (-z).exp());
-            dst[idx] = x * s;
+        // column-major обход: внешний цикл по признакам, внутренний по строкам
+        for c in 0..cols {
+            let threshold = thresholds[c];
+            for r in 0..rows {
+                let idx = c * rows + r;
+                let x = src[idx];
+                let abs_x = x.abs();
+                let z = (threshold - abs_x) / tmp;
+                let s = 1.0 / (1.0 + (-z).exp());
+                dst[idx] = x * s;
+            }
         }
     }
 
@@ -151,11 +161,16 @@ impl UniversalLayerBuffered for SoftKeepGate {
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Извлекаем входную матрицу из контекста без копирования
-        let x_mat = match ctx {
-            DynamicContext::Mat(MatContext::SoftKeepGate { input }) => input,
+        // Извлекаем буферизованный контекст
+        let bc = match ctx {
+            DynamicContext::Buffered(bc) => bc,
+            _ => panic!("Expected Buffered context"),
+        };
+        let input_arc = match bc {
+            BufferedContext::SoftKeepGate { input } => input,
             _ => panic!("Expected SoftKeepGate context"),
         };
+        let input = input_arc.as_ref();
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
@@ -166,25 +181,29 @@ impl UniversalLayerBuffered for SoftKeepGate {
 
         let go = grad_output.as_slice();
         let gi = grad_input.as_slice_mut();
+        let x_slice = input.as_slice();
+
         debug_assert_eq!(go.len(), gi.len());
 
         let mut d_thr = vec![0.0f32; self.in_features];
 
-        for idx in 0..go.len() {
-            let r = idx % rows;
-            let c = idx / rows;
+        for c in 0..cols {
+            let threshold = thresholds[c];
+            for r in 0..rows {
+                let idx = c * rows + r;
 
-            let x_val = x_mat[(r, c)];
-            let abs_x = x_val.abs();
-            let z = (thresholds[c] - abs_x) / tmp;
-            let s = 1.0 / (1.0 + (-z).exp());
-            let ds = s * (1.0 - s) / tmp;
-            let df_dx = s - abs_x * ds; // производная по x для SoftKeepGate
+                let x_val = x_slice[idx];
+                let abs_x = x_val.abs();
+                let z = (threshold - abs_x) / tmp;
+                let s = 1.0 / (1.0 + (-z).exp());
+                let ds = s * (1.0 - s) / tmp;
+                let df_dx = s - abs_x * ds; // производная по x для SoftKeepGate
 
-            gi[idx] = go[idx] * df_dx;
+                gi[idx] = go[idx] * df_dx;
 
-            // Градиент по порогам: d_s_dthr = ds
-            d_thr[c] += go[idx] * x_val * ds;
+                // Градиент по порогам: d_s_dthr = ds
+                d_thr[c] += go[idx] * x_val * ds;
+            }
         }
 
         d_thr
@@ -195,6 +214,7 @@ impl UniversalLayerBuffered for SoftKeepGate {
     fn output_features(&self) -> usize { self.in_features }
 }
 
+// Вспомогательная функция для старой матричной реализации
 fn soft_keep_gate_backward_mat(
     x: &Mat<f32>,
     dout: &Mat<f32>,

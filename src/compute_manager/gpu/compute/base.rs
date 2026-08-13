@@ -161,7 +161,6 @@ impl GpuCompute {
     // --- Работа с постоянными (persistent) буферами ---
 
     /// Копирует данные из одного persistent буфера в другой (оба должны быть на GPU).
-    /// Использует временный staging-буфер в VRAM (или напрямую копирует, если поддерживается).
     pub fn copy_persistent_to_persistent(
         &self,
         src: &DeviceBuffer,
@@ -217,18 +216,10 @@ impl GpuCompute {
     ) -> Subbuffer<[f32]> {
         match &buffer.id {
             DeviceBufferId::Gpu(raw_id) => {
-                // Получаем доступ к raw буферу через MemoryExecutor.
-                // Нам нужен Subbuffer, но raw_registry только хранит метаданные.
-                // Поэтому мы создаём временный "псевдо"-Subbuffer, используя тот же raw_id?
-                // На самом деле Subbuffer – это вулкановский буфер с known size.
-                // Мы не можем извлечь его напрямую из raw_registry, так как там нет Subbuffer.
-                // Вместо этого, мы должны хранить Subbuffer где-то вместе с persistent буфером.
-                // Это ограничение текущей архитектуры. Нужно дополнить DeviceBuffer хранением Subbuffer.
-                // Пока оставим заглушку: будем требовать, чтобы DeviceBuffer хранил сам Subbuffer,
-                // либо передавать Subbuffer вместе с буфером.
-                // Для простоты сейчас добавим метод `buffer()` в DeviceBuffer.
-                // Но т.к. DeviceBuffer определён в persistent_buffer.rs, мы должны его изменить.
-                // Временно вызовем панику, а реальная реализация потребует рефакторинга DeviceBuffer.
+                // Здесь должна быть реализация, которая достаёт Subbuffer из реестра.
+                // Поскольку в текущей архитектуре DeviceBuffer не хранит Subbuffer,
+                // этот метод не может быть реализован полностью.
+                // Он оставлен как заглушка для будущей доработки.
                 panic!("resolve_persistent_to_subbuffer needs refactoring: DeviceBuffer must store Subbuffer");
             },
             _ => panic!("Persistent buffer is not on GPU"),
@@ -359,7 +350,6 @@ impl GpuCompute {
     }
 
     /// Копирует данные из CPU MatrixBuffer в GPU MatrixBuffer.
-    /// Предполагается, что `src` – CPU, `dst` – GPU.
     pub fn copy_cpu_to_gpu(&self, src: &MatrixBuffer, dst: &mut MatrixBuffer) {
         assert!(!src.is_gpu(), "Source must be CPU");
         assert!(dst.is_gpu(), "Destination must be GPU");
@@ -378,7 +368,6 @@ impl GpuCompute {
     }
 
     /// Копирует данные из GPU MatrixBuffer в CPU MatrixBuffer.
-    /// Предполагается, что `src` – GPU, `dst` – CPU.
     pub fn copy_gpu_to_cpu(&self, src: &MatrixBuffer, dst: &mut MatrixBuffer) {
         assert!(src.is_gpu(), "Source must be GPU");
         assert!(!dst.is_gpu(), "Destination must be CPU");
@@ -435,5 +424,150 @@ impl GpuCompute {
         self.release_staging_buffer(staging_buf, staging_raw);
 
         Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
+    }
+
+    // ===================================================================
+    // НОВЫЕ МЕТОДЫ ДЛЯ ЭТАПА 4
+    // ===================================================================
+
+    /// Скачивает содержимое GPU MatrixBuffer в обычный вектор f32
+    /// без создания faer::Mat.
+    pub fn download_gpu_matrix_to_vec(&self, buf: &MatrixBuffer) -> Vec<f32> {
+        assert!(buf.is_gpu(), "Buffer must be GPU");
+        let elements = buf.size();
+
+        let src_gpu = buf.as_gpu_buffer().expect("GPU buffer");
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        self.copy_buffer_sync(src_gpu.clone(), staging_buf.clone());
+
+        let data = {
+            let guard = staging_buf.read().expect("read staging buffer");
+            guard[..elements].to_vec()
+        };
+        self.release_staging_buffer(staging_buf, staging_raw);
+        data
+    }
+
+    /// Загружает вектор f32 в новый GPU MatrixBuffer указанной формы.
+    /// Данные должны быть в column-major порядке, как ожидает MatrixBuffer.
+    pub fn upload_vec_to_gpu_buffer(
+        &self,
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> MatrixBuffer {
+        assert_eq!(data.len(), rows * cols, "Data length must match matrix size");
+
+        let mut gpu_buf = self.allocate_gpu_matrix(rows, cols);
+
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(data.len());
+        {
+            let mut write_guard = staging_buf.write().expect("write staging buffer");
+            // Исправлено: копируем только нужное количество элементов.
+            write_guard[..data.len()].copy_from_slice(data);
+        }
+        let dst_gpu = gpu_buf.as_gpu_buffer().expect("GPU buffer");
+        self.copy_buffer_sync(staging_buf.clone(), dst_gpu.clone());
+        self.release_staging_buffer(staging_buf, staging_raw);
+
+        gpu_buf
+    }
+
+    /// Заполняет существующий GPU MatrixBuffer заданным значением.
+    pub fn fill_gpu_buffer(&self, buf: &mut MatrixBuffer, value: f32) {
+        assert!(buf.is_gpu(), "Buffer must be GPU");
+        let elements = buf.size();
+        let data = vec![value; elements];
+
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        {
+            let mut write_guard = staging_buf.write().expect("write staging buffer");
+            // Исправлено: копируем только нужное количество элементов.
+            write_guard[..elements].copy_from_slice(&data);
+        }
+        let dst_gpu = buf.as_gpu_buffer().expect("GPU buffer");
+        self.copy_buffer_sync(staging_buf.clone(), dst_gpu.clone());
+        self.release_staging_buffer(staging_buf, staging_raw);
+    }
+
+    // ===================================================================
+    // НОВЫЕ МЕТОДЫ ДЛЯ ЭТАПА 5
+    // ===================================================================
+
+    /// Копирует прямоугольную область из одного GPU-буфера в другой.
+    pub fn copy_gpu_submatrix(
+        &self,
+        src: &MatrixBuffer,
+        dst: &mut MatrixBuffer,
+        src_row_start: usize,
+        src_col_start: usize,
+        dst_row_start: usize,
+        dst_col_start: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        assert!(src.is_gpu() && dst.is_gpu(), "Both buffers must be GPU");
+        let src_rows = src.rows();
+        let dst_rows = dst.rows();
+
+        let src_vec = self.download_gpu_matrix_to_vec(src);
+        let mut dst_vec = self.download_gpu_matrix_to_vec(dst);
+
+        for c in 0..cols {
+            for r in 0..rows {
+                let src_idx = (src_col_start + c) * src_rows + (src_row_start + r);
+                let dst_idx = (dst_col_start + c) * dst_rows + (dst_row_start + r);
+                dst_vec[dst_idx] = src_vec[src_idx];
+            }
+        }
+
+        let new_dst = self.upload_vec_to_gpu_buffer(&dst_vec, dst_rows, dst.cols());
+        *dst = new_dst;
+    }
+
+    /// Конкатенирует два GPU-буфера по столбцам.
+    pub fn concat_gpu_buffers(&self, a: &MatrixBuffer, b: &MatrixBuffer) -> MatrixBuffer {
+        assert!(a.is_gpu() && b.is_gpu(), "Both buffers must be GPU");
+        assert_eq!(a.rows(), b.rows(), "Row counts must match for concatenation");
+        let rows = a.rows();
+
+        let a_vec = self.download_gpu_matrix_to_vec(a);
+        let b_vec = self.download_gpu_matrix_to_vec(b);
+        let mut combined = a_vec;
+        combined.extend_from_slice(&b_vec);
+
+        self.upload_vec_to_gpu_buffer(&combined, rows, a.cols() + b.cols())
+    }
+
+    /// Повторяет вектор-столбец на указанное число столбцов (broadcast).
+    pub fn broadcast_gpu_buffer(&self, vec_buf: &MatrixBuffer, total_cols: usize) -> MatrixBuffer {
+        assert!(vec_buf.is_gpu(), "Input must be GPU buffer");
+        assert_eq!(vec_buf.cols(), 1, "Input must be a single column vector");
+        let rows = vec_buf.rows();
+
+        let vec = self.download_gpu_matrix_to_vec(vec_buf);
+        let mut result = Vec::with_capacity(rows * total_cols);
+        for _ in 0..total_cols {
+            result.extend_from_slice(&vec);
+        }
+
+        self.upload_vec_to_gpu_buffer(&result, rows, total_cols)
+    }
+
+    /// Транспонирует GPU-матрицу.
+    pub fn transpose_gpu_matrix(&self, mat: &MatrixBuffer) -> MatrixBuffer {
+        assert!(mat.is_gpu(), "Input must be GPU buffer");
+        let rows = mat.rows();
+        let cols = mat.cols();
+        let data = self.download_gpu_matrix_to_vec(mat);
+
+        let mut transposed = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                transposed[r * cols + c] = data[c * rows + r];
+            }
+        }
+
+        self.upload_vec_to_gpu_buffer(&transposed, cols, rows)
     }
 }

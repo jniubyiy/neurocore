@@ -1,5 +1,8 @@
+// src/layers/dual_anchor/dual_anchor.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -140,7 +143,7 @@ impl UniversalLayerBuffered for DualAnchor {
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
 
-        // Прямой доступ к параметрам, без выделения Vec
+        // Прямой доступ к параметрам без выделения Vec
         let base = slice.start;
         let min_vals = &params[base..base + self.features];
         let max_vals = &params[base + self.features..base + 2 * self.features];
@@ -150,17 +153,18 @@ impl UniversalLayerBuffered for DualAnchor {
         let dst = output.as_slice_mut();
         debug_assert_eq!(src.len(), dst.len());
 
-        for idx in 0..src.len() {
-            let r = idx % rows;
-            let c = idx / rows;
-
-            let x = src[idx];
+        // column-major: внешний цикл по признакам, внутренний по строкам
+        for c in 0..cols {
             let min_v = min_vals[c];
             let max_v = max_vals[c];
-            let d_min = (x - min_v).abs();
-            let d_max = (x - max_v).abs();
-            let closest = if d_min <= d_max { min_v } else { max_v };
-            dst[idx] = x + alpha * (closest - x);
+            for r in 0..rows {
+                let idx = c * rows + r;
+                let x = src[idx];
+                let d_min = (x - min_v).abs();
+                let d_max = (x - max_v).abs();
+                let closest = if d_min <= d_max { min_v } else { max_v };
+                dst[idx] = x + alpha * (closest - x);
+            }
         }
     }
 
@@ -172,11 +176,16 @@ impl UniversalLayerBuffered for DualAnchor {
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Извлекаем входную матрицу из контекста без копирования
-        let x_mat = match ctx {
-            DynamicContext::Mat(MatContext::DualAnchor1D { input }) => input,
+        // Извлекаем буферизованный контекст
+        let bc = match ctx {
+            DynamicContext::Buffered(bc) => bc,
+            _ => panic!("Expected Buffered context"),
+        };
+        let input_arc = match bc {
+            BufferedContext::DualAnchor1D { input } => input,
             _ => panic!("Expected DualAnchor1D context"),
         };
+        let input = input_arc.as_ref();
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
@@ -189,34 +198,37 @@ impl UniversalLayerBuffered for DualAnchor {
 
         let go = grad_output.as_slice();
         let gi = grad_input.as_slice_mut();
+        let x_slice = input.as_slice();
+
         debug_assert_eq!(go.len(), gi.len());
 
         let mut d_min = vec![0.0f32; self.features];
         let mut d_max = vec![0.0f32; self.features];
         let mut d_alpha = 0.0f32;
 
-        for idx in 0..go.len() {
-            let r = idx % rows;
-            let c = idx / rows;
-
-            let x_val = x_mat[(r, c)];
+        for c in 0..cols {
             let min_v = min_vals[c];
             let max_v = max_vals[c];
-            let d_min_abs = (x_val - min_v).abs();
-            let d_max_abs = (x_val - max_v).abs();
-            let is_min = d_min_abs <= d_max_abs;
-            let gout = go[idx];
+            for r in 0..rows {
+                let idx = c * rows + r;
 
-            // Градиент по входу
-            gi[idx] = gout * (1.0 - alpha);
+                let x_val = x_slice[idx];
+                let d_min_abs = (x_val - min_v).abs();
+                let d_max_abs = (x_val - max_v).abs();
+                let is_min = d_min_abs <= d_max_abs;
+                let gout = go[idx];
 
-            // Градиенты по параметрам
-            if is_min {
-                d_min[c] += gout * alpha;
-                d_alpha += gout * (min_v - x_val);
-            } else {
-                d_max[c] += gout * alpha;
-                d_alpha += gout * (max_v - x_val);
+                // Градиент по входу
+                gi[idx] = gout * (1.0 - alpha);
+
+                // Градиенты по параметрам
+                if is_min {
+                    d_min[c] += gout * alpha;
+                    d_alpha += gout * (min_v - x_val);
+                } else {
+                    d_max[c] += gout * alpha;
+                    d_alpha += gout * (max_v - x_val);
+                }
             }
         }
 

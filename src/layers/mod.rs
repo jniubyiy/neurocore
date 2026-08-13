@@ -19,6 +19,9 @@ pub mod dual_anchor;
 pub mod mat_context;
 pub mod layers_special;
 
+// Новый контекст для буферизованного CPU‑пути
+pub mod buffered_context;
+
 use crate::model_plan::param_store::ParamSlice;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
@@ -164,3 +167,4 @@ pub use dual_anchor::DualAnchor;
 
 pub use mat_context::{MatContext, LayerInfo};
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
+pub use buffered_context::BufferedContext;

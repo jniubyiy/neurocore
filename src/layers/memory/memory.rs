@@ -1,3 +1,5 @@
+// src/layers/memory/memory.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
@@ -153,8 +155,7 @@ impl UniversalLayerBuffered for Memory {
         let features = self.features;
 
         for idx in 0..src.len() {
-            let r = idx % rows;
-            let c = idx / rows;
+            let c = idx / rows; // column index (feature)
 
             let x = src[idx];
             let min_idx = c;

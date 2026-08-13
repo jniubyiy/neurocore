@@ -97,19 +97,21 @@ pub fn compute_loss_mat_buffered(
 
     // Формируем полный вход [pred | target]
     let mut full_input = pool.acquire(batch, in_features);
-    // Копируем pred в первые столбцы, target в следующие
-    let src_pred = pred.as_slice();
-    let src_target = target.as_slice();
-    let dst_full = full_input.as_slice_mut();
+    {
+        let src_pred = pred.as_slice();
+        let src_target = target.as_slice();
+        let dst_full = full_input.as_slice_mut();
 
-    for c in 0..pred_feat {
-        for r in 0..batch {
-            dst_full[c * batch + r] = src_pred[c * batch + r];
+        // Копируем pred в первые столбцы, target в следующие
+        for c in 0..pred_feat {
+            for r in 0..batch {
+                dst_full[c * batch + r] = src_pred[c * batch + r];
+            }
         }
-    }
-    for c in 0..target_feat {
-        for r in 0..batch {
-            dst_full[(c + pred_feat) * batch + r] = src_target[c * batch + r];
+        for c in 0..target_feat {
+            for r in 0..batch {
+                dst_full[(c + pred_feat) * batch + r] = src_target[c * batch + r];
+            }
         }
     }
 
@@ -117,7 +119,7 @@ pub fn compute_loss_mat_buffered(
     let (loss_vec, intermediates) = expr.forward_chunk_buffered(&full_input, pool);
     let loss = expr.aggregate_loss(&loss_vec);
 
-    // Освобождаем full_input, так как он больше не нужен
+    // full_input больше не нужен
     pool.release(full_input);
 
     // Градиент по агрегированному loss (вектор единиц)
@@ -126,16 +128,18 @@ pub fn compute_loss_mat_buffered(
 
     // Извлекаем градиент только по pred (первые pred_feat столбцов)
     let mut grad_pred = pool.acquire(batch, pred_feat);
-    let src_grad = grad_full.as_slice();
-    let dst_grad = grad_pred.as_slice_mut();
+    {
+        let src_grad = grad_full.as_slice();
+        let dst_grad = grad_pred.as_slice_mut();
 
-    for c in 0..pred_feat {
-        for r in 0..batch {
-            dst_grad[c * batch + r] = src_grad[c * batch + r];
+        for c in 0..pred_feat {
+            for r in 0..batch {
+                dst_grad[c * batch + r] = src_grad[c * batch + r];
+            }
         }
     }
 
-    // Освобождаем grad_full и все промежуточные буферы
+    // Освобождаем grad_full и промежуточные буферы
     pool.release(grad_full);
     for (inp, outp) in intermediates {
         pool.release(inp);

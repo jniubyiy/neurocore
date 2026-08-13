@@ -1,3 +1,5 @@
+// src/layers/identity/identity.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::UniversalLayer;
@@ -9,7 +11,9 @@ use faer::Mat;
 pub struct Identity;
 
 impl Identity {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -37,11 +41,21 @@ impl UniversalLayer for Identity {
         (delta.clone(), vec![])
     }
 
-    fn param_len(&self) -> usize { 0 }
-    fn input_features(&self) -> usize { 0 }
-    fn output_features(&self) -> usize { 0 }
+    fn param_len(&self) -> usize {
+        0
+    }
 
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
+    fn input_features(&self) -> usize {
+        0
+    }
+
+    fn output_features(&self) -> usize {
+        0
+    }
+
+    fn total_tasks(&self, batch_size: usize) -> usize {
+        batch_size
+    }
 
     fn execute_tasks(
         &self,
@@ -106,7 +120,15 @@ impl UniversalLayerBuffered for Identity {
         Vec::new()
     }
 
-    fn param_len(&self) -> usize { 0 }
-    fn input_features(&self) -> usize { 0 }
-    fn output_features(&self) -> usize { 0 }
+    fn param_len(&self) -> usize {
+        0
+    }
+
+    fn input_features(&self) -> usize {
+        0
+    }
+
+    fn output_features(&self) -> usize {
+        0
+    }
 }

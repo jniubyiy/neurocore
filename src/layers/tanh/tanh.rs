@@ -1,5 +1,8 @@
+// src/layers/tanh/tanh.rs
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -9,7 +12,9 @@ use faer::Mat;
 pub struct Tanh;
 
 impl Tanh {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -24,7 +29,9 @@ impl UniversalLayer for Tanh {
         _slice: &ParamSlice,
     ) -> (Mat<f32>, DynamicContext) {
         let output = input.map(|x| x.tanh());
-        let ctx = DynamicContext::Mat(MatContext::Tanh { output: output.clone() });
+        let ctx = DynamicContext::Mat(MatContext::Tanh {
+            output: output.clone(),
+        });
         (output, ctx)
     }
 
@@ -46,11 +53,21 @@ impl UniversalLayer for Tanh {
         (dx, vec![])
     }
 
-    fn param_len(&self) -> usize { 0 }
-    fn input_features(&self) -> usize { 0 }
-    fn output_features(&self) -> usize { 0 }
+    fn param_len(&self) -> usize {
+        0
+    }
 
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
+    fn input_features(&self) -> usize {
+        0
+    }
+
+    fn output_features(&self) -> usize {
+        0
+    }
+
+    fn total_tasks(&self, batch_size: usize) -> usize {
+        batch_size
+    }
 
     fn execute_tasks(
         &self,
@@ -75,7 +92,9 @@ impl UniversalLayer for Tanh {
         _input_sample: &Mat<f32>,
         output_sample: &Mat<f32>,
     ) -> DynamicContext {
-        DynamicContext::Mat(MatContext::Tanh { output: output_sample.clone() })
+        DynamicContext::Mat(MatContext::Tanh {
+            output: output_sample.clone(),
+        })
     }
 
     fn output_mat_shape(&self, _batch_size: usize) -> Mat<f32> {
@@ -117,30 +136,43 @@ impl UniversalLayerBuffered for Tanh {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Извлекаем выход tanh из контекста без копирования
-        let y_mat = match ctx {
-            DynamicContext::Mat(MatContext::Tanh { output }) => output,
+        // Извлекаем буферизованный контекст
+        let bc = match ctx {
+            DynamicContext::Buffered(bc) => bc,
+            _ => panic!("Expected Buffered context"),
+        };
+        let output_arc = match bc {
+            BufferedContext::Tanh { output } => output,
             _ => panic!("Expected Tanh context"),
         };
+        let output = output_arc.as_ref();
 
         let rows = grad_output.rows();
-        let cols = grad_output.cols();
         let go = grad_output.as_slice();
         let gi = grad_input.as_slice_mut();
+        let y_slice = output.as_slice();
 
         debug_assert_eq!(go.len(), gi.len());
 
         for idx in 0..go.len() {
             let r = idx % rows;
             let c = idx / rows;
-            let y_val = y_mat[(r, c)];
+            let y_val = y_slice[c * rows + r];
             gi[idx] = go[idx] * (1.0 - y_val * y_val);
         }
 
         Vec::new()
     }
 
-    fn param_len(&self) -> usize { 0 }
-    fn input_features(&self) -> usize { 0 }
-    fn output_features(&self) -> usize { 0 }
+    fn param_len(&self) -> usize {
+        0
+    }
+
+    fn input_features(&self) -> usize {
+        0
+    }
+
+    fn output_features(&self) -> usize {
+        0
+    }
 }

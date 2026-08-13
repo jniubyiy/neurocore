@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::layers::buffered_context::BufferedContext;
 use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::UniversalLayer;
@@ -13,7 +14,11 @@ use crate::layers::UniversalLayer;
 /// представлены как [`MatrixBuffer`].
 #[derive(Clone)]
 pub enum DynamicContext {
+    /// Матричный контекст на основе `faer::Mat` (старый путь).
     Mat(MatContext),
+
+    /// Буферизованный контекст на основе `MatrixBuffer` (новый CPU‑путь).
+    Buffered(BufferedContext),
 }
 
 /// Типы сегментов вычислительного графа.

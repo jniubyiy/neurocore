@@ -878,4 +878,58 @@ impl GpuCompute {
         );
         gi
     }
+
+    // ===================================================================
+    // SumColumns (новый функционал для Этапа 4)
+    // ===================================================================
+
+    /// Буферизованная версия прямого прохода SumColumns на GPU.
+    /// Суммирует все столбцы входной матрицы, создавая выход размера `(rows, 1)`.
+    pub fn run_sum_columns_forward_buffered(&self, input: &MatrixBuffer) -> MatrixBuffer {
+        assert!(input.is_gpu(), "Input buffer must be GPU");
+        let rows = input.rows();
+        let cols = input.cols();
+
+        let in_buf = input.as_gpu_buffer().expect("GPU buffer");
+        let out = self.allocate_gpu_matrix(rows, 1);
+        let out_buf = out.as_gpu_buffer().expect("GPU buffer");
+
+        let pipeline = self.pipeline_cache.reduce_pipeline();
+        let push = [rows as u32];
+
+        // Диспатч: каждая workgroup обрабатывает один столбец.
+        // В шейдере reduce.comp используются gl_WorkGroupID.x как индекс столбца.
+        // Количество workgroups = cols.
+        self.run_compute_shader_with_dispatch(
+            pipeline,
+            &[(0, in_buf.clone()), (1, out_buf.clone())],
+            &push,
+            [cols as u32, 1, 1],
+        );
+
+        out
+    }
+
+    /// Буферизованная версия обратного прохода SumColumns на GPU.
+    /// Принимает градиент размера `(rows, 1)`, возвращает градиент
+    /// размера `(rows, original_cols)`, где каждый столбец повторяет входной градиент.
+    ///
+    /// Реализация использует временный CPU-вектор для подготовки данных,
+    /// после чего данные загружаются обратно на GPU. Это допустимо на данном этапе.
+    pub fn run_sum_columns_backward_buffered(
+        &self,
+        grad_out: &MatrixBuffer,
+        original_cols: usize,
+    ) -> MatrixBuffer {
+        assert!(grad_out.is_gpu(), "Gradient buffer must be GPU");
+        let rows = grad_out.rows();
+        let grad_vec = self.download_gpu_matrix_to_vec(grad_out);
+
+        let mut broadcast_vec = Vec::with_capacity(rows * original_cols);
+        for _ in 0..original_cols {
+            broadcast_vec.extend_from_slice(&grad_vec);
+        }
+
+        self.upload_vec_to_gpu_buffer(&broadcast_vec, rows, original_cols)
+    }
 }

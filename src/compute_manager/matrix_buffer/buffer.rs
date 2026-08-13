@@ -9,9 +9,11 @@ use vulkano::buffer::Subbuffer;
 
 use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::memory_executor::executor::RawBufferId;
+use crate::compute_manager::memory_executor::matrix_id::MatrixBufferId;
+use crate::compute_manager::memory_executor::ssd_cache::SsdHandle;
 use crate::compute_manager::memory_executor::{MemoryDeviceKind, MemoryError, MemoryExecutor};
 
-/// Хранилище данных буфера: CPU или GPU.
+/// Хранилище данных буфера: CPU, GPU или SSD.
 pub enum BufferStorage {
     /// Данные находятся в оперативной памяти (column‑major).
     Cpu(Vec<f32>),
@@ -21,19 +23,22 @@ pub enum BufferStorage {
         raw_id: RawBufferId,
         device_id: DeviceId,
     },
+    /// Данные выгружены на SSD в виде файла.
+    SsdCache(SsdHandle),
 }
 
 /// Владеющая матрица, управляемая `MemoryExecutor`.
 ///
 /// Данные хранятся в column‑major порядке, совместимом с `faer`.
-/// Поддерживает как CPU‑память (`Vec<f32>`), так и GPU‑память (`Subbuffer<[f32]>`).
+/// Поддерживает CPU‑память, GPU‑память и SSD‑кэш.
 pub struct MatrixBuffer {
     rows: usize,
     cols: usize,
-    storage: BufferStorage,
+    pub(crate) storage: BufferStorage,
     memory: Arc<Mutex<MemoryExecutor>>,
     freed: bool,
     last_used: Instant,
+    matrix_id: Option<MatrixBufferId>,
 }
 
 /// Временный мутабельный доступ к матрице, гарантирующий обратную запись при дропе.
@@ -81,14 +86,13 @@ impl MatrixBuffer {
             memory: memory.clone(),
             freed: false,
             last_used: Instant::now(),
+            matrix_id: None,
         })
     }
 
     /// Создаёт новый буфер в видеопамяти указанного GPU.
     ///
     /// Память резервируется через `MemoryExecutor` и регистрируется в реестре сырых буферов.
-    /// Пока реализовано через временный пул GPU‑буферов (без возврата в пул).
-    /// В будущем будет заменено прямым выделением.
     pub fn new_gpu(
         memory: &Arc<Mutex<MemoryExecutor>>,
         device_id: DeviceId,
@@ -112,6 +116,7 @@ impl MatrixBuffer {
             memory: memory.clone(),
             freed: false,
             last_used: Instant::now(),
+            matrix_id: None,
         })
     }
 
@@ -135,6 +140,51 @@ impl MatrixBuffer {
             memory,
             freed: false,
             last_used: Instant::now(),
+            matrix_id: None,
+        }
+    }
+
+    /// Создаёт CPU‑буфер из готовых частей с привязкой к реестру.
+    pub(crate) fn from_cpu_parts(
+        rows: usize,
+        cols: usize,
+        data: Vec<f32>,
+        memory: Arc<Mutex<MemoryExecutor>>,
+        matrix_id: MatrixBufferId,
+    ) -> Self {
+        Self {
+            rows,
+            cols,
+            storage: BufferStorage::Cpu(data),
+            memory,
+            freed: false,
+            last_used: Instant::now(),
+            matrix_id: Some(matrix_id),
+        }
+    }
+
+    /// Создаёт GPU‑буфер из готовых частей с привязкой к реестру.
+    pub(crate) fn from_gpu_parts(
+        rows: usize,
+        cols: usize,
+        buffer: Subbuffer<[f32]>,
+        raw_id: RawBufferId,
+        device_id: DeviceId,
+        memory: Arc<Mutex<MemoryExecutor>>,
+        matrix_id: MatrixBufferId,
+    ) -> Self {
+        Self {
+            rows,
+            cols,
+            storage: BufferStorage::Gpu {
+                buffer,
+                raw_id,
+                device_id,
+            },
+            memory,
+            freed: false,
+            last_used: Instant::now(),
+            matrix_id: Some(matrix_id),
         }
     }
 
@@ -147,6 +197,7 @@ impl MatrixBuffer {
             memory: Arc::new(Mutex::new(MemoryExecutor::new())),
             freed: true,
             last_used: Instant::now(),
+            matrix_id: None,
         }
     }
 
@@ -164,6 +215,7 @@ impl MatrixBuffer {
         match &self.storage {
             BufferStorage::Cpu(_) => MemoryDeviceKind::HostRam,
             BufferStorage::Gpu { device_id, .. } => MemoryDeviceKind::DeviceVram(*device_id),
+            BufferStorage::SsdCache(_) => MemoryDeviceKind::SsdCache,
         }
     }
 
@@ -176,7 +228,7 @@ impl MatrixBuffer {
     }
 
     /// Возвращает копию данных в виде `faer::Mat<f32>`.
-    /// Для GPU‑буфера требуется синхронизация; в текущей версии паникует.
+    /// Для GPU‑ и SSD‑буферов паникует.
     pub fn to_mat(&self) -> Mat<f32> {
         match &self.storage {
             BufferStorage::Cpu(data) => {
@@ -188,7 +240,10 @@ impl MatrixBuffer {
                 })
             }
             BufferStorage::Gpu { .. } => {
-                panic!("MatrixBuffer::to_mat() is not supported for GPU buffers; use to_cpu() with GpuCompute");
+                panic!("MatrixBuffer::to_mat() is not supported for GPU buffers; use GpuCompute to download");
+            }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::to_mat() is not supported for SSD buffers; move to HostRam first");
             }
         }
     }
@@ -209,10 +264,13 @@ impl MatrixBuffer {
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::copy_from_mat() is not supported for GPU buffers");
             }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::copy_from_mat() is not supported for SSD buffers; move to HostRam first");
+            }
         }
     }
 
-    /// Неизменяемый доступ к матрице (копия). Для GPU паникует.
+    /// Неизменяемый доступ к матрице (копия). Для GPU и SSD паникует.
     pub fn as_mat(&self) -> Mat<f32> {
         self.to_mat()
     }
@@ -228,6 +286,9 @@ impl MatrixBuffer {
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::as_mat_mut() is not supported for GPU buffers");
             }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::as_mat_mut() is not supported for SSD buffers; move to HostRam first");
+            }
         }
     }
 
@@ -236,12 +297,15 @@ impl MatrixBuffer {
     // -------------------------------------------------------------------------
 
     /// Возвращает неизменяемую ссылку на внутренние данные (column‑major порядок).
-    /// Для GPU‑буфера паникует.
+    /// Для GPU‑ и SSD‑буферов паникует.
     pub fn as_slice(&self) -> &[f32] {
         match &self.storage {
             BufferStorage::Cpu(data) => data,
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::as_slice() is not supported for GPU buffers");
+            }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::as_slice() is not supported for SSD buffers; move to HostRam first");
             }
         }
     }
@@ -252,12 +316,15 @@ impl MatrixBuffer {
     }
 
     /// Возвращает мутабельную ссылку на внутренние данные.
-    /// Для GPU‑буфера паникует.
+    /// Для GPU‑ и SSD‑буферов паникует.
     pub fn as_slice_mut(&mut self) -> &mut [f32] {
         match &mut self.storage {
             BufferStorage::Cpu(data) => data,
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::as_slice_mut() is not supported for GPU buffers");
+            }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::as_slice_mut() is not supported for SSD buffers; move to HostRam first");
             }
         }
     }
@@ -277,6 +344,9 @@ impl MatrixBuffer {
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::fill() is not supported for GPU buffers");
             }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::fill() is not supported for SSD buffers; move to HostRam first");
+            }
         }
     }
 
@@ -294,11 +364,14 @@ impl MatrixBuffer {
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::copy_from_slice() is not supported for GPU buffers");
             }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::copy_from_slice() is not supported for SSD buffers; move to HostRam first");
+            }
         }
     }
 
     /// Изменяет логические размеры буфера, сохраняя общее количество элементов.
-    /// Работает для обоих типов хранилища.
+    /// Работает для всех типов хранилища.
     pub fn reshape_into(&mut self, new_rows: usize, new_cols: usize) {
         let total = self.rows * self.cols;
         assert_eq!(
@@ -320,6 +393,9 @@ impl MatrixBuffer {
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::get() is not supported for GPU buffers");
             }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::get() is not supported for SSD buffers; move to HostRam first");
+            }
         }
     }
 
@@ -332,6 +408,9 @@ impl MatrixBuffer {
             }
             BufferStorage::Gpu { .. } => {
                 panic!("MatrixBuffer::set() is not supported for GPU buffers");
+            }
+            BufferStorage::SsdCache(_) => {
+                panic!("MatrixBuffer::set() is not supported for SSD buffers; move to HostRam first");
             }
         }
     }
@@ -348,6 +427,33 @@ impl MatrixBuffer {
     /// Возвращает время последнего использования.
     pub(crate) fn last_used(&self) -> Instant {
         self.last_used
+    }
+
+    // -------------------------------------------------------------------------
+    // Управление идентификатором в реестре MemoryExecutor
+    // -------------------------------------------------------------------------
+
+    /// Присваивает идентификатор управляемого буфера.
+    pub(crate) fn set_matrix_id(&mut self, id: Option<MatrixBufferId>) {
+        self.matrix_id = id;
+    }
+
+    /// Возвращает идентификатор буфера в реестре, если он управляется.
+    pub fn matrix_id(&self) -> Option<MatrixBufferId> {
+        self.matrix_id
+    }
+
+    /// Перемещает данные буфера на другое устройство памяти.
+    /// Обновляет внутреннее хранилище и метаданные в реестре.
+    pub fn move_to(&mut self, target: MemoryDeviceKind) -> Result<(), MemoryError> {
+        let memory = self.memory.clone();
+        let mut mem = memory.lock().unwrap();
+        mem.move_matrix_storage(self, target)
+    }
+
+    /// Заменяет физическое хранилище данных (используется MemoryExecutor).
+    pub(crate) fn set_storage(&mut self, storage: BufferStorage) {
+        self.storage = storage;
     }
 
     // -------------------------------------------------------------------------
@@ -370,15 +476,42 @@ impl MatrixBuffer {
                     }
                     // Subbuffer будет освобождён при дропе
                 }
+                BufferStorage::SsdCache(handle) => {
+                    if let Ok(mut mem) = self.memory.lock() {
+                        mem.deallocate_ssd(handle);
+                    }
+                }
             }
             self.freed = true;
         }
     }
 }
 
+impl Clone for MatrixBuffer {
+    /// Глубокое клонирование CPU‑буфера.
+    /// GPU‑буферы не поддерживаются (паника).
+    fn clone(&self) -> Self {
+        assert!(
+            !self.is_gpu(),
+            "Cloning GPU MatrixBuffer is not supported"
+        );
+        let mut cloned = MatrixBuffer::new(&self.memory, self.rows, self.cols)
+            .expect("Failed to allocate clone buffer");
+        cloned.copy_from_slice(self.as_slice());
+        cloned
+    }
+}
+
 impl Drop for MatrixBuffer {
     fn drop(&mut self) {
-        self.deallocate();
+        if !self.freed {
+            if let Some(id) = self.matrix_id.take() {
+                if let Ok(mut mem) = self.memory.lock() {
+                    mem.unregister_matrix(id);
+                }
+            }
+            self.deallocate();
+        }
     }
 }
 

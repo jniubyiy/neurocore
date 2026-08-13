@@ -23,12 +23,32 @@ impl GpuCompute {
     // -------------------------------------------------------------------------
 
     /// Выполняет операцию reduce над GPU MatrixBuffer.
-    /// Вход и выход — GPU буферы. Реализовано через CPU fallback.
+    /// Вход и выход — GPU буферы. Реализовано через CPU-стагинг без `faer::Mat`.
     pub fn run_reduce_mat_buffered(&self, input: &MatrixBuffer, target_dims: &[usize]) -> MatrixBuffer {
         assert!(input.is_gpu(), "Input buffer must be GPU");
-        let mat = self.download_gpu_matrix_to_mat(input);
-        let reduced = dim_change::reduce_mat(&mat, target_dims);
-        self.upload_mat_to_gpu_matrix(&reduced)
+
+        let total = input.rows() * input.cols();
+        let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
+        let batch = input.rows() / remaining_product;
+        let new_rows = batch;
+        let new_cols = total / new_rows;
+
+        assert_eq!(total, new_rows * new_cols, "reduce_mat_buffered: element count mismatch");
+
+        // Скачиваем данные в Vec (column-major исходной матрицы)
+        let old_vec = self.download_gpu_matrix_to_vec(input);
+        let mut new_vec = vec![0.0f32; total];
+
+        // Переупаковка из column-major старой формы в column-major новой формы
+        for idx in 0..total {
+            let dst_r = idx / new_cols;
+            let dst_c = idx % new_cols;
+            let new_idx = dst_c * new_rows + dst_r;
+            new_vec[new_idx] = old_vec[idx];
+        }
+
+        // Загружаем результат обратно на GPU
+        self.upload_vec_to_gpu_buffer(&new_vec, new_rows, new_cols)
     }
 
     /// Выполняет операцию unsqueeze над GPU MatrixBuffer с использованием шейдера.

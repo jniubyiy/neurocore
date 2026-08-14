@@ -40,6 +40,7 @@ impl ElementChain {
     /// Возвращает кортеж:
     /// * итоговая матрица `(batch, out_features последнего кубика)`,
     /// * вектор промежуточных результатов в формате `(вход_кубика, выход_кубика)` для каждого кубика.
+    #[deprecated(note = "Use forward_batch_buffered for MemoryExecutor integration")]
     pub fn forward_batch(&self, input: &Mat<f32>) -> (Mat<f32>, Vec<(Mat<f32>, Mat<f32>)>) {
         let mut intermediates = Vec::with_capacity(self.cubes.len());
         let mut current = input.clone();
@@ -57,6 +58,7 @@ impl ElementChain {
     /// * `grad_out` — градиент по выходу цепочки, матрица `(batch, out_features последнего кубика)`.
     ///
     /// Возвращает градиент по входу цепочки — матрица `(batch, task_input_size())`.
+    #[deprecated(note = "Use backward_batch_buffered for MemoryExecutor integration")]
     pub fn backward_batch(
         &self,
         intermediates: &[(Mat<f32>, Mat<f32>)],

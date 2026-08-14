@@ -18,6 +18,7 @@ use super::expr::LossExpr;
 /// # Возвращает
 /// * `loss` – агрегированное значение потерь (скаляр).
 /// * `grad_pred` – матрица градиентов по pred той же размерности, что и `pred`.
+#[deprecated(note = "Use compute_loss_mat_buffered for MemoryExecutor integration")]
 pub fn compute_loss_mat(
     expr: &Arc<LossExpr>,
     pred: &Mat<f32>,

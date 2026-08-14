@@ -7,7 +7,7 @@ use faer::Mat;
 use vulkano::buffer::{BufferUsage, Subbuffer};
 use vulkano::command_buffer::{
     allocator::StandardCommandBufferAllocator,
-    AutoCommandBufferBuilder, CommandBufferUsage,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo,
 };
 use vulkano::descriptor_set::{
     allocator::StandardDescriptorSetAllocator,
@@ -229,7 +229,7 @@ impl GpuCompute {
         )
         .unwrap();
         builder
-            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(src, dst))
+            .copy_buffer(CopyBufferInfo::buffers(src, dst))
             .unwrap();
         let cb = builder.build().unwrap();
         let future = sync::now(self.context.device.clone())
@@ -566,7 +566,7 @@ impl GpuCompute {
         cols: usize,
     ) -> MatrixBufferHandle {
         assert_eq!(data.len(), rows * cols, "Data length must match matrix size");
-        let mut gpu_handle = self.allocate_gpu_matrix_handle(rows, cols);
+        let gpu_handle = self.allocate_gpu_matrix_handle(rows, cols);
 
         // Копируем данные из CPU в GPU через staging
         self.copy_slice_to_gpu_handle(&gpu_handle, data);
@@ -669,6 +669,34 @@ impl GpuCompute {
         let src_buf = self.get_gpu_subbuffer_from_handle(src);
         let dst_buf = self.get_gpu_subbuffer_from_handle(dst);
         self.copy_buffer_sync(src_buf, dst_buf);
+    }
+
+    /// Копирует подмножество элементов из одного GPU MatrixBufferHandle в другой.
+    /// Смещения указываются в количестве элементов f32.
+    /// Реализовано через создание подпредставлений буферов и копирование целых слайсов.
+    pub fn copy_gpu_handle_region(
+        &self,
+        src: &MatrixBufferHandle,
+        dst: &MatrixBufferHandle,
+        src_offset: usize,
+        dst_offset: usize,
+        elements: usize,
+    ) {
+        assert!(src.is_gpu(), "Source must be GPU");
+        assert!(dst.is_gpu(), "Destination must be GPU");
+
+        let elem_size = std::mem::size_of::<f32>() as u64;
+        let src_start_byte = src_offset as u64 * elem_size;
+        let dst_start_byte = dst_offset as u64 * elem_size;
+        let byte_len = elements as u64 * elem_size;
+
+        let src_full = self.get_gpu_subbuffer_from_handle(src);
+        let dst_full = self.get_gpu_subbuffer_from_handle(dst);
+
+        let src_slice = src_full.clone().slice(src_start_byte..(src_start_byte + byte_len));
+        let dst_slice = dst_full.clone().slice(dst_start_byte..(dst_start_byte + byte_len));
+
+        self.copy_buffer_sync(src_slice, dst_slice);
     }
 
     /// Вспомогательный метод: извлекает Subbuffer из GPU-записи по дескриптору.

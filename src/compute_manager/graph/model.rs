@@ -365,58 +365,55 @@ impl MixedModel {
         pred: &DynamicTensor,
         target: &DynamicTensor,
     ) -> (f32, DynamicTensor) {
+        let pool_arc = self.temp_matrix_pool.clone();
+        let mut pool = pool_arc.lock().unwrap();
+
         let pred_mat = self.dynamic_tensor_to_mat(pred.clone());
         let target_mat = self.dynamic_tensor_to_mat(target.clone());
-        let (loss, grad_mat) = self.compute_loss_mat(desc.build(), &pred_mat, &target_mat);
+        let pred_buf = self.mat_to_matrix_buffer_handle(&pred_mat, &mut pool);
+        let target_buf = self.mat_to_matrix_buffer_handle(&target_mat, &mut pool);
+
+        // Передаём уже захваченный пул, чтобы избежать повторного захвата.
+        let (loss, grad_buf) = self.compute_loss_handle(desc.build(), pred_buf, target_buf, &mut pool);
+
+        let grad_mat = if grad_buf.is_gpu() {
+            let gpu_compute = self.gpu_compute.as_ref().expect("GPU compute not available").lock().unwrap();
+            gpu_compute.download_gpu_handle_to_mat(&grad_buf)
+        } else {
+            let guard = grad_buf.read();
+            let slice = guard.as_slice().expect("CPU buffer");
+            Mat::from_fn(grad_buf.rows(), grad_buf.cols(), |r, c| slice[c * grad_buf.rows() + r])
+        };
         let grad_tensor = self.mat_to_dynamic_tensor(grad_mat, &self.output_shapes[0]);
         (loss, grad_tensor)
     }
 
-    pub fn compute_loss_mat(
+    // Приватный метод: вычисление потерь полностью на MatrixBufferHandle
+    fn compute_loss_handle(
         &self,
         expr: Arc<LossExpr>,
-        pred: &Mat<f32>,
-        target: &Mat<f32>,
-    ) -> (f32, Mat<f32>) {
-        let use_gpu = self.gpu_compute.is_some() && (expr.num_tasks() == pred.nrows());
+        pred: MatrixBufferHandle,
+        target: MatrixBufferHandle,
+        pool: &mut TempMatrixPool,
+    ) -> (f32, MatrixBufferHandle) {
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
-            if use_gpu {
-                let gpu_compute = gpu_compute_mutex.lock().unwrap();
-
-                // Конвертируем Mat в GPU-дескрипторы
-                let pred_flat = GpuCompute::mat_to_flat(pred);
-                let target_flat = GpuCompute::mat_to_flat(target);
-                let pred_gpu_handle = gpu_compute.upload_vec_to_gpu_handle(
-                    &pred_flat,
-                    pred.nrows(),
-                    pred.ncols(),
+            let gpu = gpu_compute_mutex.lock().unwrap();
+            if pred.is_gpu() && target.is_gpu() {
+                // GPU-путь не нуждается в пуле
+                return crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered_handle(
+                    &gpu, &expr, &pred, &target,
                 );
-                let target_gpu_handle = gpu_compute.upload_vec_to_gpu_handle(
-                    &target_flat,
-                    target.nrows(),
-                    target.ncols(),
-                );
-
-                // Вызываем handle-версию GPU-вычисления потерь
-                let (loss, grad_pred_handle) = crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered_handle(
-                    &gpu_compute,
-                    &expr,
-                    &pred_gpu_handle,
-                    &target_gpu_handle,
-                );
-
-                // Скачиваем градиент обратно в Mat
-                let grad_pred = gpu_compute.download_gpu_handle_to_mat(&grad_pred_handle);
-                (loss, grad_pred)
-            } else {
-                self.compute_loss_mat_cpu_buffered(expr, pred, target)
             }
-        } else {
-            self.compute_loss_mat_cpu_buffered(expr, pred, target)
         }
+
+        // CPU path, используем предоставленный пул
+        crate::plans::loss_plan::execution::compute_loss_mat_buffered(
+            &expr, &pred, &target, pool,
+        )
     }
 
-    fn compute_loss_mat_cpu_buffered(
+    #[deprecated(note = "Use compute_loss (DynamicTensor) or compute_loss_handle internally")]
+    pub fn compute_loss_mat(
         &self,
         expr: Arc<LossExpr>,
         pred: &Mat<f32>,
@@ -425,30 +422,19 @@ impl MixedModel {
         let pool_arc = self.temp_matrix_pool.clone();
         let mut pool = pool_arc.lock().unwrap();
 
-        // Создаём handle для pred и target из Mat
         let pred_buf = self.mat_to_matrix_buffer_handle(pred, &mut pool);
         let target_buf = self.mat_to_matrix_buffer_handle(target, &mut pool);
 
-        let (loss, grad_buf) = crate::plans::loss_plan::execution::compute_loss_mat_buffered(
-            &expr,
-            &pred_buf,
-            &target_buf,
-            &mut pool,
-        );
+        let (loss, grad_buf) = self.compute_loss_handle(expr, pred_buf, target_buf, &mut pool);
 
-        // Конвертируем градиент обратно в Mat
-        let grad_guard = grad_buf.read();
-        let grad_slice = grad_guard.as_slice().expect("CPU buffer");
-        let grad_mat = Mat::from_fn(grad_buf.rows(), grad_buf.cols(), |r, c| {
-            grad_slice[c * grad_buf.rows() + r]
-        });
-        drop(grad_guard);
-
-        // Возвращаем буферы в пул
-        pool.release(pred_buf);
-        pool.release(target_buf);
-        pool.release(grad_buf);
-
+        let grad_mat = if grad_buf.is_gpu() {
+            let gpu = self.gpu_compute.as_ref().expect("GPU compute not available").lock().unwrap();
+            gpu.download_gpu_handle_to_mat(&grad_buf)
+        } else {
+            let guard = grad_buf.read();
+            let slice = guard.as_slice().expect("CPU buffer");
+            Mat::from_fn(grad_buf.rows(), grad_buf.cols(), |r, c| slice[c * grad_buf.rows() + r])
+        };
         (loss, grad_mat)
     }
 
@@ -477,7 +463,7 @@ impl MixedModel {
     }
 
     fn mat_to_matrix_buffer_handle(&self, mat: &Mat<f32>, pool: &mut TempMatrixPool) -> MatrixBufferHandle {
-        let mut buf = pool.acquire(mat.nrows(), mat.ncols());
+        let buf = pool.acquire(mat.nrows(), mat.ncols());
         {
             let mut guard = buf.write();
             let slice = guard.as_slice_mut().expect("CPU buffer");

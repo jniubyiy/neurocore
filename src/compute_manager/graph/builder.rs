@@ -1,9 +1,4 @@
 // src/compute_manager/graph/builder.rs
-//
-// Построитель вычислительного графа MixedModel.
-// Все внутренние операции используют только матрицы faer::Mat<f32>.
-// Тензоры (DynamicTensor) применяются исключительно на публичных границах
-// (методы forward/backward обёртки), которые реализованы в model.rs.
 
 use std::sync::{Arc, Mutex};
 
@@ -364,6 +359,7 @@ impl MixedModel {
             })),
             temp_matrix_pool,
             buffered_param_store: None,
+            optimizer_expr: None,
         };
 
         // -----------------------------------------------------------

@@ -1,24 +1,78 @@
 // src/plans/optimizer_plan/expr.rs
 
+use std::sync::{Arc, Mutex};
+
+use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::matrix_buffer::{MatrixBuffer, MatrixBufferHandle, TempMatrixPool};
+
 use super::chain::OptimizerChain;
 use super::state::OptimizerState;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 /// Интерпретатор оптимизатора, объединяющий цепочку кубиков и их состояние.
+///
+/// Поддерживает два пути выполнения:
+/// - Legacy: использует `OptimizerState` и срезы `[f32]` (через `step`, `step_buffered`).
+/// - Buffered: использует вектор `MatrixBufferHandle` для состояний
+///   (через `step_buffered_handle`), без копирования в `Vec<f32>`.
 pub struct OptimizerExpr {
     chain: OptimizerChain,
-    state: OptimizerState,
+    /// Состояния для каждого кубика в новом буферизованном пути.
+    states: Vec<MatrixBufferHandle>,
+    /// Состояние для legacy‑пути (если используется `new`).
+    legacy_state: OptimizerState,
     step_counter: usize,
 }
 
 impl OptimizerExpr {
     /// Создаёт новый оптимизатор для заданного количества параметров и цепочки кубиков.
+    ///
+    /// Использует legacy‑состояние `OptimizerState`. Для работы через
+    /// `MatrixBufferHandle` используйте [`new_buffered_handle`].
+    #[deprecated(note = "Use new_buffered_handle for MemoryExecutor integration")]
     pub fn new(num_params: usize, chain: OptimizerChain) -> Self {
         let total_state = chain.total_state_size_per_param();
         Self {
             chain,
-            state: OptimizerState::new(num_params, total_state),
+            states: Vec::new(),
+            legacy_state: OptimizerState::new(num_params, total_state),
+            step_counter: 0,
+        }
+    }
+
+    /// Создаёт оптимизатор, который работает полностью на `MatrixBufferHandle`.
+    ///
+    /// Для каждого кубика выделяется отдельный `MatrixBufferHandle` через
+    /// `TempMatrixPool`. Состояния сохраняются между вызовами `step_buffered_handle`.
+    ///
+    /// # Аргументы
+    /// * `memory_executor` – менеджер памяти (используется косвенно через `pool`).
+    /// * `num_params` – количество оптимизируемых параметров.
+    /// * `chain` – цепочка кубиков.
+    /// * `pool` – пул временных матриц для выделения состояний.
+    pub fn new_buffered_handle(
+        _memory_executor: Arc<Mutex<MemoryExecutor>>,
+        num_params: usize,
+        chain: OptimizerChain,
+        pool: &mut TempMatrixPool,
+    ) -> Self {
+        let mut states = Vec::with_capacity(chain.cubes().len());
+        for cube in chain.cubes() {
+            let state_size = cube.state_size_per_param();
+            if state_size > 0 {
+                // Храним состояние как вектор размером `num_params * state_size` в столбце.
+                let handle = pool.acquire(num_params * state_size, 1);
+                states.push(handle);
+            } else {
+                // Для кубиков без состояния используем пустой handle.
+                let empty = pool.acquire(0, 0);
+                states.push(empty);
+            }
+        }
+
+        Self {
+            chain,
+            states,
+            legacy_state: OptimizerState::new(0, 0),
             step_counter: 0,
         }
     }
@@ -29,9 +83,12 @@ impl OptimizerExpr {
     /// * `params` – мутабельный срез всех параметров модели.
     /// * `grads`  – срез градиентов. Кубики могут изменять градиенты
     ///   во временном буфере, но исходный `grads` не изменяется.
+    #[deprecated(note = "Use step_buffered_handle for MemoryExecutor integration")]
+    #[allow(deprecated)]
     pub fn step(&mut self, params: &mut [f32], grads: &[f32]) {
         let mut grads_mut = grads.to_vec();
-        self.chain.apply_all(params, &mut grads_mut, self.state.as_mut_slice());
+        self.chain
+            .apply_all(params, &mut grads_mut, self.legacy_state.as_mut_slice());
         self.step_counter += 1;
     }
 
@@ -45,6 +102,8 @@ impl OptimizerExpr {
     ///
     /// # Паника
     /// Паникует, если `params` или `grads` являются GPU‑буферами.
+    #[deprecated(note = "Use step_buffered_handle for MemoryExecutor integration")]
+    #[allow(deprecated)]
     pub fn step_buffered(&mut self, params: &mut MatrixBuffer, grads: &MatrixBuffer) {
         assert!(!params.is_gpu() && !grads.is_gpu(),
             "step_buffered supports only CPU buffers");
@@ -53,85 +112,38 @@ impl OptimizerExpr {
         self.chain.apply_all(
             params.as_slice_mut(),
             &mut grads_mut,
-            self.state.as_mut_slice(),
+            self.legacy_state.as_mut_slice(),
         );
         self.step_counter += 1;
     }
 
-    /// Выполняет один шаг оптимизации, принимая параметры, градиенты и
-    /// состояние в виде дескрипторов `MatrixBufferHandle` (все CPU).
+    /// Выполняет один шаг оптимизации, работая полностью с `MatrixBufferHandle`.
     ///
-    /// Метод копирует данные из дескрипторов во временные векторы, применяет
-    /// цепочку кубиков и записывает результаты обратно. Это позволяет
-    /// использовать новую модель памяти с `MatrixBufferHandle` без изменения
-    /// самих кубиков.
+    /// Параметры и градиенты изменяются in‑place через `write()`/`read()`.
+    /// Никаких копирований в `Vec<f32>` не выполняется.
     ///
     /// # Аргументы
-    /// * `params` – дескриптор параметров (мутабельный, CPU).
+    /// * `params` – дескриптор параметров (CPU).
     /// * `grads`  – дескриптор градиентов (CPU).
-    /// * `state`  – дескриптор состояния оптимизатора (CPU). Его размер
-    ///   должен быть `num_params * total_state_size_per_param()`.
     ///
     /// # Паника
-    /// Паникует, если любой из дескрипторов является GPU‑буфером или
-    /// размеры не совпадают.
+    /// Паникует, если `params` или `grads` являются GPU‑буферами, или если
+    /// буферизованный путь не был инициализирован (состояния отсутствуют).
     pub fn step_buffered_handle(
         &mut self,
         params: &MatrixBufferHandle,
         grads: &MatrixBufferHandle,
-        state: &MatrixBufferHandle,
     ) {
-        assert!(!params.is_gpu(), "params handle must be CPU");
-        assert!(!grads.is_gpu(), "grads handle must be CPU");
-        assert!(!state.is_gpu(), "state handle must be CPU");
+        assert!(!params.is_gpu() && !grads.is_gpu(),
+            "step_buffered_handle supports only CPU handles");
+        assert_eq!(self.states.len(), self.chain.cubes().len(),
+            "OptimizerExpr was not initialized with new_buffered_handle");
 
-        let num_params = params.rows() * params.cols();
-        let total_state_per_param = self.chain.total_state_size_per_param();
-
-        // Копируем данные во временные векторы
-        let mut p_vec = {
-            let guard = params.read();
-            guard.as_slice().expect("params must be CPU").to_vec()
-        };
-        let mut g_vec = {
-            let guard = grads.read();
-            guard.as_slice().expect("grads must be CPU").to_vec()
-        };
-        let mut s_vec = {
-            let guard = state.read();
-            guard.as_slice().expect("state must be CPU").to_vec()
-        };
-
-        // Проверяем размеры
-        assert_eq!(p_vec.len(), num_params, "params size mismatch");
-        assert_eq!(g_vec.len(), num_params, "grads size mismatch");
-        assert_eq!(
-            s_vec.len(),
-            num_params * total_state_per_param,
-            "state size mismatch"
-        );
-
-        // Применяем цепочку кубиков
-        self.chain.apply_all(&mut p_vec, &mut g_vec, &mut s_vec);
-
-        // Записываем результаты обратно в дескрипторы
-        {
-            let mut p_guard = params.write();
-            p_guard.as_slice_mut().expect("params must be CPU").copy_from_slice(&p_vec);
-        }
-        {
-            let mut g_guard = grads.write();
-            g_guard.as_slice_mut().expect("grads must be CPU").copy_from_slice(&g_vec);
-        }
-        {
-            let mut s_guard = state.write();
-            s_guard.as_slice_mut().expect("state must be CPU").copy_from_slice(&s_vec);
-        }
-
+        self.chain.apply_all_buffered_handle(params, grads, &self.states);
         self.step_counter += 1;
     }
 
-    /// Возвращает номер текущего шага (начиная с 1 после первого вызова `step`).
+    /// Возвращает номер текущего шага (начиная с 1 после первого вызова шага).
     pub fn current_step(&self) -> usize {
         self.step_counter
     }

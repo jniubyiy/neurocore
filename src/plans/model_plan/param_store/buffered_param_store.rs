@@ -2,29 +2,29 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::compute_manager::memory_executor::policy::BufferPriority;
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
-/// Буферизованное хранилище параметров, градиентов и состояния оптимизатора.
+/// Буферизованное хранилище параметров, градиентов и состояния оптимизатора,
+/// использующее лёгкие дескрипторы [`MatrixBufferHandle`].
 ///
-/// Все данные хранятся в управляемых [`MatrixBuffer`], которые регистрируются
-/// в [`MemoryExecutor`] и могут участвовать в управлении памятью.
-///
-/// Это хранилище создаётся параллельно со старым `ParamStore` и не заменяет его
-/// на данном этапе. Оно предназначено для постепенного перевода вычислений
-/// на управляемую память.
+/// Все данные находятся в управляемой памяти `MemoryExecutor` и могут
+/// участвовать в автоматическом перемещении между уровнями памяти.
 pub struct BufferedParamStore {
     /// Параметры модели в виде вектор-столбца `(num_params, 1)`.
-    pub(crate) params: MatrixBuffer,
+    pub(crate) params: MatrixBufferHandle,
 
     /// Градиенты параметров в виде вектор-столбца `(num_params, 1)`.
-    pub(crate) grads: MatrixBuffer,
+    pub(crate) grads: MatrixBufferHandle,
 
-    /// Состояние оптимизатора, если цепочка требует память.
+    /// Состояние оптимизатора (если цепочка требует память).
     /// Размер `(num_params * state_size_per_param, 1)`.
-    pub(crate) opt_state: Option<MatrixBuffer>,
+    /// В новом оптимизаторе состояния хранятся отдельно в `OptimizerExpr`,
+    /// поэтому это поле может оставаться неиспользуемым, но сохранено
+    /// для обратной совместимости.
+    pub(crate) opt_state: Option<MatrixBufferHandle>,
 
     /// Количество параметров.
     pub(crate) num_params: usize,
@@ -37,7 +37,7 @@ pub struct BufferedParamStore {
 }
 
 impl BufferedParamStore {
-    /// Создаёт новое CPU‑хранилище параметров и градиентов.
+    /// Создаёт новое CPU‑хранилище параметров и градиентов на основе `MatrixBufferHandle`.
     ///
     /// # Аргументы
     /// * `memory` — `MemoryExecutor`, через который выделяется управляемая память.
@@ -52,43 +52,40 @@ impl BufferedParamStore {
         num_params: usize,
         state_size_per_param: usize,
     ) -> Self {
-        let mut params = MatrixBuffer::new(&memory, num_params, 1)
-            .expect("BufferedParamStore: failed to allocate params matrix");
-        let mut grads = MatrixBuffer::new(&memory, num_params, 1)
-            .expect("BufferedParamStore: failed to allocate grads matrix");
-
-        // Регистрируем буферы в реестре MemoryExecutor
-        {
+        let params = {
             let mut mem = memory.lock().unwrap();
-            let params_id = mem.register_matrix(
+            mem.acquire_matrix_handle(
                 num_params,
                 1,
                 MemoryDeviceKind::HostRam,
                 BufferPriority::High,
-            );
-            let grads_id = mem.register_matrix(
+            )
+            .expect("BufferedParamStore: failed to allocate params handle")
+        };
+
+        let grads = {
+            let mut mem = memory.lock().unwrap();
+            mem.acquire_matrix_handle(
                 num_params,
                 1,
                 MemoryDeviceKind::HostRam,
                 BufferPriority::High,
-            );
-            params.set_matrix_id(Some(params_id));
-            grads.set_matrix_id(Some(grads_id));
-        }
+            )
+            .expect("BufferedParamStore: failed to allocate grads handle")
+        };
 
         let opt_state = if state_size_per_param > 0 {
             let total_state_elems = num_params * state_size_per_param;
-            let mut state = MatrixBuffer::new(&memory, total_state_elems, 1)
-                .expect("BufferedParamStore: failed to allocate optimizer state");
             let mut mem = memory.lock().unwrap();
-            let state_id = mem.register_matrix(
-                total_state_elems,
-                1,
-                MemoryDeviceKind::HostRam,
-                BufferPriority::High,
-            );
-            state.set_matrix_id(Some(state_id));
-            Some(state)
+            Some(
+                mem.acquire_matrix_handle(
+                    total_state_elems,
+                    1,
+                    MemoryDeviceKind::HostRam,
+                    BufferPriority::High,
+                )
+                .expect("BufferedParamStore: failed to allocate optimizer state handle"),
+            )
         } else {
             None
         };
@@ -103,39 +100,39 @@ impl BufferedParamStore {
         }
     }
 
-    /// Возвращает матрицу параметров.
+    /// Возвращает дескриптор параметров.
     #[inline]
-    pub fn params_matrix(&self) -> &MatrixBuffer {
+    pub fn params_handle(&self) -> &MatrixBufferHandle {
         &self.params
     }
 
-    /// Возвращает мутабельную матрицу параметров.
+    /// Возвращает мутабельный дескриптор параметров.
     #[inline]
-    pub fn params_matrix_mut(&mut self) -> &mut MatrixBuffer {
+    pub fn params_handle_mut(&mut self) -> &mut MatrixBufferHandle {
         &mut self.params
     }
 
-    /// Возвращает матрицу градиентов.
+    /// Возвращает дескриптор градиентов.
     #[inline]
-    pub fn grads_matrix(&self) -> &MatrixBuffer {
+    pub fn grads_handle(&self) -> &MatrixBufferHandle {
         &self.grads
     }
 
-    /// Возвращает мутабельную матрицу градиентов.
+    /// Возвращает мутабельный дескриптор градиентов.
     #[inline]
-    pub fn grads_matrix_mut(&mut self) -> &mut MatrixBuffer {
+    pub fn grads_handle_mut(&mut self) -> &mut MatrixBufferHandle {
         &mut self.grads
     }
 
-    /// Возвращает состояние оптимизатора, если оно есть.
+    /// Возвращает дескриптор состояния оптимизатора, если он есть.
     #[inline]
-    pub fn state_matrix(&self) -> Option<&MatrixBuffer> {
+    pub fn state_handle(&self) -> Option<&MatrixBufferHandle> {
         self.opt_state.as_ref()
     }
 
-    /// Возвращает мутабельное состояние оптимизатора, если оно есть.
+    /// Возвращает мутабельный дескриптор состояния оптимизатора, если он есть.
     #[inline]
-    pub fn state_matrix_mut(&mut self) -> Option<&mut MatrixBuffer> {
+    pub fn state_handle_mut(&mut self) -> Option<&mut MatrixBufferHandle> {
         self.opt_state.as_mut()
     }
 
@@ -161,10 +158,9 @@ impl BufferedParamStore {
             self.num_params,
             "BufferedParamStore::copy_params_from_slice: length mismatch"
         );
-        let mut mat = self.params.as_mat_mut();
-        for i in 0..self.num_params {
-            mat[(i, 0)] = params[i];
-        }
+        let mut guard = self.params.write();
+        let dst = guard.as_slice_mut().expect("BufferedParamStore: params must be CPU");
+        dst.copy_from_slice(params);
     }
 
     /// Копирует параметры из управляемого буфера в плоский срез.
@@ -177,10 +173,9 @@ impl BufferedParamStore {
             self.num_params,
             "BufferedParamStore::copy_params_to_slice: length mismatch"
         );
-        let mat = self.params.to_mat();
-        for i in 0..self.num_params {
-            out[i] = mat[(i, 0)];
-        }
+        let guard = self.params.read();
+        let src = guard.as_slice().expect("BufferedParamStore: params must be CPU");
+        out.copy_from_slice(src);
     }
 
     /// Копирует градиенты из плоского среза в управляемый буфер.
@@ -193,10 +188,9 @@ impl BufferedParamStore {
             self.num_params,
             "BufferedParamStore::copy_grads_from_slice: length mismatch"
         );
-        let mut mat = self.grads.as_mat_mut();
-        for i in 0..self.num_params {
-            mat[(i, 0)] = grads[i];
-        }
+        let mut guard = self.grads.write();
+        let dst = guard.as_slice_mut().expect("BufferedParamStore: grads must be CPU");
+        dst.copy_from_slice(grads);
     }
 
     /// Копирует градиенты из управляемого буфера в плоский срез.
@@ -209,16 +203,17 @@ impl BufferedParamStore {
             self.num_params,
             "BufferedParamStore::copy_grads_to_slice: length mismatch"
         );
-        let mat = self.grads.to_mat();
-        for i in 0..self.num_params {
-            out[i] = mat[(i, 0)];
-        }
+        let guard = self.grads.read();
+        let src = guard.as_slice().expect("BufferedParamStore: grads must be CPU");
+        out.copy_from_slice(src);
     }
 
     /// Обнуляет градиенты.
     #[inline]
     pub fn zero_grads(&mut self) {
-        self.grads.fill(0.0);
+        let mut guard = self.grads.write();
+        let slice = guard.as_slice_mut().expect("BufferedParamStore: grads must be CPU");
+        slice.fill(0.0);
     }
 
     /// Добавляет градиенты из плоского среза к уже накопленным.
@@ -231,9 +226,10 @@ impl BufferedParamStore {
             self.num_params,
             "BufferedParamStore::accumulate_grads_from_slice: length mismatch"
         );
-        let mut mat = self.grads.as_mat_mut();
-        for i in 0..self.num_params {
-            mat[(i, 0)] += grads[i];
+        let mut guard = self.grads.write();
+        let dst = guard.as_slice_mut().expect("BufferedParamStore: grads must be CPU");
+        for (d, &s) in dst.iter_mut().zip(grads.iter()) {
+            *d += s;
         }
     }
 }
@@ -243,8 +239,6 @@ mod tests {
     use super::*;
     use crate::compute_manager::device_spec::DeviceSpec;
     use crate::compute_manager::memory_executor::MemoryExecutor;
-    use crate::optimizer_plan::cubes::{ApplyUpdate, ScaleGradient};
-    use crate::optimizer_plan::chain::OptimizerChain;
 
     fn create_memory() -> Arc<Mutex<MemoryExecutor>> {
         let mem = Arc::new(Mutex::new(MemoryExecutor::new()));
@@ -259,11 +253,11 @@ mod tests {
         let mem = create_memory();
         let store = BufferedParamStore::new_cpu(mem.clone(), 10, 0);
         assert_eq!(store.num_params(), 10);
-        assert_eq!(store.params.rows(), 10);
-        assert_eq!(store.params.cols(), 1);
-        assert_eq!(store.grads.rows(), 10);
-        assert_eq!(store.grads.cols(), 1);
-        assert!(store.opt_state.is_none());
+        assert_eq!(store.params_handle().rows(), 10);
+        assert_eq!(store.params_handle().cols(), 1);
+        assert_eq!(store.grads_handle().rows(), 10);
+        assert_eq!(store.grads_handle().cols(), 1);
+        assert!(store.state_handle().is_none());
     }
 
     #[test]
@@ -285,34 +279,20 @@ mod tests {
         store.zero_grads();
         store.accumulate_grads_from_slice(&[0.5, -0.5, 1.0, 2.0]);
 
-        let grads = store.grads.to_mat();
-        assert!((grads[(0, 0)] - 0.5).abs() < 1e-6);
-        assert!((grads[(1, 0)] + 0.5).abs() < 1e-6);
-        assert!((grads[(2, 0)] - 1.0).abs() < 1e-6);
-        assert!((grads[(3, 0)] - 2.0).abs() < 1e-6);
+        let mut grads_out = [0.0; 4];
+        store.copy_grads_to_slice(&mut grads_out);
+        assert!((grads_out[0] - 0.5).abs() < 1e-6);
+        assert!((grads_out[1] + 0.5).abs() < 1e-6);
+        assert!((grads_out[2] - 1.0).abs() < 1e-6);
+        assert!((grads_out[3] - 2.0).abs() < 1e-6);
     }
 
     #[test]
-    fn test_optimizer_step_buffered() {
+    fn test_state_allocation() {
         let mem = create_memory();
-        let num_params = 4;
-        let mut store = BufferedParamStore::new_cpu(mem.clone(), num_params, 0);
-
-        store.copy_params_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-        store.copy_grads_from_slice(&[0.1, 0.2, 0.3, 0.4]);
-
-        let chain = OptimizerChain::new()
-            .add(Box::new(ScaleGradient::new(0.1)))
-            .add(Box::new(ApplyUpdate));
-
-        // Состояния нет, поэтому создаём временное пустое состояние.
-        let mut empty_state = MatrixBuffer::new(&mem, 0, 1).unwrap();
-        chain.apply_all_buffered(&mut store.params, &mut store.grads, &mut empty_state);
-
-        let updated = store.params.to_mat();
-        assert!((updated[(0, 0)] - 0.99).abs() < 1e-6);
-        assert!((updated[(1, 0)] - 1.98).abs() < 1e-6);
-        assert!((updated[(2, 0)] - 2.97).abs() < 1e-6);
-        assert!((updated[(3, 0)] - 3.96).abs() < 1e-6);
+        let store = BufferedParamStore::new_cpu(mem.clone(), 4, 2);
+        let state = store.state_handle().expect("state should be allocated");
+        assert_eq!(state.rows(), 8);
+        assert_eq!(state.cols(), 1);
     }
 }

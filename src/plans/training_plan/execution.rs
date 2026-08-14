@@ -15,7 +15,7 @@ use crate::logging::training_monitor::TrainingMonitor;
 use crate::model_plan::Plan;
 use crate::tensor::Tensor2D;
 
-use super::plan::{DataSource, Initializer, TrainingPlan};
+use super::plan::{Initializer, TrainingPlan};
 use super::profiling::{Profiler, ProfileMode, ProfileResult};
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
@@ -69,7 +69,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         );
     }
 
-    // --- построение модели (теперь mut) ---
+    // --- построение модели ---
     let model_desc = (plan.model_fn)();
     let _ = Plan::from_layer_descs(model_desc.clone())?;
     let mut model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
@@ -99,7 +99,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         }
     }
 
-    // --- оптимизатор (сначала строим цепочку, чтобы извлечь learning rate) ---
+    // --- оптимизатор: строим цепочку только для извлечения learning rate ---
     let opt_chain = plan.optimizer_desc.build_chain();
 
     // --- learning rate для монитора (ищем первый ScaleGradient в цепочке) ---
@@ -112,8 +112,6 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
                 .map(|sg| sg.factor)
         })
         .unwrap_or(0.01);
-
-    let mut optimizer = model.create_optimizer(opt_chain);
 
     // --- монитор обучения ---
     let mut monitor = if plan.monitoring {
@@ -158,7 +156,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     let mut zero_loss_epoch: Option<usize> = None;
 
     for epoch in 0..plan.epochs {
-        // Адаптивная реаллокация перед каждой эпохой (внутри сама решит, нужно ли)
+        // Адаптивная реаллокация перед каждой эпохой
         model.maybe_reassign_devices(device_plan, plan.batch_size);
 
         let mut epoch_loss = 0.0f32;
@@ -191,14 +189,9 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
             let (_, grads) = model.backward(&ctxs, delta);
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
-            // обновление параметров
+            // обновление параметров через буферизованный оптимизатор
             let t3 = Instant::now();
-            {
-                let mut store = model.param_store().lock().unwrap();
-                let mut params = store.all_params_vec();
-                optimizer.step(&mut params, &grads[0]);
-                store.set_all_params(&params);
-            }
+            model.update_params_buffered(plan.optimizer_desc.clone(), &grads[0]);
             let update_dt = t3.elapsed().as_nanos() as u64;
 
             epoch_loss += loss * batch_size_actual as f32;

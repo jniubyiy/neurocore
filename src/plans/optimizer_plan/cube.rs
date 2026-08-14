@@ -1,8 +1,7 @@
 // src/plans/optimizer_plan/cube.rs
 
 use std::any::Any;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBuffer, MatrixBufferHandle};
 
 /// Атомарный блок оптимизации.
 ///
@@ -36,85 +35,40 @@ pub trait OptimizerCube: Send + Sync + Any {
     ///   `ScaleGradient` умножает их, `AddWeightDecay` добавляет слагаемое).
     /// * `state`  - мутабельный срез состояния кубика.
     ///   Его длина равна `N * state_size_per_param()`, где `N` — число параметров.
-    fn apply(&self, params: &mut [f32], grads: &mut [f32], state: &mut [f32]);
+    #[deprecated(note = "Use apply_buffered_handle for MemoryExecutor integration")]
+    fn apply(&self, params: &mut [f32], grads: &mut [f32], state: &mut [f32]) {
+        panic!("apply is deprecated; use apply_buffered_handle");
+    }
 
     /// То же, что и `apply`, но принимает управляемые буферы `MatrixBuffer`.
     ///
     /// По умолчанию паникует, если конкретный кубик не переопределил этот метод.
-    /// Буферизованная версия должна использоваться для полной интеграции
-    /// с `MemoryExecutor` и пулом временных матриц.
+    #[deprecated(note = "Use apply_buffered_handle for MemoryExecutor integration")]
     fn apply_buffered(
         &self,
         _params: &mut MatrixBuffer,
         _grads: &mut MatrixBuffer,
         _state: &mut MatrixBuffer,
     ) {
-        panic!("apply_buffered not implemented for this cube");
+        panic!("apply_buffered is deprecated; use apply_buffered_handle");
     }
 
     /// Применяет кубик к дескрипторам `MatrixBufferHandle`.
     ///
-    /// Реализация по умолчанию копирует данные из дескрипторов во временные
-    /// векторы, вызывает [`apply`], затем записывает результаты обратно.
-    /// Это обеспечивает совместимость с новой моделью памяти без необходимости
-    /// переопределять метод в каждом кубике. Однако для максимальной
-    /// производительности кубики могут предоставить собственную реализацию,
-    /// работающую напрямую с дескрипторами.
+    /// Этот метод является основным и обязательным для реализации.
     ///
-    /// # Паника
-    /// Паникует, если какой-либо из дескрипторов ссылается на GPU-буфер.
+    /// # Аргументы
+    /// * `params` – дескриптор параметров (мутабельный через `write()`).
+    /// * `grads`  – дескриптор градиентов (мутабельный).
+    /// * `state`  – дескриптор состояния кубика.
+    ///   Его размер должен быть `num_params * state_size_per_param()`.
+    ///   Для кубиков без состояния можно передавать пустой handle.
     fn apply_buffered_handle(
         &self,
         params: &MatrixBufferHandle,
         grads: &MatrixBufferHandle,
         state: &MatrixBufferHandle,
-    ) {
-        assert!(!params.is_gpu(), "params handle must be CPU");
-        assert!(!grads.is_gpu(), "grads handle must be CPU");
-        assert!(!state.is_gpu(), "state handle must be CPU");
-
-        let num_params = params.rows() * params.cols();
-
-        // Копируем данные во временные векторы
-        let mut p_vec = {
-            let guard = params.read();
-            guard.as_slice().expect("params must be CPU").to_vec()
-        };
-        let mut g_vec = {
-            let guard = grads.read();
-            guard.as_slice().expect("grads must be CPU").to_vec()
-        };
-        let mut s_vec = {
-            let guard = state.read();
-            guard.as_slice().expect("state must be CPU").to_vec()
-        };
-
-        // Проверяем размеры
-        assert_eq!(p_vec.len(), num_params, "params size mismatch");
-        assert_eq!(g_vec.len(), num_params, "grads size mismatch");
-        assert_eq!(
-            s_vec.len(),
-            num_params * self.state_size_per_param(),
-            "state size mismatch"
-        );
-
-        // Применяем кубик
-        self.apply(&mut p_vec, &mut g_vec, &mut s_vec);
-
-        // Записываем обратно
-        {
-            let mut p_guard = params.write();
-            p_guard.as_slice_mut().expect("params must be CPU").copy_from_slice(&p_vec);
-        }
-        {
-            let mut g_guard = grads.write();
-            g_guard.as_slice_mut().expect("grads must be CPU").copy_from_slice(&g_vec);
-        }
-        {
-            let mut s_guard = state.write();
-            s_guard.as_slice_mut().expect("state must be CPU").copy_from_slice(&s_vec);
-        }
-    }
+    );
 
     /// Позволяет downcasting к конкретному типу кубика.
     fn as_any(&self) -> &dyn Any;

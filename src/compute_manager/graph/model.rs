@@ -52,8 +52,12 @@ pub struct MixedModel {
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
 
     /// Новое буферизованное хранилище параметров и градиентов.
-    /// Создаётся лениво и используется для оптимизации без копирования в Vec.
+    /// Использует `MatrixBufferHandle`.
     pub(crate) buffered_param_store: Option<BufferedParamStore>,
+
+    /// Буферизованный интерпретатор оптимизатора с состояниями.
+    /// Создаётся лениво и хранится между шагами обучения.
+    pub(crate) optimizer_expr: Option<OptimizerExpr>,
 }
 
 impl MixedModel {
@@ -177,6 +181,10 @@ impl MixedModel {
         OptimizerExpr::new(num_params, chain)
     }
 
+    /// Устаревший метод обновления параметров на CPU через срезы `Vec<f32>`.
+    /// Оставлен для обратной совместимости; рекомендуется использовать
+    /// `update_params_buffered`.
+    #[deprecated(note = "Use update_params_buffered for MemoryExecutor integration")]
     pub fn update_params(&mut self, desc: OptimizerDesc, grads: &[f32]) {
         let chain = desc.build_chain();
         let mut opt = self.create_optimizer(chain);
@@ -373,7 +381,6 @@ impl MixedModel {
         let pred_buf = self.mat_to_matrix_buffer_handle(&pred_mat, &mut pool);
         let target_buf = self.mat_to_matrix_buffer_handle(&target_mat, &mut pool);
 
-        // Передаём уже захваченный пул, чтобы избежать повторного захвата.
         let (loss, grad_buf) = self.compute_loss_handle(desc.build(), pred_buf, target_buf, &mut pool);
 
         let grad_mat = if grad_buf.is_gpu() {
@@ -399,14 +406,12 @@ impl MixedModel {
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
             let gpu = gpu_compute_mutex.lock().unwrap();
             if pred.is_gpu() && target.is_gpu() {
-                // GPU-путь не нуждается в пуле
                 return crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered_handle(
                     &gpu, &expr, &pred, &target,
                 );
             }
         }
 
-        // CPU path, используем предоставленный пул
         crate::plans::loss_plan::execution::compute_loss_mat_buffered(
             &expr, &pred, &target, pool,
         )
@@ -515,59 +520,62 @@ impl MixedModel {
     // НОВЫЙ МЕТОД: шаг оптимизации через буферизованное хранилище
     // ===================================================================
 
-    pub fn update_params_buffered(&mut self, desc: OptimizerDesc) {
+    /// Выполняет один шаг оптимизации, используя `MatrixBufferHandle` и
+    /// `MemoryExecutor`. Параметры и градиенты передаются через дескрипторы,
+    /// состояние оптимизатора хранится в управляемой памяти.
+    ///
+    /// # Аргументы
+    /// * `desc` – описание оптимизатора (цепочка кубиков).
+    /// * `grads` – плоский срез градиентов для текущего шага.
+    ///
+    /// # Паника
+    /// Паникует, если `grads.len()` не совпадает с числом параметров,
+    /// или если оптимизатор не может быть инициализирован.
+    pub fn update_params_buffered(&mut self, desc: OptimizerDesc, grads: &[f32]) {
         let chain = desc.build_chain();
         let state_size = chain.total_state_size_per_param();
 
+        // Инициализация BufferedParamStore при первом вызове
         if self.buffered_param_store.is_none() {
             let num_params = self.store.lock().unwrap().len();
-            let mut bp = BufferedParamStore::new_cpu(
+            let bp = BufferedParamStore::new_cpu(
                 self.memory_executor.clone(),
                 num_params,
                 state_size,
             );
-            let old_params = self.store.lock().unwrap().all_params_vec();
-            bp.copy_params_from_slice(&old_params);
             self.buffered_param_store = Some(bp);
+        }
+
+        // Инициализация OptimizerExpr при первом вызове
+        if self.optimizer_expr.is_none() {
+            let num_params = self.buffered_param_store.as_ref().unwrap().num_params();
+            let pool_arc = self.temp_matrix_pool.clone();
+            let mut pool = pool_arc.lock().unwrap();
+            let opt_expr = OptimizerExpr::new_buffered_handle(
+                self.memory_executor.clone(),
+                num_params,
+                chain,
+                &mut pool,
+            );
+            self.optimizer_expr = Some(opt_expr);
         }
 
         let bp = self.buffered_param_store.as_mut().unwrap();
 
-        if bp.state_matrix().is_none() && state_size > 0 {
-            let total_state_elems = bp.num_params() * state_size;
-            let mut state = MatrixBuffer::new(
-                &bp.memory,
-                total_state_elems,
-                1,
-            ).expect("Failed to allocate optimizer state");
-            let id = bp.memory.lock().unwrap().register_matrix(
-                total_state_elems,
-                1,
-                crate::compute_manager::memory_executor::types::MemoryDeviceKind::HostRam,
-                crate::compute_manager::memory_executor::policy::BufferPriority::High,
-            );
-            state.set_matrix_id(Some(id));
-            state.fill(0.0);
-            bp.opt_state = Some(state);
-        }
+        // Копируем параметры из ParamStore в управляемый буфер
+        let params_vec = self.store.lock().unwrap().all_params_vec();
+        bp.copy_params_from_slice(&params_vec);
 
-        let mut opt_state = bp.opt_state.take().unwrap_or_else(|| {
-            MatrixBuffer::new(&bp.memory, 0, 1).unwrap()
-        });
+        // Копируем градиенты
+        bp.copy_grads_from_slice(grads);
 
-        chain.apply_all_buffered(
-            &mut bp.params,
-            &mut bp.grads,
-            &mut opt_state,
-        );
+        // Выполняем шаг оптимизатора
+        let opt = self.optimizer_expr.as_mut().unwrap();
+        opt.step_buffered_handle(bp.params_handle(), bp.grads_handle());
 
-        bp.opt_state = Some(opt_state);
-
-        let params_mat = bp.params.to_mat();
-        let mut new_params = vec![0.0; bp.num_params()];
-        for i in 0..bp.num_params() {
-            new_params[i] = params_mat[(i, 0)];
-        }
-        self.store.lock().unwrap().set_all_params(&new_params);
+        // Копируем обновлённые параметры обратно в ParamStore
+        let mut updated_params = vec![0.0; bp.num_params()];
+        bp.copy_params_to_slice(&mut updated_params);
+        self.store.lock().unwrap().set_all_params(&updated_params);
     }
 }

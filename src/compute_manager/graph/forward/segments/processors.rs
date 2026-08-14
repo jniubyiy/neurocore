@@ -290,21 +290,19 @@ fn call_forward_buffered(
         <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_softmax() {
         <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_memory() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_soft_sparse_gate() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_soft_keep_gate() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_dual_anchor() {
+        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else {
-        // Fallback на старый метод (если слой не переведён)
-        let input_mat = input.read();
-        let input_slice = input_mat.as_slice().expect("CPU buffer");
-        let mat_in = Mat::from_fn(input.rows(), input.cols(), |r, c| {
-            input_slice[c * input.rows() + r]
-        });
-        let (mat_out, _ctx) = layer.forward_mat(&mat_in, params, slice);
-        let mut output_guard = output.write();
-        let output_slice = output_guard.as_slice_mut().expect("CPU buffer");
-        for c in 0..mat_out.ncols() {
-            for r in 0..mat_out.nrows() {
-                output_slice[c * output.rows() + r] = mat_out[(r, c)];
-            }
-        }
+        unreachable!(
+            "Layer {:?} does not implement UniversalLayerBuffered for CPU path",
+            std::any::type_name_of_val(layer.as_ref())
+        );
     }
 }
 

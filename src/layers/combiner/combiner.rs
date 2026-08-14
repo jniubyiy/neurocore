@@ -34,6 +34,32 @@ impl Combiner {
         (wa, wb, bias)
     }
 
+    /// Возвращает параметры combiner в виде плоских Vec<f32>.
+    /// Порядок:
+    /// - `wa`: row‑major, длина `out_feat * in_feat`
+    /// - `wb`: row‑major, длина `out_feat * in_feat`
+    /// - `bias`: длина `out_feat`
+    pub(crate) fn get_weights_and_bias_vec(
+        &self,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let in_feat = self.input_dim;
+        let out_feat = self.output_dim;
+        let base = slice.start;
+
+        let wa_len = out_feat * in_feat;
+        let wa = params[base..base + wa_len].to_vec();
+
+        let wb_start = base + wa_len;
+        let wb = params[wb_start..wb_start + wa_len].to_vec();
+
+        let bias_start = wb_start + wa_len;
+        let bias = params[bias_start..bias_start + out_feat].to_vec();
+
+        (wa, wb, bias)
+    }
+
     /// Прямой матричный проход: output = ReLU( a @ Wa^T + b @ Wb^T + bias )
     pub fn forward_mat(
         &self,

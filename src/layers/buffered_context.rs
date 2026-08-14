@@ -66,4 +66,30 @@ pub enum BufferedContext {
     Identity {
         input: MatrixBufferHandle,
     },
+
+    /// Вход SplitterConnector (первый входной поток).
+    SplitterConnector {
+        input: MatrixBufferHandle,
+    },
+
+    /// Входы CombinerConnector (все входные потоки).
+    CombinerConnector {
+        inputs: Vec<MatrixBufferHandle>,
+    },
+
+    /// Контекст обучаемого Splitter:
+    /// вход + pre-activation для обеих веток.
+    Splitter {
+        input: MatrixBufferHandle,
+        pre_a: MatrixBufferHandle,
+        pre_b: MatrixBufferHandle,
+    },
+
+    /// Контекст обучаемого Combiner:
+    /// оба входа + pre-activation перед ReLU.
+    Combiner {
+        input_a: MatrixBufferHandle,
+        input_b: MatrixBufferHandle,
+        pre_act: MatrixBufferHandle,
+    },
 }

@@ -38,6 +38,38 @@ impl Splitter {
         (wa, wb, bias_a, bias_b)
     }
 
+    /// Возвращает параметры splitter в виде плоских Vec<f32>.
+    /// Порядок:
+    /// - `wa`: row‑major, длина `p * n`
+    /// - `wb`: row‑major, длина `q * n`
+    /// - `bias_a`: длина `p`
+    /// - `bias_b`: длина `q`
+    pub(crate) fn get_weights_and_biases_vec(
+        &self,
+        params: &[f32],
+        slice: &ParamSlice,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let n = self.input_dim;
+        let p = self.output_dims[0];
+        let q = self.output_dims[1];
+        let base = slice.start;
+
+        let wa_len = p * n;
+        let wa = params[base..base + wa_len].to_vec();
+
+        let wb_start = base + wa_len;
+        let wb_len = q * n;
+        let wb = params[wb_start..wb_start + wb_len].to_vec();
+
+        let bias_a_start = wb_start + wb_len;
+        let bias_a = params[bias_a_start..bias_a_start + p].to_vec();
+
+        let bias_b_start = bias_a_start + p;
+        let bias_b = params[bias_b_start..bias_b_start + q].to_vec();
+
+        (wa, wb, bias_a, bias_b)
+    }
+
     pub fn forward_mat(
         &self,
         x: &Mat<f32>,

@@ -459,18 +459,15 @@ impl MixedModel {
                 }
                 Segment::SplitterConnector { .. } => {
                     assert_eq!(stream_gradients.len(), 2);
-                    // SplitterConnector просто пропускает градиенты без изменений
-                    // Для handle-версии клонируем входы
                     let delta_a = stream_gradients[0].clone();
                     let delta_b = stream_gradients[1].clone();
 
-                    // Создаём новые выходные handle с теми же размерами (копия)
+                    // SplitterConnector просто пропускает градиенты без изменений
                     let mut in_a = pool.acquire(delta_a.rows(), delta_a.cols());
                     let mut in_b = pool.acquire(delta_b.rows(), delta_b.cols());
                     copy_handle_data(&delta_a, &in_a);
                     copy_handle_data(&delta_b, &in_b);
 
-                    // Освобождаем старые входы
                     pool.release(delta_a);
                     pool.release(delta_b);
 
@@ -488,54 +485,117 @@ impl MixedModel {
                 } => {
                     assert!(ctx_pos > 0);
                     let ctx = &contexts[0][ctx_pos - 1];
-                    let (x_mat, pre_a_mat, pre_b_mat) = match ctx {
-                        DynamicContext::Mat(
-                            crate::layers::mat_context::MatContext::Splitter {
-                                input,
-                                pre_a,
-                                pre_b,
-                            },
-                        ) => (input.clone(), pre_a.clone(), pre_b.clone()),
-                        _ => panic!("Expected Splitter context"),
+                    let (x_handle, pre_a_handle, pre_b_handle) = match ctx {
+                        DynamicContext::Buffered(crate::layers::buffered_context::BufferedContext::Splitter {
+                            input,
+                            pre_a,
+                            pre_b,
+                        }) => (input.clone(), pre_a.clone(), pre_b.clone()),
+                        _ => panic!("Expected Splitter Buffered context"),
                     };
 
                     let da_handle = stream_gradients[0].clone();
                     let db_handle = stream_gradients[1].clone();
 
-                    // Конвертируем в Mat для CPU-вычислений (временное решение)
-                    let da_mat = handle_to_mat(&da_handle);
-                    let db_mat = handle_to_mat(&db_handle);
+                    // Читаем данные в Vec<f32>
+                    let x_vec = handle_to_vec(&x_handle);
+                    let da_vec = handle_to_vec(&da_handle);
+                    let db_vec = handle_to_vec(&db_handle);
+                    let pre_a_vec = handle_to_vec(&pre_a_handle);
+                    let pre_b_vec = handle_to_vec(&pre_b_handle);
 
                     let splitter = crate::layers::Splitter::new(*input_dim, output_dims.clone());
-                    let (wa, wb, _, _) = splitter.get_weights_and_biases(&params, slice);
+                    let (wa_vec, wb_vec, _, _) = splitter.get_weights_and_biases_vec(&params, slice);
 
-                    let (dx_mat, grad) = splitter.backward_mat(
-                        &x_mat,
-                        &da_mat,
-                        &db_mat,
-                        &pre_a_mat,
-                        &pre_b_mat,
-                        &wa,
-                        &wb,
-                    );
+                    // Вычисляем градиенты
+                    let batch = x_handle.rows();
+                    let n = *input_dim;
+                    let p = output_dims[0];
+                    let q = output_dims[1];
 
-                    for (idx, &g) in grad.iter().enumerate() {
-                        total_grad[slice.start + idx] += g;
+                    // d_pre_a = relu_backward(pre_a, da), d_pre_b = relu_backward(pre_b, db)
+                    let mut d_pre_a_vec = vec![0.0f32; batch * p];
+                    let mut d_pre_b_vec = vec![0.0f32; batch * q];
+                    for i in 0..batch * p {
+                        d_pre_a_vec[i] = if pre_a_vec[i] > 0.0 { da_vec[i] } else { 0.0 };
+                    }
+                    for i in 0..batch * q {
+                        d_pre_b_vec[i] = if pre_b_vec[i] > 0.0 { db_vec[i] } else { 0.0 };
                     }
 
-                    let mut dx_handle = pool.acquire(dx_mat.nrows(), dx_mat.ncols());
-                    {
-                        let mut guard = dx_handle.write();
-                        let dst = guard.as_slice_mut().expect("CPU buffer");
-                        for c in 0..dx_mat.ncols() {
-                            for r in 0..dx_mat.nrows() {
-                                dst[c * dx_mat.nrows() + r] = dx_mat[(r, c)];
+                    // dx = d_pre_a * wa + d_pre_b * wb
+                    let mut dx_vec = vec![0.0f32; batch * n];
+                    for r in 0..batch {
+                        for c in 0..n {
+                            let mut sum = 0.0;
+                            for k in 0..p {
+                                // d_pre_a: column-major => d_pre_a_vec[k * batch + r]
+                                // wa: row-major => wa_vec[k * n + c]
+                                sum += d_pre_a_vec[k * batch + r] * wa_vec[k * n + c];
                             }
+                            for k in 0..q {
+                                sum += d_pre_b_vec[k * batch + r] * wb_vec[k * n + c];
+                            }
+                            dx_vec[c * batch + r] = sum;
                         }
                     }
 
+                    // Градиенты весов и смещений
+                    let mut d_wa_vec = vec![0.0f32; p * n];
+                    let mut d_wb_vec = vec![0.0f32; q * n];
+                    for out_idx in 0..p {
+                        for in_idx in 0..n {
+                            let mut sum = 0.0;
+                            for r in 0..batch {
+                                sum += d_pre_a_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                            }
+                            d_wa_vec[out_idx * n + in_idx] = sum;
+                        }
+                    }
+                    for out_idx in 0..q {
+                        for in_idx in 0..n {
+                            let mut sum = 0.0;
+                            for r in 0..batch {
+                                sum += d_pre_b_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                            }
+                            d_wb_vec[out_idx * n + in_idx] = sum;
+                        }
+                    }
+
+                    let d_bias_a_vec: Vec<f32> = (0..p)
+                        .map(|c| (0..batch).map(|r| d_pre_a_vec[c * batch + r]).sum())
+                        .collect();
+                    let d_bias_b_vec: Vec<f32> = (0..q)
+                        .map(|c| (0..batch).map(|r| d_pre_b_vec[c * batch + r]).sum())
+                        .collect();
+
+                    // Записываем градиенты параметров в total_grad
+                    for (i, &g) in d_wa_vec.iter().enumerate() {
+                        total_grad[slice.start + i] += g;
+                    }
+                    let offset = slice.start + p * n;
+                    for (i, &g) in d_wb_vec.iter().enumerate() {
+                        total_grad[offset + i] += g;
+                    }
+                    let offset = offset + q * n;
+                    for (i, &g) in d_bias_a_vec.iter().enumerate() {
+                        total_grad[offset + i] += g;
+                    }
+                    let offset = offset + p;
+                    for (i, &g) in d_bias_b_vec.iter().enumerate() {
+                        total_grad[offset + i] += g;
+                    }
+
+                    // Создаём выходной градиент dx
+                    let mut dx_handle = pool.acquire(batch, n);
+                    vec_to_handle(&dx_vec, &mut dx_handle);
+
+                    // Освобождаем входные градиенты и контекстные буферы
                     pool.release(da_handle);
                     pool.release(db_handle);
+                    pool.release(x_handle);
+                    pool.release(pre_a_handle);
+                    pool.release(pre_b_handle);
 
                     stream_gradients = vec![dx_handle];
                     ctx_pos -= 1;
@@ -547,56 +607,96 @@ impl MixedModel {
                 } => {
                     assert!(ctx_pos > 0);
                     let ctx = &contexts[0][ctx_pos - 1];
-                    let (a_mat, b_mat, pre_mat) = match ctx {
-                        DynamicContext::Mat(
-                            crate::layers::mat_context::MatContext::Combiner {
-                                input_a,
-                                input_b,
-                                pre_act,
-                            },
-                        ) => (input_a.clone(), input_b.clone(), pre_act.clone()),
-                        _ => panic!("Expected Combiner context"),
+                    let (a_handle, b_handle, pre_handle) = match ctx {
+                        DynamicContext::Buffered(crate::layers::buffered_context::BufferedContext::Combiner {
+                            input_a,
+                            input_b,
+                            pre_act,
+                        }) => (input_a.clone(), input_b.clone(), pre_act.clone()),
+                        _ => panic!("Expected Combiner Buffered context"),
                     };
 
                     let dout_handle = stream_gradients[0].clone();
-                    let dout_mat = handle_to_mat(&dout_handle);
+
+                    // Читаем данные
+                    let a_vec = handle_to_vec(&a_handle);
+                    let b_vec = handle_to_vec(&b_handle);
+                    let pre_vec = handle_to_vec(&pre_handle);
+                    let dout_vec = handle_to_vec(&dout_handle);
 
                     let combiner = crate::layers::Combiner::new(vec![*input_dim, *input_dim], *output_dim);
-                    let (wa, wb, _) = combiner.get_weights_and_bias(&params, slice);
-                    let (da_mat, db_mat, grad) = combiner.backward_mat(
-                        &a_mat,
-                        &b_mat,
-                        &dout_mat,
-                        &params,
-                        slice,
-                    );
+                    let (wa_vec, wb_vec, _) = combiner.get_weights_and_bias_vec(&params, slice);
 
-                    for (idx, &g) in grad.iter().enumerate() {
-                        total_grad[slice.start + idx] += g;
+                    let batch = a_handle.rows();
+                    let n = *input_dim;
+                    let m = *output_dim;
+
+                    // d_pre = dout * relu'(pre)
+                    let mut d_pre_vec = vec![0.0f32; batch * m];
+                    for i in 0..batch * m {
+                        d_pre_vec[i] = if pre_vec[i] > 0.0 { dout_vec[i] } else { 0.0 };
                     }
 
-                    let mut da_handle = pool.acquire(da_mat.nrows(), da_mat.ncols());
-                    {
-                        let mut guard = da_handle.write();
-                        let dst = guard.as_slice_mut().expect("CPU buffer");
-                        for c in 0..da_mat.ncols() {
-                            for r in 0..da_mat.nrows() {
-                                dst[c * da_mat.nrows() + r] = da_mat[(r, c)];
+                    // da = d_pre * wa^T, db = d_pre * wb^T
+                    let mut da_vec = vec![0.0f32; batch * n];
+                    let mut db_vec = vec![0.0f32; batch * n];
+                    for r in 0..batch {
+                        for c in 0..n {
+                            let mut sum_a = 0.0;
+                            let mut sum_b = 0.0;
+                            for k in 0..m {
+                                sum_a += d_pre_vec[k * batch + r] * wa_vec[k * n + c];
+                                sum_b += d_pre_vec[k * batch + r] * wb_vec[k * n + c];
                             }
-                        }
-                    }
-                    let mut db_handle = pool.acquire(db_mat.nrows(), db_mat.ncols());
-                    {
-                        let mut guard = db_handle.write();
-                        let dst = guard.as_slice_mut().expect("CPU buffer");
-                        for c in 0..db_mat.ncols() {
-                            for r in 0..db_mat.nrows() {
-                                dst[c * db_mat.nrows() + r] = db_mat[(r, c)];
-                            }
+                            da_vec[c * batch + r] = sum_a;
+                            db_vec[c * batch + r] = sum_b;
                         }
                     }
 
+                    // Градиенты весов и смещений
+                    let mut d_wa_vec = vec![0.0f32; m * n];
+                    let mut d_wb_vec = vec![0.0f32; m * n];
+                    for out_idx in 0..m {
+                        for in_idx in 0..n {
+                            let mut sum_a = 0.0;
+                            let mut sum_b = 0.0;
+                            for r in 0..batch {
+                                sum_a += d_pre_vec[out_idx * batch + r] * a_vec[in_idx * batch + r];
+                                sum_b += d_pre_vec[out_idx * batch + r] * b_vec[in_idx * batch + r];
+                            }
+                            d_wa_vec[out_idx * n + in_idx] = sum_a;
+                            d_wb_vec[out_idx * n + in_idx] = sum_b;
+                        }
+                    }
+
+                    let d_bias_vec: Vec<f32> = (0..m)
+                        .map(|c| (0..batch).map(|r| d_pre_vec[c * batch + r]).sum())
+                        .collect();
+
+                    // Записываем градиенты параметров
+                    for (i, &g) in d_wa_vec.iter().enumerate() {
+                        total_grad[slice.start + i] += g;
+                    }
+                    let offset = slice.start + m * n;
+                    for (i, &g) in d_wb_vec.iter().enumerate() {
+                        total_grad[offset + i] += g;
+                    }
+                    let offset = offset + m * n;
+                    for (i, &g) in d_bias_vec.iter().enumerate() {
+                        total_grad[offset + i] += g;
+                    }
+
+                    // Создаём выходные градиенты da, db
+                    let mut da_handle = pool.acquire(batch, n);
+                    let mut db_handle = pool.acquire(batch, n);
+                    vec_to_handle(&da_vec, &mut da_handle);
+                    vec_to_handle(&db_vec, &mut db_handle);
+
+                    // Освобождаем входные данные
                     pool.release(dout_handle);
+                    pool.release(a_handle);
+                    pool.release(b_handle);
+                    pool.release(pre_handle);
 
                     stream_gradients = vec![da_handle, db_handle];
                     ctx_pos -= 1;
@@ -648,7 +748,7 @@ impl MixedModel {
             {
                 current_grad.cols()
             } else {
-                current_grad.cols() // fallback
+                current_grad.cols() // fallback, но не должно использоваться
             };
 
             let batch = current_grad.rows();
@@ -699,19 +799,10 @@ impl MixedModel {
                     dual_anchor, ctx, &current_grad, &mut grad_input, params, slice
                 )
             } else {
-                // Fallback на старый метод
-                let delta_mat = handle_to_mat(&current_grad);
-                let (dx, grad) = layer.backward_mat(ctx, &delta_mat, params, slice);
-                {
-                    let mut guard = grad_input.write();
-                    let dst = guard.as_slice_mut().expect("CPU buffer");
-                    for c in 0..dx.ncols() {
-                        for r in 0..dx.nrows() {
-                            dst[c * dx.nrows() + r] = dx[(r, c)];
-                        }
-                    }
-                }
-                grad
+                unreachable!(
+                    "Layer {:?} does not have a buffered backward implementation",
+                    std::any::type_name_of_val(layer.as_ref())
+                );
             };
 
             for (idx, &g) in grad_params.iter().enumerate() {
@@ -725,30 +816,25 @@ impl MixedModel {
     }
 }
 
-// Вспомогательные функции для конвертации handle <-> Mat (CPU)
+// Вспомогательные функции для работы с CPU-буферами
 
-fn handle_to_mat(handle: &MatrixBufferHandle) -> Mat<f32> {
+/// Читает данные из CPU handle в Vec<f32> (column-major порядок).
+fn handle_to_vec(handle: &MatrixBufferHandle) -> Vec<f32> {
+    assert!(!handle.is_gpu(), "handle_to_vec supports only CPU buffers");
     let guard = handle.read();
-    let slice = guard.as_slice().expect("handle_to_mat: expected CPU buffer");
-    Mat::from_fn(handle.rows(), handle.cols(), |r, c| {
-        slice[c * handle.rows() + r]
-    })
+    guard.as_slice().expect("CPU buffer").to_vec()
 }
 
-fn mat_to_handle(mat: &Mat<f32>, pool: &mut TempMatrixPool) -> MatrixBufferHandle {
-    let mut handle = pool.acquire(mat.nrows(), mat.ncols());
-    {
-        let mut guard = handle.write();
-        let dst = guard.as_slice_mut().expect("CPU buffer");
-        for c in 0..mat.ncols() {
-            for r in 0..mat.nrows() {
-                dst[c * mat.nrows() + r] = mat[(r, c)];
-            }
-        }
-    }
-    handle
+/// Записывает Vec<f32> в CPU handle (column-major порядок).
+fn vec_to_handle(data: &[f32], handle: &mut MatrixBufferHandle) {
+    assert!(!handle.is_gpu(), "vec_to_handle supports only CPU buffers");
+    let mut guard = handle.write();
+    let dst = guard.as_slice_mut().expect("CPU buffer");
+    assert_eq!(data.len(), dst.len());
+    dst.copy_from_slice(data);
 }
 
+/// Копирует данные между двумя CPU handle.
 fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
     let src_guard = src.read();
     let src_slice = src_guard.as_slice().expect("copy_handle_data: source must be CPU");

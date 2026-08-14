@@ -13,6 +13,7 @@ use crate::layers::splitter::Splitter;
 use crate::layers::combiner::Combiner;
 use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
+use crate::layers::buffered_context::BufferedContext;
 
 impl MixedModel {
     // ---------------------------------------------------------------
@@ -240,7 +241,7 @@ impl MixedModel {
 
     /// SplitterConnector с управляемыми буферами.
     /// Входные дескрипторы извлекаются, создаются выходные через пул.
-    /// Контекст сохраняется как MatContext для совместимости.
+    /// Контекст сохраняется как BufferedContext.
     pub(crate) fn process_splitter_connector_forward_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -260,19 +261,15 @@ impl MixedModel {
         assert_eq!(stream_buffers.len(), 2, "SplitterConnector buffered: expected 2 input streams");
 
         // Извлекаем входные дескрипторы
-        let mut option_buffers: Vec<Option<MatrixBufferHandle>> = stream_buffers
-            .iter()
-            .map(|h| Some(h.clone()))
-            .collect();
-        let input_a = option_buffers[0].take().unwrap();
-        let input_b = option_buffers[1].take().unwrap();
+        let input_a = stream_buffers[0].clone();
+        let input_b = stream_buffers[1].clone();
 
-        // Создаём выходные буферы того же размера
         let rows_a = input_a.rows();
         let cols_a = input_a.cols();
         let rows_b = input_b.rows();
         let cols_b = input_b.cols();
 
+        // Создаём выходные буферы того же размера
         let out_a = pool.acquire(rows_a, cols_a);
         let out_b = pool.acquire(rows_b, cols_b);
 
@@ -280,17 +277,10 @@ impl MixedModel {
         copy_handle_data(&input_a, &out_a);
         copy_handle_data(&input_b, &out_b);
 
-        // Строим контекст (используем CPU-копию входных данных для MatContext)
-        let input_a_mat = {
-            let input_a_slice = input_a.read();
-            let input_a_data = input_a_slice.as_slice().expect("CPU buffer");
-            Mat::from_fn(rows_a, cols_a, |r, c| input_a_data[c * rows_a + r])
-        };
-
-        let ctx = DynamicContext::Mat(MatContext::SplitterConnector {
-            input: input_a_mat,
+        // Сохраняем контекст (Buffered)
+        let ctx = DynamicContext::Buffered(BufferedContext::SplitterConnector {
+            input: input_a.clone(),
         });
-
         for sample_ctxs in all_ctxs.iter_mut() {
             sample_ctxs.push(ctx.clone());
         }
@@ -299,7 +289,6 @@ impl MixedModel {
         pool.release(input_a);
         pool.release(input_b);
 
-        // Заменяем вектор на выходные дескрипторы
         *stream_buffers = vec![out_a, out_b];
 
         let duration = start.elapsed().as_nanos() as f64;
@@ -328,21 +317,13 @@ impl MixedModel {
             "CombinerConnector buffered: expected {} input streams, got {}",
             n, stream_buffers.len());
 
-        // Сохраняем контекст только для первого потока
-        if let Some(first_buf) = stream_buffers.first() {
-            let first_mat = {
-                let first_slice = first_buf.read();
-                let first_data = first_slice.as_slice().expect("CPU buffer");
-                Mat::from_fn(first_buf.rows(), first_buf.cols(), |r, c| {
-                    first_data[c * first_buf.rows() + r]
-                })
-            };
-
-            let connector = CombinerConnector::new(vec![]);
-            let (_, ctx) = connector.forward_mat(&first_mat);
-            for sample_ctxs in all_ctxs.iter_mut() {
-                sample_ctxs.push(ctx.clone());
-            }
+        // Сохраняем контекст со всеми входными дескрипторами
+        let inputs = stream_buffers.clone();
+        let ctx = DynamicContext::Buffered(BufferedContext::CombinerConnector {
+            inputs,
+        });
+        for sample_ctxs in all_ctxs.iter_mut() {
+            sample_ctxs.push(ctx.clone());
         }
 
         let duration = start.elapsed().as_nanos() as f64;
@@ -369,55 +350,60 @@ impl MixedModel {
 
         assert_eq!(stream_buffers.len(), 1, "Splitter buffered: expected 1 input stream");
 
-        let mut option_buffers: Vec<Option<MatrixBufferHandle>> = stream_buffers
-            .iter()
-            .map(|h| Some(h.clone()))
-            .collect();
-        let input_handle = option_buffers[0].take().unwrap();
-
+        let input_handle = stream_buffers[0].clone();
         let batch = input_handle.rows();
         let params = self.store.lock().unwrap().all_params();
         let splitter = Splitter::new(input_dim, output_dims.clone());
+        let (wa_vec, wb_vec, bias_a_vec, bias_b_vec) =
+            splitter.get_weights_and_biases_vec(&params, &slice);
 
-        // Получаем входную матрицу
-        let input_mat = {
-            let input_guard = input_handle.read();
-            let input_slice = input_guard.as_slice().expect("CPU buffer");
-            Mat::from_fn(batch, input_dim, |r, c| input_slice[c * batch + r])
-        };
+        let x_vec = handle_to_vec(&input_handle);
 
-        // Выполняем прямой проход на CPU
-        let (a_mat, b_mat, pre_a_mat, pre_b_mat) =
-            splitter.forward_mat(&input_mat, &params, &slice);
+        let p = output_dims[0];
+        let q = output_dims[1];
 
-        let out_a = pool.acquire(batch, output_dims[0]);
-        let out_b = pool.acquire(batch, output_dims[1]);
+        // Выделяем буферы для выходов и pre-активаций
+        let out_a = pool.acquire(batch, p);
+        let out_b = pool.acquire(batch, q);
+        let pre_a = pool.acquire(batch, p);
+        let pre_b = pool.acquire(batch, q);
 
-        // Записываем результаты
+        // Вычисляем
         {
             let mut out_a_guard = out_a.write();
             let out_a_slice = out_a_guard.as_slice_mut().expect("CPU buffer");
-            for c in 0..a_mat.ncols() {
-                for r in 0..batch {
-                    out_a_slice[c * batch + r] = a_mat[(r, c)];
-                }
-            }
-        }
-        {
             let mut out_b_guard = out_b.write();
             let out_b_slice = out_b_guard.as_slice_mut().expect("CPU buffer");
-            for c in 0..b_mat.ncols() {
-                for r in 0..batch {
-                    out_b_slice[c * batch + r] = b_mat[(r, c)];
+            let mut pre_a_guard = pre_a.write();
+            let pre_a_slice = pre_a_guard.as_slice_mut().expect("CPU buffer");
+            let mut pre_b_guard = pre_b.write();
+            let pre_b_slice = pre_b_guard.as_slice_mut().expect("CPU buffer");
+
+            for r in 0..batch {
+                for c in 0..p {
+                    let mut sum = bias_a_vec[c];
+                    for k in 0..input_dim {
+                        sum += x_vec[k * batch + r] * wa_vec[c * input_dim + k];
+                    }
+                    pre_a_slice[c * batch + r] = sum;
+                    out_a_slice[c * batch + r] = sum.max(0.0);
+                }
+                for c in 0..q {
+                    let mut sum = bias_b_vec[c];
+                    for k in 0..input_dim {
+                        sum += x_vec[k * batch + r] * wb_vec[c * input_dim + k];
+                    }
+                    pre_b_slice[c * batch + r] = sum;
+                    out_b_slice[c * batch + r] = sum.max(0.0);
                 }
             }
         }
 
         // Сохраняем контекст
-        let ctx = DynamicContext::Mat(MatContext::Splitter {
-            input: input_mat.clone(),
-            pre_a: pre_a_mat.clone(),
-            pre_b: pre_b_mat.clone(),
+        let ctx = DynamicContext::Buffered(BufferedContext::Splitter {
+            input: input_handle.clone(),
+            pre_a: pre_a.clone(),
+            pre_b: pre_b.clone(),
         });
         for sample_ctxs in all_ctxs.iter_mut() {
             sample_ctxs.push(ctx.clone());
@@ -452,54 +438,52 @@ impl MixedModel {
 
         assert_eq!(stream_buffers.len(), 2, "Combiner buffered: expected 2 input streams");
 
-        let mut option_buffers: Vec<Option<MatrixBufferHandle>> = stream_buffers
-            .iter()
-            .map(|h| Some(h.clone()))
-            .collect();
-        let a_handle = option_buffers[0].take().unwrap();
-        let b_handle = option_buffers[1].take().unwrap();
+        let a_handle = stream_buffers[0].clone();
+        let b_handle = stream_buffers[1].clone();
 
         let batch = a_handle.rows();
         let params = self.store.lock().unwrap().all_params();
         let combiner = Combiner::new(vec![input_dim, input_dim], output_dim);
+        let (wa_vec, wb_vec, bias_vec) = combiner.get_weights_and_bias_vec(&params, &slice);
 
-        // Получаем входные матрицы
-        let a_mat = {
-            let a_guard = a_handle.read();
-            let a_slice = a_guard.as_slice().expect("CPU buffer");
-            Mat::from_fn(batch, input_dim, |r, c| a_slice[c * batch + r])
-        };
-        let b_mat = {
-            let b_guard = b_handle.read();
-            let b_slice = b_guard.as_slice().expect("CPU buffer");
-            Mat::from_fn(batch, input_dim, |r, c| b_slice[c * batch + r])
-        };
+        let a_vec = handle_to_vec(&a_handle);
+        let b_vec = handle_to_vec(&b_handle);
 
-        // Выполняем прямой проход на CPU
-        let out_mat = combiner.forward_mat(&a_mat, &b_mat, &params, &slice);
-
+        // Выделяем буферы для выхода и pre-активации
         let out_handle = pool.acquire(batch, output_dim);
+        let pre_handle = pool.acquire(batch, output_dim);
 
+        // Вычисляем
         {
             let mut out_guard = out_handle.write();
             let out_slice = out_guard.as_slice_mut().expect("CPU buffer");
-            for c in 0..out_mat.ncols() {
-                for r in 0..batch {
-                    out_slice[c * batch + r] = out_mat[(r, c)];
+            let mut pre_guard = pre_handle.write();
+            let pre_slice = pre_guard.as_slice_mut().expect("CPU buffer");
+
+            for r in 0..batch {
+                for c in 0..output_dim {
+                    let mut sum = bias_vec[c];
+                    for k in 0..input_dim {
+                        sum += a_vec[k * batch + r] * wa_vec[c * input_dim + k];
+                        sum += b_vec[k * batch + r] * wb_vec[c * input_dim + k];
+                    }
+                    pre_slice[c * batch + r] = sum;
+                    out_slice[c * batch + r] = sum.max(0.0);
                 }
             }
         }
 
         // Сохраняем контекст
-        let ctx = DynamicContext::Mat(MatContext::Combiner {
-            input_a: a_mat.clone(),
-            input_b: b_mat.clone(),
-            pre_act: Mat::zeros(batch, output_dim),
+        let ctx = DynamicContext::Buffered(BufferedContext::Combiner {
+            input_a: a_handle.clone(),
+            input_b: b_handle.clone(),
+            pre_act: pre_handle.clone(),
         });
         for sample_ctxs in all_ctxs.iter_mut() {
             sample_ctxs.push(ctx.clone());
         }
 
+        // Возвращаем входные дескрипторы в пул
         pool.release(a_handle);
         pool.release(b_handle);
 
@@ -510,6 +494,8 @@ impl MixedModel {
     }
 }
 
+// Вспомогательные функции для работы с CPU-буферами
+
 /// Копирует данные между двумя дескрипторами (оба должны быть CPU).
 fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
     let src_guard = src.read();
@@ -518,4 +504,20 @@ fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
     let dst_slice = dst_guard.as_slice_mut().expect("Destination must be CPU");
     assert_eq!(src_slice.len(), dst_slice.len());
     dst_slice.copy_from_slice(src_slice);
+}
+
+/// Читает данные из CPU handle в Vec<f32> (column-major порядок).
+fn handle_to_vec(handle: &MatrixBufferHandle) -> Vec<f32> {
+    assert!(!handle.is_gpu(), "handle_to_vec supports only CPU buffers");
+    let guard = handle.read();
+    guard.as_slice().expect("CPU buffer").to_vec()
+}
+
+/// Записывает Vec<f32> в CPU handle (column-major порядок).
+fn vec_to_handle(data: &[f32], handle: &mut MatrixBufferHandle) {
+    assert!(!handle.is_gpu(), "vec_to_handle supports only CPU buffers");
+    let mut guard = handle.write();
+    let dst = guard.as_slice_mut().expect("CPU buffer");
+    assert_eq!(data.len(), dst.len());
+    dst.copy_from_slice(data);
 }

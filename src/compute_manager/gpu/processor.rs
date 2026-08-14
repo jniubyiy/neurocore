@@ -230,8 +230,12 @@ pub fn process_backward_gpu(
 // ===================================================================
 
 /// Прямой проход на GPU с использованием MatrixBufferHandle.
-/// Вход и выход — GPU-дескрипторы. Контексты создаются как Buffered (для обычных слоёв)
-/// или Mat (для кастомных слоёв, которые обрабатываются через CPU fallback).
+/// Вход и выход — GPU-дескрипторы. Контексты создаются как Buffered.
+///
+/// Примечание: для слоя Memory требуется предварительная инициализация
+/// внутреннего состояния GPU через `GpuCompute::init_memory_state`.
+/// В текущей реализации эта инициализация выполняется в вызывающем коде
+/// до вызова данной функции (см. `MixedModel::forward_mat_multi_buffered`).
 pub fn process_forward_gpu_buffered(
     gpu_compute: &GpuCompute,
     _segment_buffers: &SegmentPersistentBuffers,
@@ -264,7 +268,6 @@ pub fn process_forward_gpu_buffered(
                 &out_handle,
             );
 
-            // Сохраняем входной дескриптор в контексте
             let input_for_ctx = current.clone();
             ctxs.push(DynamicContext::Buffered(BufferedContext::Linear {
                 input: input_for_ctx,
@@ -280,7 +283,6 @@ pub fn process_forward_gpu_buffered(
         } else if let Some(_) = layer.as_sigmoid() {
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
             gpu_compute.run_sigmoid_forward_buffered_handle(&current, &out_handle);
-            // Для сигмоиды контекст хранит выход
             ctxs.push(DynamicContext::Buffered(BufferedContext::Sigmoid {
                 output: out_handle.clone(),
             }));
@@ -307,48 +309,73 @@ pub fn process_forward_gpu_buffered(
             }));
             current = out_handle;
         } else if let Some(_) = layer.as_identity() {
-            // Identity: копируем данные в новый дескриптор
+            // Identity: копируем данные GPU -> GPU
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
-            // Копируем GPU->GPU через промежуточный CPU или используем copy_buffer_sync?
-            // Проще: скачать в vec и загрузить обратно
-            let vec = gpu_compute.download_gpu_handle_to_vec(&current);
-            gpu_compute.copy_slice_to_gpu_handle(&out_handle, &vec);
+            gpu_compute.copy_gpu_handle_to_gpu_handle(&current, &out_handle);
             ctxs.push(DynamicContext::Buffered(BufferedContext::Identity {
                 input: current.clone(),
             }));
             current = out_handle;
         } else if let Some(memory) = layer.as_memory() {
-            // Fallback: CPU-вычисление с конвертацией
-            let input_mat = download_gpu_handle_to_mat(gpu_compute, &current);
-            let (out_mat, ctx) = layer.forward_mat(&input_mat, params, slice);
-            let out_handle = upload_mat_to_gpu_handle(gpu_compute, &out_mat);
-            ctxs.push(ctx);
+            // Инициализируем состояние Memory, если ещё не инициализировано.
+            // Внимание: `memory_state` должен быть инициализирован заранее;
+            // в противном случае здесь произойдёт паника при вызове handle-метода.
+            // В вызывающем коде должна быть выполнена инициализация.
+            let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
+            gpu_compute.run_memory_forward_buffered_handle(&current, &out_handle, memory.alpha);
+            ctxs.push(DynamicContext::Buffered(BufferedContext::Memory {
+                input: current.clone(),
+            }));
             current = out_handle;
-        } else if let Some(softsparse) = layer.as_soft_sparse_gate() {
-            let input_mat = download_gpu_handle_to_mat(gpu_compute, &current);
-            let (out_mat, ctx) = layer.forward_mat(&input_mat, params, slice);
-            let out_handle = upload_mat_to_gpu_handle(gpu_compute, &out_mat);
-            ctxs.push(ctx);
+        } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
+            let thresholds = &params[slice.start..slice.start + soft_sparse.in_features];
+            let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
+            gpu_compute.run_softsparse_forward_buffered_handle(
+                &current,
+                thresholds,
+                soft_sparse.temperature,
+                &out_handle,
+            );
+            ctxs.push(DynamicContext::Buffered(BufferedContext::SoftSparseGate {
+                input: current.clone(),
+            }));
             current = out_handle;
-        } else if let Some(softkeep) = layer.as_soft_keep_gate() {
-            let input_mat = download_gpu_handle_to_mat(gpu_compute, &current);
-            let (out_mat, ctx) = layer.forward_mat(&input_mat, params, slice);
-            let out_handle = upload_mat_to_gpu_handle(gpu_compute, &out_mat);
-            ctxs.push(ctx);
+        } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
+            let thresholds = &params[slice.start..slice.start + soft_keep.in_features];
+            let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
+            gpu_compute.run_softkeep_forward_buffered_handle(
+                &current,
+                thresholds,
+                soft_keep.temperature,
+                &out_handle,
+            );
+            ctxs.push(DynamicContext::Buffered(BufferedContext::SoftKeepGate {
+                input: current.clone(),
+            }));
             current = out_handle;
         } else if let Some(dual) = layer.as_dual_anchor() {
-            let input_mat = download_gpu_handle_to_mat(gpu_compute, &current);
-            let (out_mat, ctx) = layer.forward_mat(&input_mat, params, slice);
-            let out_handle = upload_mat_to_gpu_handle(gpu_compute, &out_mat);
-            ctxs.push(ctx);
+            let features = dual.features;
+            let min_vals = &params[slice.start..slice.start + features];
+            let max_vals = &params[slice.start + features..slice.start + 2 * features];
+            let alpha = params[slice.start + 2 * features];
+            let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
+            gpu_compute.run_dualanchor_forward_buffered_handle(
+                &current,
+                min_vals,
+                max_vals,
+                alpha,
+                &out_handle,
+            );
+            ctxs.push(DynamicContext::Buffered(BufferedContext::DualAnchor1D {
+                input: current.clone(),
+            }));
             current = out_handle;
         } else {
-            // Неизвестный слой – fallback на старый метод
-            let input_mat = download_gpu_handle_to_mat(gpu_compute, &current);
-            let (out_mat, ctx) = layer.forward_mat(&input_mat, params, slice);
-            let out_handle = upload_mat_to_gpu_handle(gpu_compute, &out_mat);
-            ctxs.push(ctx);
-            current = out_handle;
+            // Неизвестный слой – такого не должно быть, так как все слои перечислены.
+            panic!(
+                "Unsupported layer in GPU buffered forward: {:?}",
+                std::any::type_name_of_val(layer.as_ref())
+            );
         }
     }
 
@@ -357,7 +384,7 @@ pub fn process_forward_gpu_buffered(
 
 /// Обратный проход на GPU с использованием MatrixBufferHandle.
 /// Входной градиент — GPU-дескриптор, выходной градиент — GPU-дескриптор.
-/// Для обычных слоёв используются GPU handle-операции, для кастомных — CPU fallback.
+/// Для всех слоёв используются GPU handle-методы.
 pub fn process_backward_gpu_buffered(
     gpu_compute: &GpuCompute,
     _segment_buffers: &SegmentPersistentBuffers,
@@ -390,7 +417,7 @@ pub fn process_backward_gpu_buffered(
             let input_handle = match ctx {
                 DynamicContext::Buffered(BufferedContext::Linear { input }) => input.clone(),
                 DynamicContext::Mat(MatContext::Linear { input }) => {
-                    // Конвертируем Mat в GPU handle
+                    // Конвертируем Mat в GPU handle (на случай, если контекст старый)
                     upload_mat_to_gpu_handle(gpu_compute, input)
                 }
                 _ => panic!("Expected Linear context"),
@@ -402,6 +429,7 @@ pub fn process_backward_gpu_buffered(
 
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), in_feat);
             let grad_weight_handle = gpu_compute.allocate_gpu_matrix_handle(out_feat, in_feat);
+            let grad_bias_handle = gpu_compute.allocate_gpu_matrix_handle(1, out_feat);
 
             let grad_bias = gpu_compute.run_linear_backward_buffered_handle(
                 &input_handle,
@@ -409,6 +437,7 @@ pub fn process_backward_gpu_buffered(
                 &current_grad,
                 &grad_input_handle,
                 &grad_weight_handle,
+                &grad_bias_handle,
             );
 
             // Записываем градиенты в total_grad
@@ -498,48 +527,101 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_identity() {
-            // Identity: градиент проходит насквозь, копируем
+            // Identity: градиент проходит насквозь, копируем GPU -> GPU
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
-            let vec = gpu_compute.download_gpu_handle_to_vec(&current_grad);
-            gpu_compute.copy_slice_to_gpu_handle(&grad_input_handle, &vec);
+            gpu_compute.copy_gpu_handle_to_gpu_handle(&current_grad, &grad_input_handle);
             current_grad = grad_input_handle;
         } else if let Some(memory) = layer.as_memory() {
-            // Fallback: конвертируем в Mat
-            let grad_output_mat = download_gpu_handle_to_mat(gpu_compute, &current_grad);
-            let (dx_mat, layer_grad) = layer.backward_mat(ctx, &grad_output_mat, params, slice);
-            for (i, &g) in layer_grad.iter().enumerate() {
+            // Memory обратный проход: gi = go * (1 - alpha)
+            let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
+            gpu_compute.run_memory_backward_buffered_handle(
+                &current_grad,
+                &grad_input_handle,
+                memory.alpha,
+            );
+            current_grad = grad_input_handle;
+        } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
+            let input_handle = match ctx {
+                DynamicContext::Buffered(BufferedContext::SoftSparseGate { input }) => input.clone(),
+                DynamicContext::Mat(MatContext::SoftSparseGate { input }) => {
+                    upload_mat_to_gpu_handle(gpu_compute, input)
+                }
+                _ => panic!("Expected SoftSparseGate context"),
+            };
+            let thresholds = &params[slice.start..slice.start + soft_sparse.in_features];
+            let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
+            let grad_thresh_handle = gpu_compute.allocate_gpu_matrix_handle(1, soft_sparse.in_features);
+            let grad_thresh_vec = gpu_compute.run_softsparse_backward_buffered_handle(
+                &input_handle,
+                &current_grad,
+                thresholds,
+                soft_sparse.temperature,
+                &grad_input_handle,
+                &grad_thresh_handle,
+            );
+            for (i, &g) in grad_thresh_vec.iter().enumerate() {
                 total_grad[slice.start + i] += g;
             }
-            current_grad = upload_mat_to_gpu_handle(gpu_compute, &dx_mat);
-        } else if let Some(softsparse) = layer.as_soft_sparse_gate() {
-            let grad_output_mat = download_gpu_handle_to_mat(gpu_compute, &current_grad);
-            let (dx_mat, layer_grad) = layer.backward_mat(ctx, &grad_output_mat, params, slice);
-            for (i, &g) in layer_grad.iter().enumerate() {
+            current_grad = grad_input_handle;
+        } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
+            let input_handle = match ctx {
+                DynamicContext::Buffered(BufferedContext::SoftKeepGate { input }) => input.clone(),
+                DynamicContext::Mat(MatContext::SoftKeepGate { input }) => {
+                    upload_mat_to_gpu_handle(gpu_compute, input)
+                }
+                _ => panic!("Expected SoftKeepGate context"),
+            };
+            let thresholds = &params[slice.start..slice.start + soft_keep.in_features];
+            let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
+            let grad_thresh_handle = gpu_compute.allocate_gpu_matrix_handle(1, soft_keep.in_features);
+            let grad_thresh_vec = gpu_compute.run_softkeep_backward_buffered_handle(
+                &input_handle,
+                &current_grad,
+                thresholds,
+                soft_keep.temperature,
+                &grad_input_handle,
+                &grad_thresh_handle,
+            );
+            for (i, &g) in grad_thresh_vec.iter().enumerate() {
                 total_grad[slice.start + i] += g;
             }
-            current_grad = upload_mat_to_gpu_handle(gpu_compute, &dx_mat);
-        } else if let Some(softkeep) = layer.as_soft_keep_gate() {
-            let grad_output_mat = download_gpu_handle_to_mat(gpu_compute, &current_grad);
-            let (dx_mat, layer_grad) = layer.backward_mat(ctx, &grad_output_mat, params, slice);
-            for (i, &g) in layer_grad.iter().enumerate() {
-                total_grad[slice.start + i] += g;
-            }
-            current_grad = upload_mat_to_gpu_handle(gpu_compute, &dx_mat);
+            current_grad = grad_input_handle;
         } else if let Some(dual) = layer.as_dual_anchor() {
-            let grad_output_mat = download_gpu_handle_to_mat(gpu_compute, &current_grad);
-            let (dx_mat, layer_grad) = layer.backward_mat(ctx, &grad_output_mat, params, slice);
-            for (i, &g) in layer_grad.iter().enumerate() {
+            let input_handle = match ctx {
+                DynamicContext::Buffered(BufferedContext::DualAnchor1D { input }) => input.clone(),
+                DynamicContext::Mat(MatContext::DualAnchor1D { input }) => {
+                    upload_mat_to_gpu_handle(gpu_compute, input)
+                }
+                _ => panic!("Expected DualAnchor1D context"),
+            };
+            let features = dual.features;
+            let min_vals = &params[slice.start..slice.start + features];
+            let max_vals = &params[slice.start + features..slice.start + 2 * features];
+            let alpha = params[slice.start + 2 * features];
+            let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
+            let grad_min_handle = gpu_compute.allocate_gpu_matrix_handle(1, features);
+            let grad_max_handle = gpu_compute.allocate_gpu_matrix_handle(1, features);
+            let grad_alpha_handle = gpu_compute.allocate_gpu_matrix_handle(1, 1);
+            let grad_vec = gpu_compute.run_dualanchor_backward_buffered_handle(
+                &input_handle,
+                &current_grad,
+                min_vals,
+                max_vals,
+                alpha,
+                &grad_input_handle,
+                &grad_min_handle,
+                &grad_max_handle,
+                &grad_alpha_handle,
+            );
+            for (i, &g) in grad_vec.iter().enumerate() {
                 total_grad[slice.start + i] += g;
             }
-            current_grad = upload_mat_to_gpu_handle(gpu_compute, &dx_mat);
+            current_grad = grad_input_handle;
         } else {
-            // Fallback на старый метод
-            let grad_output_mat = download_gpu_handle_to_mat(gpu_compute, &current_grad);
-            let (dx_mat, layer_grad) = layer.backward_mat(ctx, &grad_output_mat, params, slice);
-            for (i, &g) in layer_grad.iter().enumerate() {
-                total_grad[slice.start + i] += g;
-            }
-            current_grad = upload_mat_to_gpu_handle(gpu_compute, &dx_mat);
+            panic!(
+                "Unsupported layer in GPU buffered backward: {:?}",
+                std::any::type_name_of_val(layer.as_ref())
+            );
         }
     }
 

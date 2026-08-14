@@ -128,37 +128,34 @@ impl GpuCompute {
         assert_eq!(output.cols(), out_features, "Output cols mismatch");
         assert_eq!(bias.len(), out_features, "Bias length mismatch");
 
-        // Получаем данные из GPU в CPU для простой корректной реализации.
-        // В дальнейшем можно заменить на чисто GPU-операции.
-        let input_vec = self.download_gpu_handle_to_vec(input);
-        let weight_vec = self.download_gpu_handle_to_vec(weight);
+        let in_buf = self.get_gpu_subbuffer_from_handle(input);
+        let w_buf = self.get_gpu_subbuffer_from_handle(weight);
+        let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        // Входные данные хранятся column-major: input_vec[c * batch + r]
-        // Веса хранятся column-major? weight_vec[col * out_features + row] или row-major?
-        // В MatrixBuffer column-major, поэтому weight_vec[in_idx * out_features + out_idx] для элемента (out_idx, in_idx).
-        // Проверим: MatrixBuffer хранит column-major, т.е. data[col * rows + row].
-        // Для weight размером (out_features, in_features) => data[in_idx * out_features + out_idx] = W[out_idx, in_idx].
-        // Нам удобнее использовать row-major для вычислений на CPU, но мы можем напрямую индексировать.
-        let mut out_vec = vec![0.0f32; batch * out_features];
-        for r in 0..batch {
-            for c in 0..out_features {
-                let mut sum = bias[c];
-                for k in 0..in_features {
-                    // input[k, r] (column-major) => input_vec[k * batch + r]
-                    // weight[c, k] (column-major) => weight_vec[k * out_features + c]
-                    sum += input_vec[k * batch + r] * weight_vec[k * out_features + c];
-                }
-                out_vec[c * batch + r] = sum;
-            }
-        }
+        let (bias_buf, bias_raw) = self.upload_to_temp_buffer(bias);
 
-        // Загружаем результат обратно в GPU output handle.
-        self.copy_slice_to_gpu_handle(output, &out_vec);
+        let pipeline = self.pipeline_cache.linear_fwd.clone();
+        let push = [batch as u32, in_features as u32, out_features as u32];
+
+        self.run_compute_shader_with_dispatch(
+            pipeline,
+            &[
+                (0, in_buf),
+                (1, w_buf),
+                (2, bias_buf.clone()),
+                (3, out_buf),
+            ],
+            &push,
+            [((batch * out_features + 255) / 256) as u32, 1, 1],
+        );
+
+        self.release_temp_buffer(bias_buf, bias_raw);
     }
 
     /// Обратный проход Linear на GPU с использованием MatrixBufferHandle.
-    /// `input`, `weight`, `grad_output`, `grad_input`, `grad_weight` должны быть GPU-буферами.
-    /// Возвращает градиент по bias как Vec<f32>.
+    /// Входные данные, веса, градиент выхода и все градиентные буферы должны быть GPU-буферами.
+    /// `grad_weight` и `grad_bias_handle` будут обнулены перед накоплением.
+    /// Возвращает градиент смещения как Vec<f32>.
     pub fn run_linear_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -166,67 +163,57 @@ impl GpuCompute {
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
         grad_weight: &MatrixBufferHandle,
+        grad_bias_handle: &MatrixBufferHandle,
     ) -> Vec<f32> {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(weight.is_gpu(), "Weight handle must be GPU");
         assert!(grad_output.is_gpu(), "grad_output handle must be GPU");
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
         assert!(grad_weight.is_gpu(), "grad_weight handle must be GPU");
+        assert!(grad_bias_handle.is_gpu(), "grad_bias_handle must be GPU");
 
         let batch = input.rows();
         let in_features = input.cols();
-        let out_features = grad_output.cols();
-        assert_eq!(weight.rows(), out_features, "Weight shape mismatch");
+        let out_features = weight.rows();
         assert_eq!(weight.cols(), in_features, "Weight shape mismatch");
         assert_eq!(grad_input.rows(), batch, "grad_input rows mismatch");
         assert_eq!(grad_input.cols(), in_features, "grad_input cols mismatch");
         assert_eq!(grad_weight.rows(), out_features, "grad_weight rows mismatch");
         assert_eq!(grad_weight.cols(), in_features, "grad_weight cols mismatch");
         assert_eq!(grad_output.rows(), batch, "grad_output rows mismatch");
+        assert_eq!(grad_output.cols(), out_features, "grad_output cols mismatch");
+        assert_eq!(grad_bias_handle.rows(), 1, "grad_bias_handle rows must be 1");
+        assert_eq!(grad_bias_handle.cols(), out_features, "grad_bias_handle cols mismatch");
 
-        // Получаем данные из GPU в CPU.
-        let input_vec = self.download_gpu_handle_to_vec(input);
-        let weight_vec = self.download_gpu_handle_to_vec(weight);
-        let go_vec = self.download_gpu_handle_to_vec(grad_output);
+        let x_buf = self.get_gpu_subbuffer_from_handle(input);
+        let w_buf = self.get_gpu_subbuffer_from_handle(weight);
+        let dout_buf = self.get_gpu_subbuffer_from_handle(grad_output);
+        let dx_buf = self.get_gpu_subbuffer_from_handle(grad_input);
+        let dw_buf = self.get_gpu_subbuffer_from_handle(grad_weight);
+        let db_buf = self.get_gpu_subbuffer_from_handle(grad_bias_handle);
 
-        // Вычисляем grad_input = grad_output * weight (batch x out_features) * (out_features x in_features) -> (batch x in_features)
-        let mut gi_vec = vec![0.0f32; batch * in_features];
-        for r in 0..batch {
-            for c in 0..in_features {
-                let mut sum = 0.0;
-                for k in 0..out_features {
-                    // grad_output[k, r] => go_vec[k * batch + r]
-                    // weight[k, c] => weight_vec[c * out_features + k]
-                    sum += go_vec[k * batch + r] * weight_vec[c * out_features + k];
-                }
-                gi_vec[c * batch + r] = sum;
-            }
-        }
+        // Обнуляем градиентные буферы перед атомарным накоплением
+        self.fill_gpu_handle(grad_weight, 0.0);
+        self.fill_gpu_handle(grad_bias_handle, 0.0);
 
-        // Вычисляем grad_weight = grad_output^T * input (out_features x batch) * (batch x in_features) -> (out_features x in_features)
-        let mut gw_vec = vec![0.0f32; out_features * in_features];
-        for out_idx in 0..out_features {
-            for in_idx in 0..in_features {
-                let mut sum = 0.0;
-                for r in 0..batch {
-                    // grad_output[out_idx, r] => go_vec[out_idx * batch + r]
-                    // input[in_idx, r] => input_vec[in_idx * batch + r]
-                    sum += go_vec[out_idx * batch + r] * input_vec[in_idx * batch + r];
-                }
-                // Column-major: data[in_idx * out_features + out_idx]
-                gw_vec[in_idx * out_features + out_idx] = sum;
-            }
-        }
+        let pipeline = self.pipeline_cache.linear_bwd.clone();
+        let push = [batch as u32, in_features as u32, out_features as u32];
 
-        // Вычисляем grad_bias = сумма по батчу grad_output
-        let grad_bias: Vec<f32> = (0..out_features)
-            .map(|c| (0..batch).map(|r| go_vec[c * batch + r]).sum())
-            .collect();
+        self.run_compute_shader_with_dispatch(
+            pipeline,
+            &[
+                (0, x_buf),
+                (1, w_buf),
+                (2, dout_buf),
+                (3, dx_buf),
+                (4, dw_buf),
+                (5, db_buf),
+            ],
+            &push,
+            [((batch + 255) / 256) as u32, 1, 1],
+        );
 
-        // Загружаем результаты в GPU handles.
-        self.copy_slice_to_gpu_handle(grad_input, &gi_vec);
-        self.copy_slice_to_gpu_handle(grad_weight, &gw_vec);
-
-        grad_bias
+        // Скачиваем градиент смещения как Vec<f32>
+        self.download_gpu_handle_to_vec(grad_bias_handle)
     }
 }

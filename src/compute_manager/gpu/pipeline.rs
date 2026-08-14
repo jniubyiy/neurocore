@@ -27,16 +27,16 @@ macro_rules! include_spv {
 pub struct PipelineCache {
     device: Arc<Device>,
 
-    // --- общие пайплайны ---
     pub mat_mul: Arc<ComputePipeline>,
     pub activation: Arc<ComputePipeline>,
     pub activation_backward: Arc<ComputePipeline>,
+    pub linear_fwd: Arc<ComputePipeline>,
+    pub linear_bwd: Arc<ComputePipeline>,
     pub softmax: Arc<ComputePipeline>,
     pub softmax_backward: Arc<ComputePipeline>,
     pub reduce: Arc<ComputePipeline>,
     pub unsqueeze: Arc<ComputePipeline>,
 
-    // --- loss-кубики (20 пайплайнов) ---
     pub sub_fwd: Arc<ComputePipeline>,
     pub sub_bwd: Arc<ComputePipeline>,
     pub square_fwd: Arc<ComputePipeline>,
@@ -58,7 +58,6 @@ pub struct PipelineCache {
     pub cross_entropy_fwd: Arc<ComputePipeline>,
     pub cross_entropy_bwd: Arc<ComputePipeline>,
 
-    // --- оптимизаторные кубики (7 пайплайнов) ---
     pub scale_grad: Arc<ComputePipeline>,
     pub weight_decay: Arc<ComputePipeline>,
     pub grad_clip: Arc<ComputePipeline>,
@@ -67,7 +66,6 @@ pub struct PipelineCache {
     pub adam: Arc<ComputePipeline>,
     pub apply_update: Arc<ComputePipeline>,
 
-    // --- custom слои (12 пайплайнов) ---
     pub memory_fwd: Arc<ComputePipeline>,
     pub memory_bwd: Arc<ComputePipeline>,
     pub softsparse_fwd: Arc<ComputePipeline>,
@@ -82,19 +80,77 @@ pub struct PipelineCache {
     pub splitter_bwd: Arc<ComputePipeline>,
 }
 
+// Вспомогательная функция для создания layout с ТОЧНЫМ числом storage-буферов.
+fn create_ds_layout_n(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
+    let mut bindings = BTreeMap::new();
+    for binding in 0..n {
+        bindings.insert(
+            binding,
+            DescriptorSetLayoutBinding {
+                binding_flags: DescriptorBindingFlags::empty(),
+                descriptor_type: DescriptorType::StorageBuffer,
+                descriptor_count: 1,
+                stages: ShaderStages::COMPUTE,
+                immutable_samplers: Vec::new(),
+                _ne: unsafe { std::mem::zeroed() },
+            },
+        );
+    }
+    DescriptorSetLayout::new(
+        device,
+        DescriptorSetLayoutCreateInfo {
+            bindings,
+            ..Default::default()
+        },
+    )
+    .expect("Failed to create descriptor set layout")
+}
+
+fn build_pipeline(
+    device: Arc<Device>,
+    shader: Arc<ShaderModule>,
+    ds_layout: Arc<DescriptorSetLayout>,
+    push_constants: Option<PushConstantRange>,
+    name: &str,
+) -> Arc<ComputePipeline> {
+    let ranges = push_constants.into_iter().collect();
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![ds_layout],
+            push_constant_ranges: ranges,
+            ..Default::default()
+        },
+    )
+    .expect("Failed to create pipeline layout");
+
+    let entry_point = shader
+        .entry_point_with_execution("main", ExecutionModel::GLCompute)
+        .expect("Shader entry point not found");
+
+    let stage = PipelineShaderStageCreateInfo::new(entry_point);
+
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .expect("Failed to create compute pipeline")
+}
+
 impl PipelineCache {
     pub fn new(device: Arc<Device>) -> Self {
         // ==================== Загрузка SPIR‑V ====================
-        // общие
         let mat_mul_spv         = include_spv!("shaders/common/mat_mul.spv");
         let activation_spv      = include_spv!("shaders/common/activation.spv");
         let activation_bw_spv   = include_spv!("shaders/common/activation_backward.spv");
+        let linear_fwd_spv      = include_spv!("shaders/layers/linear_fwd.spv");
+        let linear_bwd_spv      = include_spv!("shaders/layers/linear_bwd.spv");
         let softmax_spv         = include_spv!("shaders/common/softmax.spv");
         let softmax_bw_spv      = include_spv!("shaders/common/softmax_backward.spv");
         let reduce_spv          = include_spv!("shaders/common/reduce.spv");
         let unsqueeze_spv       = include_spv!("shaders/common/unsqueeze.spv");
 
-        // loss
         let sub_fwd_spv         = include_spv!("shaders/loss/sub_fwd.spv");
         let sub_bwd_spv         = include_spv!("shaders/loss/sub_bwd.spv");
         let square_fwd_spv      = include_spv!("shaders/loss/square_fwd.spv");
@@ -116,7 +172,6 @@ impl PipelineCache {
         let cross_entropy_fwd_spv = include_spv!("shaders/loss/cross_entropy_fwd.spv");
         let cross_entropy_bwd_spv = include_spv!("shaders/loss/cross_entropy_bwd.spv");
 
-        // оптимизаторы
         let scale_grad_spv      = include_spv!("shaders/optim/scale_grad.spv");
         let weight_decay_spv    = include_spv!("shaders/optim/weight_decay.spv");
         let grad_clip_spv       = include_spv!("shaders/optim/grad_clip.spv");
@@ -125,7 +180,6 @@ impl PipelineCache {
         let adam_spv            = include_spv!("shaders/optim/adam.spv");
         let apply_update_spv    = include_spv!("shaders/optim/apply_update.spv");
 
-        // custom слои
         let memory_fwd_spv      = include_spv!("shaders/layers/memory_fwd.spv");
         let memory_bwd_spv      = include_spv!("shaders/layers/memory_bwd.spv");
         let softsparse_fwd_spv  = include_spv!("shaders/layers/softsparse_fwd.spv");
@@ -143,6 +197,8 @@ impl PipelineCache {
         let mat_mul_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(mat_mul_spv)).expect("mat_mul") };
         let activation_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(activation_spv)).expect("activation") };
         let activation_bw_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(activation_bw_spv)).expect("activation_backward") };
+        let linear_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(linear_fwd_spv)).expect("linear_fwd") };
+        let linear_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(linear_bwd_spv)).expect("linear_bwd") };
         let softmax_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softmax_spv)).expect("softmax") };
         let softmax_bw_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softmax_bw_spv)).expect("softmax_backward") };
         let reduce_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(reduce_spv)).expect("reduce") };
@@ -190,400 +246,144 @@ impl PipelineCache {
         let splitter_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(splitter_fwd_spv)).expect("splitter_fwd") };
         let splitter_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(splitter_bwd_spv)).expect("splitter_bwd") };
 
-        // ==================== Вспомогательная функция для storage-биндинга ====================
-        fn storage_binding() -> DescriptorSetLayoutBinding {
-            DescriptorSetLayoutBinding {
-                binding_flags: DescriptorBindingFlags::empty(),
-                descriptor_type: DescriptorType::StorageBuffer,
-                descriptor_count: 1,
-                stages: ShaderStages::COMPUTE,
-                immutable_samplers: Vec::new(),
-                _ne: unsafe { std::mem::zeroed() },
-            }
-        }
+        // ==================== Создание layout'ов ====================
+        let mat_mul_ds = create_ds_layout_n(device.clone(), 3);
+        let activation_ds = create_ds_layout_n(device.clone(), 2);
+        let activation_bw_ds = create_ds_layout_n(device.clone(), 3);
+        let linear_fwd_ds = create_ds_layout_n(device.clone(), 4);
+        let linear_bwd_ds = create_ds_layout_n(device.clone(), 6);
+        let softmax_ds = create_ds_layout_n(device.clone(), 2);
+        let softmax_bw_ds = create_ds_layout_n(device.clone(), 3);
+        let reduce_ds = create_ds_layout_n(device.clone(), 2);
+        let unsqueeze_ds = create_ds_layout_n(device.clone(), 2);
 
-        // ==================== Дескриптор‑лейауты ====================
-        // --- существующие ---
-        let mut mat_mul_bindings = BTreeMap::new();
-        mat_mul_bindings.insert(0, storage_binding());
-        mat_mul_bindings.insert(1, storage_binding());
-        mat_mul_bindings.insert(2, storage_binding());
+        let sub_fwd_ds = create_ds_layout_n(device.clone(), 3);
+        let sub_bwd_ds = create_ds_layout_n(device.clone(), 3);
+        let square_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let square_bwd_ds = create_ds_layout_n(device.clone(), 3);
+        let abs_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let abs_bwd_ds = create_ds_layout_n(device.clone(), 3);
+        let log1p_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let log1p_bwd_ds = create_ds_layout_n(device.clone(), 3);
+        let absdiff_fwd_ds = create_ds_layout_n(device.clone(), 3);
+        let absdiff_bwd_ds = create_ds_layout_n(device.clone(), 5);
+        let log_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let log_bwd_ds = create_ds_layout_n(device.clone(), 3);
+        let neg_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let neg_bwd_ds = create_ds_layout_n(device.clone(), 2);
+        let mul_fwd_ds = create_ds_layout_n(device.clone(), 3);
+        let mul_bwd_ds = create_ds_layout_n(device.clone(), 5);
+        let addscalar_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let addscalar_bwd_ds = create_ds_layout_n(device.clone(), 2);
+        let ce_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let ce_bwd_ds = create_ds_layout_n(device.clone(), 3);
 
-        let mut act_bindings = BTreeMap::new();
-        act_bindings.insert(0, storage_binding());
-        act_bindings.insert(1, storage_binding());
+        let scale_grad_ds = create_ds_layout_n(device.clone(), 1);
+        let weight_decay_ds = create_ds_layout_n(device.clone(), 2);
+        let grad_clip_ds = create_ds_layout_n(device.clone(), 1);
+        let momentum_ds = create_ds_layout_n(device.clone(), 2);
+        let adam_ds = create_ds_layout_n(device.clone(), 2);
+        let apply_update_ds = create_ds_layout_n(device.clone(), 2);
 
-        let mut act_bw_bindings = BTreeMap::new();
-        act_bw_bindings.insert(0, storage_binding());
-        act_bw_bindings.insert(1, storage_binding());
-        act_bw_bindings.insert(2, storage_binding());
-
-        let mut softmax_bindings = BTreeMap::new();
-        softmax_bindings.insert(0, storage_binding());
-        softmax_bindings.insert(1, storage_binding());
-
-        let mut softmax_bw_bindings = BTreeMap::new();
-        softmax_bw_bindings.insert(0, storage_binding());
-        softmax_bw_bindings.insert(1, storage_binding());
-        softmax_bw_bindings.insert(2, storage_binding());
-
-        let mut reduce_bindings = BTreeMap::new();
-        reduce_bindings.insert(0, storage_binding());
-        reduce_bindings.insert(1, storage_binding());
-
-        let mut unsqueeze_bindings = BTreeMap::new();
-        unsqueeze_bindings.insert(0, storage_binding());
-        unsqueeze_bindings.insert(1, storage_binding());
-
-        // --- loss-кубики ---
-        let ds1 = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // input
-            b.insert(1, storage_binding());  // output
-            b
-        });
-
-        let ds2 = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // a
-            b.insert(1, storage_binding());  // b
-            b.insert(2, storage_binding());  // out
-            b
-        });
-
-        let ds_sub_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // go
-            b.insert(1, storage_binding());  // ga
-            b.insert(2, storage_binding());  // gb
-            b
-        });
-
-        let ds_mul_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // a
-            b.insert(1, storage_binding());  // b
-            b.insert(2, storage_binding());  // go
-            b.insert(3, storage_binding());  // ga
-            b.insert(4, storage_binding());  // gb
-            b
-        });
-
-        let ds_absdiff_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // a
-            b.insert(1, storage_binding());  // b
-            b.insert(2, storage_binding());  // go
-            b.insert(3, storage_binding());  // ga
-            b.insert(4, storage_binding());  // gb
-            b
-        });
-
-        let ds1_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // x
-            b.insert(1, storage_binding());  // go
-            b.insert(2, storage_binding());  // gi
-            b
-        });
-
-        let ds_neg_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // go
-            b.insert(1, storage_binding());  // gi
-            b
-        });
-
-        let ds_ce_fwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // data
-            b.insert(1, storage_binding());  // loss
-            b
-        });
-
-        let ds_ce_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // data
-            b.insert(1, storage_binding());  // go
-            b.insert(2, storage_binding());  // gi
-            b
-        });
-
-        // --- оптимизаторные кубики ---
-        let ds_grad_rw = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // grads (RW)
-            b
-        });
-
-        let ds_params_grads = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // params (R)
-            b.insert(1, storage_binding());  // grads (RW)
-            b
-        });
-
-        let ds_gradclip = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // grads (RW)
-            b
-        });
-
-        let ds_momentum = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // grads (RW)
-            b.insert(1, storage_binding());  // state (RW)
-            b
-        });
-
-        let ds_adam = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // grads (RW)
-            b.insert(1, storage_binding());  // state (RW) – m и v чередуются
-            b
-        });
-
-        let ds_apply = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding());  // params (RW)
-            b.insert(1, storage_binding());  // grads (R)
-            b
-        });
-
-        // --- custom слои ---
-        // memory forward: 3 буфера (x, state, y)
-        let ds_memory_fwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // state
-            b.insert(2, storage_binding()); // y
-            b
-        });
-        // memory backward: 2 буфера (go, gi)
-        let ds_memory_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // go
-            b.insert(1, storage_binding()); // gi
-            b
-        });
-
-        // softsparse forward: 3 буфера (x, thresholds, y)
-        let ds_softsparse_fwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // thresholds
-            b.insert(2, storage_binding()); // y
-            b
-        });
-        // softsparse backward: 5 буферов (x, go, thresholds, gi, gthresh)
-        let ds_softsparse_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // go
-            b.insert(2, storage_binding()); // thresholds
-            b.insert(3, storage_binding()); // gi
-            b.insert(4, storage_binding()); // gthresh
-            b
-        });
-
-        // softkeep forward: 3 буфера (x, thresholds, y)
-        let ds_softkeep_fwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // thresholds
-            b.insert(2, storage_binding()); // y
-            b
-        });
-        // softkeep backward: 5 буферов (x, go, thresholds, gi, gthresh)
-        let ds_softkeep_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // go
-            b.insert(2, storage_binding()); // thresholds
-            b.insert(3, storage_binding()); // gi
-            b.insert(4, storage_binding()); // gthresh
-            b
-        });
-
-        // dualanchor forward: 4 буфера (x, min_vals, max_vals, y)
-        let ds_dualanchor_fwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // min_vals
-            b.insert(2, storage_binding()); // max_vals
-            b.insert(3, storage_binding()); // y
-            b
-        });
-        // dualanchor backward: 8 буферов (x, go, min_vals, max_vals, gi, gmin, gmax, galpha)
-        let ds_dualanchor_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // go
-            b.insert(2, storage_binding()); // min_vals
-            b.insert(3, storage_binding()); // max_vals
-            b.insert(4, storage_binding()); // gi
-            b.insert(5, storage_binding()); // gmin
-            b.insert(6, storage_binding()); // gmax
-            b.insert(7, storage_binding()); // galpha
-            b
-        });
-
-        // combiner forward: 7 буферов
-        let ds_combiner_fwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // a
-            b.insert(1, storage_binding()); // b
-            b.insert(2, storage_binding()); // wa
-            b.insert(3, storage_binding()); // wb
-            b.insert(4, storage_binding()); // bias
-            b.insert(5, storage_binding()); // out
-            b.insert(6, storage_binding()); // pre_act
-            b
-        });
-        // combiner backward: 11 буферов
-        let ds_combiner_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // dout
-            b.insert(1, storage_binding()); // pre
-            b.insert(2, storage_binding()); // a
-            b.insert(3, storage_binding()); // b
-            b.insert(4, storage_binding()); // wa
-            b.insert(5, storage_binding()); // wb
-            b.insert(6, storage_binding()); // da
-            b.insert(7, storage_binding()); // db
-            b.insert(8, storage_binding()); // dwa
-            b.insert(9, storage_binding()); // dwb
-            b.insert(10, storage_binding()); // dbias
-            b
-        });
-
-        // splitter forward: 9 буферов
-        let ds_splitter_fwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // wa
-            b.insert(2, storage_binding()); // biasA
-            b.insert(3, storage_binding()); // wb
-            b.insert(4, storage_binding()); // biasB
-            b.insert(5, storage_binding()); // out_a
-            b.insert(6, storage_binding()); // pre_a
-            b.insert(7, storage_binding()); // out_b
-            b.insert(8, storage_binding()); // pre_b
-            b
-        });
-        // splitter backward: 12 буферов
-        let ds_splitter_bwd = create_ds_layout(device.clone(), {
-            let mut b = BTreeMap::new();
-            b.insert(0, storage_binding()); // x
-            b.insert(1, storage_binding()); // da
-            b.insert(2, storage_binding()); // db
-            b.insert(3, storage_binding()); // pre_a
-            b.insert(4, storage_binding()); // pre_b
-            b.insert(5, storage_binding()); // wa
-            b.insert(6, storage_binding()); // wb
-            b.insert(7, storage_binding()); // dx
-            b.insert(8, storage_binding()); // dwa
-            b.insert(9, storage_binding()); // dbiasa
-            b.insert(10, storage_binding()); // dwb
-            b.insert(11, storage_binding()); // dbiasb
-            b
-        });
+        let memory_fwd_ds = create_ds_layout_n(device.clone(), 3);
+        let memory_bwd_ds = create_ds_layout_n(device.clone(), 2);
+        let softsparse_fwd_ds = create_ds_layout_n(device.clone(), 3);
+        let softsparse_bwd_ds = create_ds_layout_n(device.clone(), 5);
+        let softkeep_fwd_ds = create_ds_layout_n(device.clone(), 3);
+        let softkeep_bwd_ds = create_ds_layout_n(device.clone(), 5);
+        let dualanchor_fwd_ds = create_ds_layout_n(device.clone(), 4);
+        let dualanchor_bwd_ds = create_ds_layout_n(device.clone(), 8);
+        let combiner_fwd_ds = create_ds_layout_n(device.clone(), 7);
+        let combiner_bwd_ds = create_ds_layout_n(device.clone(), 11);
+        let splitter_fwd_ds = create_ds_layout_n(device.clone(), 9);
+        let splitter_bwd_ds = create_ds_layout_n(device.clone(), 12);
 
         // ==================== Push‑константы ====================
         let push_mat_mul = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_act = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_act_bw = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
+        let push_linear = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_softmax = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_softmax_bw = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_reduce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-
         let push_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
         let push_total_scalar = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_ce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-
         let push_factor_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_decay_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_clip = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_beta = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_adam = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 24 };
         let push_optim_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-
-        // push-константы для custom слоёв
-        let push_memory_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 }; // batch, features, alpha_bits
-        let push_memory_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };  // total, alpha_bits
-        let push_softsparse_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 }; // total, temperature_bits, features
+        let push_memory_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
+        let push_memory_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
+        let push_softsparse_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_softsparse_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_softkeep_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_softkeep_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_dualanchor_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 }; // total, features, alpha_bits
+        let push_dualanchor_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_dualanchor_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_combiner_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 }; // batch, n, m
+        let push_combiner_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_combiner_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_splitter_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 16 }; // batch, n, p, q
+        let push_splitter_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 16 };
         let push_splitter_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 16 };
 
         // ==================== Сборка пайплайнов ====================
-        let mat_mul_ds_layout = create_ds_layout(device.clone(), mat_mul_bindings);
-        let activation_ds_layout = create_ds_layout(device.clone(), act_bindings);
-        let activation_bw_ds_layout = create_ds_layout(device.clone(), act_bw_bindings);
-        let softmax_ds_layout = create_ds_layout(device.clone(), softmax_bindings);
-        let softmax_bw_ds_layout = create_ds_layout(device.clone(), softmax_bw_bindings);
-        let reduce_ds_layout = create_ds_layout(device.clone(), reduce_bindings);
-        let unsqueeze_ds_layout = create_ds_layout(device.clone(), unsqueeze_bindings);
+        let mat_mul = build_pipeline(device.clone(), mat_mul_mod, mat_mul_ds, Some(push_mat_mul), "mat_mul");
+        let activation = build_pipeline(device.clone(), activation_mod, activation_ds, Some(push_act), "activation");
+        let activation_backward = build_pipeline(device.clone(), activation_bw_mod, activation_bw_ds, Some(push_act_bw), "activation_backward");
+        let linear_fwd = build_pipeline(device.clone(), linear_fwd_mod, linear_fwd_ds, Some(push_linear), "linear_fwd");
+        let linear_bwd = build_pipeline(device.clone(), linear_bwd_mod, linear_bwd_ds, Some(push_linear), "linear_bwd");
+        let softmax = build_pipeline(device.clone(), softmax_mod, softmax_ds, Some(push_softmax), "softmax");
+        let softmax_backward = build_pipeline(device.clone(), softmax_bw_mod, softmax_bw_ds, Some(push_softmax_bw), "softmax_backward");
+        let reduce = build_pipeline(device.clone(), reduce_mod, reduce_ds, Some(push_reduce), "reduce");
+        let unsqueeze = build_pipeline(device.clone(), unsqueeze_mod, unsqueeze_ds, None, "unsqueeze");
 
-        let mat_mul = build_pipeline(device.clone(), mat_mul_mod, mat_mul_ds_layout, Some(push_mat_mul));
-        let activation = build_pipeline(device.clone(), activation_mod, activation_ds_layout, Some(push_act));
-        let activation_backward = build_pipeline(device.clone(), activation_bw_mod, activation_bw_ds_layout, Some(push_act_bw));
-        let softmax = build_pipeline(device.clone(), softmax_mod, softmax_ds_layout, Some(push_softmax));
-        let softmax_backward = build_pipeline(device.clone(), softmax_bw_mod, softmax_bw_ds_layout, Some(push_softmax_bw));
-        let reduce = build_pipeline(device.clone(), reduce_mod, reduce_ds_layout, Some(push_reduce));
-        let unsqueeze = build_pipeline(device.clone(), unsqueeze_mod, unsqueeze_ds_layout, None);
+        let sub_fwd = build_pipeline(device.clone(), sub_fwd_mod, sub_fwd_ds, Some(push_total), "sub_fwd");
+        let sub_bwd = build_pipeline(device.clone(), sub_bwd_mod, sub_bwd_ds, Some(push_total), "sub_bwd");
+        let square_fwd = build_pipeline(device.clone(), square_fwd_mod, square_fwd_ds, Some(push_total), "square_fwd");
+        let square_bwd = build_pipeline(device.clone(), square_bwd_mod, square_bwd_ds, Some(push_total), "square_bwd");
+        let abs_fwd = build_pipeline(device.clone(), abs_fwd_mod, abs_fwd_ds, Some(push_total), "abs_fwd");
+        let abs_bwd = build_pipeline(device.clone(), abs_bwd_mod, abs_bwd_ds, Some(push_total), "abs_bwd");
+        let log1p_fwd = build_pipeline(device.clone(), log1p_fwd_mod, log1p_fwd_ds, Some(push_total), "log1p_fwd");
+        let log1p_bwd = build_pipeline(device.clone(), log1p_bwd_mod, log1p_bwd_ds, Some(push_total), "log1p_bwd");
+        let absdiff_fwd = build_pipeline(device.clone(), absdiff_fwd_mod, absdiff_fwd_ds, Some(push_total), "absdiff_fwd");
+        let absdiff_bwd = build_pipeline(device.clone(), absdiff_bwd_mod, absdiff_bwd_ds, Some(push_total), "absdiff_bwd");
+        let log_fwd = build_pipeline(device.clone(), log_fwd_mod, log_fwd_ds, Some(push_total), "log_fwd");
+        let log_bwd = build_pipeline(device.clone(), log_bwd_mod, log_bwd_ds, Some(push_total), "log_bwd");
+        let neg_fwd = build_pipeline(device.clone(), neg_fwd_mod, neg_fwd_ds, Some(push_total), "neg_fwd");
+        let neg_bwd = build_pipeline(device.clone(), neg_bwd_mod, neg_bwd_ds, Some(push_total), "neg_bwd");
+        let mul_fwd = build_pipeline(device.clone(), mul_fwd_mod, mul_fwd_ds, Some(push_total), "mul_fwd");
+        let mul_bwd = build_pipeline(device.clone(), mul_bwd_mod, mul_bwd_ds, Some(push_total), "mul_bwd");
+        let addscalar_fwd = build_pipeline(device.clone(), addscalar_fwd_mod, addscalar_fwd_ds, Some(push_total_scalar), "addscalar_fwd");
+        let addscalar_bwd = build_pipeline(device.clone(), addscalar_bwd_mod, addscalar_bwd_ds, Some(push_total), "addscalar_bwd");
+        let cross_entropy_fwd = build_pipeline(device.clone(), ce_fwd_mod, ce_fwd_ds, Some(push_ce), "cross_entropy_fwd");
+        let cross_entropy_bwd = build_pipeline(device.clone(), ce_bwd_mod, ce_bwd_ds, Some(push_ce), "cross_entropy_bwd");
 
-        let sub_fwd = build_pipeline(device.clone(), sub_fwd_mod, ds2.clone(), Some(push_total));
-        let sub_bwd = build_pipeline(device.clone(), sub_bwd_mod, ds_sub_bwd.clone(), Some(push_total));
-        let square_fwd = build_pipeline(device.clone(), square_fwd_mod, ds1.clone(), Some(push_total));
-        let square_bwd = build_pipeline(device.clone(), square_bwd_mod, ds1_bwd.clone(), Some(push_total));
-        let abs_fwd = build_pipeline(device.clone(), abs_fwd_mod, ds1.clone(), Some(push_total));
-        let abs_bwd = build_pipeline(device.clone(), abs_bwd_mod, ds1_bwd.clone(), Some(push_total));
-        let log1p_fwd = build_pipeline(device.clone(), log1p_fwd_mod, ds1.clone(), Some(push_total));
-        let log1p_bwd = build_pipeline(device.clone(), log1p_bwd_mod, ds1_bwd.clone(), Some(push_total));
-        let absdiff_fwd = build_pipeline(device.clone(), absdiff_fwd_mod, ds2.clone(), Some(push_total));
-        let absdiff_bwd = build_pipeline(device.clone(), absdiff_bwd_mod, ds_absdiff_bwd.clone(), Some(push_total));
-        let log_fwd = build_pipeline(device.clone(), log_fwd_mod, ds1.clone(), Some(push_total));
-        let log_bwd = build_pipeline(device.clone(), log_bwd_mod, ds1_bwd.clone(), Some(push_total));
-        let neg_fwd = build_pipeline(device.clone(), neg_fwd_mod, ds1.clone(), Some(push_total));
-        let neg_bwd = build_pipeline(device.clone(), neg_bwd_mod, ds_neg_bwd.clone(), Some(push_total));
-        let mul_fwd = build_pipeline(device.clone(), mul_fwd_mod, ds2.clone(), Some(push_total));
-        let mul_bwd = build_pipeline(device.clone(), mul_bwd_mod, ds_mul_bwd.clone(), Some(push_total));
-        let addscalar_fwd = build_pipeline(device.clone(), addscalar_fwd_mod, ds1.clone(), Some(push_total_scalar));
-        let addscalar_bwd = build_pipeline(device.clone(), addscalar_bwd_mod, ds_neg_bwd.clone(), Some(push_total));
-        let cross_entropy_fwd = build_pipeline(device.clone(), ce_fwd_mod, ds_ce_fwd.clone(), Some(push_ce));
-        let cross_entropy_bwd = build_pipeline(device.clone(), ce_bwd_mod, ds_ce_bwd.clone(), Some(push_ce));
+        let scale_grad = build_pipeline(device.clone(), scale_grad_mod, scale_grad_ds, Some(push_factor_total), "scale_grad");
+        let weight_decay = build_pipeline(device.clone(), weight_decay_mod, weight_decay_ds, Some(push_decay_total), "weight_decay");
+        let grad_clip = build_pipeline(device.clone(), grad_clip_mod, grad_clip_ds, Some(push_clip), "grad_clip");
+        let momentum = build_pipeline(device.clone(), momentum_mod, momentum_ds.clone(), Some(push_beta), "momentum");
+        let nesterov_momentum = build_pipeline(device.clone(), nesterov_momentum_mod, momentum_ds, Some(push_beta), "nesterov_momentum");
+        let adam = build_pipeline(device.clone(), adam_mod, adam_ds, Some(push_adam), "adam");
+        let apply_update = build_pipeline(device.clone(), apply_update_mod, apply_update_ds, Some(push_optim_total), "apply_update");
 
-        let scale_grad = build_pipeline(device.clone(), scale_grad_mod, ds_grad_rw.clone(), Some(push_factor_total));
-        let weight_decay = build_pipeline(device.clone(), weight_decay_mod, ds_params_grads.clone(), Some(push_decay_total));
-        let grad_clip = build_pipeline(device.clone(), grad_clip_mod, ds_gradclip.clone(), Some(push_clip));
-        let momentum = build_pipeline(device.clone(), momentum_mod, ds_momentum.clone(), Some(push_beta));
-        let nesterov_momentum = build_pipeline(device.clone(), nesterov_momentum_mod, ds_momentum.clone(), Some(push_beta));
-        let adam = build_pipeline(device.clone(), adam_mod, ds_adam.clone(), Some(push_adam));
-        let apply_update = build_pipeline(device.clone(), apply_update_mod, ds_apply.clone(), Some(push_optim_total));
-
-        let memory_fwd = build_pipeline(device.clone(), memory_fwd_mod, ds_memory_fwd, Some(push_memory_fwd));
-        let memory_bwd = build_pipeline(device.clone(), memory_bwd_mod, ds_memory_bwd, Some(push_memory_bwd));
-        let softsparse_fwd = build_pipeline(device.clone(), softsparse_fwd_mod, ds_softsparse_fwd, Some(push_softsparse_fwd));
-        let softsparse_bwd = build_pipeline(device.clone(), softsparse_bwd_mod, ds_softsparse_bwd, Some(push_softsparse_bwd));
-        let softkeep_fwd = build_pipeline(device.clone(), softkeep_fwd_mod, ds_softkeep_fwd, Some(push_softkeep_fwd));
-        let softkeep_bwd = build_pipeline(device.clone(), softkeep_bwd_mod, ds_softkeep_bwd, Some(push_softkeep_bwd));
-        let dualanchor_fwd = build_pipeline(device.clone(), dualanchor_fwd_mod, ds_dualanchor_fwd, Some(push_dualanchor_fwd));
-        let dualanchor_bwd = build_pipeline(device.clone(), dualanchor_bwd_mod, ds_dualanchor_bwd, Some(push_dualanchor_bwd));
-        let combiner_fwd = build_pipeline(device.clone(), combiner_fwd_mod, ds_combiner_fwd, Some(push_combiner_fwd));
-        let combiner_bwd = build_pipeline(device.clone(), combiner_bwd_mod, ds_combiner_bwd, Some(push_combiner_bwd));
-        let splitter_fwd = build_pipeline(device.clone(), splitter_fwd_mod, ds_splitter_fwd, Some(push_splitter_fwd));
-        let splitter_bwd = build_pipeline(device.clone(), splitter_bwd_mod, ds_splitter_bwd, Some(push_splitter_bwd));
+        let memory_fwd = build_pipeline(device.clone(), memory_fwd_mod, memory_fwd_ds, Some(push_memory_fwd), "memory_fwd");
+        let memory_bwd = build_pipeline(device.clone(), memory_bwd_mod, memory_bwd_ds, Some(push_memory_bwd), "memory_bwd");
+        let softsparse_fwd = build_pipeline(device.clone(), softsparse_fwd_mod, softsparse_fwd_ds, Some(push_softsparse_fwd), "softsparse_fwd");
+        let softsparse_bwd = build_pipeline(device.clone(), softsparse_bwd_mod, softsparse_bwd_ds, Some(push_softsparse_bwd), "softsparse_bwd");
+        let softkeep_fwd = build_pipeline(device.clone(), softkeep_fwd_mod, softkeep_fwd_ds, Some(push_softkeep_fwd), "softkeep_fwd");
+        let softkeep_bwd = build_pipeline(device.clone(), softkeep_bwd_mod, softkeep_bwd_ds, Some(push_softkeep_bwd), "softkeep_bwd");
+        let dualanchor_fwd = build_pipeline(device.clone(), dualanchor_fwd_mod, dualanchor_fwd_ds, Some(push_dualanchor_fwd), "dualanchor_fwd");
+        let dualanchor_bwd = build_pipeline(device.clone(), dualanchor_bwd_mod, dualanchor_bwd_ds, Some(push_dualanchor_bwd), "dualanchor_bwd");
+        let combiner_fwd = build_pipeline(device.clone(), combiner_fwd_mod, combiner_fwd_ds, Some(push_combiner_fwd), "combiner_fwd");
+        let combiner_bwd = build_pipeline(device.clone(), combiner_bwd_mod, combiner_bwd_ds, Some(push_combiner_bwd), "combiner_bwd");
+        let splitter_fwd = build_pipeline(device.clone(), splitter_fwd_mod, splitter_fwd_ds, Some(push_splitter_fwd), "splitter_fwd");
+        let splitter_bwd = build_pipeline(device.clone(), splitter_bwd_mod, splitter_bwd_ds, Some(push_splitter_bwd), "splitter_bwd");
 
         Self {
             device,
-            mat_mul, activation, activation_backward, softmax, softmax_backward, reduce, unsqueeze,
+            mat_mul, activation, activation_backward, linear_fwd, linear_bwd, softmax, softmax_backward, reduce, unsqueeze,
             sub_fwd, sub_bwd, square_fwd, square_bwd, abs_fwd, abs_bwd,
             log1p_fwd, log1p_bwd, absdiff_fwd, absdiff_bwd, log_fwd, log_bwd,
             neg_fwd, neg_bwd, mul_fwd, mul_bwd, addscalar_fwd, addscalar_bwd,
@@ -598,59 +398,14 @@ impl PipelineCache {
         }
     }
 
-    // Геттеры для основных пайплайнов
     pub fn mat_mul_pipeline(&self) -> Arc<ComputePipeline> { self.mat_mul.clone() }
     pub fn activation_pipeline(&self) -> Arc<ComputePipeline> { self.activation.clone() }
     pub fn activation_backward_pipeline(&self) -> Arc<ComputePipeline> { self.activation_backward.clone() }
+    pub fn linear_fwd_pipeline(&self) -> Arc<ComputePipeline> { self.linear_fwd.clone() }
+    pub fn linear_bwd_pipeline(&self) -> Arc<ComputePipeline> { self.linear_bwd.clone() }
     pub fn softmax_pipeline(&self) -> Arc<ComputePipeline> { self.softmax.clone() }
     pub fn softmax_backward_pipeline(&self) -> Arc<ComputePipeline> { self.softmax_backward.clone() }
     pub fn reduce_pipeline(&self) -> Arc<ComputePipeline> { self.reduce.clone() }
     pub fn unsqueeze_pipeline(&self) -> Arc<ComputePipeline> { self.unsqueeze.clone() }
     pub fn device(&self) -> Arc<Device> { self.device.clone() }
-}
-
-// Вспомогательные функции
-fn create_ds_layout(
-    device: Arc<Device>,
-    bindings: BTreeMap<u32, DescriptorSetLayoutBinding>,
-) -> Arc<DescriptorSetLayout> {
-    DescriptorSetLayout::new(
-        device,
-        DescriptorSetLayoutCreateInfo {
-            bindings,
-            ..Default::default()
-        },
-    )
-    .expect("Failed to create descriptor set layout")
-}
-
-fn build_pipeline(
-    device: Arc<Device>,
-    shader: Arc<ShaderModule>,
-    ds_layout: Arc<DescriptorSetLayout>,
-    push_constants: Option<PushConstantRange>,
-) -> Arc<ComputePipeline> {
-    let ranges = push_constants.into_iter().collect();
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![ds_layout],
-            push_constant_ranges: ranges,
-            ..Default::default()
-        },
-    )
-    .expect("Failed to create pipeline layout");
-
-    let entry_point = shader
-        .entry_point_with_execution("main", ExecutionModel::GLCompute)
-        .expect("Shader entry point not found");
-
-    let stage = PipelineShaderStageCreateInfo::new(entry_point);
-
-    ComputePipeline::new(
-        device,
-        None,
-        ComputePipelineCreateInfo::stage_layout(stage, layout),
-    )
-    .expect("Failed to create compute pipeline")
 }

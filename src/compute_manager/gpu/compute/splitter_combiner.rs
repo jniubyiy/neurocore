@@ -410,6 +410,12 @@ impl GpuCompute {
         let d_wb_buf = self.get_gpu_subbuffer_from_handle(d_wb);
         let d_bias_b_buf = self.get_gpu_subbuffer_from_handle(d_bias_b);
 
+        // Обнуляем градиентные буферы перед атомарным накоплением
+        self.fill_gpu_handle(d_wa, 0.0);
+        self.fill_gpu_handle(d_wb, 0.0);
+        self.fill_gpu_handle(d_bias_a, 0.0);
+        self.fill_gpu_handle(d_bias_b, 0.0);
+
         let pipeline = self.pipeline_cache.splitter_bwd.clone();
         let push = [batch as u32, n as u32, p as u32, q as u32];
         self.run_compute_shader_with_dispatch(
@@ -548,96 +554,37 @@ impl GpuCompute {
         let d_wb_buf = self.get_gpu_subbuffer_from_handle(d_wb);
         let d_bias_buf = self.get_gpu_subbuffer_from_handle(d_bias);
 
-        // Шейдер combiner_bwd вычисляет только da и db; градиенты весов и смещений
-        // вычисляем через отдельные операции на GPU с последующим копированием.
-        // Для простоты используем CPU fallback: скачиваем необходимые данные и считаем на CPU,
-        // затем загружаем результаты обратно. Это медленнее, но корректно и не требует
-        // дополнительных шейдеров.
-        let d_out_vec = self.download_gpu_handle_to_vec(d_out);
-        let pre_vec = self.download_gpu_handle_to_vec(pre);
-        let a_vec = self.download_gpu_handle_to_vec(a);
-        let b_vec = self.download_gpu_handle_to_vec(b);
-        let wa_vec = self.download_gpu_handle_to_vec(wa);
-        let wb_vec = self.download_gpu_handle_to_vec(wb);
+        // Обнуляем градиентные буферы перед атомарным накоплением
+        self.fill_gpu_handle(d_wa, 0.0);
+        self.fill_gpu_handle(d_wb, 0.0);
+        self.fill_gpu_handle(d_bias, 0.0);
 
-        // Вычисляем d_pre = d_out * relu'(pre)
-        let mut d_pre_vec = vec![0.0f32; batch * m];
-        for c in 0..m {
-            for r in 0..batch {
-                let pre_val = pre_vec[c * batch + r];
-                let dpre = if pre_val > 0.0 { d_out_vec[c * batch + r] } else { 0.0 };
-                d_pre_vec[c * batch + r] = dpre;
-            }
-        }
+        let pipeline = self.pipeline_cache.combiner_bwd.clone();
+        let push = [batch as u32, n as u32, m as u32];
+        self.run_compute_shader_with_dispatch(
+            pipeline,
+            &[
+                (0, d_out_buf),
+                (1, pre_buf),
+                (2, a_buf),
+                (3, b_buf),
+                (4, wa_buf),
+                (5, wb_buf),
+                (6, da_buf),
+                (7, db_buf),
+                (8, d_wa_buf),
+                (9, d_wb_buf),
+                (10, d_bias_buf),
+            ],
+            &push,
+            [((batch + 255) / 256) as u32, 1, 1],
+        );
 
-        // da = d_pre * wa^T  (batch x m) * (m x n) -> batch x n
-        let mut da_vec = vec![0.0f32; batch * n];
-        for r in 0..batch {
-            for col in 0..n {
-                let mut sum = 0.0;
-                for k in 0..m {
-                    // d_pre[k, r] (column-major) = d_pre_vec[k * batch + r]
-                    // wa[k, col] (column-major) = wa_vec[col * m + k]
-                    sum += d_pre_vec[k * batch + r] * wa_vec[col * m + k];
-                }
-                da_vec[col * batch + r] = sum;
-            }
-        }
-
-        // db = d_pre * wb^T
-        let mut db_vec = vec![0.0f32; batch * n];
-        for r in 0..batch {
-            for col in 0..n {
-                let mut sum = 0.0;
-                for k in 0..m {
-                    sum += d_pre_vec[k * batch + r] * wb_vec[col * m + k];
-                }
-                db_vec[col * batch + r] = sum;
-            }
-        }
-
-        // d_wa = d_pre^T * a  (m x batch) * (batch x n) -> m x n
-        let mut d_wa_vec = vec![0.0f32; m * n];
-        for out_idx in 0..m {
-            for in_idx in 0..n {
-                let mut sum = 0.0;
-                for r in 0..batch {
-                    sum += d_pre_vec[out_idx * batch + r] * a_vec[in_idx * batch + r];
-                }
-                // column-major для d_wa: data[in_idx * m + out_idx]
-                d_wa_vec[in_idx * m + out_idx] = sum;
-            }
-        }
-
-        // d_wb = d_pre^T * b
-        let mut d_wb_vec = vec![0.0f32; m * n];
-        for out_idx in 0..m {
-            for in_idx in 0..n {
-                let mut sum = 0.0;
-                for r in 0..batch {
-                    sum += d_pre_vec[out_idx * batch + r] * b_vec[in_idx * batch + r];
-                }
-                d_wb_vec[in_idx * m + out_idx] = sum;
-            }
-        }
-
-        // d_bias = сумма по r d_pre
-        let d_bias_vec: Vec<f32> = (0..m)
-            .map(|c| (0..batch).map(|r| d_pre_vec[c * batch + r]).sum())
-            .collect();
-
-        // Загружаем результаты обратно в GPU handles
-        self.copy_slice_to_gpu_handle(da, &da_vec);
-        self.copy_slice_to_gpu_handle(db, &db_vec);
-        self.copy_slice_to_gpu_handle(d_wa, &d_wa_vec);
-        self.copy_slice_to_gpu_handle(d_wb, &d_wb_vec);
-        self.copy_slice_to_gpu_handle(d_bias, &d_bias_vec);
-
-        // Формируем общий градиент параметров
+        // Скачиваем градиенты параметров в CPU
         let mut grad = Vec::with_capacity(2 * m * n + m);
-        grad.extend_from_slice(&d_wa_vec);
-        grad.extend_from_slice(&d_wb_vec);
-        grad.extend_from_slice(&d_bias_vec);
+        grad.extend_from_slice(&self.download_gpu_handle_to_vec(d_wa));
+        grad.extend_from_slice(&self.download_gpu_handle_to_vec(d_wb));
+        grad.extend_from_slice(&self.download_gpu_handle_to_vec(d_bias));
         grad
     }
 }

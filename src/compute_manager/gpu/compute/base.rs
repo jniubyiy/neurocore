@@ -658,6 +658,19 @@ impl GpuCompute {
         dst_slice.copy_from_slice(&data_vec);
     }
 
+    /// Копирует данные между двумя GPU MatrixBufferHandle.
+    pub fn copy_gpu_handle_to_gpu_handle(
+        &self,
+        src: &MatrixBufferHandle,
+        dst: &MatrixBufferHandle,
+    ) {
+        assert!(src.is_gpu(), "Source must be GPU");
+        assert!(dst.is_gpu(), "Destination must be GPU");
+        let src_buf = self.get_gpu_subbuffer_from_handle(src);
+        let dst_buf = self.get_gpu_subbuffer_from_handle(dst);
+        self.copy_buffer_sync(src_buf, dst_buf);
+    }
+
     /// Вспомогательный метод: извлекает Subbuffer из GPU-записи по дескриптору.
     /// Блокировка MemoryExecutor снимается после получения клона Subbuffer.
     pub(crate) fn get_gpu_subbuffer_from_handle(&self, handle: &MatrixBufferHandle) -> Subbuffer<[f32]> {

@@ -14,7 +14,10 @@ pub use init::GpuContext;
 pub use executor::GpuExecutor;
 pub use memory::GpuTensor;
 pub use compute::GpuCompute;
-pub use processor::process_forward_gpu;
+pub use processor::{
+    process_forward_gpu_buffered,
+    process_backward_gpu_buffered,
+};
 pub use param_store::GpuParamStore;   // <-- добавлено
 
 /// Обнаружить доступные GPU с помощью Vulkan.

@@ -138,29 +138,6 @@ impl GpuCompute {
         (gpu_buf, raw_id)
     }
 
-    pub fn read_temp_buffer_to_mat(
-        &self,
-        buffer: Subbuffer<[f32]>,
-        raw_id: RawBufferId,
-        rows: usize,
-        cols: usize,
-    ) -> Mat<f32> {
-        let total = rows * cols;
-        let (staging_buf, staging_raw) = self.acquire_staging_buffer(total);
-        self.copy_buffer_sync(buffer.clone(), staging_buf.clone());
-
-        let data_vec = {
-            let guard = staging_buf.read().expect("read staging buffer");
-            let slice = &guard[..total];
-            slice.to_vec()
-        };
-
-        self.release_staging_buffer(staging_buf, staging_raw);
-        self.release_temp_buffer(buffer, raw_id);
-
-        Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
-    }
-
     // --- Работа с постоянными (persistent) буферами ---
 
     pub fn copy_persistent_to_persistent(
@@ -376,43 +353,6 @@ impl GpuCompute {
         self.release_staging_buffer(staging_buf, staging_raw);
 
         dst.copy_from_slice(&data_vec);
-    }
-
-    pub fn upload_mat_to_gpu_matrix(&self, mat: &Mat<f32>) -> MatrixBuffer {
-        let rows = mat.nrows();
-        let cols = mat.ncols();
-        let mut gpu_buf = self.allocate_gpu_matrix(rows, cols);
-
-        let flat = Self::mat_to_flat(mat);
-        let (staging_buf, staging_raw) = self.acquire_staging_buffer(flat.len());
-        {
-            let mut write_guard = staging_buf.write().expect("write staging buffer");
-            write_guard[..flat.len()].copy_from_slice(&flat);
-        }
-        let dst_gpu = gpu_buf.as_gpu_buffer().expect("GPU buffer");
-        self.copy_buffer_sync(staging_buf.clone(), dst_gpu.clone());
-        self.release_staging_buffer(staging_buf, staging_raw);
-
-        gpu_buf
-    }
-
-    pub fn download_gpu_matrix_to_mat(&self, buf: &MatrixBuffer) -> Mat<f32> {
-        assert!(buf.is_gpu(), "Buffer must be GPU");
-        let rows = buf.rows();
-        let cols = buf.cols();
-        let elements = buf.size();
-
-        let src_gpu = buf.as_gpu_buffer().expect("GPU buffer");
-        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
-        self.copy_buffer_sync(src_gpu.clone(), staging_buf.clone());
-
-        let data_vec = {
-            let guard = staging_buf.read().expect("read staging buffer");
-            guard[..elements].to_vec()
-        };
-        self.release_staging_buffer(staging_buf, staging_raw);
-
-        Mat::from_fn(rows, cols, |r, c| data_vec[r * cols + c])
     }
 
     pub fn download_gpu_matrix_to_vec(&self, buf: &MatrixBuffer) -> Vec<f32> {

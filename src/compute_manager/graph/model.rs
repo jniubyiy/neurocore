@@ -14,7 +14,7 @@ use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::compute_manager::adaptive_planner::ProfilingData;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::DevicePlan;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::{BufferedParamStore, ParamStore};

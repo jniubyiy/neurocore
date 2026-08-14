@@ -1,7 +1,7 @@
 // src/plans/optimizer_plan/chain.rs
 
 use super::cube::OptimizerCube;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, MatrixBufferHandle};
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 /// Цепочка кубиков оптимизации.
 ///
@@ -53,31 +53,6 @@ impl OptimizerChain {
             cube.apply(params, grads, state_slice);
             offset += state_len;
         }
-    }
-
-    /// Применяет все кубики последовательно, работая с управляемыми буферами
-    /// `MatrixBuffer`. Внутри извлекаются обычные слайсы, поэтому метод
-    /// эквивалентен `apply_all`, но принимает `MatrixBuffer` для удобства
-    /// интеграции с памятью под контролем `MemoryExecutor`.
-    ///
-    /// # Паника
-    /// Паникует, если любой из переданных буферов находится на GPU.
-    #[deprecated(note = "Use apply_all_buffered_handle for MemoryExecutor integration")]
-    #[allow(deprecated)]
-    pub fn apply_all_buffered(
-        &self,
-        params: &mut MatrixBuffer,
-        grads: &mut MatrixBuffer,
-        state: &mut MatrixBuffer,
-    ) {
-        assert!(!params.is_gpu() && !grads.is_gpu() && !state.is_gpu(),
-            "apply_all_buffered supports only CPU buffers");
-
-        let p = params.as_slice_mut();
-        let g = grads.as_slice_mut();
-        let s = state.as_slice_mut();
-
-        self.apply_all(p, g, s);
     }
 
     /// Применяет все кубики последовательно, работая с дескрипторами

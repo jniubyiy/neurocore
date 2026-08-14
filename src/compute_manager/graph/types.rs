@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;

@@ -1,73 +1,11 @@
 // src/compute_manager/gpu/compute/softmax.rs
 
 use super::base::GpuCompute;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 impl GpuCompute {
     // ===================================================================
-    // Буферизованные версии (MatrixBuffer)
-    // ===================================================================
-
-    /// Прямой проход softmax на GPU с использованием MatrixBuffer.
-    /// Принимает входной GPU-буфер и возвращает выходной GPU-буфер.
-    pub fn run_softmax_forward_buffered(&self, input: &MatrixBuffer) -> MatrixBuffer {
-        assert!(input.is_gpu(), "Input buffer must be GPU");
-        let batch = input.rows();
-        let cols = input.cols();
-        let total = batch * cols;
-
-        let in_buf = input.as_gpu_buffer().expect("GPU buffer");
-        let out = self.allocate_gpu_matrix(batch, cols);
-        let out_buf = out.as_gpu_buffer().expect("GPU buffer");
-
-        let pipeline = self.pipeline_cache.softmax_pipeline();
-        let push: [u32; 2] = [batch as u32, cols as u32];
-
-        self.run_compute_shader_with_dispatch(
-            pipeline,
-            &[(0, in_buf.clone()), (1, out_buf.clone())],
-            &push,
-            [batch as u32, 1, 1],
-        );
-
-        out
-    }
-
-    /// Обратный проход softmax на GPU с использованием MatrixBuffer.
-    /// Принимает выход softmax (GPU) и градиент по выходу (GPU), возвращает градиент по входу (GPU).
-    pub fn run_softmax_backward_buffered(
-        &self,
-        output: &MatrixBuffer,
-        grad_output: &MatrixBuffer,
-    ) -> MatrixBuffer {
-        assert!(output.is_gpu() && grad_output.is_gpu(), "Buffers must be GPU");
-        let batch = output.rows();
-        let cols = output.cols();
-        let total = batch * cols;
-        assert_eq!(grad_output.rows(), batch);
-        assert_eq!(grad_output.cols(), cols);
-
-        let y_buf = output.as_gpu_buffer().expect("GPU buffer");
-        let go_buf = grad_output.as_gpu_buffer().expect("GPU buffer");
-        let gi = self.allocate_gpu_matrix(batch, cols);
-        let gi_buf = gi.as_gpu_buffer().expect("GPU buffer");
-
-        let pipeline = self.pipeline_cache.softmax_backward_pipeline();
-        let push: [u32; 2] = [batch as u32, cols as u32];
-
-        self.run_compute_shader_with_dispatch(
-            pipeline,
-            &[(0, y_buf.clone()), (1, go_buf.clone()), (2, gi_buf.clone())],
-            &push,
-            [batch as u32, 1, 1],
-        );
-
-        gi
-    }
-
-    // ===================================================================
-    // НОВЫЕ Handle-версии (MatrixBufferHandle)
+    // Handle-версии (MatrixBufferHandle)
     // ===================================================================
 
     /// Прямой проход softmax на GPU с использованием MatrixBufferHandle.

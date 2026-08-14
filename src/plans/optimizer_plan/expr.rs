@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::memory_executor::MemoryExecutor;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
 use super::chain::OptimizerChain;
 use super::state::OptimizerState;
@@ -11,7 +11,7 @@ use super::state::OptimizerState;
 /// Интерпретатор оптимизатора, объединяющий цепочку кубиков и их состояние.
 ///
 /// Поддерживает два пути выполнения:
-/// - Legacy: использует `OptimizerState` и срезы `[f32]` (через `step`, `step_buffered`).
+/// - Legacy: использует `OptimizerState` и срезы `[f32]` (через `step`).
 /// - Buffered: использует вектор `MatrixBufferHandle` для состояний
 ///   (через `step_buffered_handle`), без копирования в `Vec<f32>`.
 pub struct OptimizerExpr {
@@ -92,31 +92,6 @@ impl OptimizerExpr {
         self.step_counter += 1;
     }
 
-    /// Выполняет один шаг оптимизации, принимая параметры и градиенты
-    /// в виде управляемых буферов `MatrixBuffer` (только CPU).
-    ///
-    /// Внутри извлекаются обычные слайсы, а градиенты копируются во временный
-    /// вектор, поэтому исходный `grads` не изменяется. Этот метод удобен для
-    /// интеграции с буферизованным графом, когда параметры и градиенты уже
-    /// находятся под управлением `MemoryExecutor`.
-    ///
-    /// # Паника
-    /// Паникует, если `params` или `grads` являются GPU‑буферами.
-    #[deprecated(note = "Use step_buffered_handle for MemoryExecutor integration")]
-    #[allow(deprecated)]
-    pub fn step_buffered(&mut self, params: &mut MatrixBuffer, grads: &MatrixBuffer) {
-        assert!(!params.is_gpu() && !grads.is_gpu(),
-            "step_buffered supports only CPU buffers");
-
-        let mut grads_mut = grads.as_slice().to_vec();
-        self.chain.apply_all(
-            params.as_slice_mut(),
-            &mut grads_mut,
-            self.legacy_state.as_mut_slice(),
-        );
-        self.step_counter += 1;
-    }
-
     /// Выполняет один шаг оптимизации, работая полностью с `MatrixBufferHandle`.
     ///
     /// Параметры и градиенты изменяются in‑place через `write()`/`read()`.
@@ -147,4 +122,4 @@ impl OptimizerExpr {
     pub fn current_step(&self) -> usize {
         self.step_counter
     }
-}
+}  

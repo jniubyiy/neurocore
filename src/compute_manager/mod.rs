@@ -20,4 +20,4 @@ pub use executor::Executor;
 pub use graph::types::DynamicContext;
 pub use dim_change::DynamicTensor;
 pub use gpu::GpuExecutor;
-pub use matrix_buffer::{MatrixBuffer, TempMatrixPool};
+pub use matrix_buffer::{MatrixBufferHandle, TempMatrixPool};

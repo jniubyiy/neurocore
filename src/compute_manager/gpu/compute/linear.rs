@@ -1,73 +1,11 @@
 // src/compute_manager/gpu/compute/linear.rs
 
 use super::base::GpuCompute;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 impl GpuCompute {
     // ===================================================================
-    // Буферизованные версии для MatrixBuffer
-    // ===================================================================
-
-    pub fn run_linear_forward_buffered(
-        &self,
-        input: &MatrixBuffer,
-        weight: &MatrixBuffer,
-        bias: &[f32],
-    ) -> MatrixBuffer {
-        assert!(input.is_gpu() && weight.is_gpu(), "Buffers must be GPU");
-        let batch = input.rows();
-        let in_features = input.cols();
-        let out_features = weight.rows();
-        assert_eq!(weight.cols(), in_features, "Weight shape mismatch");
-        assert_eq!(bias.len(), out_features, "Bias length mismatch");
-
-        let weight_t = self.transpose_gpu_matrix(weight);
-        let mut out = self.run_mat_mul_buffered(input, &weight_t);
-
-        let mut out_vec = self.download_gpu_matrix_to_vec(&out);
-        for c in 0..out_features {
-            let bias_val = bias[c];
-            for r in 0..batch {
-                out_vec[c * batch + r] += bias_val;
-            }
-        }
-        out = self.upload_vec_to_gpu_buffer(&out_vec, batch, out_features);
-        out
-    }
-
-    pub fn run_linear_backward_buffered(
-        &self,
-        input: &MatrixBuffer,
-        weight: &MatrixBuffer,
-        grad_output: &MatrixBuffer,
-    ) -> (MatrixBuffer, MatrixBuffer, Vec<f32>) {
-        assert!(
-            input.is_gpu() && weight.is_gpu() && grad_output.is_gpu(),
-            "Buffers must be GPU"
-        );
-        let batch = input.rows();
-        let in_features = input.cols();
-        let out_features = grad_output.cols();
-        assert_eq!(weight.rows(), out_features, "Weight shape mismatch");
-        assert_eq!(weight.cols(), in_features, "Weight shape mismatch");
-        assert_eq!(input.rows(), batch, "Batch mismatch");
-
-        let grad_input = self.run_mat_mul_buffered(grad_output, weight);
-
-        let grad_output_t = self.transpose_gpu_matrix(grad_output);
-        let grad_weight = self.run_mat_mul_buffered(&grad_output_t, input);
-
-        let go_vec = self.download_gpu_matrix_to_vec(grad_output);
-        let grad_bias: Vec<f32> = (0..out_features)
-            .map(|c| (0..batch).map(|r| go_vec[c * batch + r]).sum())
-            .collect();
-
-        (grad_input, grad_weight, grad_bias)
-    }
-
-    // ===================================================================
-    // НОВЫЕ Handle-версии (MatrixBufferHandle)
+    // Handle-версии (MatrixBufferHandle)
     // ===================================================================
 
     /// Прямой проход Linear на GPU с использованием MatrixBufferHandle.

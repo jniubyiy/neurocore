@@ -1,104 +1,11 @@
 // src/compute_manager/gpu/compute/activation.rs
 
 use super::base::GpuCompute;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 impl GpuCompute {
     // ===================================================================
-    // Буферизованные версии (MatrixBuffer)
-    // ===================================================================
-
-    /// Прямой проход активации на GPU с использованием MatrixBuffer.
-    pub fn run_activation_forward_buffered(
-        &self,
-        input: &MatrixBuffer,
-        op_type: u32,
-        alpha: f32,
-    ) -> MatrixBuffer {
-        assert!(input.is_gpu(), "Input buffer must be GPU");
-        let rows = input.rows();
-        let cols = input.cols();
-        let total_elements = rows * cols;
-
-        let in_buf = input.as_gpu_buffer().expect("GPU buffer");
-        let out = self.allocate_gpu_matrix(rows, cols);
-        let out_buf = out.as_gpu_buffer().expect("GPU buffer");
-
-        let pipeline = self.pipeline_cache.activation_pipeline();
-        let push: [u32; 3] = [op_type, alpha.to_bits(), total_elements as u32];
-
-        self.run_compute_shader(
-            pipeline,
-            &[(0, in_buf.clone()), (1, out_buf.clone())],
-            &push,
-            total_elements,
-        );
-
-        out
-    }
-
-    pub fn run_relu_forward_buffered(&self, input: &MatrixBuffer) -> MatrixBuffer {
-        self.run_activation_forward_buffered(input, 0, 0.0)
-    }
-    pub fn run_sigmoid_forward_buffered(&self, input: &MatrixBuffer) -> MatrixBuffer {
-        self.run_activation_forward_buffered(input, 1, 0.0)
-    }
-    pub fn run_tanh_forward_buffered(&self, input: &MatrixBuffer) -> MatrixBuffer {
-        self.run_activation_forward_buffered(input, 2, 0.0)
-    }
-    pub fn run_leaky_relu_forward_buffered(&self, input: &MatrixBuffer, alpha: f32) -> MatrixBuffer {
-        self.run_activation_forward_buffered(input, 3, alpha)
-    }
-
-    /// Обратный проход активации на GPU с использованием MatrixBuffer.
-    pub fn run_activation_backward_buffered(
-        &self,
-        input_or_output: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        op_type: u32,
-        alpha: f32,
-    ) -> MatrixBuffer {
-        assert!(input_or_output.is_gpu() && grad_out.is_gpu(), "Buffers must be GPU");
-        let rows = input_or_output.rows();
-        let cols = input_or_output.cols();
-        let total_elements = rows * cols;
-        assert_eq!(grad_out.rows(), rows);
-        assert_eq!(grad_out.cols(), cols);
-
-        let in_buf = input_or_output.as_gpu_buffer().expect("GPU buffer");
-        let go_buf = grad_out.as_gpu_buffer().expect("GPU buffer");
-        let gi = self.allocate_gpu_matrix(rows, cols);
-        let gi_buf = gi.as_gpu_buffer().expect("GPU buffer");
-
-        let pipeline = self.pipeline_cache.activation_backward_pipeline();
-        let push: [u32; 3] = [op_type, alpha.to_bits(), total_elements as u32];
-
-        self.run_compute_shader(
-            pipeline,
-            &[(0, in_buf.clone()), (1, go_buf.clone()), (2, gi_buf.clone())],
-            &push,
-            total_elements,
-        );
-
-        gi
-    }
-
-    pub fn run_relu_backward_buffered(&self, input: &MatrixBuffer, grad_output: &MatrixBuffer) -> MatrixBuffer {
-        self.run_activation_backward_buffered(input, grad_output, 0, 0.0)
-    }
-    pub fn run_sigmoid_backward_buffered(&self, output: &MatrixBuffer, grad_output: &MatrixBuffer) -> MatrixBuffer {
-        self.run_activation_backward_buffered(output, grad_output, 1, 0.0)
-    }
-    pub fn run_tanh_backward_buffered(&self, output: &MatrixBuffer, grad_output: &MatrixBuffer) -> MatrixBuffer {
-        self.run_activation_backward_buffered(output, grad_output, 2, 0.0)
-    }
-    pub fn run_leaky_relu_backward_buffered(&self, input: &MatrixBuffer, grad_output: &MatrixBuffer, alpha: f32) -> MatrixBuffer {
-        self.run_activation_backward_buffered(input, grad_output, 3, alpha)
-    }
-
-    // ===================================================================
-    // НОВЫЕ Handle-версии (MatrixBufferHandle)
+    // Handle-версии (MatrixBufferHandle)
     // ===================================================================
 
     /// Прямой проход активации на GPU с использованием MatrixBufferHandle.
@@ -135,6 +42,7 @@ impl GpuCompute {
     ) {
         self.run_activation_forward_buffered_handle(input, output, 0, 0.0)
     }
+
     pub fn run_sigmoid_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -142,6 +50,7 @@ impl GpuCompute {
     ) {
         self.run_activation_forward_buffered_handle(input, output, 1, 0.0)
     }
+
     pub fn run_tanh_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -149,6 +58,7 @@ impl GpuCompute {
     ) {
         self.run_activation_forward_buffered_handle(input, output, 2, 0.0)
     }
+
     pub fn run_leaky_relu_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -199,6 +109,7 @@ impl GpuCompute {
     ) {
         self.run_activation_backward_buffered_handle(input, grad_output, grad_input, 0, 0.0)
     }
+
     pub fn run_sigmoid_backward_buffered_handle(
         &self,
         output: &MatrixBufferHandle,
@@ -207,6 +118,7 @@ impl GpuCompute {
     ) {
         self.run_activation_backward_buffered_handle(output, grad_output, grad_input, 1, 0.0)
     }
+
     pub fn run_tanh_backward_buffered_handle(
         &self,
         output: &MatrixBufferHandle,
@@ -215,6 +127,7 @@ impl GpuCompute {
     ) {
         self.run_activation_backward_buffered_handle(output, grad_output, grad_input, 2, 0.0)
     }
+
     pub fn run_leaky_relu_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,

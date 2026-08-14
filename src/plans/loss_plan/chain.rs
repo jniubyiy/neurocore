@@ -1,8 +1,7 @@
 // src/plans/loss_plan/chain.rs
 
-use faer::Mat;
-use super::cubes::ElemCube;
 use super::cubes::BufferedElemCube;
+use super::cubes::ElemCube;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
 /// Цепочка элементарных кубиков, выполняющая последовательное преобразование над батчем.
@@ -34,47 +33,6 @@ impl ElementChain {
         &self.cubes
     }
 
-    /// Выполняет полный прямой проход по всей цепочке над одним батчем (матричная версия).
-    ///
-    /// Принимает матрицу `input` размером `(batch, task_input_size())`.
-    /// Возвращает кортеж:
-    /// * итоговая матрица `(batch, out_features последнего кубика)`,
-    /// * вектор промежуточных результатов в формате `(вход_кубика, выход_кубика)` для каждого кубика.
-    #[deprecated(note = "Use forward_batch_buffered for MemoryExecutor integration")]
-    pub fn forward_batch(&self, input: &Mat<f32>) -> (Mat<f32>, Vec<(Mat<f32>, Mat<f32>)>) {
-        let mut intermediates = Vec::with_capacity(self.cubes.len());
-        let mut current = input.clone();
-        for cube in &self.cubes {
-            let out = cube.forward_batch(&current);
-            intermediates.push((current.clone(), out.clone()));
-            current = out;
-        }
-        (current, intermediates)
-    }
-
-    /// Выполняет обратный проход по всей цепочке, используя сохранённые промежуточные значения (матричная версия).
-    ///
-    /// * `intermediates` — результат `forward_batch` (вектор пар (вход, выход) для каждого кубика),
-    /// * `grad_out` — градиент по выходу цепочки, матрица `(batch, out_features последнего кубика)`.
-    ///
-    /// Возвращает градиент по входу цепочки — матрица `(batch, task_input_size())`.
-    #[deprecated(note = "Use backward_batch_buffered for MemoryExecutor integration")]
-    pub fn backward_batch(
-        &self,
-        intermediates: &[(Mat<f32>, Mat<f32>)],
-        grad_out: &Mat<f32>,
-    ) -> Mat<f32> {
-        assert_eq!(intermediates.len(), self.cubes.len(),
-            "ElementChain::backward_batch: количество промежуточных результатов не совпадает с числом кубиков");
-
-        let mut grad = grad_out.clone();
-        // Идём по кубикам в обратном порядке
-        for (cube, (inp, outp)) in self.cubes.iter().zip(intermediates.iter()).rev() {
-            grad = cube.backward_batch(inp, outp, &grad);
-        }
-        grad
-    }
-
     // ===================================================================
     // БУФЕРИЗОВАННЫЕ МЕТОДЫ (MatrixBufferHandle + TempMatrixPool)
     // ===================================================================
@@ -89,7 +47,6 @@ impl ElementChain {
         input: &MatrixBufferHandle,
         pool: &mut TempMatrixPool,
     ) -> (MatrixBufferHandle, Vec<(MatrixBufferHandle, MatrixBufferHandle)>) {
-        let batch = input.rows();
         let mut intermediates = Vec::with_capacity(self.cubes.len());
 
         // Начальный буфер — копия входа (чтобы сохранить данные для обратного прохода)

@@ -1,7 +1,7 @@
 // src/plans/loss_plan/expr.rs
 
-use faer::Mat;
 use std::sync::Arc;
+
 use super::chain::ElementChain;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
@@ -75,34 +75,6 @@ impl LossExpr {
     /// Тип агрегации.
     pub fn aggregation(&self) -> Aggregation {
         self.aggregation
-    }
-
-    /// Прямой проход (матричная версия).
-    pub fn forward_chunk(
-        &self,
-        chunk_input: &Mat<f32>,
-    ) -> (Vec<f32>, Vec<(Mat<f32>, Mat<f32>)>) {
-        let (out_mat, intermediates) = self.chain.forward_batch(chunk_input);
-        let loss_vec: Vec<f32> = (0..out_mat.nrows())
-            .map(|i| out_mat[(i, 0)])
-            .collect();
-        (loss_vec, intermediates)
-    }
-
-    /// Обратный проход (матричная версия).
-    pub fn backward_chunk(
-        &self,
-        intermediates: &[(Mat<f32>, Mat<f32>)],
-        grad_loss: &[f32],
-    ) -> Mat<f32> {
-        let batch = intermediates.first()
-            .map(|(inp, _)| inp.nrows())
-            .unwrap_or(0);
-        assert_eq!(batch, grad_loss.len(),
-            "backward_chunk: длина grad_loss должна совпадать с размером батча");
-
-        let grad_out = Mat::from_fn(batch, 1, |i, _| grad_loss[i]);
-        self.chain.backward_batch(intermediates, &grad_out)
     }
 
     /// Агрегирует значения потерь.

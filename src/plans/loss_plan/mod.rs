@@ -13,5 +13,5 @@ pub use cross_entropy::CrossEntropyWithLogits;
 pub use chain::ElementChain;
 pub use expr::{Aggregation, LossExpr};
 pub use desc::LossDesc;
-pub use execution::compute_loss_mat;
+pub use execution::compute_loss_mat_buffered;
 pub use gpu_exec::compute_loss_gpu_buffered_handle;

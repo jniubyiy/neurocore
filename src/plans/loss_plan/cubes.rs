@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::fmt::Debug;
 use faer::Mat;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 /// Элементарный кубик функции потерь (матричная версия).
 pub trait ElemCube: Any + Send + Sync + Debug {
@@ -20,17 +20,17 @@ pub trait ElemCube: Any + Send + Sync + Debug {
 }
 
 /// Буферизованный элементарный кубик функции потерь.
-/// Работает с управляемыми буферами `MatrixBuffer` (CPU).
+/// Работает с управляемыми буферами `MatrixBufferHandle` (CPU).
 pub trait BufferedElemCube: Send + Sync + Debug {
     fn in_features(&self) -> usize;
     fn out_features(&self) -> usize;
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer);
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle);
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     );
 }
 
@@ -100,11 +100,18 @@ impl BufferedElemCube for Sub {
         self.features
     }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
         let rows = input.rows();
         let f = self.features;
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Sub forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Sub forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), rows * 2 * f);
+        debug_assert_eq!(dst.len(), rows * f);
 
         for r in 0..rows {
             for c in 0..f {
@@ -115,15 +122,22 @@ impl BufferedElemCube for Sub {
 
     fn backward_buffered(
         &self,
-        _input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        _input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
         let rows = grad_out.rows();
         let f = self.features;
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("Sub backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("Sub backward: expected CPU buffer");
+
+        debug_assert_eq!(go.len(), rows * f);
+        debug_assert_eq!(gi.len(), rows * 2 * f);
 
         for r in 0..rows {
             for c in 0..f {
@@ -170,9 +184,15 @@ impl BufferedElemCube for Square {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Square forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Square forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), dst.len());
+
         for (o, &x) in dst.iter_mut().zip(src.iter()) {
             *o = x * x;
         }
@@ -180,14 +200,23 @@ impl BufferedElemCube for Square {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
-        let x = input.as_slice();
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+        let x_guard = input.read();
+        let x = x_guard.as_slice().expect("Square backward: expected CPU buffer");
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("Square backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("Square backward: expected CPU buffer");
+
+        debug_assert_eq!(x.len(), go.len());
+        debug_assert_eq!(x.len(), gi.len());
+
         for i in 0..x.len() {
             gi[i] = 2.0 * x[i] * go[i];
         }
@@ -202,7 +231,7 @@ impl BufferedElemCube for Square {
 pub struct SumColumns;
 
 impl ElemCube for SumColumns {
-    fn in_features(&self) -> usize { 0 } // фактически не важно, т.к. применяется к матрице с произвольным числом столбцов
+    fn in_features(&self) -> usize { 0 }
     fn out_features(&self) -> usize { 1 }
 
     fn forward_batch(&self, input: &Mat<f32>) -> Mat<f32> {
@@ -224,7 +253,7 @@ impl ElemCube for SumColumns {
         grad_out: &Mat<f32>,
     ) -> Mat<f32> {
         let batch = grad_out.nrows();
-        let cols = _input.ncols(); // нужно знать исходное число столбцов; передадим его через input
+        let cols = _input.ncols();
         let mut grad = Mat::zeros(batch, cols);
         for i in 0..batch {
             let g = grad_out[(i, 0)];
@@ -242,11 +271,18 @@ impl BufferedElemCube for SumColumns {
     fn in_features(&self) -> usize { 0 }
     fn out_features(&self) -> usize { 1 }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
         let rows = input.rows();
         let cols = input.cols();
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("SumColumns forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("SumColumns forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), rows * cols);
+        debug_assert_eq!(dst.len(), rows);
 
         for r in 0..rows {
             let mut sum = 0.0;
@@ -259,15 +295,22 @@ impl BufferedElemCube for SumColumns {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
         let rows = grad_out.rows();
         let cols = input.cols();
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("SumColumns backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("SumColumns backward: expected CPU buffer");
+
+        debug_assert_eq!(go.len(), rows);
+        debug_assert_eq!(gi.len(), rows * cols);
 
         for r in 0..rows {
             let g = go[r];
@@ -312,9 +355,15 @@ impl BufferedElemCube for Log {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Log forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Log forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), dst.len());
+
         for (o, &x) in dst.iter_mut().zip(src.iter()) {
             *o = x.ln();
         }
@@ -322,14 +371,23 @@ impl BufferedElemCube for Log {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
-        let x = input.as_slice();
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+        let x_guard = input.read();
+        let x = x_guard.as_slice().expect("Log backward: expected CPU buffer");
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("Log backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("Log backward: expected CPU buffer");
+
+        debug_assert_eq!(x.len(), go.len());
+        debug_assert_eq!(x.len(), gi.len());
+
         for i in 0..x.len() {
             gi[i] = go[i] / x[i];
         }
@@ -367,9 +425,15 @@ impl BufferedElemCube for Neg {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Neg forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Neg forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), dst.len());
+
         for (o, &x) in dst.iter_mut().zip(src.iter()) {
             *o = -x;
         }
@@ -377,13 +441,19 @@ impl BufferedElemCube for Neg {
 
     fn backward_buffered(
         &self,
-        _input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        _input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("Neg backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("Neg backward: expected CPU buffer");
+
+        debug_assert_eq!(go.len(), gi.len());
+
         for (o, &g) in gi.iter_mut().zip(go.iter()) {
             *o = -g;
         }
@@ -459,11 +529,18 @@ impl BufferedElemCube for Mul {
         self.features
     }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
         let rows = input.rows();
         let f = self.features;
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Mul forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Mul forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), rows * 2 * f);
+        debug_assert_eq!(dst.len(), rows * f);
 
         for r in 0..rows {
             for c in 0..f {
@@ -474,16 +551,26 @@ impl BufferedElemCube for Mul {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
         let rows = grad_out.rows();
         let f = self.features;
-        let src = input.as_slice();
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Mul backward: expected CPU buffer");
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("Mul backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("Mul backward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), rows * 2 * f);
+        debug_assert_eq!(go.len(), rows * f);
+        debug_assert_eq!(gi.len(), rows * 2 * f);
 
         for r in 0..rows {
             for c in 0..f {
@@ -532,9 +619,15 @@ impl BufferedElemCube for Abs {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Abs forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Abs forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), dst.len());
+
         for (o, &x) in dst.iter_mut().zip(src.iter()) {
             *o = x.abs();
         }
@@ -542,14 +635,23 @@ impl BufferedElemCube for Abs {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
-        let x = input.as_slice();
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+        let x_guard = input.read();
+        let x = x_guard.as_slice().expect("Abs backward: expected CPU buffer");
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("Abs backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("Abs backward: expected CPU buffer");
+
+        debug_assert_eq!(x.len(), go.len());
+        debug_assert_eq!(x.len(), gi.len());
+
         for i in 0..x.len() {
             if x[i] > 0.0 {
                 gi[i] = go[i];
@@ -593,10 +695,16 @@ impl BufferedElemCube for AddScalar {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
         let scalar = self.0;
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("AddScalar forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("AddScalar forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), dst.len());
+
         for (o, &x) in dst.iter_mut().zip(src.iter()) {
             *o = x + scalar;
         }
@@ -604,13 +712,18 @@ impl BufferedElemCube for AddScalar {
 
     fn backward_buffered(
         &self,
-        _input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        _input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("AddScalar backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("AddScalar backward: expected CPU buffer");
+
+        debug_assert_eq!(go.len(), gi.len());
         gi.copy_from_slice(go);
     }
 }
@@ -650,9 +763,15 @@ impl BufferedElemCube for Log1p {
     fn in_features(&self) -> usize { 1 }
     fn out_features(&self) -> usize { 1 }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Log1p forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Log1p forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), dst.len());
+
         for (o, &x) in dst.iter_mut().zip(src.iter()) {
             *o = (x + 1.0).ln();
         }
@@ -660,14 +779,23 @@ impl BufferedElemCube for Log1p {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
-        let x = input.as_slice();
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+        let x_guard = input.read();
+        let x = x_guard.as_slice().expect("Log1p backward: expected CPU buffer");
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("Log1p backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("Log1p backward: expected CPU buffer");
+
+        debug_assert_eq!(x.len(), go.len());
+        debug_assert_eq!(x.len(), gi.len());
+
         for i in 0..x.len() {
             gi[i] = go[i] / (1.0 + x[i]);
         }
@@ -741,11 +869,18 @@ impl BufferedElemCube for AbsDiff {
         self.features
     }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
         let rows = input.rows();
         let f = self.features;
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("AbsDiff forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("AbsDiff forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), rows * 2 * f);
+        debug_assert_eq!(dst.len(), rows * f);
 
         for r in 0..rows {
             for c in 0..f {
@@ -756,16 +891,26 @@ impl BufferedElemCube for AbsDiff {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
         let rows = grad_out.rows();
         let f = self.features;
-        let src = input.as_slice();
-        let go = grad_out.as_slice();
-        let gi = grad_in.as_slice_mut();
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("AbsDiff backward: expected CPU buffer");
+
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("AbsDiff backward: expected CPU buffer");
+
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("AbsDiff backward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), rows * 2 * f);
+        debug_assert_eq!(go.len(), rows * f);
+        debug_assert_eq!(gi.len(), rows * 2 * f);
 
         for r in 0..rows {
             for c in 0..f {
@@ -780,10 +925,9 @@ impl BufferedElemCube for AbsDiff {
 }
 
 // ----------------------------------------------------------------
-// CrossEntropyWithLogits (буферизованная реализация перенесена сюда,
-// хотя сам struct объявлен в cross_entropy.rs)
+// CrossEntropyWithLogits (буферизованная реализация находится в cross_entropy.rs)
 // ----------------------------------------------------------------
 
 // Внимание: чтобы не создавать циклическую зависимость, реализация для
-// CrossEntropyWithLogits находится в файле cross_entropy.rs (будет добавлена позже).
+// CrossEntropyWithLogits находится в файле cross_entropy.rs.
 // В этом файле мы оставляем только те кубики, которые определены здесь.

@@ -1,7 +1,8 @@
 // src/layers/memory/memory.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -138,24 +139,24 @@ impl UniversalLayer for Memory {
 impl UniversalLayerBuffered for Memory {
     fn forward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let rows = input.rows();
-        let cols = input.cols();
-        debug_assert_eq!(cols, self.features);
+        let input_guard = input.read();
+        let src = input_guard.as_slice().expect("Memory forward: expected CPU buffer");
 
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+        let mut output_guard = output.write();
+        let dst = output_guard.as_slice_mut().expect("Memory forward: expected CPU buffer");
+
+        let features = self.features;
+        let mut cells = self.cells.lock().unwrap();
+
         debug_assert_eq!(src.len(), dst.len());
 
-        let mut cells = self.cells.lock().unwrap();
-        let features = self.features;
-
         for idx in 0..src.len() {
-            let c = idx / rows; // column index (feature)
+            let c = idx / input.rows(); // column index (feature)
 
             let x = src[idx];
             let min_idx = c;
@@ -181,15 +182,29 @@ impl UniversalLayerBuffered for Memory {
 
     fn backward_buffered(
         &self,
-        _ctx: &DynamicContext,
-        grad_output: &MatrixBuffer,
-        grad_input: &mut MatrixBuffer,
+        ctx: &DynamicContext,
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
+        // Извлекаем буферизованный контекст, чтобы убедиться в его типе.
+        let bc = match ctx {
+            DynamicContext::Buffered(bc) => bc,
+            _ => panic!("Expected Buffered context"),
+        };
+        let _input_handle = match bc {
+            BufferedContext::Memory { input } => input,
+            _ => panic!("Expected Memory context"),
+        };
+
         let factor = 1.0 - self.alpha;
-        let go = grad_output.as_slice();
-        let gi = grad_input.as_slice_mut();
+        let go_guard = grad_output.read();
+        let go = go_guard.as_slice().expect("Memory backward: expected CPU buffer");
+
+        let mut gi_guard = grad_input.write();
+        let gi = gi_guard.as_slice_mut().expect("Memory backward: expected CPU buffer");
+
         debug_assert_eq!(go.len(), gi.len());
 
         for (out, &in_val) in gi.iter_mut().zip(go.iter()) {

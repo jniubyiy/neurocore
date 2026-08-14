@@ -1,7 +1,7 @@
 // src/layers/dual_anchor/dual_anchor.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
@@ -134,11 +134,17 @@ impl UniversalLayer for DualAnchor {
 impl UniversalLayerBuffered for DualAnchor {
     fn forward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     ) {
+        let input_guard = input.read();
+        let src = input_guard.as_slice().expect("DualAnchor forward: expected CPU buffer");
+
+        let mut output_guard = output.write();
+        let dst = output_guard.as_slice_mut().expect("DualAnchor forward: expected CPU buffer");
+
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
@@ -149,8 +155,6 @@ impl UniversalLayerBuffered for DualAnchor {
         let max_vals = &params[base + self.features..base + 2 * self.features];
         let alpha = params[base + 2 * self.features];
 
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
         debug_assert_eq!(src.len(), dst.len());
 
         // column-major: внешний цикл по признакам, внутренний по строкам
@@ -171,8 +175,8 @@ impl UniversalLayerBuffered for DualAnchor {
     fn backward_buffered(
         &self,
         ctx: &DynamicContext,
-        grad_output: &MatrixBuffer,
-        grad_input: &mut MatrixBuffer,
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
@@ -181,11 +185,13 @@ impl UniversalLayerBuffered for DualAnchor {
             DynamicContext::Buffered(bc) => bc,
             _ => panic!("Expected Buffered context"),
         };
-        let input_arc = match bc {
+        let input_handle = match bc {
             BufferedContext::DualAnchor1D { input } => input,
             _ => panic!("Expected DualAnchor1D context"),
         };
-        let input = input_arc.as_ref();
+
+        let input_guard = input_handle.read();
+        let x_slice = input_guard.as_slice().expect("DualAnchor backward: expected CPU buffer");
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
@@ -196,14 +202,17 @@ impl UniversalLayerBuffered for DualAnchor {
         let max_vals = &params[base + self.features..base + 2 * self.features];
         let alpha = params[base + 2 * self.features];
 
-        let go = grad_output.as_slice();
-        let gi = grad_input.as_slice_mut();
-        let x_slice = input.as_slice();
+        let go_guard = grad_output.read();
+        let go = go_guard.as_slice().expect("DualAnchor backward: expected CPU buffer");
+
+        let mut gi_guard = grad_input.write();
+        let gi = gi_guard.as_slice_mut().expect("DualAnchor backward: expected CPU buffer");
 
         debug_assert_eq!(go.len(), gi.len());
+        debug_assert_eq!(go.len(), x_slice.len());
 
-        let mut d_min = vec![0.0f32; self.features];
-        let mut d_max = vec![0.0f32; self.features];
+        let mut d_min_accum = vec![0.0f32; self.features];
+        let mut d_max_accum = vec![0.0f32; self.features];
         let mut d_alpha = 0.0f32;
 
         for c in 0..cols {
@@ -223,18 +232,18 @@ impl UniversalLayerBuffered for DualAnchor {
 
                 // Градиенты по параметрам
                 if is_min {
-                    d_min[c] += gout * alpha;
+                    d_min_accum[c] += gout * alpha;
                     d_alpha += gout * (min_v - x_val);
                 } else {
-                    d_max[c] += gout * alpha;
+                    d_max_accum[c] += gout * alpha;
                     d_alpha += gout * (max_v - x_val);
                 }
             }
         }
 
         let mut grad = Vec::with_capacity(2 * self.features + 1);
-        grad.extend_from_slice(&d_min);
-        grad.extend_from_slice(&d_max);
+        grad.extend_from_slice(&d_min_accum);
+        grad.extend_from_slice(&d_max_accum);
         grad.push(d_alpha);
         grad
     }

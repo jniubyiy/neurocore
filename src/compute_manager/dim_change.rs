@@ -3,8 +3,7 @@
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 use faer::Mat;
 
-use crate::compute_manager::MatrixBuffer;
-use crate::compute_manager::TempMatrixPool;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
 #[derive(Clone, Debug)]
 pub enum DynamicTensor {
@@ -185,74 +184,103 @@ pub fn reduce_mat(
     reshape_matrix(mat, new_rows, new_cols)
 }
 
-// ------------------ Буферизованные версии (под управлением MemoryExecutor) ------------------
+// ------------------ Буферизованные версии (MatrixBufferHandle) ------------------
 
-/// Версия `unsqueeze_mat` с использованием [`MatrixBuffer`] и пула [`TempMatrixPool`].
-pub fn unsqueeze_mat_buffered(
+/// Версия `unsqueeze_mat` с использованием [`MatrixBufferHandle`] и пула [`TempMatrixPool`].
+pub fn unsqueeze_mat_buffered_handle(
     pool: &mut TempMatrixPool,
-    input: MatrixBuffer,
+    input: MatrixBufferHandle,
     target_dims: &[usize],
-) -> MatrixBuffer {
+) -> MatrixBufferHandle {
     let batch = input.rows();
     let features = input.cols();
     let total_new: usize = target_dims.iter().product();
-    assert_eq!(features, total_new, "unsqueeze_mat_buffered: features mismatch");
+    assert_eq!(features, total_new, "unsqueeze_mat_buffered_handle: features mismatch");
 
     let last_dim = target_dims[target_dims.len() - 1];
     let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
     let new_rows = batch * remaining_product;
     let new_cols = last_dim;
 
-    let mut output = pool.acquire(new_rows, new_cols);
+    // Читаем данные из входного handle
+    let input_guard = input.read();
+    let src = input_guard.as_slice().expect("unsqueeze_mat_buffered_handle: input must be CPU");
+    let data = src.to_vec();
+    drop(input_guard);
 
-    // Ограничиваем область действия guard, чтобы output можно было переместить
+    // Возвращаем входной буфер в пул
+    pool.release(input);
+
+    // Создаём выходной буфер
+    let output = pool.acquire(new_rows, new_cols);
+
+    // Записываем данные с перестановкой
     {
-        let src = input.to_mat();
-        let mut dst = output.as_mat_mut();  // guard начинает заимствование output
+        let mut output_guard = output.write();
+        let dst = output_guard.as_slice_mut().expect("unsqueeze_mat_buffered_handle: output must be CPU");
         let mut idx = 0;
-        for c in 0..src.ncols() {
-            for r in 0..src.nrows() {
+        // column-major обход входного: внешний цикл по c, внутренний по r
+        for c in 0..features {
+            for r in 0..batch {
+                let src_idx = c * batch + r;
                 let dst_r = idx / new_cols;
                 let dst_c = idx % new_cols;
-                dst[(dst_r, dst_c)] = src[(r, c)];
+                let dst_idx = dst_c * new_rows + dst_r; // column-major в выходном
+                dst[dst_idx] = data[src_idx];
                 idx += 1;
             }
         }
-        // Здесь guard дропается, освобождая заимствование output
     }
 
     output
 }
 
-/// Версия `reduce_mat` с использованием [`MatrixBuffer`] и пула [`TempMatrixPool`].
-pub fn reduce_mat_buffered(
+/// Версия `reduce_mat` с использованием [`MatrixBufferHandle`] и пула [`TempMatrixPool`].
+pub fn reduce_mat_buffered_handle(
     pool: &mut TempMatrixPool,
-    input: MatrixBuffer,
+    input: MatrixBufferHandle,
     target_dims: &[usize],
-) -> MatrixBuffer {
-    let total = input.rows() * input.cols();
+) -> MatrixBufferHandle {
+    // Сохраняем размеры до перемещения
+    let input_rows = input.rows();
+    let input_cols = input.cols();
+    let total = input_rows * input_cols;
+
     let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
-    let batch = input.rows() / remaining_product;
+    let batch = input_rows / remaining_product;
     let new_rows = batch;
     let new_cols = total / new_rows;
 
-    assert_eq!(total, new_rows * new_cols, "reduce_mat_buffered: element count mismatch");
+    assert_eq!(total, new_rows * new_cols, "reduce_mat_buffered_handle: element count mismatch");
 
-    let mut output = pool.acquire(new_rows, new_cols);
+    // Читаем данные
+    let input_guard = input.read();
+    let src = input_guard.as_slice().expect("reduce_mat_buffered_handle: input must be CPU");
+    let data = src.to_vec();
+    drop(input_guard);
 
+    // Возвращаем входной буфер в пул
+    pool.release(input);
+
+    // Создаём выходной буфер
+    let output = pool.acquire(new_rows, new_cols);
+
+    // Записываем данные с перестановкой
     {
-        let src = input.to_mat();
-        let mut dst = output.as_mat_mut();
+        let mut output_guard = output.write();
+        let dst = output_guard.as_slice_mut().expect("reduce_mat_buffered_handle: output must be CPU");
         let mut idx = 0;
-        for c in 0..src.ncols() {
-            for r in 0..src.nrows() {
+        // column-major обход входного: внешний цикл по c, внутренний по r
+        for c in 0..input_cols {
+            for r in 0..input_rows {
+                let src_idx = c * input_rows + r;
                 let dst_r = idx / new_cols;
                 let dst_c = idx % new_cols;
-                dst[(dst_r, dst_c)] = src[(r, c)];
+                let dst_idx = dst_c * new_rows + dst_r;
+                dst[dst_idx] = data[src_idx];
                 idx += 1;
             }
         }
-        // guard дропается
     }
 
     output

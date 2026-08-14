@@ -238,6 +238,10 @@ impl DevicePlan {
     pub fn build_memory_executor(&self) -> (Arc<Mutex<MemoryExecutor>>, Option<Arc<GpuContext>>) {
         let mem_exec = Arc::new(Mutex::new(MemoryExecutor::new()));
 
+        // ВАЖНО: устанавливаем ссылку на самого себя, чтобы `acquire_matrix_handle`
+        // мог создавать `MatrixBufferHandle`.
+        mem_exec.lock().unwrap().set_self_arc(mem_exec.clone());
+
         // Регистрация хранилищ RAM и SSD
         for storage in &self.storage_devices {
             match storage {

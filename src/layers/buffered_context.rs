@@ -1,70 +1,69 @@
 // src/layers/buffered_context.rs
 
-use std::sync::Arc;
-
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 /// Контекст, сохраняемый слоями при буферизованном прямом проходе.
 ///
-/// В отличие от `MatContext`, здесь хранятся не `faer::Mat`, а управляемые
-/// буферы `MatrixBuffer`, обёрнутые в `Arc` для безопасного разделения между
-/// прямым и обратным проходами.
+/// В отличие от `MatContext`, здесь хранятся не `faer::Mat`, а лёгкие
+/// дескрипторы `MatrixBufferHandle`, которые ссылаются на данные в
+/// `MemoryExecutor`. Дескрипторы можно свободно клонировать, что позволяет
+/// разделять один буфер между контекстом и следующим слоем без копирования.
 ///
 /// Используется только в варианте `DynamicContext::Buffered`.
 #[derive(Clone)]
 pub enum BufferedContext {
     /// Вход линейного слоя.
     Linear {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 
     /// Вход ReLU.
     ReLU {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 
     /// Выход Sigmoid (для обратного прохода нужен выход).
     Sigmoid {
-        output: Arc<MatrixBuffer>,
+        output: MatrixBufferHandle,
     },
 
     /// Выход Tanh (для обратного прохода нужен выход).
     Tanh {
-        output: Arc<MatrixBuffer>,
+        output: MatrixBufferHandle,
     },
 
     /// Выход Softmax (для обратного прохода нужен выход).
     Softmax {
-        output: Arc<MatrixBuffer>,
+        output: MatrixBufferHandle,
     },
 
     /// Вход Memory (текущий обратный проход может его не использовать, но сохранён для полноты).
     Memory {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 
     /// Вход LeakyReLU.
     LeakyReLU {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 
     /// Вход SoftSparseGate.
     SoftSparseGate {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 
     /// Вход SoftKeepGate.
     SoftKeepGate {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 
     /// Вход DualAnchor.
     DualAnchor1D {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 
     /// Вход Identity.
     Identity {
-        input: Arc<MatrixBuffer>,
+        input: MatrixBufferHandle,
     },
 }

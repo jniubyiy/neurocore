@@ -1,15 +1,14 @@
 // src/compute_manager/matrix_buffer/pool.rs
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::compute_manager::device_spec::DeviceId;
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::memory_executor::executor::MemoryExecutor;
 use crate::compute_manager::memory_executor::policy::BufferPriority;
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
-
-use super::buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::handle::MatrixBufferHandle;
 
 /// Статистика использования пула временных матриц.
 #[derive(Debug, Default, Clone)]
@@ -24,22 +23,20 @@ pub struct PoolStats {
     pub removed: usize,
 }
 
-/// Пул переиспользуемых [`MatrixBuffer`], минимизирующий выделения памяти.
+/// Пул переиспользуемых [`MatrixBufferHandle`].
 ///
-/// Свободные буферы сгруппированы по типу памяти, количеству строк и столбцов.
-/// При запросе буфера сначала ищется подходящий в пуле; если его нет,
-/// создаётся новый через [`MatrixBuffer::new`] (для CPU) или [`MatrixBuffer::new_gpu`] (для GPU).
-///
-/// Пул **не** является потокобезопасным сам по себе – для использования из
-/// нескольких потоков следует обернуть его в `Arc<Mutex<...>>`.
+/// Свободные дескрипторы группируются по типу памяти, количеству строк и столбцов.
+/// Пул не владеет физическими данными напрямую — они находятся в `MemoryExecutor`.
+/// При получении из пула дескриптор помечается как непомещенный в пул,
+/// при возврате — как удерживаемый пулом.
 pub struct TempMatrixPool {
-    /// Свободные буферы, ключ – (тип памяти, rows, cols).
-    free: HashMap<(MemoryDeviceKind, usize, usize), Vec<MatrixBuffer>>,
-    /// Глобальный менеджер памяти, используемый для создания новых буферов.
+    /// Свободные дескрипторы, ключ – (тип памяти, rows, cols).
+    free: HashMap<(MemoryDeviceKind, usize, usize), VecDeque<MatrixBufferHandle>>,
+    /// Глобальный менеджер памяти.
     memory: Arc<Mutex<MemoryExecutor>>,
-    /// Максимальное время простоя буфера, после которого он будет удалён из пула.
+    /// Максимальное время простоя буфера, после которого он удаляется из пула.
     max_idle_age: Option<Duration>,
-    /// Максимальное количество свободных буферов, хранящихся в пуле.
+    /// Максимальное количество свободных буферов в пуле.
     max_pool_size: Option<usize>,
     /// Статистика использования пула.
     stats: PoolStats,
@@ -58,19 +55,12 @@ impl TempMatrixPool {
     }
 
     /// Устанавливает максимальное время простоя буфера, после которого он будет удалён.
-    ///
-    /// # Пример
-    /// ```
-    /// let pool = TempMatrixPool::new(memory).with_max_idle_age(Duration::from_secs(30));
-    /// ```
     pub fn with_max_idle_age(mut self, age: Duration) -> Self {
         self.max_idle_age = Some(age);
         self
     }
 
     /// Устанавливает максимальное количество свободных буферов в пуле.
-    ///
-    /// При превышении лимита самые старые буферы удаляются.
     pub fn with_max_pool_size(mut self, size: usize) -> Self {
         self.max_pool_size = Some(size);
         self
@@ -82,58 +72,40 @@ impl TempMatrixPool {
     }
 
     /// Извлекает из пула или создаёт новый CPU-буфер заданного размера.
-    ///
-    /// Буфер возвращается с нулевым содержимым.
-    pub fn acquire(&mut self, rows: usize, cols: usize) -> MatrixBuffer {
+    pub fn acquire(&mut self, rows: usize, cols: usize) -> MatrixBufferHandle {
         self.acquire_kind(MemoryDeviceKind::HostRam, rows, cols)
     }
 
     /// Извлекает из пула или создаёт новый GPU-буфер заданного размера
     /// на указанном устройстве.
-    pub fn acquire_gpu(&mut self, device_id: DeviceId, rows: usize, cols: usize) -> MatrixBuffer {
+    pub fn acquire_gpu(
+        &mut self,
+        device_id: DeviceId,
+        rows: usize,
+        cols: usize,
+    ) -> MatrixBufferHandle {
         self.acquire_kind(MemoryDeviceKind::DeviceVram(device_id), rows, cols)
     }
 
-    /// Извлекает из пула или создаёт новый управляемый `MatrixBuffer`
+    /// Извлекает из пула или создаёт новый управляемый `MatrixBufferHandle`
     /// в указанной памяти с приоритетом `Medium`.
-    ///
-    /// Буфер регистрируется в `MemoryExecutor` и получает `MatrixBufferId`.
     pub fn acquire_matrix(
         &mut self,
         rows: usize,
         cols: usize,
         location: MemoryDeviceKind,
-    ) -> MatrixBuffer {
-        let key = (location, rows, cols);
-        if let Some(list) = self.free.get_mut(&key) {
-            if let Some(mut buf) = list.pop() {
-                buf.mark_used();
-                self.stats.reused += 1;
-                return buf;
-            }
-        }
-
-        // Создаём через MemoryExecutor с регистрацией
-        let mut mem = self.memory.lock().unwrap();
-        let buf = mem
-            .acquire_matrix(rows, cols, location, BufferPriority::Medium)
-            .expect("TempMatrixPool: failed to acquire MatrixBuffer via MemoryExecutor");
-        drop(mem);
-
-        self.stats.created += 1;
-        buf
+    ) -> MatrixBufferHandle {
+        self.acquire_kind(location, rows, cols)
     }
 
-    /// Извлекает из пула или создаёт новый управляемый `MatrixBuffer`
-    /// с автоматическим выбором памяти на основе политики MemoryExecutor.
-    ///
-    /// Сначала пытается разместить в `preferred`, затем в RAM, затем в SSD (если доступен).
+    /// Извлекает из пула или создаёт новый управляемый `MatrixBufferHandle`
+    /// с автоматическим выбором памяти на основе политики `MemoryExecutor`.
     pub fn acquire_matrix_auto(
         &mut self,
         rows: usize,
         cols: usize,
         preferred: MemoryDeviceKind,
-    ) -> MatrixBuffer {
+    ) -> MatrixBufferHandle {
         let elements = rows * cols;
         let target = {
             let mem = self.memory.lock().unwrap();
@@ -142,58 +114,103 @@ impl TempMatrixPool {
         self.acquire_matrix(rows, cols, target)
     }
 
-    /// Внутренний метод для получения буфера определённого типа памяти.
-    fn acquire_kind(&mut self, kind: MemoryDeviceKind, rows: usize, cols: usize) -> MatrixBuffer {
-        // Сначала очищаем устаревшие буферы
+    /// Внутренний метод получения буфера определённого типа памяти.
+    fn acquire_kind(
+        &mut self,
+        kind: MemoryDeviceKind,
+        rows: usize,
+        cols: usize,
+    ) -> MatrixBufferHandle {
+        // Сначала очищаем устаревшие буферы.
         self.cleanup();
 
         let key = (kind, rows, cols);
-        if let Some(list) = self.free.get_mut(&key) {
-            if let Some(mut buf) = list.pop() {
-                buf.mark_used();
+        if let Some(queue) = self.free.get_mut(&key) {
+            if let Some(handle) = queue.pop_front() {
+                // Снимаем пометку pooled без изменения счётчика ссылок.
+                {
+                    let mut mem = self.memory.lock().unwrap();
+                    if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
+                        entry.pooled = false;
+                    }
+                }
                 self.stats.reused += 1;
-                return buf;
+                return handle;
             }
         }
 
-        // Создаём новый буфер в зависимости от типа памяти
-        let buf = match kind {
-            MemoryDeviceKind::HostRam => MatrixBuffer::new(&self.memory, rows, cols)
-                .expect("TempMatrixPool: failed to allocate CPU MatrixBuffer"),
-            MemoryDeviceKind::DeviceVram(device_id) => MatrixBuffer::new_gpu(&self.memory, device_id, rows, cols)
-                .expect("TempMatrixPool: failed to allocate GPU MatrixBuffer"),
-            _ => panic!("TempMatrixPool: unsupported memory kind {:?}", kind),
+        // Создаём новый буфер через MemoryExecutor.
+        let handle = {
+            let mut mem = self.memory.lock().unwrap();
+            mem.acquire_matrix_handle(rows, cols, kind, BufferPriority::Medium)
+                .expect("TempMatrixPool: failed to acquire MatrixBufferHandle")
         };
         self.stats.created += 1;
-        buf
+        handle
     }
 
     /// Возвращает буфер в пул для последующего переиспользования.
     ///
-    /// Буфер **не** очищается – предполагается, что новые данные будут
-    /// записаны поверх старых при следующем использовании.
-    pub fn release(&mut self, mut buf: MatrixBuffer) {
-        buf.mark_used(); // обновляем время последнего использования
-        // Обновляем время в реестре MemoryExecutor, если буфер управляется
-        if let Some(id) = buf.matrix_id() {
-            if let Ok(mut mem) = self.memory.lock() {
-                mem.touch_matrix(id);
+    /// Если на запись ссылается больше одного дескриптора (например, есть клоны),
+    /// то буфер не помещается в пул, а просто сбрасывается.
+    pub fn release(&mut self, handle: MatrixBufferHandle) {
+        let id = handle.id();
+        let (rows, cols) = (handle.rows(), handle.cols());
+        let kind = handle.device_kind();
+
+        // Проверяем, что на запись ссылается только этот handle.
+        // Блокировка MemoryExecutor снимается до возможного drop(handle),
+        // чтобы избежать повторного входа в Mutex из Drop дескриптора.
+        let should_pool = {
+            let mut mem = self.memory.lock().unwrap();
+            if let Some(entry) = mem.get_matrix_entry_mut(id) {
+                if entry.ref_count > 1 {
+                    // Есть другие владельцы — не кладём в пул, просто дропаем.
+                    false
+                } else {
+                    // Помечаем как pooled, не меняя счётчик.
+                    entry.pooled = true;
+                    entry.touch();
+                    true
+                }
+            } else {
+                // Запись уже удалена.
+                false
             }
+        };
+        // Блокировка снята.
+
+        if !should_pool {
+            // Запись используется другими владельцами или уже удалена.
+            drop(handle);
+            return;
         }
-        let kind = buf.device_kind();
-        let key = (kind, buf.rows(), buf.cols());
-        self.free.entry(key).or_insert_with(Vec::new).push(buf);
+
+        // Кладём дескриптор в очередь. ref_count остаётся 1 (пул владеет).
+        let key = (kind, rows, cols);
+        self.free
+            .entry(key)
+            .or_insert_with(VecDeque::new)
+            .push_back(handle);
         self.stats.released += 1;
-        // Проверяем лимит размера пула
         self.enforce_max_size();
     }
 
-    /// Очищает все свободные буферы, возвращая зарезервированную память
-    /// менеджеру памяти. После этого пул пуст.
+    /// Очищает все свободные буферы, возвращая зарезервированную память.
     pub fn clear(&mut self) {
         for list in self.free.values_mut() {
-            for buf in list.iter_mut() {
-                buf.deallocate();
+            while let Some(handle) = list.pop_front() {
+                // Сначала снимаем флаг pooled, затем снимаем блокировку,
+                // и только после этого удаляем дескриптор.
+                {
+                    let mut mem = self.memory.lock().unwrap();
+                    if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
+                        entry.pooled = false;
+                    }
+                }
+                // Блокировка MemoryExecutor снята.
+                drop(handle); // ref_count станет 0, запись будет удалена.
+                self.stats.removed += 1;
             }
         }
         self.free.clear();
@@ -201,64 +218,84 @@ impl TempMatrixPool {
 
     /// Возвращает количество свободных буферов во всех категориях.
     pub fn free_count(&self) -> usize {
-        self.free.values().map(|v| v.len()).sum()
+        self.free.values().map(|q| q.len()).sum()
     }
 
-    /// Удаляет из пула буферы, которые простаивали дольше `max_idle_age`,
-    /// а также вызывает ограничение по общему количеству.
+    /// Удаляет буферы, которые простаивали дольше `max_idle_age`,
+    /// а также применяет ограничение по общему количеству.
     pub fn cleanup(&mut self) {
         if self.max_idle_age.is_none() && self.max_pool_size.is_none() {
-            return; // нет ограничений – ничего не делаем
+            return;
         }
 
         let now = Instant::now();
         let mut empty_keys = Vec::new();
 
-        // Удаляем устаревшие буферы
+        // Удаляем устаревшие.
         if let Some(max_age) = self.max_idle_age {
-            for (key, list) in self.free.iter_mut() {
-                let before = list.len();
-                list.retain(|buf| {
-                    let keep = now.duration_since(buf.last_used()) < max_age;
-                    if !keep {
+            for (key, queue) in self.free.iter_mut() {
+                let before = queue.len();
+                let mut new_queue = VecDeque::new();
+                while let Some(handle) = queue.pop_front() {
+                    let last_access = {
+                        let mem = self.memory.lock().unwrap();
+                        mem.get_matrix_entry(handle.id())
+                            .map(|e| e.last_access)
+                            .unwrap_or(Instant::now() - max_age)
+                    };
+                    if now.duration_since(last_access) < max_age {
+                        new_queue.push_back(handle);
+                    } else {
+                        {
+                            let mut mem = self.memory.lock().unwrap();
+                            if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
+                                entry.pooled = false;
+                            }
+                        }
+                        // Блокировка снята.
+                        drop(handle);
                         self.stats.removed += 1;
                     }
-                    keep
-                });
-                if list.is_empty() && before > 0 {
+                }
+                *queue = new_queue;
+                if queue.is_empty() && before > 0 {
                     empty_keys.push(*key);
                 }
             }
         }
 
-        // Убираем пустые записи
         for key in empty_keys {
             self.free.remove(&key);
         }
 
-        // Принудительно ограничиваем размер пула
         self.enforce_max_size();
     }
 
-    /// Вспомогательный метод для поддержания лимита на количество свободных буферов.
+    /// Поддерживает лимит на количество свободных буферов.
     fn enforce_max_size(&mut self) {
         if let Some(limit) = self.max_pool_size {
             while self.free_count() > limit {
-                // Находим первый непустой список и удаляем из него последний буфер
                 let mut removed = false;
-                for list in self.free.values_mut() {
-                    if let Some(_buf) = list.pop() {
+                for queue in self.free.values_mut() {
+                    if let Some(handle) = queue.pop_back() {
+                        {
+                            let mut mem = self.memory.lock().unwrap();
+                            if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
+                                entry.pooled = false;
+                            }
+                        }
+                        // Блокировка снята.
+                        drop(handle);
                         self.stats.removed += 1;
                         removed = true;
                         break;
                     }
                 }
                 if !removed {
-                    break; // защита от бесконечного цикла, если все списки пусты
+                    break;
                 }
             }
-            // Удаляем пустые записи
-            self.free.retain(|_, list| !list.is_empty());
+            self.free.retain(|_, q| !q.is_empty());
         }
     }
 }
@@ -266,11 +303,16 @@ impl TempMatrixPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute_manager::device_spec::DeviceSpec;
     use crate::compute_manager::memory_executor::MemoryExecutor;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn create_pool() -> (Arc<Mutex<MemoryExecutor>>, TempMatrixPool) {
         let mem = Arc::new(Mutex::new(MemoryExecutor::new()));
+        mem.lock()
+            .unwrap()
+            .register_compute_device(DeviceSpec::cpu(0, 1024, 1), None);
+        mem.lock().unwrap().set_self_arc(mem.clone());
         let pool = TempMatrixPool::new(mem.clone());
         (mem, pool)
     }
@@ -286,7 +328,6 @@ mod tests {
         pool.release(a);
         assert_eq!(pool.free_count(), 1);
 
-        // Повторный запрос того же размера должен вернуть буфер из пула
         let b = pool.acquire(3, 4);
         assert_eq!(pool.free_count(), 0);
         assert_eq!(b.rows(), 3);
@@ -300,7 +341,6 @@ mod tests {
         let (_mem, mut pool) = create_pool();
         let a = pool.acquire(2, 5);
         pool.release(a);
-        // Запрос другого размера должен создать новый буфер
         let b = pool.acquire(5, 2);
         assert_eq!(b.rows(), 5);
         assert_eq!(b.cols(), 2);
@@ -311,16 +351,13 @@ mod tests {
     #[test]
     fn test_cleanup_removes_old_buffers() {
         let (_mem, mut pool) = create_pool();
-        // Настраиваем пул на удаление буферов старше 0 секунд
         pool.max_idle_age = Some(Duration::from_secs(0));
 
         let a = pool.acquire(3, 4);
         pool.release(a);
-        // Так как max_idle_age = 0, при следующем acquire буфер будет удалён
         let b = pool.acquire(3, 4);
         assert_eq!(b.rows(), 3);
         assert_eq!(b.cols(), 4);
-        // Должен быть создан новый буфер
         assert_eq!(pool.stats().created, 2);
         assert_eq!(pool.stats().reused, 0);
         assert_eq!(pool.stats().removed, 1);
@@ -336,49 +373,7 @@ mod tests {
         pool.release(a);
         pool.release(b);
 
-        // После двух release при лимите 1 должен остаться только один буфер
         assert_eq!(pool.free_count(), 1);
-        // Один буфер был удалён
         assert_eq!(pool.stats().removed, 1);
-    }
-
-    // Тесты для GPU-буферов не запускаются без реального GPU,
-    // но оставлены для иллюстрации.
-    #[test]
-    #[ignore]
-    fn test_acquire_release_gpu() {
-        let (_mem, mut pool) = create_pool();
-        // Предположим, что у нас есть GPU-контекст с DeviceId(0)
-        let device_id = DeviceId(0);
-        let a = pool.acquire_gpu(device_id, 3, 4);
-        assert!(a.is_gpu());
-        assert_eq!(a.device_kind(), MemoryDeviceKind::DeviceVram(device_id));
-        pool.release(a);
-        assert_eq!(pool.free_count(), 1);
-
-        let b = pool.acquire_gpu(device_id, 3, 4);
-        assert_eq!(pool.free_count(), 0);
-        assert!(b.is_gpu());
-    }
-
-    // Новый тест: acquire_matrix через MemoryExecutor
-    #[test]
-    fn test_acquire_matrix_cpu() {
-        let (mut mem, mut pool) = create_pool();
-        // Регистрируем CPU устройство, чтобы MemoryExecutor мог выделять HostRam
-        mem.lock().unwrap().register_compute_device(
-            crate::compute_manager::device_spec::DeviceSpec::cpu(0, 1024, 1),
-            None,
-        );
-        let buf = pool.acquire_matrix(2, 3, MemoryDeviceKind::HostRam);
-        assert_eq!(buf.rows(), 2);
-        assert_eq!(buf.cols(), 3);
-        assert!(buf.matrix_id().is_some());
-        let id = buf.matrix_id().unwrap();
-        assert!(mem.lock().unwrap().get_matrix_info(id).is_some());
-        pool.release(buf);
-        // После release, если буфер возвращён в пул, он остаётся в реестре,
-        // так как он не деаллоцирован. Проверим, что реестр всё ещё содержит id.
-        assert!(mem.lock().unwrap().get_matrix_info(id).is_some());
     }
 }

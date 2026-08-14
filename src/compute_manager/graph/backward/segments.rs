@@ -2,12 +2,14 @@
 
 use std::time::Instant;
 use faer::Mat;
+
 use crate::compute_manager::dim_change;
 use crate::compute_manager::graph::model::MixedModel;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::plan::ComputeDevice;
 
 impl MixedModel {
-    /// Обратный проход для операции Unsqueeze.
+    /// Обратный проход для операции Unsqueeze (старая Mat-версия).
     /// Выполняет уменьшение размерности (reduce) над всеми потоковыми матрицами.
     /// При наличии GPU выполняет операцию на GPU, если сегмент размещён на GPU.
     pub(super) fn process_unsqueeze_backward(
@@ -18,24 +20,17 @@ impl MixedModel {
     ) {
         let start = Instant::now();
 
-        // Определяем устройство, на котором работает сегмент
-        let device = self.segment_placement
+        let device = self
+            .segment_placement
             .get(seg_index)
             .map(|p| p.compute_device.clone())
             .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
 
         match device {
-            ComputeDevice::Gpu { id } => {
-                // Используем GPU-реализацию, если доступен GpuCompute
+            ComputeDevice::Gpu { .. } => {
                 if let Some(ref gpu_compute_mutex) = self.gpu_compute {
                     let gpu = gpu_compute_mutex.lock().unwrap();
-                    let segment_buffers = self.get_segment_buffers(seg_index);
-                    for (i, mat) in stream_matrices.iter_mut().enumerate() {
-                        // Входной persistent-буфер (выход предыдущего сегмента) содержит данные.
-                        // Здесь предполагается, что данные для этого сегмента уже находятся в его входном буфере.
-                        // Для простоты пока используем CPU-матрицу и загружаем её в GPU.
-                        // В будущем можно передавать persistent-буферы напрямую.
-                        // Сейчас выполняем reduce на GPU через временный буфер.
+                    for mat in stream_matrices.iter_mut() {
                         let reduced = crate::compute_manager::gpu::compute::dim_ops::reduce_mat_gpu(
                             &gpu,
                             mat,
@@ -44,14 +39,12 @@ impl MixedModel {
                         *mat = reduced;
                     }
                 } else {
-                    // GPU не доступен, делаем CPU fallback
                     for mat in stream_matrices.iter_mut() {
                         *mat = dim_change::reduce_mat(mat, target_dims);
                     }
                 }
             }
             _ => {
-                // CPU-реализация
                 for mat in stream_matrices.iter_mut() {
                     *mat = dim_change::reduce_mat(mat, target_dims);
                 }
@@ -62,9 +55,8 @@ impl MixedModel {
         self.record_segment_timing(seg_index, &device, duration);
     }
 
-    /// Обратный проход для операции ReduceMean.
+    /// Обратный проход для операции ReduceMean (старая Mat-версия).
     /// Выполняет увеличение размерности (unsqueeze) над всеми потоковыми матрицами.
-    /// При наличии GPU выполняет операцию на GPU, если сегмент размещён на GPU.
     pub(super) fn process_reduce_mean_backward(
         &mut self,
         stream_matrices: &mut Vec<Mat<f32>>,
@@ -73,13 +65,14 @@ impl MixedModel {
     ) {
         let start = Instant::now();
 
-        let device = self.segment_placement
+        let device = self
+            .segment_placement
             .get(seg_index)
             .map(|p| p.compute_device.clone())
             .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
 
         match device {
-            ComputeDevice::Gpu { id } => {
+            ComputeDevice::Gpu { .. } => {
                 if let Some(ref gpu_compute_mutex) = self.gpu_compute {
                     let gpu = gpu_compute_mutex.lock().unwrap();
                     for mat in stream_matrices.iter_mut() {
@@ -102,6 +95,69 @@ impl MixedModel {
                 }
             }
         }
+
+        let duration = start.elapsed().as_nanos() as f64;
+        self.record_segment_timing(seg_index, &device, duration);
+    }
+
+    // ===================================================================
+    // Handle-версии (MatrixBufferHandle + TempMatrixPool)
+    // ===================================================================
+
+    /// Обратный проход для операции Unsqueeze (handle-версия).
+    /// Выполняет уменьшение размерности (reduce) над всеми потоковыми дескрипторами.
+    /// Старые входные дескрипторы возвращаются в пул, новые берутся из пула.
+    pub(super) fn process_unsqueeze_backward_buffered_handle(
+        &mut self,
+        pool: &mut TempMatrixPool,
+        stream_buffers: &mut Vec<MatrixBufferHandle>,
+        target_dims: &[usize],
+        seg_index: usize,
+    ) {
+        let start = Instant::now();
+
+        let device = self
+            .segment_placement
+            .get(seg_index)
+            .map(|p| p.compute_device.clone())
+            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+
+        // Перебираем все потоковые буферы и преобразуем их
+        let mut new_stream = Vec::with_capacity(stream_buffers.len());
+        for buf in stream_buffers.drain(..) {
+            // Выполняем reduce над handle
+            let new_buf = dim_change::reduce_mat_buffered_handle(pool, buf, target_dims);
+            new_stream.push(new_buf);
+        }
+        *stream_buffers = new_stream;
+
+        let duration = start.elapsed().as_nanos() as f64;
+        self.record_segment_timing(seg_index, &device, duration);
+    }
+
+    /// Обратный проход для операции ReduceMean (handle-версия).
+    /// Выполняет увеличение размерности (unsqueeze) над всеми потоковыми дескрипторами.
+    pub(super) fn process_reduce_mean_backward_buffered_handle(
+        &mut self,
+        pool: &mut TempMatrixPool,
+        stream_buffers: &mut Vec<MatrixBufferHandle>,
+        target_dims: &[usize],
+        seg_index: usize,
+    ) {
+        let start = Instant::now();
+
+        let device = self
+            .segment_placement
+            .get(seg_index)
+            .map(|p| p.compute_device.clone())
+            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+
+        let mut new_stream = Vec::with_capacity(stream_buffers.len());
+        for buf in stream_buffers.drain(..) {
+            let new_buf = dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims);
+            new_stream.push(new_buf);
+        }
+        *stream_buffers = new_stream;
 
         let duration = start.elapsed().as_nanos() as f64;
         self.record_segment_timing(seg_index, &device, duration);

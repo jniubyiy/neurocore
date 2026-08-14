@@ -1,7 +1,7 @@
 // src/layers/leaky_relu/leaky_relu.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
@@ -115,13 +115,16 @@ impl UniversalLayer for LeakyReLU {
 impl UniversalLayerBuffered for LeakyReLU {
     fn forward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("LeakyReLU forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("LeakyReLU forward: expected CPU buffer");
 
         debug_assert_eq!(src.len(), dst.len());
 
@@ -133,8 +136,8 @@ impl UniversalLayerBuffered for LeakyReLU {
     fn backward_buffered(
         &self,
         ctx: &DynamicContext,
-        grad_output: &MatrixBuffer,
-        grad_input: &mut MatrixBuffer,
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
@@ -143,23 +146,25 @@ impl UniversalLayerBuffered for LeakyReLU {
             DynamicContext::Buffered(bc) => bc,
             _ => panic!("Expected Buffered context"),
         };
-        let input_arc = match bc {
+        let input_handle = match bc {
             BufferedContext::LeakyReLU { input } => input,
             _ => panic!("Expected LeakyReLU context"),
         };
-        let input = input_arc.as_ref();
 
-        let rows = grad_output.rows();
-        let go = grad_output.as_slice();
-        let gi = grad_input.as_slice_mut();
-        let x_slice = input.as_slice();
+        let input_guard = input_handle.read();
+        let x_slice = input_guard.as_slice().expect("LeakyReLU backward: expected CPU buffer");
+
+        let go_guard = grad_output.read();
+        let go = go_guard.as_slice().expect("LeakyReLU backward: expected CPU buffer");
+
+        let mut gi_guard = grad_input.write();
+        let gi = gi_guard.as_slice_mut().expect("LeakyReLU backward: expected CPU buffer");
 
         debug_assert_eq!(go.len(), gi.len());
+        debug_assert_eq!(go.len(), x_slice.len());
 
         for idx in 0..go.len() {
-            let r = idx % rows;
-            let c = idx / rows;
-            let x_val = x_slice[c * rows + r];
+            let x_val = x_slice[idx];
             let derivative = if x_val > 0.0 { 1.0 } else { self.alpha };
             gi[idx] = go[idx] * derivative;
         }

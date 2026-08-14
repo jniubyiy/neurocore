@@ -24,7 +24,7 @@ pub mod buffered_context;
 
 use crate::model_plan::param_store::ParamSlice;
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use faer::Mat;
 
 // ---------------------------------------------------------------------------
@@ -93,23 +93,23 @@ pub trait UniversalLayer: Send + Sync + 'static {
 // Новый трейт UniversalLayerBuffered – основа для работы с буферами
 // ---------------------------------------------------------------------------
 
-/// Версия слоя, работающая с управляемыми буферами [`MatrixBuffer`].
+/// Версия слоя, работающая с управляемыми буферами [`MatrixBufferHandle`].
 ///
-/// Входные и выходные данные передаются через пул временных матриц,
-/// что позволяет `MemoryExecutor` отслеживать и переиспользовать память.
+/// Входные и выходные данные передаются через лёгкие дескрипторы, которые
+/// ссылаются на записи в `MemoryExecutor`. Это позволяет избежать копирования
+/// данных и централизованно управлять памятью.
 pub trait UniversalLayerBuffered: Send + Sync + 'static {
     /// Прямой проход.
     ///
     /// # Аргументы
-    /// * `input` – входная матрица (доступна только для чтения).
-    /// * `output` – матрица, в которую будет записан результат.
-    ///   Должна иметь размер `(batch_size, output_features())`.
+    /// * `input` – входной дескриптор (только для чтения).
+    /// * `output` – выходной дескриптор (для записи).
     /// * `params` – плоский срез всех параметров модели.
     /// * `slice` – границы параметров, принадлежащих данному слою.
     fn forward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     );
@@ -117,8 +117,7 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
     /// Обратный проход.
     ///
     /// # Аргументы
-    /// * `ctx` – контекст, сохранённый прямым проходом (пока старая версия,
-    ///   в будущем будет заменён на хранение [`MatrixBuffer`]).
+    /// * `ctx` – контекст, сохранённый прямым проходом.
     /// * `grad_output` – градиент по выходу слоя.
     /// * `grad_input` – буфер, куда будет записан градиент по входу.
     /// * `params` – плоский срез всех параметров модели.
@@ -129,8 +128,8 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
     fn backward_buffered(
         &self,
         ctx: &DynamicContext,
-        grad_output: &MatrixBuffer,
-        grad_input: &mut MatrixBuffer,
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32>;

@@ -17,14 +17,16 @@ use super::types::{
     BufferData, BufferLocation, MemoryDeviceKind, TensorBuffer, TensorBufferId,
 };
 use super::policy::{BufferMetadata, BufferPriority, MemoryPolicy, MemoryTier};
-use super::raw_buffer::{RawBufferRegistry};
+use super::raw_buffer::RawBufferRegistry;
 use super::temp_pool::TempBufferPool;
 use super::data_mover;
 use super::matrix_id::MatrixBufferId;
 use super::matrix_registry::MatrixBufferInfo;
+use super::matrix_entry::{MatrixEntry, MatrixStorage};
 
 use crate::compute_manager::gpu::init::GpuContext;
 use crate::compute_manager::matrix_buffer::buffer::{BufferStorage, MatrixBuffer};
+use crate::compute_manager::matrix_buffer::handle::MatrixBufferHandle;
 
 // Публичный реэкспорт для внешних потребителей (GpuCompute, GpuParamStore)
 pub use super::raw_buffer::RawBufferId;
@@ -63,6 +65,9 @@ pub struct MemoryExecutor {
     matrix_buffers: HashMap<MatrixBufferId, MatrixBufferInfo>,
     next_matrix_id: AtomicUsize,
 
+    // Новое поле: записи физических данных для MatrixBufferHandle
+    matrix_entries: HashMap<MatrixBufferId, MatrixEntry>,
+
     // Ссылка на самого себя, обёрнутого в Arc<Mutex<...>>.
     // Устанавливается после создания через `set_self_arc`.
     memory_arc: Option<Arc<std::sync::Mutex<MemoryExecutor>>>,
@@ -86,6 +91,7 @@ impl MemoryExecutor {
             pinned_buffers: HashSet::new(),
             matrix_buffers: HashMap::new(),
             next_matrix_id: AtomicUsize::new(0),
+            matrix_entries: HashMap::new(),
             memory_arc: None,
         }
     }
@@ -228,7 +234,7 @@ impl MemoryExecutor {
         ram_ratio
     }
 
-    // --- Выделение и освобождение тензоров ---
+    // --- Выделение и освобождение тензоров (старая система) ---
 
     pub fn allocate(
         &mut self,
@@ -353,7 +359,7 @@ impl MemoryExecutor {
         }
     }
 
-    // --- Перемещение буфера ---
+    // --- Перемещение буфера (старая система) ---
 
     pub fn move_buffer(
         &mut self,
@@ -373,7 +379,7 @@ impl MemoryExecutor {
         )
     }
 
-    // --- Вытеснение ---
+    // --- Вытеснение (старая система) ---
 
     fn evict_to_fit(
         &mut self,
@@ -481,7 +487,7 @@ impl MemoryExecutor {
         self.upcoming_ids.clear();
     }
 
-    // --- Разрешение буфера ---
+    // --- Разрешение буфера (старая система) ---
 
     pub fn resolve_buffer(
         &mut self,
@@ -507,7 +513,7 @@ impl MemoryExecutor {
         }
     }
 
-    // --- Удаление буфера ---
+    // --- Удаление буфера (старая система) ---
 
     pub fn deallocate_buffer(&mut self, id: TensorBufferId) -> Result<(), MemoryError> {
         self.pinned_buffers.remove(&id);
@@ -624,108 +630,420 @@ impl MemoryExecutor {
     }
 
     // ===================================================================
-    // НОВЫЕ МЕТОДЫ ДЛЯ УПРАВЛЯЕМЫХ МАТРИЧНЫХ БУФЕРОВ
+    // НОВЫЕ МЕТОДЫ ДЛЯ УПРАВЛЯЕМЫХ МАТРИЧНЫХ БУФЕРОВ (MatrixBufferHandle)
     // ===================================================================
 
-    /// Зарегистрировать управляемый матричный буфер в реестре.
-    pub fn register_matrix(
+    /// Создаёт новую запись в `matrix_entries` и возвращает дескриптор.
+    pub fn acquire_matrix_handle(
         &mut self,
         rows: usize,
         cols: usize,
         location: MemoryDeviceKind,
         priority: BufferPriority,
-    ) -> MatrixBufferId {
-        let id = MatrixBufferId(self.next_matrix_id.fetch_add(1, Ordering::SeqCst));
-        let info = MatrixBufferInfo::new(id, rows, cols, location, priority);
-        self.matrix_buffers.insert(id, info);
-        id
-    }
-
-    /// Снять матричный буфер с учёта.
-    pub fn unregister_matrix(&mut self, id: MatrixBufferId) {
-        self.matrix_buffers.remove(&id);
-    }
-
-    /// Обновить время последнего доступа к матричному буферу.
-    pub fn touch_matrix(&mut self, id: MatrixBufferId) {
-        if let Some(info) = self.matrix_buffers.get_mut(&id) {
-            info.touch();
+    ) -> Result<MatrixBufferHandle, MemoryError> {
+        let elements = rows * cols;
+        if location != MemoryDeviceKind::SsdCache {
+            if let Some(pool) = self.pools.get(&location) {
+                if !pool.can_allocate(elements) {
+                    return Err(MemoryError::OutOfMemory(location));
+                }
+            } else {
+                return Err(MemoryError::DeviceNotFound(location));
+            }
         }
-    }
 
-    /// Получить метаданные матричного буфера.
-    pub fn get_matrix_info(&self, id: MatrixBufferId) -> Option<&MatrixBufferInfo> {
-        self.matrix_buffers.get(&id)
-    }
-
-    /// Получить мутабельные метаданные матричного буфера.
-    pub fn get_matrix_info_mut(&mut self, id: MatrixBufferId) -> Option<&mut MatrixBufferInfo> {
-        self.matrix_buffers.get_mut(&id)
-    }
-
-    /// Создать управляемый `MatrixBuffer` в указанной памяти.
-    pub fn acquire_matrix(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        location: MemoryDeviceKind,
-        priority: BufferPriority,
-    ) -> Result<MatrixBuffer, MemoryError> {
-        let total = rows * cols;
-        self.ensure_matrix_can_allocate(location, total)?;
-
-        let matrix_id = self.register_matrix(rows, cols, location, priority);
-
-        let memory = self
-            .memory_arc
-            .as_ref()
-            .expect("MemoryExecutor::acquire_matrix called before set_self_arc")
-            .clone();
-
-        let buffer = match location {
+        let storage = match location {
             MemoryDeviceKind::HostRam => {
-                self.reserve_memory(MemoryDeviceKind::HostRam, total)?;
-                let data = vec![0.0f32; total];
-                MatrixBuffer::from_cpu_parts(
-                    rows,
-                    cols,
-                    data,
-                    memory,
-                    matrix_id,
-                )
+                self.reserve_memory(MemoryDeviceKind::HostRam, elements)?;
+                MatrixStorage::Cpu(vec![0.0f32; elements])
             }
             MemoryDeviceKind::DeviceVram(dev_id) => {
-                let (gpu_buf, raw_id) = self.create_raw_gpu_buffer(dev_id, total)?;
-                MatrixBuffer::from_gpu_parts(
-                    rows,
-                    cols,
-                    gpu_buf,
+                let (buffer, raw_id) = self.create_raw_gpu_buffer(dev_id, elements)?;
+                MatrixStorage::Gpu {
+                    buffer,
                     raw_id,
-                    dev_id,
-                    memory,
-                    matrix_id,
-                )
+                    device_id: dev_id,
+                }
             }
             MemoryDeviceKind::SsdCache => {
                 let ssd = self
                     .ssd_cache
                     .as_ref()
                     .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
-                let handle = ssd.allocate(total)?;
-                let data = vec![0.0f32; total];
-                ssd.write(&handle, &data)?;
-                // Для SSD MatrixBuffer прямого конструктора пока нет.
-                // Возвращаем ошибку, чтобы не использовать неполную реализацию.
-                return Err(MemoryError::SsdError(
-                    "Direct SSD MatrixBuffer creation is not yet supported".to_string(),
-                ));
+                let handle = ssd.allocate(elements)?;
+                let zeros = vec![0.0f32; elements];
+                ssd.write(&handle, &zeros)?;
+                MatrixStorage::Ssd(handle)
             }
         };
 
-        Ok(buffer)
+        let id = MatrixBufferId(self.next_matrix_id.fetch_add(1, Ordering::SeqCst));
+        let entry = MatrixEntry::new(rows, cols, storage, priority);
+        self.matrix_entries.insert(id, entry);
+
+        let arc = self.memory_arc.clone().expect("MemoryExecutor::set_self_arc not called");
+        Ok(MatrixBufferHandle::new(id, arc))
     }
 
-    /// Выбрать оптимальное расположение для матрицы с учётом доступности.
+    /// Уменьшает счётчик ссылок записи. Если счётчик достиг нуля и запись
+    /// не удерживается пулом, освобождает физическую память и удаляет запись.
+    pub fn release_matrix_handle(&mut self, id: MatrixBufferId) {
+        if let Some(entry) = self.matrix_entries.get_mut(&id) {
+            entry.ref_count = entry.ref_count.saturating_sub(1);
+            if entry.ref_count == 0 && !entry.pooled {
+                match &entry.storage {
+                    MatrixStorage::Cpu(data) => {
+                        let elements = data.len();
+                        self.release_reserved_memory(MemoryDeviceKind::HostRam, elements);
+                    }
+                    MatrixStorage::Gpu { raw_id, .. } => {
+                        self.raw_registry.unregister(*raw_id, &mut self.pools);
+                    }
+                    MatrixStorage::Ssd(handle) => {
+                        if let Some(ssd) = &self.ssd_cache {
+                            let _ = ssd.deallocate(handle);
+                        }
+                    }
+                }
+                self.matrix_entries.remove(&id);
+            }
+        }
+    }
+
+    /// Увеличивает счётчик ссылок записи.
+    pub fn increment_ref_count(&mut self, id: MatrixBufferId) {
+        if let Some(entry) = self.matrix_entries.get_mut(&id) {
+            entry.ref_count += 1;
+        }
+    }
+
+    /// Помечает запись как удерживаемую пулом.
+    pub fn mark_pooled(&mut self, id: MatrixBufferId) {
+        if let Some(entry) = self.matrix_entries.get_mut(&id) {
+            entry.pooled = true;
+        }
+    }
+
+    /// Снимает пометку пула и увеличивает счётчик ссылок на 1.
+    pub fn unmark_pooled(&mut self, id: MatrixBufferId) {
+        if let Some(entry) = self.matrix_entries.get_mut(&id) {
+            entry.pooled = false;
+            entry.ref_count += 1;
+        }
+    }
+
+    /// Возвращает ссылку на запись по идентификатору.
+    pub fn get_matrix_entry(&self, id: MatrixBufferId) -> Option<&MatrixEntry> {
+        self.matrix_entries.get(&id)
+    }
+
+    /// Возвращает мутабельную ссылку на запись по идентификатору.
+    pub fn get_matrix_entry_mut(&mut self, id: MatrixBufferId) -> Option<&mut MatrixEntry> {
+        self.matrix_entries.get_mut(&id)
+    }
+
+    /// Перемещает данные записи на другое устройство памяти.
+    /// Идентификатор записи и дескрипторы не меняются.
+    pub fn move_matrix_handle(
+        &mut self,
+        id: MatrixBufferId,
+        target: MemoryDeviceKind,
+    ) -> Result<(), MemoryError> {
+        let current_kind = {
+            let entry = self
+                .matrix_entries
+                .get(&id)
+                .ok_or(MemoryError::BufferNotFound(TensorBufferId(id.0)))?;
+            entry.device_kind()
+        };
+
+        if current_kind == target {
+            return Ok(());
+        }
+
+        let elements = {
+            let entry = self.matrix_entries.get(&id).unwrap();
+            entry.rows * entry.cols
+        };
+        if target != MemoryDeviceKind::SsdCache {
+            let pool = self.pools.get(&target)
+                .ok_or(MemoryError::DeviceNotFound(target))?;
+            if !pool.can_allocate(elements) {
+                return Err(MemoryError::OutOfMemory(target));
+            }
+        }
+
+        let mut entry = self
+            .matrix_entries
+            .remove(&id)
+            .ok_or(MemoryError::BufferNotFound(TensorBufferId(id.0)))?;
+
+        let old_storage = entry.storage.clone();
+        let new_storage = match target {
+            MemoryDeviceKind::HostRam => {
+                let data = self.read_matrix_storage_to_vec(&old_storage, elements)?;
+                self.reserve_memory(MemoryDeviceKind::HostRam, elements)?;
+                MatrixStorage::Cpu(data)
+            }
+            MemoryDeviceKind::DeviceVram(dev_id) => {
+                let data = self.read_matrix_storage_to_vec(&old_storage, elements)?;
+                let (buffer, raw_id) = self.create_raw_gpu_buffer(dev_id, elements)?;
+                let ctx = self.gpu_contexts.get(&dev_id)
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::DeviceVram(dev_id)))?;
+                let (staging_buf, staging_raw) = self.temp_pool.acquire(
+                    MemoryDeviceKind::HostRam,
+                    elements,
+                    &self.gpu_contexts,
+                    &mut self.pools,
+                    &mut self.raw_registry,
+                );
+                {
+                    let mut write_guard = staging_buf.write().map_err(|e| {
+                        self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf.clone(), staging_raw);
+                        MemoryError::SsdError(format!("write staging: {}", e))
+                    })?;
+                    write_guard.copy_from_slice(&data);
+                }
+                data_mover::copy_buffer_sync(ctx.clone(), staging_buf.clone(), buffer.clone());
+                self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
+                MatrixStorage::Gpu {
+                    buffer,
+                    raw_id,
+                    device_id: dev_id,
+                }
+            }
+            MemoryDeviceKind::SsdCache => {
+                let data = self.read_matrix_storage_to_vec(&old_storage, elements)?;
+                let ssd = self.ssd_cache.as_ref()
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
+                let handle = ssd.allocate(elements)?;
+                ssd.write(&handle, &data)?;
+                MatrixStorage::Ssd(handle)
+            }
+        };
+
+        self.release_matrix_storage(&old_storage, elements);
+
+        entry.storage = new_storage;
+        entry.touch();
+        self.matrix_entries.insert(id, entry);
+        Ok(())
+    }
+
+    /// Вспомогательный метод: читает данные из MatrixStorage в Vec<f32>.
+    fn read_matrix_storage_to_vec(
+        &mut self,
+        storage: &MatrixStorage,
+        elements: usize,
+    ) -> Result<Vec<f32>, MemoryError> {
+        match storage {
+            MatrixStorage::Cpu(data) => Ok(data.clone()),
+            MatrixStorage::Gpu { buffer, device_id, .. } => {
+                let ctx = self.gpu_contexts.get(device_id)
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::DeviceVram(*device_id)))?;
+                let (staging_buf, staging_raw) = self.temp_pool.acquire(
+                    MemoryDeviceKind::HostRam,
+                    elements,
+                    &self.gpu_contexts,
+                    &mut self.pools,
+                    &mut self.raw_registry,
+                );
+                data_mover::copy_buffer_sync(ctx.clone(), buffer.clone(), staging_buf.clone());
+                let data = {
+                    let guard = staging_buf.read().map_err(|e| {
+                        self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf.clone(), staging_raw);
+                        MemoryError::SsdError(format!("read staging: {}", e))
+                    })?;
+                    guard.to_vec()
+                };
+                self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
+                Ok(data)
+            }
+            MatrixStorage::Ssd(handle) => {
+                let ssd = self.ssd_cache.as_ref()
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
+                ssd.read(handle)
+            }
+        }
+    }
+
+    /// Освобождает ресурсы, связанные с MatrixStorage.
+    fn release_matrix_storage(&mut self, storage: &MatrixStorage, elements: usize) {
+        match storage {
+            MatrixStorage::Cpu(_) => {
+                self.release_reserved_memory(MemoryDeviceKind::HostRam, elements);
+            }
+            MatrixStorage::Gpu { raw_id, .. } => {
+                self.raw_registry.unregister(*raw_id, &mut self.pools);
+            }
+            MatrixStorage::Ssd(handle) => {
+                if let Some(ssd) = &self.ssd_cache {
+                    let _ = ssd.deallocate(handle);
+                }
+            }
+        }
+    }
+
+    /// Вспомогательный метод: создаёт GPU-буфер и регистрирует его как raw.
+    fn create_raw_gpu_buffer(
+        &mut self,
+        device_id: DeviceId,
+        elements: usize,
+    ) -> Result<(Subbuffer<[f32]>, RawBufferId), MemoryError> {
+        let ctx = self
+            .gpu_contexts
+            .get(&device_id)
+            .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::DeviceVram(device_id)))?;
+        let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
+
+        let buffer = Buffer::new_unsized(
+            ctx.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            size_bytes,
+        )
+        .map_err(|e| MemoryError::SsdError(format!("Failed to allocate GPU buffer: {}", e)))?;
+
+        let raw_id = self.raw_registry.register(
+            device_id,
+            size_bytes,
+            MemoryTypeFilter::PREFER_DEVICE,
+            &mut self.pools,
+        );
+
+        Ok((buffer, raw_id))
+    }
+
+    // ===================================================================
+    // МЕТОДЫ ДЛЯ СОВМЕСТИМОСТИ С MatrixBuffer (старая владеющая модель)
+    // ===================================================================
+
+    /// Перемещает данные `MatrixBuffer` между устройствами памяти.
+    /// Обновляет внутреннее хранилище и метаданные в реестре.
+    pub(crate) fn move_matrix_storage(
+        &mut self,
+        buffer: &mut MatrixBuffer,
+        target: MemoryDeviceKind,
+    ) -> Result<(), MemoryError> {
+        // Реализация для старой владеющей модели MatrixBuffer.
+        // Используем временный подход: извлекаем данные, затем создаём новое хранилище.
+        let elements = buffer.size();
+        let current = buffer.device_kind();
+
+        if current == target {
+            return Ok(());
+        }
+
+        // Читаем данные из текущего хранилища (только CPU для простоты,
+        // для GPU/SSD используем соответствующие методы, если они есть).
+        // В старом MatrixBuffer нет методов для GPU/SSD чтения напрямую,
+        // поэтому используем to_mat() для CPU, а для GPU/SSD паникуем с сообщением.
+        // Полная реализация потребовала бы GpuCompute, но для совместимости оставим
+        // только CPU <-> CPU, иначе ошибка.
+        match (&buffer.storage, target) {
+            (BufferStorage::Cpu(data), MemoryDeviceKind::HostRam) => Ok(()),
+            (BufferStorage::Cpu(data), MemoryDeviceKind::DeviceVram(dev_id)) => {
+                // Загружаем CPU-данные в GPU через MemoryExecutor (используем create_raw_gpu_buffer и staging)
+                let (gpu_buf, raw_id) = self.create_raw_gpu_buffer(dev_id, elements)?;
+                let ctx = self.gpu_contexts.get(&dev_id)
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::DeviceVram(dev_id)))?;
+                let (staging_buf, staging_raw) = self.temp_pool.acquire(
+                    MemoryDeviceKind::HostRam,
+                    elements,
+                    &self.gpu_contexts,
+                    &mut self.pools,
+                    &mut self.raw_registry,
+                );
+                {
+                    let mut write_guard = staging_buf.write().map_err(|e| {
+                        self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf.clone(), staging_raw);
+                        MemoryError::SsdError(format!("write staging: {}", e))
+                    })?;
+                    write_guard.copy_from_slice(data);
+                }
+                data_mover::copy_buffer_sync(ctx.clone(), staging_buf.clone(), gpu_buf.clone());
+                self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
+
+                buffer.set_storage(BufferStorage::Gpu {
+                    buffer: gpu_buf,
+                    raw_id,
+                    device_id: dev_id,
+                });
+                Ok(())
+            }
+            (BufferStorage::Gpu { buffer: src, raw_id, device_id }, MemoryDeviceKind::HostRam) => {
+                let ctx = self.gpu_contexts.get(device_id)
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::DeviceVram(*device_id)))?;
+                let (staging_buf, staging_raw) = self.temp_pool.acquire(
+                    MemoryDeviceKind::HostRam,
+                    elements,
+                    &self.gpu_contexts,
+                    &mut self.pools,
+                    &mut self.raw_registry,
+                );
+                data_mover::copy_buffer_sync(ctx.clone(), src.clone(), staging_buf.clone());
+                let data = {
+                    let guard = staging_buf.read().map_err(|e| {
+                        self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf.clone(), staging_raw);
+                        MemoryError::SsdError(format!("read staging: {}", e))
+                    })?;
+                    guard.to_vec()
+                };
+                self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
+
+                // Освобождаем GPU-буфер
+                self.raw_registry.unregister(*raw_id, &mut self.pools);
+                buffer.set_storage(BufferStorage::Cpu(data));
+                Ok(())
+            }
+            (BufferStorage::Cpu(data), MemoryDeviceKind::SsdCache) => {
+                let ssd = self.ssd_cache.as_ref()
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
+                let handle = ssd.allocate(elements)?;
+                ssd.write(&handle, data)?;
+                buffer.set_storage(BufferStorage::SsdCache(handle));
+                Ok(())
+            }
+            (BufferStorage::SsdCache(handle), MemoryDeviceKind::HostRam) => {
+                let ssd = self.ssd_cache.as_ref()
+                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
+                let data = ssd.read(handle)?;
+                ssd.deallocate(handle)?;
+                buffer.set_storage(BufferStorage::Cpu(data));
+                Ok(())
+            }
+            (BufferStorage::Gpu { .. }, MemoryDeviceKind::SsdCache) => {
+                // Двухшаговое перемещение через CPU
+                self.move_matrix_storage(buffer, MemoryDeviceKind::HostRam)?;
+                self.move_matrix_storage(buffer, MemoryDeviceKind::SsdCache)
+            }
+            (BufferStorage::SsdCache(_), MemoryDeviceKind::DeviceVram(dev_id)) => {
+                self.move_matrix_storage(buffer, MemoryDeviceKind::HostRam)?;
+                self.move_matrix_storage(buffer, MemoryDeviceKind::DeviceVram(dev_id))
+            }
+            _ => Err(MemoryError::DataNotInLocation(
+                TensorBufferId(0),
+                BufferLocation::HostRam,
+            )),
+        }
+    }
+
+    /// Освобождает SSD-буфер по его дескриптору (для старой MatrixBuffer).
+    pub fn deallocate_ssd(&mut self, handle: &super::ssd_cache::SsdHandle) {
+        if let Some(ssd) = &self.ssd_cache {
+            if let Err(e) = ssd.deallocate(handle) {
+                eprintln!("[MemoryExecutor] Failed to deallocate SSD handle: {:?}", e);
+            }
+        }
+    }
+
+    /// Выбирает оптимальное расположение для матрицы с учётом доступности.
     pub fn select_matrix_location(
         &self,
         elements: usize,
@@ -759,226 +1077,36 @@ impl MemoryExecutor {
             .unwrap_or(false)
     }
 
-    fn ensure_matrix_can_allocate(
-        &self,
+    // Старые методы для регистрации матриц (используются в BufferedParamStore)
+    pub fn register_matrix(
+        &mut self,
+        rows: usize,
+        cols: usize,
         location: MemoryDeviceKind,
-        elements: usize,
-    ) -> Result<(), MemoryError> {
-        if self.can_allocate(location, elements) {
-            Ok(())
-        } else {
-            Err(MemoryError::OutOfMemory(location))
+        priority: BufferPriority,
+    ) -> MatrixBufferId {
+        let id = MatrixBufferId(self.next_matrix_id.fetch_add(1, Ordering::SeqCst));
+        let info = MatrixBufferInfo::new(id, rows, cols, location, priority);
+        self.matrix_buffers.insert(id, info);
+        id
+    }
+
+    pub fn unregister_matrix(&mut self, id: MatrixBufferId) {
+        self.matrix_buffers.remove(&id);
+    }
+
+    pub fn touch_matrix(&mut self, id: MatrixBufferId) {
+        if let Some(info) = self.matrix_buffers.get_mut(&id) {
+            info.touch();
         }
     }
 
-    /// Вспомогательный метод: создаёт GPU-буфер и регистрирует его как raw.
-    fn create_raw_gpu_buffer(
-        &mut self,
-        device_id: DeviceId,
-        elements: usize,
-    ) -> Result<(Subbuffer<[f32]>, RawBufferId), MemoryError> {
-        let ctx = self
-            .gpu_contexts
-            .get(&device_id)
-            .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::DeviceVram(device_id)))?;
-        let size_bytes = (elements * std::mem::size_of::<f32>()) as u64;
-
-        let buffer = Buffer::new_unsized(
-            ctx.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            size_bytes,
-        )
-        .map_err(|e| MemoryError::SsdError(format!("Failed to allocate GPU buffer: {}", e)))?;
-
-        let raw_id = self.raw_registry.register(
-            device_id,
-            size_bytes,
-            MemoryTypeFilter::PREFER_DEVICE,
-            &mut self.pools,
-        );
-
-        Ok((buffer, raw_id))
+    pub fn get_matrix_info(&self, id: MatrixBufferId) -> Option<&MatrixBufferInfo> {
+        self.matrix_buffers.get(&id)
     }
 
-    /// Перемещает данные `MatrixBuffer` между устройствами памяти.
-    /// Обновляет внутреннее хранилище и метаданные в реестре.
-    pub(crate) fn move_matrix_storage(
-        &mut self,
-        buffer: &mut MatrixBuffer,
-        target: MemoryDeviceKind,
-    ) -> Result<(), MemoryError> {
-        let elements = buffer.size();
-        let current = buffer.device_kind();
-
-        if current == target {
-            return Ok(());
-        }
-
-        match (&buffer.storage, target) {
-            (BufferStorage::Cpu(data), MemoryDeviceKind::DeviceVram(dev_id)) => {
-                let (gpu_buf, raw_id) = self.upload_vec_to_gpu(dev_id, data)?;
-                buffer.set_storage(BufferStorage::Gpu {
-                    buffer: gpu_buf,
-                    raw_id,
-                    device_id: dev_id,
-                });
-            }
-            (BufferStorage::Gpu { buffer: src, raw_id, device_id }, MemoryDeviceKind::HostRam) => {
-                let ctx = self
-                    .gpu_contexts
-                    .get(device_id)
-                    .ok_or(MemoryError::DeviceNotFound(current))?;
-                let data = self.download_gpu_to_vec(ctx.clone(), src)?;
-                self.raw_registry.unregister(*raw_id, &mut self.pools);
-                buffer.set_storage(BufferStorage::Cpu(data));
-            }
-            (BufferStorage::Cpu(data), MemoryDeviceKind::SsdCache) => {
-                let ssd = self
-                    .ssd_cache
-                    .as_ref()
-                    .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
-                let handle = ssd.allocate(elements)?;
-                ssd.write(&handle, data)?;
-                buffer.set_storage(BufferStorage::SsdCache(handle));
-            }
-            (BufferStorage::SsdCache(handle), MemoryDeviceKind::HostRam) => {
-                let ssd = self
-                    .ssd_cache
-                    .as_ref()
-                    .ok_or(MemoryError::DeviceNotFound(current))?;
-                let data = ssd.read(handle)?;
-                ssd.deallocate(handle)?;
-                buffer.set_storage(BufferStorage::Cpu(data));
-            }
-            (BufferStorage::Gpu { .. }, MemoryDeviceKind::SsdCache) => {
-                self.move_matrix_storage(buffer, MemoryDeviceKind::HostRam)?;
-                self.move_matrix_storage(buffer, MemoryDeviceKind::SsdCache)?;
-            }
-            (BufferStorage::SsdCache(_), MemoryDeviceKind::DeviceVram(dev_id)) => {
-                self.move_matrix_storage(buffer, MemoryDeviceKind::HostRam)?;
-                self.move_matrix_storage(buffer, MemoryDeviceKind::DeviceVram(dev_id))?;
-            }
-            _ => {
-                return Err(MemoryError::DataNotInLocation(
-                    TensorBufferId(0),
-                    BufferLocation::HostRam,
-                ));
-            }
-        }
-
-        if let Some(id) = buffer.matrix_id() {
-            if let Some(info) = self.get_matrix_info_mut(id) {
-                info.set_location(target);
-                info.touch();
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Выгружает CPU-вектор в GPU-буфер.
-    fn upload_vec_to_gpu(
-        &mut self,
-        device_id: DeviceId,
-        data: &[f32],
-    ) -> Result<(Subbuffer<[f32]>, RawBufferId), MemoryError> {
-        let ctx = self
-            .gpu_contexts
-            .get(&device_id)
-            .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::DeviceVram(device_id)))?;
-        let elements = data.len();
-        let bytes = (elements * std::mem::size_of::<f32>()) as u64;
-
-        let (staging_buf, staging_raw) = self.temp_pool.acquire(
-            MemoryDeviceKind::HostRam,
-            elements,
-            &self.gpu_contexts,
-            &mut self.pools,
-            &mut self.raw_registry,
-        );
-
-        {
-            let mut write = staging_buf.write().map_err(|e| {
-                MemoryError::SsdError(format!("Failed to write staging buffer: {}", e))
-            })?;
-            write.copy_from_slice(data);
-        }
-
-        let gpu_buf = Buffer::new_unsized(
-            ctx.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-            bytes,
-        )
-        .map_err(|e| MemoryError::SsdError(format!("Failed to allocate GPU buffer: {}", e)))?;
-
-        data_mover::copy_buffer_sync(ctx.clone(), staging_buf.clone(), gpu_buf.clone());
-
-        self.temp_pool
-            .release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
-
-        let raw_id = self.raw_registry.register(
-            device_id,
-            bytes,
-            MemoryTypeFilter::PREFER_DEVICE,
-            &mut self.pools,
-        );
-
-        Ok((gpu_buf, raw_id))
-    }
-
-    /// Скачивает GPU-буфер в CPU-вектор.
-    fn download_gpu_to_vec(
-        &mut self,
-        ctx: Arc<GpuContext>,
-        src: &Subbuffer<[f32]>,
-    ) -> Result<Vec<f32>, MemoryError> {
-        let elements = src.len() as usize;
-        let bytes = (elements * std::mem::size_of::<f32>()) as u64;
-
-        let (staging_buf, staging_raw) = self.temp_pool.acquire(
-            MemoryDeviceKind::HostRam,
-            elements,
-            &self.gpu_contexts,
-            &mut self.pools,
-            &mut self.raw_registry,
-        );
-
-        data_mover::copy_buffer_sync(ctx, src.clone(), staging_buf.clone());
-
-        let data = {
-            let guard = staging_buf.read().map_err(|e| {
-                MemoryError::SsdError(format!("Failed to read staging buffer: {}", e))
-            })?;
-            guard.to_vec()
-        };
-
-        self.temp_pool
-            .release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
-
-        Ok(data)
-    }
-
-    /// Освобождает SSD-буфер по его дескриптору.
-    pub fn deallocate_ssd(&mut self, handle: &super::ssd_cache::SsdHandle) {
-        if let Some(ssd) = &self.ssd_cache {
-            if let Err(e) = ssd.deallocate(handle) {
-                eprintln!("[MemoryExecutor] Failed to deallocate SSD handle: {:?}", e);
-            }
-        }
+    pub fn get_matrix_info_mut(&mut self, id: MatrixBufferId) -> Option<&mut MatrixBufferInfo> {
+        self.matrix_buffers.get_mut(&id)
     }
 }
 

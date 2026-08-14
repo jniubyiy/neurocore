@@ -1,7 +1,7 @@
 // src/layers/identity/identity.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -98,25 +98,38 @@ impl UniversalLayer for Identity {
 impl UniversalLayerBuffered for Identity {
     fn forward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
     ) {
-        // Прямое копирование данных без создания Mat
-        output.copy_from_slice(input.as_slice());
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("Identity forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("Identity forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), dst.len());
+        dst.copy_from_slice(src);
     }
 
     fn backward_buffered(
         &self,
         _ctx: &DynamicContext,
-        grad_output: &MatrixBuffer,
-        grad_input: &mut MatrixBuffer,
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Градиент проходит насквозь: копируем из grad_output в grad_input
-        grad_input.copy_from_slice(grad_output.as_slice());
+        let go_guard = grad_output.read();
+        let go = go_guard.as_slice().expect("Identity backward: expected CPU buffer");
+
+        let mut gi_guard = grad_input.write();
+        let gi = gi_guard.as_slice_mut().expect("Identity backward: expected CPU buffer");
+
+        debug_assert_eq!(go.len(), gi.len());
+        gi.copy_from_slice(go);
+
         Vec::new()
     }
 

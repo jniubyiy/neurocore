@@ -4,7 +4,7 @@ use std::time::Instant;
 use faer::Mat;
 
 use crate::compute_manager::dim_change;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
@@ -153,16 +153,16 @@ impl MixedModel {
     // Новый метод: прямой проход с управляемыми буферами через TempMatrixPool
     // -----------------------------------------------------------------------
 
-    /// Прямой проход с использованием [`MatrixBuffer`] и пула [`TempMatrixPool`].
+    /// Прямой проход с использованием [`MatrixBufferHandle`] и пула [`TempMatrixPool`].
     ///
-    /// Этот метод полностью заменяет `forward_mat_multi` в новом CPU‑пути.
-    /// Все промежуточные матрицы выделяются через пул, что позволяет
+    /// Этот метод полностью заменяет `forward_mat_multi_buffered` в новом CPU/GPU‑пути.
+    /// Все промежуточные матрицы выделяются через пул дескрипторов, что позволяет
     /// `MemoryExecutor` отслеживать и переиспользовать память.
     pub fn forward_mat_multi_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
-        inputs: Vec<MatrixBuffer>,
-    ) -> (Vec<MatrixBuffer>, Vec<Vec<DynamicContext>>) {
+        inputs: Vec<MatrixBufferHandle>,
+    ) -> (Vec<MatrixBufferHandle>, Vec<Vec<DynamicContext>>) {
         assert_eq!(
             inputs.len(),
             self.input_stream_count,
@@ -184,7 +184,7 @@ impl MixedModel {
             );
         }
 
-        let mut stream_buffers: Vec<MatrixBuffer> = inputs;
+        let mut stream_buffers: Vec<MatrixBufferHandle> = inputs;
         let mut all_ctxs: Vec<Vec<DynamicContext>> = vec![Vec::new(); batch_size];
 
         let segments = self.segments.clone();
@@ -196,14 +196,14 @@ impl MixedModel {
                 Segment::Unsqueeze(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
-                        new_stream.push(dim_change::unsqueeze_mat_buffered(pool, buf, target_dims));
+                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_buffers = new_stream;
                 }
                 Segment::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
-                        new_stream.push(dim_change::reduce_mat_buffered(pool, buf, target_dims));
+                        new_stream.push(dim_change::reduce_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_buffers = new_stream;
                 }
@@ -233,17 +233,17 @@ impl MixedModel {
                         };
 
                         for &stream_idx in &active_indices {
-                            let input_buf = std::mem::replace(
-                                &mut stream_buffers[stream_idx],
-                                MatrixBuffer::dummy(pool),
-                            );
+                            let input_buf = stream_buffers[stream_idx].clone();
 
                             // Если входной буфер CPU, загружаем его на GPU
                             let input_gpu = if input_buf.is_gpu() {
                                 input_buf
                             } else {
-                                let mut gpu_buf = gpu.allocate_gpu_matrix(input_buf.rows(), input_buf.cols());
-                                gpu.copy_cpu_to_gpu(&input_buf, &mut gpu_buf);
+                                let mut gpu_buf = gpu.allocate_gpu_matrix_handle(
+                                    input_buf.rows(),
+                                    input_buf.cols(),
+                                );
+                                gpu.copy_cpu_to_gpu_handle(&input_buf, &gpu_buf);
                                 gpu_buf
                             };
 

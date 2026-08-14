@@ -4,7 +4,7 @@ use std::time::Instant;
 use faer::Mat;
 
 use crate::compute_manager::dim_change;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
@@ -13,6 +13,7 @@ use crate::device_plan::plan::ComputeDevice;
 use crate::layers::{
     UniversalLayer, UniversalLayerBuffered,
     Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
+    Memory, SoftSparseGate, SoftKeepGate, DualAnchor,
 };
 use crate::model_plan::param_store::ParamSlice;
 
@@ -299,25 +300,25 @@ impl MixedModel {
                 layers[i].backward_mat(ctxs[i], &current_delta, params, &slices[i]);
             current_delta = in_delta;
             for (idx, &g) in grad.iter().enumerate() {
-                total_grad[idx] += g;
+                total_grad[slices[i].start + idx] += g;
             }
         }
         current_delta
     }
 
     // ===================================================================
-    // Буферизованная версия обратного прохода (MatrixBuffer + TempMatrixPool)
+    // Буферизованная версия обратного прохода (MatrixBufferHandle + TempMatrixPool)
     // ===================================================================
 
-    /// Обратный проход с использованием пула временных матриц.
-    /// Принимает контексты (пока `DynamicContext` с `Mat<f32>`),
-    /// градиенты выходов как `Vec<MatrixBuffer>` и возвращает градиенты входов и накопленные градиенты параметров.
+    /// Обратный проход с использованием пула временных дескрипторов.
+    /// Принимает контексты (могут быть `DynamicContext::Buffered` или `Mat`),
+    /// градиенты выходов как `Vec<MatrixBufferHandle>` и возвращает градиенты входов и накопленные градиенты параметров.
     pub fn backward_mat_multi_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
         contexts: &[Vec<DynamicContext>],
-        deltas: Vec<MatrixBuffer>,
-    ) -> (Vec<MatrixBuffer>, Vec<Vec<f32>>) {
+        deltas: Vec<MatrixBufferHandle>,
+    ) -> (Vec<MatrixBufferHandle>, Vec<Vec<f32>>) {
         assert_eq!(deltas.len(), self.output_stream_count,
             "backward_mat_multi_buffered: expected {} deltas, got {}",
             self.output_stream_count, deltas.len());
@@ -339,14 +340,14 @@ impl MixedModel {
                 Segment::Unsqueeze(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
-                        new_stream.push(dim_change::reduce_mat_buffered(pool, buf, target_dims));
+                        new_stream.push(dim_change::reduce_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_gradients = new_stream;
                 }
                 Segment::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
-                        new_stream.push(dim_change::unsqueeze_mat_buffered(pool, buf, target_dims));
+                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_gradients = new_stream;
                 }
@@ -357,14 +358,11 @@ impl MixedModel {
                         None => (0..stream_gradients.len()).collect(),
                     };
 
-                    let mut new_gradients: Vec<Option<MatrixBuffer>> =
+                    let mut new_gradients: Vec<Option<MatrixBufferHandle>> =
                         (0..stream_gradients.len()).map(|_| None).collect();
 
                     for &stream_idx in &active_indices {
-                        let delta_buf = std::mem::replace(
-                            &mut stream_gradients[stream_idx],
-                            MatrixBuffer::dummy(pool),
-                        );
+                        let delta_handle = stream_gradients[stream_idx].clone();
                         let pos_in_sorted = active_indices.iter().position(|&x| x == stream_idx).unwrap();
                         let stream_ctx_start = ctx_pos - (active_indices.len() - pos_in_sorted) * num_layers;
                         let layer_ctxs: Vec<&DynamicContext> = contexts[0]
@@ -376,11 +374,20 @@ impl MixedModel {
                         let ctxs_slice: &[DynamicContext] = &ctxs_owned;
 
                         if self.gpu_compute.is_some() {
+                            // GPU-ветка
                             let gpu = self.gpu_compute.as_ref().unwrap().lock().unwrap();
 
-                            // Загружаем градиент на GPU
-                            let delta_mat = delta_buf.to_mat();
-                            let delta_gpu = gpu.upload_mat_to_gpu_matrix(&delta_mat);
+                            // Гарантируем, что входной градиент находится на GPU
+                            let delta_gpu_handle = if delta_handle.is_gpu() {
+                                delta_handle.clone()
+                            } else {
+                                let mut gpu_handle = gpu.allocate_gpu_matrix_handle(
+                                    delta_handle.rows(),
+                                    delta_handle.cols(),
+                                );
+                                gpu.copy_cpu_to_gpu_handle(&delta_handle, &gpu_handle);
+                                gpu_handle
+                            };
 
                             // Получаем persistent buffers для сегмента
                             let segment_buffers_opt = self.get_segment_buffers(seg_index);
@@ -391,12 +398,13 @@ impl MixedModel {
                                 temp_buffers = SegmentPersistentBuffers::for_segment(
                                     seg,
                                     &self.segment_placement[seg_index].compute_device,
-                                    delta_buf.rows(),
+                                    delta_handle.rows(),
                                     &mut self.memory_executor.lock().unwrap(),
                                 );
                                 temp_buffers
                             };
 
+                            // Вызываем GPU-обработку, получаем GPU-градиент
                             let out_gpu = process_backward_gpu_buffered(
                                 &gpu,
                                 &segment_buffers,
@@ -404,57 +412,65 @@ impl MixedModel {
                                 slices,
                                 ctxs_slice,
                                 &params,
-                                delta_gpu,
+                                delta_gpu_handle,
                                 &mut total_grad,
                             );
 
-                            // Конвертируем результат обратно в CPU MatrixBuffer
-                            let out_mat = gpu.download_gpu_matrix_to_mat(&out_gpu);
-                            let mut cpu_buf = pool.acquire(out_mat.nrows(), out_mat.ncols());
-                            cpu_buf.copy_from_mat(&out_mat);
-                            new_gradients[stream_idx] = Some(cpu_buf);
+                            // Конвертируем результат обратно в CPU handle
+                            let out_mat = gpu.download_gpu_handle_to_mat(&out_gpu);
+                            let mut cpu_handle = pool.acquire(out_mat.nrows(), out_mat.ncols());
+                            {
+                                let mut guard = cpu_handle.write();
+                                let dst = guard.as_slice_mut().expect("CPU buffer");
+                                for c in 0..out_mat.ncols() {
+                                    for r in 0..out_mat.nrows() {
+                                        dst[c * out_mat.nrows() + r] = out_mat[(r, c)];
+                                    }
+                                }
+                            }
+                            new_gradients[stream_idx] = Some(cpu_handle);
                         } else {
                             // CPU-путь
-                            let in_delta_buf = self.backward_universal_batch_buffered(
+                            let in_delta_handle = self.backward_universal_batch_buffered_handle(
                                 pool,
                                 proc,
                                 slices,
                                 &layer_ctxs,
-                                delta_buf,
+                                delta_handle,
                                 &params,
                                 &mut total_grad,
                             );
-                            new_gradients[stream_idx] = Some(in_delta_buf);
+                            new_gradients[stream_idx] = Some(in_delta_handle);
                         }
                     }
 
-                    // Подставляем результаты в stream_gradients
+                    // Заполняем пропущенные потоки клонами исходных градиентов
                     let mut final_grads = Vec::with_capacity(stream_gradients.len());
                     for i in 0..stream_gradients.len() {
-                        if let Some(buf) = new_gradients[i].take() {
-                            final_grads.push(buf);
+                        if let Some(handle) = new_gradients[i].take() {
+                            final_grads.push(handle);
                         } else {
-                            final_grads.push(std::mem::replace(
-                                &mut stream_gradients[i],
-                                MatrixBuffer::dummy(pool),
-                            ));
+                            final_grads.push(stream_gradients[i].clone());
                         }
                     }
                     stream_gradients = final_grads;
 
                     ctx_pos -= num_layers * active_indices.len();
                 }
-                Segment::SplitterConnector { dim_a, dim_b } => {
+                Segment::SplitterConnector { .. } => {
                     assert_eq!(stream_gradients.len(), 2);
-                    let delta_a = std::mem::replace(&mut stream_gradients[0], MatrixBuffer::dummy(pool));
-                    let delta_b = std::mem::replace(&mut stream_gradients[1], MatrixBuffer::dummy(pool));
+                    // SplitterConnector просто пропускает градиенты без изменений
+                    // Для handle-версии клонируем входы
+                    let delta_a = stream_gradients[0].clone();
+                    let delta_b = stream_gradients[1].clone();
 
-                    // Коннектор просто пропускает градиенты без изменений.
+                    // Создаём новые выходные handle с теми же размерами (копия)
                     let mut in_a = pool.acquire(delta_a.rows(), delta_a.cols());
                     let mut in_b = pool.acquire(delta_b.rows(), delta_b.cols());
-                    in_a.copy_from_slice(delta_a.as_slice());
-                    in_b.copy_from_slice(delta_b.as_slice());
+                    copy_handle_data(&delta_a, &in_a);
+                    copy_handle_data(&delta_b, &in_b);
 
+                    // Освобождаем старые входы
                     pool.release(delta_a);
                     pool.release(delta_b);
 
@@ -462,7 +478,7 @@ impl MixedModel {
                     ctx_pos -= 1;
                 }
                 Segment::CombinerConnector { .. } => {
-                    // Прозрачный проход: градиенты не меняются.
+                    // Прозрачный проход: градиенты не меняются
                     ctx_pos -= 1;
                 }
                 Segment::Splitter {
@@ -483,15 +499,15 @@ impl MixedModel {
                         _ => panic!("Expected Splitter context"),
                     };
 
-                    let da_buf = std::mem::replace(&mut stream_gradients[0], MatrixBuffer::dummy(pool));
-                    let db_buf = std::mem::replace(&mut stream_gradients[1], MatrixBuffer::dummy(pool));
+                    let da_handle = stream_gradients[0].clone();
+                    let db_handle = stream_gradients[1].clone();
+
+                    // Конвертируем в Mat для CPU-вычислений (временное решение)
+                    let da_mat = handle_to_mat(&da_handle);
+                    let db_mat = handle_to_mat(&db_handle);
 
                     let splitter = crate::layers::Splitter::new(*input_dim, output_dims.clone());
                     let (wa, wb, _, _) = splitter.get_weights_and_biases(&params, slice);
-
-                    // Временно используем Mat для вычислений (до полного перехода на буферы в Этапе 2)
-                    let da_mat = da_buf.to_mat();
-                    let db_mat = db_buf.to_mat();
 
                     let (dx_mat, grad) = splitter.backward_mat(
                         &x_mat,
@@ -507,15 +523,21 @@ impl MixedModel {
                         total_grad[slice.start + idx] += g;
                     }
 
-                    let rows = dx_mat.nrows();
-                    let cols = dx_mat.ncols();
-                    let mut dx_buf = pool.acquire(rows, cols);
-                    dx_buf.copy_from_mat(&dx_mat);
+                    let mut dx_handle = pool.acquire(dx_mat.nrows(), dx_mat.ncols());
+                    {
+                        let mut guard = dx_handle.write();
+                        let dst = guard.as_slice_mut().expect("CPU buffer");
+                        for c in 0..dx_mat.ncols() {
+                            for r in 0..dx_mat.nrows() {
+                                dst[c * dx_mat.nrows() + r] = dx_mat[(r, c)];
+                            }
+                        }
+                    }
 
-                    pool.release(da_buf);
-                    pool.release(db_buf);
+                    pool.release(da_handle);
+                    pool.release(db_handle);
 
-                    stream_gradients = vec![dx_buf];
+                    stream_gradients = vec![dx_handle];
                     ctx_pos -= 1;
                 }
                 Segment::Combiner {
@@ -536,12 +558,11 @@ impl MixedModel {
                         _ => panic!("Expected Combiner context"),
                     };
 
-                    let dout_buf = std::mem::replace(&mut stream_gradients[0], MatrixBuffer::dummy(pool));
+                    let dout_handle = stream_gradients[0].clone();
+                    let dout_mat = handle_to_mat(&dout_handle);
 
                     let combiner = crate::layers::Combiner::new(vec![*input_dim, *input_dim], *output_dim);
                     let (wa, wb, _) = combiner.get_weights_and_bias(&params, slice);
-
-                    let dout_mat = dout_buf.to_mat();
                     let (da_mat, db_mat, grad) = combiner.backward_mat(
                         &a_mat,
                         &b_mat,
@@ -554,19 +575,30 @@ impl MixedModel {
                         total_grad[slice.start + idx] += g;
                     }
 
-                    let rows_a = da_mat.nrows();
-                    let cols_a = da_mat.ncols();
-                    let mut da_buf = pool.acquire(rows_a, cols_a);
-                    da_buf.copy_from_mat(&da_mat);
+                    let mut da_handle = pool.acquire(da_mat.nrows(), da_mat.ncols());
+                    {
+                        let mut guard = da_handle.write();
+                        let dst = guard.as_slice_mut().expect("CPU buffer");
+                        for c in 0..da_mat.ncols() {
+                            for r in 0..da_mat.nrows() {
+                                dst[c * da_mat.nrows() + r] = da_mat[(r, c)];
+                            }
+                        }
+                    }
+                    let mut db_handle = pool.acquire(db_mat.nrows(), db_mat.ncols());
+                    {
+                        let mut guard = db_handle.write();
+                        let dst = guard.as_slice_mut().expect("CPU buffer");
+                        for c in 0..db_mat.ncols() {
+                            for r in 0..db_mat.nrows() {
+                                dst[c * db_mat.nrows() + r] = db_mat[(r, c)];
+                            }
+                        }
+                    }
 
-                    let rows_b = db_mat.nrows();
-                    let cols_b = db_mat.ncols();
-                    let mut db_buf = pool.acquire(rows_b, cols_b);
-                    db_buf.copy_from_mat(&db_mat);
+                    pool.release(dout_handle);
 
-                    pool.release(dout_buf);
-
-                    stream_gradients = vec![da_buf, db_buf];
+                    stream_gradients = vec![da_handle, db_handle];
                     ctx_pos -= 1;
                 }
             }
@@ -583,48 +615,44 @@ impl MixedModel {
         (stream_gradients, vec![total_grad])
     }
 
-    /// Универсальный обратный проход через слои с использованием MatrixBuffer
-    fn backward_universal_batch_buffered(
+    /// Универсальный обратный проход через слои с использованием MatrixBufferHandle
+    fn backward_universal_batch_buffered_handle(
         &mut self,
         pool: &mut TempMatrixPool,
         layers: &[Box<dyn UniversalLayer>],
         slices: &[ParamSlice],
         ctxs: &[&DynamicContext],
-        grad_out: MatrixBuffer,
+        grad_out: MatrixBufferHandle,
         params: &[f32],
         total_grad: &mut Vec<f32>,
-    ) -> MatrixBuffer {
+    ) -> MatrixBufferHandle {
         let mut current_grad = grad_out;
         for i in (0..layers.len()).rev() {
             let layer = &layers[i];
             let slice = &slices[i];
             let ctx = ctxs[i];
 
-            // Явно разрешаем неоднозначность input_features через трейт UniversalLayer
+            // Определяем входные размеры
             let in_features = if let Some(l) = layer.as_linear() {
-                <dyn UniversalLayer>::input_features(l)
-            } else if let Some(l) = layer.as_relu() {
-                <dyn UniversalLayer>::input_features(l)
-            } else if let Some(l) = layer.as_sigmoid() {
-                <dyn UniversalLayer>::input_features(l)
-            } else if let Some(l) = layer.as_tanh() {
-                <dyn UniversalLayer>::input_features(l)
-            } else if let Some(l) = layer.as_leaky_relu() {
-                <dyn UniversalLayer>::input_features(l)
-            } else if let Some(l) = layer.as_identity() {
-                <dyn UniversalLayer>::input_features(l)
-            } else if let Some(l) = layer.as_softmax() {
-                <dyn UniversalLayer>::input_features(l)
-            } else {
-                // fallback – используем число столбцов текущего градиента
+                <dyn UniversalLayerBuffered>::input_features(l)
+            } else if layer.as_relu().is_some()
+                || layer.as_sigmoid().is_some()
+                || layer.as_tanh().is_some()
+                || layer.as_leaky_relu().is_some()
+                || layer.as_identity().is_some()
+                || layer.as_softmax().is_some()
+                || layer.as_memory().is_some()
+                || layer.as_soft_sparse_gate().is_some()
+                || layer.as_soft_keep_gate().is_some()
+                || layer.as_dual_anchor().is_some()
+            {
                 current_grad.cols()
+            } else {
+                current_grad.cols() // fallback
             };
 
-            // Для слоёв без параметров (ReLU и т.п.) input_features возвращает 0,
-            // но реальная размерность определяется current_grad. Поэтому подменяем.
-            let real_in_features = if in_features == 0 { current_grad.cols() } else { in_features };
             let batch = current_grad.rows();
-            let mut grad_input = pool.acquire(batch, real_in_features);
+            let mut grad_input = pool.acquire(batch, in_features);
 
             let grad_params = if let Some(linear) = layer.as_linear() {
                 <Linear as UniversalLayerBuffered>::backward_buffered(
@@ -654,10 +682,35 @@ impl MixedModel {
                 <Softmax as UniversalLayerBuffered>::backward_buffered(
                     softmax, ctx, &current_grad, &mut grad_input, params, slice
                 )
+            } else if let Some(memory) = layer.as_memory() {
+                <Memory as UniversalLayerBuffered>::backward_buffered(
+                    memory, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
+                <SoftSparseGate as UniversalLayerBuffered>::backward_buffered(
+                    soft_sparse, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
+                <SoftKeepGate as UniversalLayerBuffered>::backward_buffered(
+                    soft_keep, ctx, &current_grad, &mut grad_input, params, slice
+                )
+            } else if let Some(dual_anchor) = layer.as_dual_anchor() {
+                <DualAnchor as UniversalLayerBuffered>::backward_buffered(
+                    dual_anchor, ctx, &current_grad, &mut grad_input, params, slice
+                )
             } else {
-                // fallback на старый метод
-                let (dx, grad) = layer.backward_mat(ctx, &current_grad.to_mat(), params, slice);
-                grad_input.copy_from_mat(&dx);
+                // Fallback на старый метод
+                let delta_mat = handle_to_mat(&current_grad);
+                let (dx, grad) = layer.backward_mat(ctx, &delta_mat, params, slice);
+                {
+                    let mut guard = grad_input.write();
+                    let dst = guard.as_slice_mut().expect("CPU buffer");
+                    for c in 0..dx.ncols() {
+                        for r in 0..dx.nrows() {
+                            dst[c * dx.nrows() + r] = dx[(r, c)];
+                        }
+                    }
+                }
                 grad
             };
 
@@ -670,4 +723,37 @@ impl MixedModel {
         }
         current_grad
     }
+}
+
+// Вспомогательные функции для конвертации handle <-> Mat (CPU)
+
+fn handle_to_mat(handle: &MatrixBufferHandle) -> Mat<f32> {
+    let guard = handle.read();
+    let slice = guard.as_slice().expect("handle_to_mat: expected CPU buffer");
+    Mat::from_fn(handle.rows(), handle.cols(), |r, c| {
+        slice[c * handle.rows() + r]
+    })
+}
+
+fn mat_to_handle(mat: &Mat<f32>, pool: &mut TempMatrixPool) -> MatrixBufferHandle {
+    let mut handle = pool.acquire(mat.nrows(), mat.ncols());
+    {
+        let mut guard = handle.write();
+        let dst = guard.as_slice_mut().expect("CPU buffer");
+        for c in 0..mat.ncols() {
+            for r in 0..mat.nrows() {
+                dst[c * mat.nrows() + r] = mat[(r, c)];
+            }
+        }
+    }
+    handle
+}
+
+fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
+    let src_guard = src.read();
+    let src_slice = src_guard.as_slice().expect("copy_handle_data: source must be CPU");
+    let mut dst_guard = dst.write();
+    let dst_slice = dst_guard.as_slice_mut().expect("copy_handle_data: destination must be CPU");
+    assert_eq!(src_slice.len(), dst_slice.len());
+    dst_slice.copy_from_slice(src_slice);
 }

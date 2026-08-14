@@ -4,7 +4,7 @@ use std::any::Any;
 use faer::Mat;
 use super::cubes::ElemCube;
 use super::cubes::BufferedElemCube;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 /// Кросс‑энтропия с логитами.
 ///
@@ -109,14 +109,21 @@ impl BufferedElemCube for CrossEntropyWithLogits {
         1
     }
 
-    fn forward_buffered(&self, input: &MatrixBuffer, output: &mut MatrixBuffer) {
+    fn forward_buffered(&self, input: &MatrixBufferHandle, output: &mut MatrixBufferHandle) {
         assert!(!input.is_gpu() && !output.is_gpu(),
             "BufferedElemCube for CrossEntropyWithLogits supports only CPU buffers");
 
         let batch = input.rows();
         let nclass = self.num_classes;
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("CrossEntropy forward: expected CPU buffer");
+
+        let mut dst_guard = output.write();
+        let dst = dst_guard.as_slice_mut().expect("CrossEntropy forward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), batch * (nclass + 1));
+        debug_assert_eq!(dst.len(), batch);
 
         // входная матрица имеет размер (batch, nclass+1), column-major
         for r in 0..batch {
@@ -138,19 +145,27 @@ impl BufferedElemCube for CrossEntropyWithLogits {
 
     fn backward_buffered(
         &self,
-        input: &MatrixBuffer,
-        _output_cache: &MatrixBuffer,
-        grad_out: &MatrixBuffer,
-        grad_in: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        _output_cache: &MatrixBufferHandle,
+        grad_out: &MatrixBufferHandle,
+        grad_in: &mut MatrixBufferHandle,
     ) {
         assert!(!input.is_gpu() && !grad_out.is_gpu() && !grad_in.is_gpu(),
             "BufferedElemCube for CrossEntropyWithLogits supports only CPU buffers");
 
         let batch = input.rows();
         let nclass = self.num_classes;
-        let src = input.as_slice();
-        let go = grad_out.as_slice(); // размер (batch,1)
-        let gi = grad_in.as_slice_mut(); // размер (batch, nclass+1)
+
+        let src_guard = input.read();
+        let src = src_guard.as_slice().expect("CrossEntropy backward: expected CPU buffer");
+        let go_guard = grad_out.read();
+        let go = go_guard.as_slice().expect("CrossEntropy backward: expected CPU buffer");
+        let mut gi_guard = grad_in.write();
+        let gi = gi_guard.as_slice_mut().expect("CrossEntropy backward: expected CPU buffer");
+
+        debug_assert_eq!(src.len(), batch * (nclass + 1));
+        debug_assert_eq!(go.len(), batch);
+        debug_assert_eq!(gi.len(), batch * (nclass + 1));
 
         for r in 0..batch {
             let class_idx = src[nclass * batch + r] as usize;

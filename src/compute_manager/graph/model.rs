@@ -14,7 +14,7 @@ use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::compute_manager::adaptive_planner::ProfilingData;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBuffer, MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::DevicePlan;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::{BufferedParamStore, ParamStore};
@@ -279,11 +279,11 @@ impl MixedModel {
         let mut pool = pool_arc.lock().unwrap();
 
         let mat = self.dynamic_tensor_to_mat(input);
-        let buf = self.mat_to_matrix_buffer(&mat, &mut pool);
+        let buf = self.mat_to_matrix_buffer_handle(&mat, &mut pool);
 
         let (out_bufs, ctxs) = self.forward_mat_multi_buffered(&mut pool, vec![buf]);
         let out_buf = out_bufs.into_iter().next().expect("No output buffer");
-        let out_tensor = self.matrix_buffer_to_dynamic_tensor(out_buf, &self.output_shapes[0]);
+        let out_tensor = self.matrix_buffer_handle_to_dynamic_tensor(out_buf, &self.output_shapes[0]);
 
         (out_tensor, ctxs)
     }
@@ -297,11 +297,11 @@ impl MixedModel {
         let mut pool = pool_arc.lock().unwrap();
 
         let delta_mat = self.dynamic_tensor_to_mat(delta);
-        let delta_buf = self.mat_to_matrix_buffer(&delta_mat, &mut pool);
+        let delta_buf = self.mat_to_matrix_buffer_handle(&delta_mat, &mut pool);
 
         let (in_bufs, grads) = self.backward_mat_multi_buffered(&mut pool, contexts, vec![delta_buf]);
         let in_buf = in_bufs.into_iter().next().expect("No input buffer");
-        let in_tensor = self.matrix_buffer_to_dynamic_tensor(in_buf, &self.input_shapes[0]);
+        let in_tensor = self.matrix_buffer_handle_to_dynamic_tensor(in_buf, &self.input_shapes[0]);
 
         (in_tensor, grads)
     }
@@ -313,11 +313,11 @@ impl MixedModel {
         let pool_arc = self.temp_matrix_pool.clone();
         let mut pool = pool_arc.lock().unwrap();
 
-        let bufs: Vec<MatrixBuffer> = inputs
+        let bufs: Vec<MatrixBufferHandle> = inputs
             .into_iter()
             .map(|tensor| {
                 let mat = self.dynamic_tensor_to_mat(tensor);
-                self.mat_to_matrix_buffer(&mat, &mut pool)
+                self.mat_to_matrix_buffer_handle(&mat, &mut pool)
             })
             .collect();
 
@@ -326,7 +326,7 @@ impl MixedModel {
         let out_tensors = out_bufs
             .into_iter()
             .zip(self.output_shapes.iter())
-            .map(|(buf, shape)| self.matrix_buffer_to_dynamic_tensor(buf, shape))
+            .map(|(buf, shape)| self.matrix_buffer_handle_to_dynamic_tensor(buf, shape))
             .collect();
 
         (out_tensors, ctxs)
@@ -340,11 +340,11 @@ impl MixedModel {
         let pool_arc = self.temp_matrix_pool.clone();
         let mut pool = pool_arc.lock().unwrap();
 
-        let delta_bufs: Vec<MatrixBuffer> = deltas
+        let delta_bufs: Vec<MatrixBufferHandle> = deltas
             .into_iter()
             .map(|tensor| {
                 let mat = self.dynamic_tensor_to_mat(tensor);
-                self.mat_to_matrix_buffer(&mat, &mut pool)
+                self.mat_to_matrix_buffer_handle(&mat, &mut pool)
             })
             .collect();
 
@@ -353,7 +353,7 @@ impl MixedModel {
         let in_tensors = in_bufs
             .into_iter()
             .zip(self.input_shapes.iter())
-            .map(|(buf, shape)| self.matrix_buffer_to_dynamic_tensor(buf, shape))
+            .map(|(buf, shape)| self.matrix_buffer_handle_to_dynamic_tensor(buf, shape))
             .collect();
 
         (in_tensors, grads)
@@ -382,15 +382,31 @@ impl MixedModel {
         if let Some(ref gpu_compute_mutex) = self.gpu_compute {
             if use_gpu {
                 let gpu_compute = gpu_compute_mutex.lock().unwrap();
-                let pred_gpu = gpu_compute.upload_mat_to_gpu_matrix(pred);
-                let target_gpu = gpu_compute.upload_mat_to_gpu_matrix(target);
-                let (loss, grad_pred_gpu) = crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered(
+
+                // Конвертируем Mat в GPU-дескрипторы
+                let pred_flat = GpuCompute::mat_to_flat(pred);
+                let target_flat = GpuCompute::mat_to_flat(target);
+                let pred_gpu_handle = gpu_compute.upload_vec_to_gpu_handle(
+                    &pred_flat,
+                    pred.nrows(),
+                    pred.ncols(),
+                );
+                let target_gpu_handle = gpu_compute.upload_vec_to_gpu_handle(
+                    &target_flat,
+                    target.nrows(),
+                    target.ncols(),
+                );
+
+                // Вызываем handle-версию GPU-вычисления потерь
+                let (loss, grad_pred_handle) = crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered_handle(
                     &gpu_compute,
                     &expr,
-                    &pred_gpu,
-                    &target_gpu,
+                    &pred_gpu_handle,
+                    &target_gpu_handle,
                 );
-                let grad_pred = gpu_compute.download_gpu_matrix_to_mat(&grad_pred_gpu);
+
+                // Скачиваем градиент обратно в Mat
+                let grad_pred = gpu_compute.download_gpu_handle_to_mat(&grad_pred_handle);
                 (loss, grad_pred)
             } else {
                 self.compute_loss_mat_cpu_buffered(expr, pred, target)
@@ -408,20 +424,36 @@ impl MixedModel {
     ) -> (f32, Mat<f32>) {
         let pool_arc = self.temp_matrix_pool.clone();
         let mut pool = pool_arc.lock().unwrap();
-        let pred_buf = self.mat_to_matrix_buffer(pred, &mut pool);
-        let target_buf = self.mat_to_matrix_buffer(target, &mut pool);
+
+        // Создаём handle для pred и target из Mat
+        let pred_buf = self.mat_to_matrix_buffer_handle(pred, &mut pool);
+        let target_buf = self.mat_to_matrix_buffer_handle(target, &mut pool);
+
         let (loss, grad_buf) = crate::plans::loss_plan::execution::compute_loss_mat_buffered(
             &expr,
             &pred_buf,
             &target_buf,
             &mut pool,
         );
-        let grad_mat = grad_buf.to_mat();
+
+        // Конвертируем градиент обратно в Mat
+        let grad_guard = grad_buf.read();
+        let grad_slice = grad_guard.as_slice().expect("CPU buffer");
+        let grad_mat = Mat::from_fn(grad_buf.rows(), grad_buf.cols(), |r, c| {
+            grad_slice[c * grad_buf.rows() + r]
+        });
+        drop(grad_guard);
+
+        // Возвращаем буферы в пул
+        pool.release(pred_buf);
+        pool.release(target_buf);
+        pool.release(grad_buf);
+
         (loss, grad_mat)
     }
 
     // ===================================================================
-    // Вспомогательные функции конвертации DynamicTensor <-> MatrixBuffer
+    // Вспомогательные функции конвертации DynamicTensor <-> MatrixBufferHandle
     // ===================================================================
 
     fn dynamic_tensor_to_mat(&self, tensor: DynamicTensor) -> Mat<f32> {
@@ -444,19 +476,34 @@ impl MixedModel {
         }
     }
 
-    fn mat_to_matrix_buffer(&self, mat: &Mat<f32>, pool: &mut TempMatrixPool) -> MatrixBuffer {
+    fn mat_to_matrix_buffer_handle(&self, mat: &Mat<f32>, pool: &mut TempMatrixPool) -> MatrixBufferHandle {
         let mut buf = pool.acquire(mat.nrows(), mat.ncols());
-        buf.copy_from_mat(mat);
+        {
+            let mut guard = buf.write();
+            let slice = guard.as_slice_mut().expect("CPU buffer");
+            for c in 0..mat.ncols() {
+                for r in 0..mat.nrows() {
+                    slice[c * mat.nrows() + r] = mat[(r, c)];
+                }
+            }
+        }
         buf
     }
 
-    fn matrix_buffer_to_dynamic_tensor(&self, buf: MatrixBuffer, shape: &[usize]) -> DynamicTensor {
+    fn matrix_buffer_handle_to_dynamic_tensor(
+        &self,
+        buf: MatrixBufferHandle,
+        shape: &[usize],
+    ) -> DynamicTensor {
         let mat = if buf.is_gpu() {
             let gpu_compute = self.gpu_compute.as_ref().expect("GPU compute not available").lock().unwrap();
-            gpu_compute.download_gpu_matrix_to_mat(&buf)
+            gpu_compute.download_gpu_handle_to_mat(&buf)
         } else {
-            buf.to_mat()
+            let guard = buf.read();
+            let slice = guard.as_slice().expect("CPU buffer");
+            Mat::from_fn(buf.rows(), buf.cols(), |r, c| slice[c * buf.rows() + r])
         };
+
         let tensor = self.mat_to_dynamic_tensor(mat, shape);
         drop(buf);
         tensor
@@ -482,14 +529,6 @@ impl MixedModel {
     // НОВЫЙ МЕТОД: шаг оптимизации через буферизованное хранилище
     // ===================================================================
 
-    /// Выполняет шаг оптимизации, используя `BufferedParamStore`.
-    ///
-    /// Метод создаёт буферизованное хранилище при первом вызове,
-    /// инициализирует параметры из старого `ParamStore` и применяет
-    /// цепочку оптимизатора к `MatrixBuffer`.
-    ///
-    /// После шага параметры синхронизируются обратно в `ParamStore`
-    /// для сохранения совместимости со старым путём.
     pub fn update_params_buffered(&mut self, desc: OptimizerDesc) {
         let chain = desc.build_chain();
         let state_size = chain.total_state_size_per_param();

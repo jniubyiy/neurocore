@@ -1,7 +1,7 @@
 // src/layers/soft_keep_gate/soft_keep_gate.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
@@ -106,7 +106,6 @@ impl UniversalLayer for SoftKeepGate {
         Mat::zeros(batch_size, self.in_features)
     }
 
-    // Исправлено: возвращаем None для as_soft_sparse_gate и Some(self) для as_soft_keep_gate
     fn as_soft_sparse_gate(&self) -> Option<&crate::layers::SoftSparseGate> {
         None
     }
@@ -123,11 +122,17 @@ impl UniversalLayer for SoftKeepGate {
 impl UniversalLayerBuffered for SoftKeepGate {
     fn forward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     ) {
+        let input_guard = input.read();
+        let src = input_guard.as_slice().expect("SoftKeepGate forward: expected CPU buffer");
+
+        let mut output_guard = output.write();
+        let dst = output_guard.as_slice_mut().expect("SoftKeepGate forward: expected CPU buffer");
+
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.in_features);
@@ -135,8 +140,6 @@ impl UniversalLayerBuffered for SoftKeepGate {
         let thresholds = &params[slice.start..slice.start + self.in_features];
         let tmp = self.temperature;
 
-        let src = input.as_slice();
-        let dst = output.as_slice_mut();
         debug_assert_eq!(src.len(), dst.len());
 
         // column-major обход: внешний цикл по признакам, внутренний по строкам
@@ -156,8 +159,8 @@ impl UniversalLayerBuffered for SoftKeepGate {
     fn backward_buffered(
         &self,
         ctx: &DynamicContext,
-        grad_output: &MatrixBuffer,
-        grad_input: &mut MatrixBuffer,
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
@@ -166,11 +169,19 @@ impl UniversalLayerBuffered for SoftKeepGate {
             DynamicContext::Buffered(bc) => bc,
             _ => panic!("Expected Buffered context"),
         };
-        let input_arc = match bc {
+        let input_handle = match bc {
             BufferedContext::SoftKeepGate { input } => input,
             _ => panic!("Expected SoftKeepGate context"),
         };
-        let input = input_arc.as_ref();
+
+        let input_guard = input_handle.read();
+        let x_slice = input_guard.as_slice().expect("SoftKeepGate backward: expected CPU buffer");
+
+        let go_guard = grad_output.read();
+        let go = go_guard.as_slice().expect("SoftKeepGate backward: expected CPU buffer");
+
+        let mut gi_guard = grad_input.write();
+        let gi = gi_guard.as_slice_mut().expect("SoftKeepGate backward: expected CPU buffer");
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
@@ -179,11 +190,8 @@ impl UniversalLayerBuffered for SoftKeepGate {
         let thresholds = &params[slice.start..slice.start + self.in_features];
         let tmp = self.temperature;
 
-        let go = grad_output.as_slice();
-        let gi = grad_input.as_slice_mut();
-        let x_slice = input.as_slice();
-
         debug_assert_eq!(go.len(), gi.len());
+        debug_assert_eq!(go.len(), x_slice.len());
 
         let mut d_thr = vec![0.0f32; self.in_features];
 

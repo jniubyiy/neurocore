@@ -8,7 +8,7 @@ use crate::compute_manager::cpu::worker_pool::WorkerPool;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::gpu::processor::process_forward_gpu;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::layers::{UniversalLayer, UniversalLayerBuffered};
 use crate::layers::buffered_context::BufferedContext;
@@ -170,6 +170,7 @@ impl MixedModel {
         }
     }
 
+    // CPU-путь с использованием MatrixBufferHandle
     pub(crate) fn process_universal_processor_forward_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -177,7 +178,7 @@ impl MixedModel {
         slices: &[ParamSlice],
         _seg_index: usize,
         params: &[f32],
-        stream_buffers: &mut Vec<MatrixBuffer>,
+        stream_buffers: &mut Vec<MatrixBufferHandle>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
         stream_indices: &Option<Vec<usize>>,
     ) {
@@ -189,66 +190,63 @@ impl MixedModel {
         let layers = proc.as_ref();
         let num_layers = layers.len();
 
-        let mut stream_opt: Vec<Option<MatrixBuffer>> = std::mem::take(stream_buffers)
-            .into_iter()
-            .map(Some)
+        // Клонируем входные дескрипторы для неактивных потоков (они не меняются)
+        let mut new_stream: Vec<Option<MatrixBufferHandle>> = stream_buffers
+            .iter()
+            .map(|handle| Some(handle.clone()))
             .collect();
-        let total_streams = stream_opt.len();
-
-        let mut new_stream: Vec<MatrixBuffer> = Vec::with_capacity(active_indices.len());
 
         for &stream_idx in &active_indices {
-            // Забираем входной буфер и оборачиваем в Arc
-            let initial_buf = stream_opt[stream_idx].take().unwrap();
-            let mut current_input: Arc<MatrixBuffer> = Arc::new(initial_buf);
-            let batch_size = current_input.rows();
+            // Забираем входной дескриптор (клонируем, исходный останется для других)
+            let input_handle = stream_buffers[stream_idx].clone();
+            let batch_size = input_handle.rows();
+            let mut current_input = input_handle;
             let mut layer_ctxs: Vec<DynamicContext> = Vec::with_capacity(num_layers);
 
             for i in 0..num_layers {
                 let layer = &layers[i];
                 let slice = &slices[i];
 
-                let out_features = get_buffered_output_features(layer, current_input.as_ref());
+                // Определяем размер выходного буфера
+                let out_features = get_buffered_output_features(layer, &current_input);
+                let output_handle = pool.acquire(batch_size, out_features);
 
-                let mut output_buf = pool.acquire(batch_size, out_features);
+                // Выполняем прямой проход
                 call_forward_buffered(
                     layer,
-                    current_input.as_ref(),
-                    &mut output_buf,
+                    &current_input,
+                    &output_handle,
                     params,
                     slice,
                 );
 
-                // Оборачиваем выходной буфер в Arc и сохраняем в контексте
-                let output_arc = Arc::new(output_buf);
-                let buffered_ctx = build_buffered_context(layer, &current_input, &output_arc);
+                // Создаём контекст для обратного прохода
+                let buffered_ctx = build_buffered_context(layer, &current_input, &output_handle);
                 layer_ctxs.push(DynamicContext::Buffered(buffered_ctx));
 
-                current_input = output_arc;
+                // Обновляем текущий вход для следующего слоя
+                current_input = output_handle;
             }
 
-            new_stream.push(Arc::try_unwrap(current_input).unwrap_or_else(|arc| (*arc).clone()));
+            // Записываем результат для этого потока
+            new_stream[stream_idx] = Some(current_input);
 
+            // Добавляем контексты для всех сэмплов (одинаковы для всех)
             for sample_ctxs in all_ctxs.iter_mut() {
                 sample_ctxs.extend(layer_ctxs.clone());
             }
         }
 
-        let mut final_buffers = Vec::with_capacity(total_streams);
-        for i in 0..total_streams {
-            if active_indices.contains(&i) {
-                final_buffers.push(new_stream.remove(0));
-            } else {
-                final_buffers.push(stream_opt[i].take().unwrap());
-            }
-        }
-        *stream_buffers = final_buffers;
+        // Обновляем stream_buffers
+        *stream_buffers = new_stream
+            .into_iter()
+            .map(|opt| opt.expect("Missing stream buffer after forward"))
+            .collect();
     }
 }
 
-/// Возвращает количество выходных признаков слоя, используя UniversalLayerBuffered,
-/// а для не-буферизованных слоёв — размерность входа.
-fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBuffer) -> usize {
+/// Возвращает количество выходных признаков слоя, используя UniversalLayerBuffered.
+fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
     if let Some(l) = layer.as_linear() {
         <dyn UniversalLayerBuffered>::output_features(l)
     } else if layer.as_relu().is_some()
@@ -273,8 +271,8 @@ fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixB
 /// Вызывает буферизованный прямой проход для слоя.
 fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
-    input: &MatrixBuffer,
-    output: &mut MatrixBuffer,
+    input: &MatrixBufferHandle,
+    output: &MatrixBufferHandle,
     params: &[f32],
     slice: &ParamSlice,
 ) {
@@ -293,20 +291,31 @@ fn call_forward_buffered(
     } else if let Some(l) = layer.as_softmax() {
         <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else {
-        let mat_in = input.to_mat();
+        // Fallback на старый метод (если слой не переведён)
+        let input_mat = input.read();
+        let input_slice = input_mat.as_slice().expect("CPU buffer");
+        let mat_in = Mat::from_fn(input.rows(), input.cols(), |r, c| {
+            input_slice[c * input.rows() + r]
+        });
         let (mat_out, _ctx) = layer.forward_mat(&mat_in, params, slice);
-        output.copy_from_mat(&mat_out);
+        let mut output_guard = output.write();
+        let output_slice = output_guard.as_slice_mut().expect("CPU buffer");
+        for c in 0..mat_out.ncols() {
+            for r in 0..mat_out.nrows() {
+                output_slice[c * output.rows() + r] = mat_out[(r, c)];
+            }
+        }
     }
 }
 
 /// Создаёт буферизованный контекст для слоя.
 ///
 /// В зависимости от типа слоя возвращает соответствующий вариант `BufferedContext`,
-/// сохраняя `Arc<MatrixBuffer>` на входные или выходные данные.
+/// сохраняя `MatrixBufferHandle` на входные или выходные данные.
 fn build_buffered_context(
     layer: &Box<dyn UniversalLayer>,
-    input: &Arc<MatrixBuffer>,
-    output: &Arc<MatrixBuffer>,
+    input: &MatrixBufferHandle,
+    output: &MatrixBufferHandle,
 ) -> BufferedContext {
     if layer.as_linear().is_some() {
         BufferedContext::Linear { input: input.clone() }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use faer::Mat;
 use crate::compute_manager::cpu::{Scheduler, WorkerPool};
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use super::expr::LossExpr;
 
 /// Вычисляет значение функции потерь и градиент по предсказанию на CPU (матричная версия).
@@ -63,26 +63,26 @@ pub fn compute_loss_mat(
 }
 
 /// Вычисляет значение функции потерь и градиент по предсказанию на CPU с использованием
-/// управляемых буферов `MatrixBuffer` и пула `TempMatrixPool`.
+/// управляемых буферов `MatrixBufferHandle` и пула `TempMatrixPool`.
 ///
 /// # Аргументы
 /// * `expr` – выражение потерь.
-/// * `pred` – буфер предсказаний `(batch, pred_features)` (CPU).
-/// * `target` – буфер целей `(batch, target_features)` (CPU).
+/// * `pred` – дескриптор предсказаний `(batch, pred_features)` (CPU).
+/// * `target` – дескриптор целей `(batch, target_features)` (CPU).
 /// * `pool` – пул временных матриц для выделения промежуточных буферов.
 ///
 /// # Возвращает
 /// * `loss` – агрегированное значение потерь.
-/// * `grad_pred` – буфер градиентов по pred размерности `(batch, pred_features)`.
+/// * `grad_pred` – дескриптор градиентов по pred размерности `(batch, pred_features)`.
 ///
 /// # Паника
 /// Паникует, если `pred` или `target` являются GPU-буферами.
 pub fn compute_loss_mat_buffered(
     expr: &Arc<LossExpr>,
-    pred: &MatrixBuffer,
-    target: &MatrixBuffer,
+    pred: &MatrixBufferHandle,
+    target: &MatrixBufferHandle,
     pool: &mut TempMatrixPool,
-) -> (f32, MatrixBuffer) {
+) -> (f32, MatrixBufferHandle) {
     assert!(!pred.is_gpu() && !target.is_gpu(),
         "compute_loss_mat_buffered supports only CPU buffers");
 
@@ -96,11 +96,15 @@ pub fn compute_loss_mat_buffered(
     let in_features = pred_feat + target_feat;
 
     // Формируем полный вход [pred | target]
-    let mut full_input = pool.acquire(batch, in_features);
+    let full_input = pool.acquire(batch, in_features);
     {
-        let src_pred = pred.as_slice();
-        let src_target = target.as_slice();
-        let dst_full = full_input.as_slice_mut();
+        let src_pred_guard = pred.read();
+        let src_pred = src_pred_guard.as_slice().expect("Pred must be CPU");
+        let src_target_guard = target.read();
+        let src_target = src_target_guard.as_slice().expect("Target must be CPU");
+
+        let mut dst_guard = full_input.write();
+        let dst_full = dst_guard.as_slice_mut().expect("Full input must be CPU");
 
         // Копируем pred в первые столбцы, target в следующие
         for c in 0..pred_feat {
@@ -127,10 +131,12 @@ pub fn compute_loss_mat_buffered(
     let grad_full = expr.backward_chunk_buffered(&intermediates, &grad_loss, pool);
 
     // Извлекаем градиент только по pred (первые pred_feat столбцов)
-    let mut grad_pred = pool.acquire(batch, pred_feat);
+    let grad_pred = pool.acquire(batch, pred_feat);
     {
-        let src_grad = grad_full.as_slice();
-        let dst_grad = grad_pred.as_slice_mut();
+        let src_grad_guard = grad_full.read();
+        let src_grad = src_grad_guard.as_slice().expect("Grad full must be CPU");
+        let mut dst_guard = grad_pred.write();
+        let dst_grad = dst_guard.as_slice_mut().expect("Grad pred must be CPU");
 
         for c in 0..pred_feat {
             for r in 0..batch {

@@ -3,7 +3,7 @@
 use faer::Mat;
 use super::cubes::ElemCube;
 use super::cubes::BufferedElemCube;
-use crate::compute_manager::matrix_buffer::{MatrixBuffer, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
 /// Цепочка элементарных кубиков, выполняющая последовательное преобразование над батчем.
 #[derive(Debug)]
@@ -34,13 +34,12 @@ impl ElementChain {
         &self.cubes
     }
 
-    /// Выполняет полный прямой проход по всей цепочке над одним батчем.
+    /// Выполняет полный прямой проход по всей цепочке над одним батчем (матричная версия).
     ///
     /// Принимает матрицу `input` размером `(batch, task_input_size())`.
     /// Возвращает кортеж:
     /// * итоговая матрица `(batch, out_features последнего кубика)`,
     /// * вектор промежуточных результатов в формате `(вход_кубика, выход_кубика)` для каждого кубика.
-    ///   Это необходимо для последующего обратного прохода.
     pub fn forward_batch(&self, input: &Mat<f32>) -> (Mat<f32>, Vec<(Mat<f32>, Mat<f32>)>) {
         let mut intermediates = Vec::with_capacity(self.cubes.len());
         let mut current = input.clone();
@@ -52,7 +51,7 @@ impl ElementChain {
         (current, intermediates)
     }
 
-    /// Выполняет обратный проход по всей цепочке, используя сохранённые промежуточные значения.
+    /// Выполняет обратный проход по всей цепочке, используя сохранённые промежуточные значения (матричная версия).
     ///
     /// * `intermediates` — результат `forward_batch` (вектор пар (вход, выход) для каждого кубика),
     /// * `grad_out` — градиент по выходу цепочки, матрица `(batch, out_features последнего кубика)`.
@@ -75,29 +74,27 @@ impl ElementChain {
     }
 
     // ===================================================================
-    // БУФЕРИЗОВАННЫЕ МЕТОДЫ (MatrixBuffer + TempMatrixPool)
+    // БУФЕРИЗОВАННЫЕ МЕТОДЫ (MatrixBufferHandle + TempMatrixPool)
     // ===================================================================
 
-    /// Прямой проход по цепочке с использованием управляемых буферов.
+    /// Прямой проход по цепочке с использованием управляемых дескрипторов.
     ///
-    /// Принимает входной `MatrixBuffer` (CPU) и пул для выделения промежуточных буферов.
+    /// Принимает входной `MatrixBufferHandle` (CPU) и пул для выделения промежуточных буферов.
     /// Возвращает итоговый буфер и вектор пар `(вход, выход)` для обратного прохода.
     /// Все промежуточные данные выделяются через пул и управляются `MemoryExecutor`.
     pub fn forward_batch_buffered(
         &self,
-        input: &MatrixBuffer,
+        input: &MatrixBufferHandle,
         pool: &mut TempMatrixPool,
-    ) -> (MatrixBuffer, Vec<(MatrixBuffer, MatrixBuffer)>) {
+    ) -> (MatrixBufferHandle, Vec<(MatrixBufferHandle, MatrixBufferHandle)>) {
         let batch = input.rows();
         let mut intermediates = Vec::with_capacity(self.cubes.len());
 
-        // Начальный буфер — копия входа
-        let mut current = clone_matrix_buffer(pool, input);
+        // Начальный буфер — копия входа (чтобы сохранить данные для обратного прохода)
+        let mut current = clone_handle_data(pool, input);
 
         for cube in &self.cubes {
             // Определяем размеры выходного буфера.
-            // Для поэлементных кубиков (Square, Abs, Neg, Log, Log1p, AddScalar)
-            // сохраняем размерность входа.
             let out_rows = current.rows();
             let out_cols = if cube_preserves_shape(cube.as_ref()) {
                 current.cols()
@@ -110,10 +107,12 @@ impl ElementChain {
             let buffered_cube = cube_as_buffered(cube);
             buffered_cube.forward_buffered(&current, &mut out);
 
-            // Сохраняем копии входа и выхода для обратного прохода
+            // Сохраняем копии входа и выхода для обратного прохода.
+            // Важно: создаём новые буферы с копией данных, так как `current` и `out`
+            // могут быть изменены в следующих итерациях.
             intermediates.push((
-                clone_matrix_buffer(pool, &current),
-                clone_matrix_buffer(pool, &out),
+                clone_handle_data(pool, &current),
+                clone_handle_data(pool, &out),
             ));
 
             current = out;
@@ -122,22 +121,22 @@ impl ElementChain {
         (current, intermediates)
     }
 
-    /// Обратный проход по цепочке с использованием управляемых буферов.
+    /// Обратный проход по цепочке с использованием управляемых дескрипторов.
     ///
     /// Принимает промежуточные результаты (из `forward_batch_buffered`),
     /// градиент по выходу цепочки и пул.
     /// Возвращает градиент по входу цепочки.
     pub fn backward_batch_buffered(
         &self,
-        intermediates: &[(MatrixBuffer, MatrixBuffer)],
-        grad_out: &MatrixBuffer,
+        intermediates: &[(MatrixBufferHandle, MatrixBufferHandle)],
+        grad_out: &MatrixBufferHandle,
         pool: &mut TempMatrixPool,
-    ) -> MatrixBuffer {
+    ) -> MatrixBufferHandle {
         assert_eq!(intermediates.len(), self.cubes.len(),
             "ElementChain::backward_batch_buffered: количество промежуточных результатов не совпадает с числом кубиков");
 
-        // Начальный градиент — копия grad_out
-        let mut grad = clone_matrix_buffer(pool, grad_out);
+        // Начальный градиент — копия grad_out (чтобы не изменять оригинал)
+        let mut grad = clone_handle_data(pool, grad_out);
 
         // Идём по кубикам в обратном порядке
         for (cube, (inp, outp)) in self.cubes.iter().zip(intermediates.iter()).rev() {
@@ -160,18 +159,26 @@ impl ElementChain {
 // Вспомогательные функции
 // ---------------------------------------------------------------------------
 
-/// Создаёт копию буфера через пул.
+/// Создаёт копию данных из исходного handle через пул.
 /// Работает только для CPU-буферов (для GPU не реализовано).
-fn clone_matrix_buffer(pool: &mut TempMatrixPool, src: &MatrixBuffer) -> MatrixBuffer {
-    assert!(!src.is_gpu(), "clone_matrix_buffer does not support GPU buffers");
+fn clone_handle_data(pool: &mut TempMatrixPool, src: &MatrixBufferHandle) -> MatrixBufferHandle {
+    assert!(!src.is_gpu(), "clone_handle_data does not support GPU buffers");
     let rows = src.rows();
     let cols = src.cols();
     let mut copy = pool.acquire(rows, cols);
-    copy.copy_from_slice(src.as_slice());
+    {
+        let src_guard = src.read();
+        let src_slice = src_guard.as_slice().expect("Source must be CPU");
+        let mut dst_guard = copy.write();
+        let dst_slice = dst_guard.as_slice_mut().expect("Destination must be CPU");
+        assert_eq!(src_slice.len(), dst_slice.len());
+        dst_slice.copy_from_slice(src_slice);
+    }
     copy
 }
 
 /// Преобразует `&Box<dyn ElemCube>` в `&dyn BufferedElemCube`.
+/// Использует downcasting к конкретным типам, которые реализуют оба трейта.
 fn cube_as_buffered(cube: &Box<dyn ElemCube>) -> &dyn BufferedElemCube {
     use super::cubes::{Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff};
     use super::cross_entropy::CrossEntropyWithLogits;

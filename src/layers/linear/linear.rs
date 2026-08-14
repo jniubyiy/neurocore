@@ -1,7 +1,7 @@
 // src/layers/linear/linear.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBuffer;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayer;
 use crate::layers::UniversalLayerBuffered;
@@ -142,8 +142,8 @@ impl UniversalLayer for Linear {
 impl UniversalLayerBuffered for Linear {
     fn forward_buffered(
         &self,
-        input: &MatrixBuffer,
-        output: &mut MatrixBuffer,
+        input: &MatrixBufferHandle,
+        output: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     ) {
@@ -151,8 +151,11 @@ impl UniversalLayerBuffered for Linear {
         let in_cols = input.cols();
         let out_cols = self.out_features;
 
-        let input_slice = input.as_slice();
-        let output_slice = output.as_slice_mut();
+        let input_guard = input.read();
+        let input_slice = input_guard.as_slice().expect("Linear forward: expected CPU buffer");
+
+        let mut output_guard = output.write();
+        let output_slice = output_guard.as_slice_mut().expect("Linear forward: expected CPU buffer");
 
         debug_assert_eq!(input_slice.len(), in_rows * in_cols);
         debug_assert_eq!(output_slice.len(), in_rows * out_cols);
@@ -175,8 +178,8 @@ impl UniversalLayerBuffered for Linear {
     fn backward_buffered(
         &self,
         ctx: &DynamicContext,
-        grad_output: &MatrixBuffer,
-        grad_input: &mut MatrixBuffer,
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
@@ -185,19 +188,23 @@ impl UniversalLayerBuffered for Linear {
             DynamicContext::Buffered(bc) => bc,
             _ => panic!("Expected Buffered context"),
         };
-        let input_arc = match bc {
+        let input_handle = match bc {
             BufferedContext::Linear { input } => input,
             _ => panic!("Expected Linear context"),
         };
-        let input = input_arc.as_ref();
+
+        let input_guard = input_handle.read();
+        let x_slice = input_guard.as_slice().expect("Linear backward: expected CPU buffer");
 
         let in_rows = grad_input.rows();
         let in_cols = grad_input.cols();      // == self.in_features
         let out_cols = grad_output.cols();    // == self.out_features
 
-        let go_slice = grad_output.as_slice();
-        let gi_slice = grad_input.as_slice_mut();
-        let x_slice = input.as_slice();
+        let go_guard = grad_output.read();
+        let go_slice = go_guard.as_slice().expect("Linear backward: expected CPU buffer");
+
+        let mut gi_guard = grad_input.write();
+        let gi_slice = gi_guard.as_slice_mut().expect("Linear backward: expected CPU buffer");
 
         debug_assert_eq!(go_slice.len(), in_rows * out_cols);
         debug_assert_eq!(gi_slice.len(), in_rows * in_cols);

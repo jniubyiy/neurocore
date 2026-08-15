@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use faer::Mat;
 
 use crate::compute_manager::cpu::{Scheduler, WorkerPool};
-use crate::compute_manager::cpu::scheduler::LayerInfo;
 use crate::compute_manager::device_assignment::SegmentPlacement;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
@@ -16,7 +15,7 @@ use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::DevicePlan;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::{BufferedParamStore, ParamStore};
-use crate::optimizer_plan::{OptimizerExpr, OptimizerChain, OptimizerDesc, cubes::*};
+use crate::optimizer_plan::{OptimizerExpr, OptimizerChain, OptimizerDesc};
 use crate::linalg;
 
 pub(crate) struct DevicePlacementState {
@@ -32,8 +31,6 @@ pub struct MixedModel {
     pub(crate) scheduler: Mutex<Scheduler>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) gpu_compute: Option<Mutex<GpuCompute>>,
-    #[allow(dead_code)]
-    pub(crate) layer_infos: Vec<Vec<LayerInfo>>,
     pub(crate) input_stream_count: usize,
     pub(crate) output_stream_count: usize,
     pub(crate) memory_executor: Arc<Mutex<MemoryExecutor>>,
@@ -44,15 +41,12 @@ pub struct MixedModel {
     pub(crate) placement_state: Arc<Mutex<DevicePlacementState>>,
 
     /// Пул временных матриц для управляемого выделения памяти на CPU.
-    /// Обёрнут в Arc<Mutex<...>> для потокобезопасного доступа из графа.
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
 
     /// Новое буферизованное хранилище параметров и градиентов.
-    /// Использует `MatrixBufferHandle`.
     pub(crate) buffered_param_store: Option<BufferedParamStore>,
 
     /// Буферизованный интерпретатор оптимизатора с состояниями.
-    /// Создаётся лениво и хранится между шагами обучения.
     pub(crate) optimizer_expr: Option<OptimizerExpr>,
 }
 
@@ -374,22 +368,6 @@ impl MixedModel {
         let tensor = self.mat_to_dynamic_tensor(mat, shape);
         drop(buf);
         tensor
-    }
-
-    pub fn forward_universal_batch_mat(
-        layers: &[Box<dyn crate::layers::UniversalLayer>],
-        slices: &[crate::model_plan::param_store::ParamSlice],
-        batch: &Mat<f32>,
-        params: &[f32],
-    ) -> (Mat<f32>, Vec<DynamicContext>) {
-        let mut current = batch.clone();
-        let mut ctxs = Vec::new();
-        for (layer, slice) in layers.iter().zip(slices.iter()) {
-            let (next, ctx) = layer.forward_mat(&current, params, slice);
-            ctxs.push(ctx);
-            current = next;
-        }
-        (current, ctxs)
     }
 
     // ===================================================================

@@ -3,20 +3,13 @@
 use std::sync::Arc;
 
 use crate::layers::buffered_context::BufferedContext;
-use crate::layers::mat_context::MatContext;
 use crate::model_plan::param_store::ParamSlice;
 use crate::layers::UniversalLayer;
 
 /// Контекст, сохраняемый слоями для обратного прохода.
-///
-/// После перехода на управляемые буферы все матрицы внутри контекста
-/// представлены как [`MatrixBuffer`].
 #[derive(Clone)]
 pub enum DynamicContext {
-    /// Матричный контекст на основе `faer::Mat` (старый путь).
-    Mat(MatContext),
-
-    /// Буферизованный контекст на основе `MatrixBuffer` (новый CPU‑путь).
+    /// Буферизованный контекст на основе `MatrixBufferHandle`.
     Buffered(BufferedContext),
 }
 

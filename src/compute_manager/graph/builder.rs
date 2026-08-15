@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::cpu::{CostModel, Scheduler, WorkerPool};
 use crate::compute_manager::cpu::hardware::CPU_INFO;
-use crate::compute_manager::cpu::scheduler::LayerInfo;
 use crate::compute_manager::device::Device;
 use crate::compute_manager::device_assignment::assign_devices_initial;
 use crate::compute_manager::device_spec::DeviceId;
@@ -144,7 +143,6 @@ impl MixedModel {
         // 5. Строим сегменты модели
         // -----------------------------------------------------------
         let mut segments: Vec<Segment> = Vec::new();
-        let mut layer_infos: Vec<Vec<LayerInfo>> = Vec::new();
         let mut current_layers: Vec<Box<dyn UniversalLayer>> = Vec::new();
         let mut current_slices: Vec<ParamSlice> = Vec::new();
         let mut active_ports: Option<Vec<usize>> = None;
@@ -154,23 +152,11 @@ impl MixedModel {
         macro_rules! finalize_universal {
             () => {
                 if !current_layers.is_empty() {
-                    let infos: Vec<LayerInfo> = current_layers
-                        .iter()
-                        .enumerate()
-                        .map(|(i, layer)| LayerInfo {
-                            id: i,
-                            layer_type: crate::compute_manager::cpu::scheduler::LayerType::Linear,
-                            in_features: layer.input_features(),
-                            out_features: layer.output_features(),
-                            total_rows: 0,
-                        })
-                        .collect();
                     segments.push(Segment::UniversalProcessor(
                         Arc::new(std::mem::take(&mut current_layers)),
                         std::mem::take(&mut current_slices),
                         current_stream_indices.take(),
                     ));
-                    layer_infos.push(infos);
                 }
             };
         }
@@ -327,7 +313,6 @@ impl MixedModel {
             scheduler: Mutex::new(scheduler),
             executor,
             gpu_compute,
-            layer_infos,
             input_stream_count,
             output_stream_count,
             memory_executor,

@@ -16,64 +16,18 @@ pub mod soft_sparse_gate;
 pub mod soft_keep_gate;
 pub mod dual_anchor;
 
-pub mod mat_context;
 pub mod layers_special;
-
-// Новый контекст для буферизованного CPU‑пути
 pub mod buffered_context;
 
 use crate::model_plan::param_store::ParamSlice;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use faer::Mat;
 
 // ---------------------------------------------------------------------------
-// Старый трейт UniversalLayer (оставлен для обратной совместимости)
+// Маркерный трейт UniversalLayer (для downcasting и общей информации)
 // ---------------------------------------------------------------------------
 
 pub trait UniversalLayer: Send + Sync + 'static {
-    fn forward_mat(
-        &self,
-        input: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, DynamicContext);
-
-    fn backward_mat(
-        &self,
-        ctx: &DynamicContext,
-        delta: &Mat<f32>,
-        params: &[f32],
-        slice: &ParamSlice,
-    ) -> (Mat<f32>, Vec<f32>);
-
-    fn param_len(&self) -> usize;
-    fn input_features(&self) -> usize;
-    fn output_features(&self) -> usize;
-
-    fn total_tasks(&self, batch_size: usize) -> usize { batch_size }
-
-    fn execute_tasks(
-        &self,
-        input: &Mat<f32>,
-        output: &mut Mat<f32>,
-        task_offset: usize,
-        task_count: usize,
-        params: &[f32],
-        slice: &ParamSlice,
-    );
-
-    fn create_sample_context(
-        &self,
-        input_sample: &Mat<f32>,
-        output_sample: &Mat<f32>,
-    ) -> DynamicContext;
-
-    fn output_mat_shape(&self, batch_size: usize) -> Mat<f32> {
-        Mat::zeros(batch_size, self.output_features())
-    }
-
-    // ----- Методы для GPU-диспетчеризации -----
     fn as_linear(&self) -> Option<&Linear> { None }
     fn as_relu(&self) -> Option<&ReLU> { None }
     fn as_sigmoid(&self) -> Option<&Sigmoid> { None }
@@ -81,31 +35,25 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_leaky_relu(&self) -> Option<&LeakyReLU> { None }
     fn as_identity(&self) -> Option<&Identity> { None }
     fn as_softmax(&self) -> Option<&Softmax> { None }
-    fn as_dual_anchor(&self) -> Option<&DualAnchor> { None }
+    fn as_memory(&self) -> Option<&Memory> { None }
     fn as_soft_sparse_gate(&self) -> Option<&SoftSparseGate> { None }
     fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> { None }
+    fn as_dual_anchor(&self) -> Option<&DualAnchor> { None }
     fn as_reduce_mean(&self) -> Option<&ReduceMean> { None }
     fn as_unsqueeze(&self) -> Option<&Unsqueeze> { None }
-    fn as_memory(&self) -> Option<&Memory> { None }
+
+    // Общая информация о слое, используемая планировщиком.
+    // По умолчанию возвращает 0. Конкретные слои переопределяют.
+    fn param_len(&self) -> usize { 0 }
+    fn input_features(&self) -> usize { 0 }
+    fn output_features(&self) -> usize { 0 }
 }
 
 // ---------------------------------------------------------------------------
 // Новый трейт UniversalLayerBuffered – основа для работы с буферами
 // ---------------------------------------------------------------------------
 
-/// Версия слоя, работающая с управляемыми буферами [`MatrixBufferHandle`].
-///
-/// Входные и выходные данные передаются через лёгкие дескрипторы, которые
-/// ссылаются на записи в `MemoryExecutor`. Это позволяет избежать копирования
-/// данных и централизованно управлять памятью.
 pub trait UniversalLayerBuffered: Send + Sync + 'static {
-    /// Прямой проход.
-    ///
-    /// # Аргументы
-    /// * `input` – входной дескриптор (только для чтения).
-    /// * `output` – выходной дескриптор (для записи).
-    /// * `params` – плоский срез всех параметров модели.
-    /// * `slice` – границы параметров, принадлежащих данному слою.
     fn forward_buffered(
         &self,
         input: &MatrixBufferHandle,
@@ -114,17 +62,6 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
         slice: &ParamSlice,
     );
 
-    /// Обратный проход.
-    ///
-    /// # Аргументы
-    /// * `ctx` – контекст, сохранённый прямым проходом.
-    /// * `grad_output` – градиент по выходу слоя.
-    /// * `grad_input` – буфер, куда будет записан градиент по входу.
-    /// * `params` – плоский срез всех параметров модели.
-    /// * `slice` – границы параметров, принадлежащих данному слою.
-    ///
-    /// # Возвращает
-    /// Вектор градиентов по параметрам слоя.
     fn backward_buffered(
         &self,
         ctx: &DynamicContext,
@@ -134,13 +71,10 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
         slice: &ParamSlice,
     ) -> Vec<f32>;
 
-    /// Количество обучаемых параметров слоя.
     fn param_len(&self) -> usize;
 
-    /// Количество входных признаков.
     fn input_features(&self) -> usize;
 
-    /// Количество выходных признаков.
     fn output_features(&self) -> usize;
 }
 
@@ -164,6 +98,5 @@ pub use soft_sparse_gate::SoftSparseGate;
 pub use soft_keep_gate::SoftKeepGate;
 pub use dual_anchor::DualAnchor;
 
-pub use mat_context::{MatContext, LayerInfo};
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 pub use buffered_context::BufferedContext;

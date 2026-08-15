@@ -5,7 +5,6 @@ pub mod executor;
 pub mod pipeline;
 pub mod compute;
 pub mod processor;
-pub mod param_store;
 
 pub use init::GpuContext;
 pub use executor::GpuExecutor;
@@ -14,7 +13,6 @@ pub use processor::{
     process_forward_gpu_buffered,
     process_backward_gpu_buffered,
 };
-pub use param_store::GpuParamStore;
 
 /// Обнаружить доступные GPU с помощью Vulkan.
 /// Возвращает список имён устройств (или None, если Vulkan недоступен).

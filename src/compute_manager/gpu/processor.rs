@@ -3,7 +3,6 @@
 use faer::Mat;
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::mat_context::MatContext;
@@ -29,7 +28,7 @@ fn download_gpu_handle_to_mat(gpu: &GpuCompute, handle: &MatrixBufferHandle) -> 
 }
 
 // ===================================================================
-// НОВЫЕ БУФЕРИЗОВАННЫЕ ВЕРСИИ ДЛЯ GPU (MatrixBufferHandle)
+// БУФЕРИЗОВАННЫЕ ВЕРСИИ ДЛЯ GPU (MatrixBufferHandle)
 // ===================================================================
 
 /// Прямой проход на GPU с использованием MatrixBufferHandle.
@@ -41,7 +40,6 @@ fn download_gpu_handle_to_mat(gpu: &GpuCompute, handle: &MatrixBufferHandle) -> 
 /// до вызова данной функции (см. `MixedModel::forward_mat_multi_buffered`).
 pub fn process_forward_gpu_buffered(
     gpu_compute: &GpuCompute,
-    _segment_buffers: &SegmentPersistentBuffers,
     layers: &[Box<dyn UniversalLayer>],
     slices: &[ParamSlice],
     params: &[f32],
@@ -120,10 +118,6 @@ pub fn process_forward_gpu_buffered(
             }));
             current = out_handle;
         } else if let Some(memory) = layer.as_memory() {
-            // Инициализируем состояние Memory, если ещё не инициализировано.
-            // Внимание: `memory_state` должен быть инициализирован заранее;
-            // в противном случае здесь произойдёт паника при вызове handle-метода.
-            // В вызывающем коде должна быть выполнена инициализация.
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
             gpu_compute.run_memory_forward_buffered_handle(&current, &out_handle, memory.alpha);
             ctxs.push(DynamicContext::Buffered(BufferedContext::Memory {
@@ -174,7 +168,6 @@ pub fn process_forward_gpu_buffered(
             }));
             current = out_handle;
         } else {
-            // Неизвестный слой – такого не должно быть, так как все слои перечислены.
             panic!(
                 "Unsupported layer in GPU buffered forward: {:?}",
                 std::any::type_name_of_val(layer.as_ref())
@@ -190,7 +183,6 @@ pub fn process_forward_gpu_buffered(
 /// Для всех слоёв используются GPU handle-методы.
 pub fn process_backward_gpu_buffered(
     gpu_compute: &GpuCompute,
-    _segment_buffers: &SegmentPersistentBuffers,
     layers: &[Box<dyn UniversalLayer>],
     slices: &[ParamSlice],
     contexts: &[DynamicContext],
@@ -220,7 +212,6 @@ pub fn process_backward_gpu_buffered(
             let input_handle = match ctx {
                 DynamicContext::Buffered(BufferedContext::Linear { input }) => input.clone(),
                 DynamicContext::Mat(MatContext::Linear { input }) => {
-                    // Конвертируем Mat в GPU handle (на случай, если контекст старый)
                     upload_mat_to_gpu_handle(gpu_compute, input)
                 }
                 _ => panic!("Expected Linear context"),
@@ -330,12 +321,10 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_identity() {
-            // Identity: градиент проходит насквозь, копируем GPU -> GPU
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             gpu_compute.copy_gpu_handle_to_gpu_handle(&current_grad, &grad_input_handle);
             current_grad = grad_input_handle;
         } else if let Some(memory) = layer.as_memory() {
-            // Memory обратный проход: gi = go * (1 - alpha)
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             gpu_compute.run_memory_backward_buffered_handle(
                 &current_grad,

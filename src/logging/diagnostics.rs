@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use crate::compute_manager::device_spec::DeviceId;
-use crate::compute_manager::memory_executor::TensorBufferId;
+use crate::compute_manager::memory_executor::MatrixBufferId;
 use crate::compute_manager::graph::types::Segment;
 
 /// Статистика по параметрам модели или градиентам
@@ -22,7 +22,7 @@ pub struct ParamsStats {
 pub struct TensorDiagInfo {
     pub size_elements: usize,
     pub device: DeviceId,
-    pub handle: TensorBufferId,
+    pub handle: MatrixBufferId,
 }
 
 /// Полный контекст ошибки, собираемый во время выполнения
@@ -32,8 +32,8 @@ pub struct DiagContext {
     pub device_info: Vec<String>,
     /// Краткое описание сегментов модели
     pub segment_summary: Vec<String>,
-    /// Снимок состояния тензоров (TensorBufferId -> информация)
-    pub tensor_snapshot: HashMap<TensorBufferId, TensorDiagInfo>,
+    /// Снимок состояния тензоров (MatrixBufferId -> информация)
+    pub tensor_snapshot: HashMap<MatrixBufferId, TensorDiagInfo>,
     /// Статистика параметров модели
     pub params_stats: Option<ParamsStats>,
     /// Описание последнего выполнявшегося шага
@@ -62,8 +62,8 @@ impl DiagContext {
 /// * `device_info` – список строк с описанием устройств
 /// * `segment_summary` – список строк с описанием сегментов
 /// * `_segments` – ссылка на сегменты (задел на будущее)
-/// * `tensor_loc` – карта расположения тензоров (TensorBufferId -> DeviceId)
-/// * `tensor_sizes` – карта размеров тензоров (TensorBufferId -> количество элементов)
+/// * `tensor_loc` – карта расположения тензоров (MatrixBufferId -> DeviceId)
+/// * `tensor_sizes` – карта размеров тензоров (MatrixBufferId -> количество элементов)
 /// * `params` – плоский срез всех параметров модели
 /// * `grads` – плоский срез градиентов (может быть пустым)
 /// * `last_step_description` – описание шага, на котором произошла ошибка
@@ -72,8 +72,8 @@ pub fn capture_diagnostics(
     device_info: Vec<String>,
     segment_summary: Vec<String>,
     _segments: &[Segment],               // задел на будущее
-    tensor_loc: &HashMap<TensorBufferId, DeviceId>,
-    tensor_sizes: &HashMap<TensorBufferId, usize>,
+    tensor_loc: &HashMap<MatrixBufferId, DeviceId>,
+    tensor_sizes: &HashMap<MatrixBufferId, usize>,
     params: &[f32],
     grads: &[f32],
     last_step_description: String,

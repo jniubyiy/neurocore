@@ -10,8 +10,6 @@ pub mod memory_executor;
 pub mod matrix_buffer;
 pub mod device_spec;
 pub mod device_assignment;
-pub mod device_tensor;
-pub mod persistent_buffer;
 pub mod adaptive_planner;
 
 // Публичные реэкспорты

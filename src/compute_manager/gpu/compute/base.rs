@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use faer::Mat;
-use vulkano::buffer::{BufferUsage, Subbuffer};
+use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::{
     allocator::StandardCommandBufferAllocator,
     AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo,
@@ -21,10 +21,8 @@ use crate::compute_manager::memory_executor::{
     MemoryExecutor,
     types::MemoryDeviceKind,
     executor::RawBufferId,
-    TensorBufferId,
     BufferPriority,
 };
-use crate::compute_manager::persistent_buffer::DeviceBuffer;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::compute_manager::memory_executor::matrix_entry::MatrixStorage;
 
@@ -67,22 +65,6 @@ impl GpuCompute {
         }
     }
 
-    // --- Долгоживущие буферы (для совместимости с моделью) ---
-
-    pub fn create_buffer(
-        &self,
-        elements: usize,
-        _usage: BufferUsage,
-    ) -> (Subbuffer<[f32]>, TensorBufferId) {
-        let mut mem = self.memory_executor.lock().unwrap();
-        let kind = MemoryDeviceKind::DeviceVram(self.gpu_device_id);
-        let id = mem.allocate(kind, elements, BufferPriority::High)
-            .expect("Failed to allocate GPU buffer");
-        let resolved = mem.resolve_buffer(id, kind)
-            .expect("Failed to resolve buffer");
-        (resolved.as_device_buffer().clone(), id)
-    }
-
     // --- Временные буферы ---
 
     pub fn acquire_temp_buffer(
@@ -117,7 +99,7 @@ impl GpuCompute {
         self.memory_executor.lock().unwrap().release_temp_buffer(MemoryDeviceKind::HostRam, buffer, raw_id);
     }
 
-    // --- Загрузка / выгрузка данных ---
+    // --- Загрузка данных ---
 
     pub fn upload_to_temp_buffer(
         &self,
@@ -137,62 +119,7 @@ impl GpuCompute {
         (gpu_buf, raw_id)
     }
 
-    // --- Работа с постоянными (persistent) буферами ---
-
-    pub fn copy_persistent_to_persistent(
-        &self,
-        src: &DeviceBuffer,
-        dst: &DeviceBuffer,
-    ) {
-        let src_buf = self.resolve_persistent_to_subbuffer(src);
-        let dst_buf = self.resolve_persistent_to_subbuffer(dst);
-        self.copy_buffer_sync(src_buf, dst_buf);
-    }
-
-    pub fn fill_persistent_buffer(
-        &self,
-        buffer: &DeviceBuffer,
-        data: &[f32],
-    ) {
-        let elements = buffer.size_elements;
-        assert_eq!(data.len(), elements, "Data size must match buffer size");
-
-        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
-        {
-            let mut write_guard = staging_buf.write().expect("write staging buffer");
-            write_guard[..elements].copy_from_slice(data);
-        }
-        let dst_buf = self.resolve_persistent_to_subbuffer(buffer);
-        self.copy_buffer_sync(staging_buf.clone(), dst_buf);
-        self.release_staging_buffer(staging_buf, staging_raw);
-    }
-
-    pub fn read_persistent_buffer(
-        &self,
-        buffer: &DeviceBuffer,
-    ) -> Vec<f32> {
-        let elements = buffer.size_elements;
-        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
-        let src_buf = self.resolve_persistent_to_subbuffer(buffer);
-        self.copy_buffer_sync(src_buf, staging_buf.clone());
-
-        let data_vec = {
-            let guard = staging_buf.read().expect("read staging buffer");
-            let slice = &guard[..elements];
-            slice.to_vec()
-        };
-        self.release_staging_buffer(staging_buf, staging_raw);
-        data_vec
-    }
-
-    fn resolve_persistent_to_subbuffer(
-        &self,
-        _buffer: &DeviceBuffer,
-    ) -> Subbuffer<[f32]> {
-        panic!("resolve_persistent_to_subbuffer needs refactoring: DeviceBuffer must store Subbuffer");
-    }
-
-    // --- Копирование между двумя Subbuffer'ами (синхронно) ---
+    // --- Копирование между Subbuffer'ами ---
 
     pub fn copy_buffer_sync(&self, src: Subbuffer<[f32]>, dst: Subbuffer<[f32]>) {
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -213,7 +140,7 @@ impl GpuCompute {
         future.wait(None).unwrap();
     }
 
-    // --- Одномерный диспатч ---
+    // --- Диспатч ---
 
     pub fn run_compute_shader<const N: usize>(
         &self,
@@ -225,8 +152,6 @@ impl GpuCompute {
         let dispatch_dim = [((total_elements + 255) / 256) as u32, 1, 1];
         self.run_compute_shader_with_dispatch(pipeline, buffers, push_constants, dispatch_dim);
     }
-
-    // --- Явный диспатч ---
 
     pub fn run_compute_shader_with_dispatch<const N: usize>(
         &self,
@@ -282,8 +207,6 @@ impl GpuCompute {
         future.wait(None).unwrap();
     }
 
-    // --- Двумерный диспатч ---
-
     pub fn run_compute_shader_2d<const N: usize>(
         &self,
         pipeline: Arc<vulkano::pipeline::ComputePipeline>,
@@ -307,7 +230,7 @@ impl GpuCompute {
     }
 
     // ===================================================================
-    // НОВЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С MatrixBufferHandle
+    // МЕТОДЫ ДЛЯ РАБОТЫ С MatrixBufferHandle
     // ===================================================================
 
     pub fn allocate_gpu_matrix_handle(&self, rows: usize, cols: usize) -> MatrixBufferHandle {
@@ -389,7 +312,6 @@ impl GpuCompute {
 
         let src_guard = src.read();
         let src_slice = src_guard.as_slice().expect("Source is not CPU");
-
         self.copy_slice_to_gpu_handle(dst, src_slice);
     }
 
@@ -404,7 +326,6 @@ impl GpuCompute {
         assert_eq!(elements, dst.rows() * dst.cols(), "Buffer sizes must match");
 
         let data_vec = self.download_gpu_handle_to_vec(src);
-
         let mut dst_guard = dst.write();
         let dst_slice = dst_guard.as_slice_mut().expect("Destination is not CPU");
         dst_slice.copy_from_slice(&data_vec);

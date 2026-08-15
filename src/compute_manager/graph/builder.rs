@@ -11,7 +11,6 @@ use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::gpu::GpuCompute;
-use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::compute_manager::graph::model::{DevicePlacementState, MixedModel};
 use crate::compute_manager::matrix_buffer::TempMatrixPool;
 use crate::device_plan::{ComputeDevice, DevicePlan};
@@ -116,7 +115,6 @@ impl MixedModel {
         // 4. Настройка исполнителя (CPU или GPU)
         // -----------------------------------------------------------
         let mut gpu_compute: Option<Mutex<GpuCompute>> = None;
-        let mut gpu_param_store: Option<Mutex<GpuParamStore>> = None;
         let executor: Box<dyn Executor> = if let Some(gpu_ctx) = gpu_context {
             let gpu_id = device_plan.compute_devices.iter()
                 .find_map(|d| if let ComputeDevice::Gpu { id } = d { Some(*id) } else { None })
@@ -288,22 +286,7 @@ impl MixedModel {
         let segment_placement = assign_devices_initial(&segments, &device_plan, batch_size);
 
         // -----------------------------------------------------------
-        // 6. Создаём GPU-хранилище параметров, если есть GPU
-        // -----------------------------------------------------------
-        if let Some(ref gpu_compute_mutex) = gpu_compute {
-            let initial_params = store.lock().unwrap().all_params_vec();
-            let gpu_compute = gpu_compute_mutex.lock().unwrap();
-            let gpu_store = GpuParamStore::from_cpu(
-                gpu_compute.context.memory_allocator.clone(),
-                &initial_params,
-                0,
-            );
-            gpu_param_store = Some(Mutex::new(gpu_store));
-            eprintln!("[BUILDER] GpuParamStore initialized");
-        }
-
-        // -----------------------------------------------------------
-        // 7. Вычисляем ожидаемые формы входных и выходных тензоров
+        // 6. Вычисляем ожидаемые формы входных и выходных тензоров
         // -----------------------------------------------------------
         let input_shapes: Vec<Vec<usize>> = vec![layers.first().unwrap().input_shape.streams.clone()];
         let output_shapes: Vec<Vec<usize>> = if output_stream_count == 1 {
@@ -324,18 +307,17 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
-        // 8. Создаём пул временных матриц
+        // 7. Создаём пул временных матриц
         // -----------------------------------------------------------
         let temp_matrix_pool = Arc::new(Mutex::new(TempMatrixPool::new(memory_executor.clone())));
 
         eprintln!(
-            "[BUILDER] gpu_compute.is_some() = {}, gpu_param_store.is_some() = {}",
-            gpu_compute.is_some(),
-            gpu_param_store.is_some()
+            "[BUILDER] gpu_compute.is_some() = {}",
+            gpu_compute.is_some()
         );
 
         // -----------------------------------------------------------
-        // 9. Собираем MixedModel с начальным состоянием размещения
+        // 8. Собираем MixedModel с начальным состоянием размещения
         // -----------------------------------------------------------
         let mut model = MixedModel {
             segments,
@@ -345,7 +327,6 @@ impl MixedModel {
             scheduler: Mutex::new(scheduler),
             executor,
             gpu_compute,
-            gpu_param_store,
             layer_infos,
             input_stream_count,
             output_stream_count,
@@ -353,7 +334,6 @@ impl MixedModel {
             input_shapes,
             output_shapes,
             placement_state: Arc::new(Mutex::new(DevicePlacementState {
-                segment_buffers: vec![],
                 profiling_data: crate::compute_manager::adaptive_planner::ProfilingData::new(),
                 placements: vec![],
             })),
@@ -363,7 +343,7 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
-        // 10. Выделяем постоянные буферы для начального размещения
+        // 9. Выделяем постоянные буферы для начального размещения
         // -----------------------------------------------------------
         model.maybe_reassign_devices(&device_plan, batch_size);
 

@@ -15,9 +15,9 @@ pub mod matrix_entry;
 
 pub use executor::MemoryExecutor;
 pub use executor::MemoryError;
-pub use types::{TensorBufferId, BufferLocation, BufferData, TensorBuffer, MemoryDeviceKind};
+pub use types::MemoryDeviceKind;
 pub use policy::{BufferPriority, MemoryTier, MemoryPolicy};
 
-// Реэкспорт новых идентификаторов, метаданных и хранилища
+// Реэкспорт новых идентификаторов и хранилища
 pub use matrix_id::MatrixBufferId;
 pub use matrix_entry::{MatrixEntry, MatrixStorage};

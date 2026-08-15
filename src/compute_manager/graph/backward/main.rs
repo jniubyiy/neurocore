@@ -6,7 +6,6 @@ use crate::compute_manager::dim_change;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
-use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::compute_manager::gpu::processor::process_backward_gpu_buffered;
 use crate::device_plan::plan::ComputeDevice;
 use crate::layers::{
@@ -21,9 +20,6 @@ impl MixedModel {
     // Буферизованная версия обратного прохода (MatrixBufferHandle + TempMatrixPool)
     // ===================================================================
 
-    /// Обратный проход с использованием пула временных дескрипторов.
-    /// Принимает контексты (могут быть `DynamicContext::Buffered` или `Mat`),
-    /// градиенты выходов как `Vec<MatrixBufferHandle>` и возвращает градиенты входов и накопленные градиенты параметров.
     pub fn backward_mat_multi_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -92,7 +88,7 @@ impl MixedModel {
                             let delta_gpu_handle = if delta_handle.is_gpu() {
                                 delta_handle.clone()
                             } else {
-                                let mut gpu_handle = gpu.allocate_gpu_matrix_handle(
+                                let gpu_handle = gpu.allocate_gpu_matrix_handle(
                                     delta_handle.rows(),
                                     delta_handle.cols(),
                                 );
@@ -100,25 +96,9 @@ impl MixedModel {
                                 gpu_handle
                             };
 
-                            // Получаем persistent buffers для сегмента
-                            let segment_buffers_opt = self.get_segment_buffers(seg_index);
-                            let temp_buffers;
-                            let segment_buffers = if let Some(b) = segment_buffers_opt {
-                                b
-                            } else {
-                                temp_buffers = SegmentPersistentBuffers::for_segment(
-                                    seg,
-                                    &self.segment_placement[seg_index].compute_device,
-                                    delta_handle.rows(),
-                                    &mut self.memory_executor.lock().unwrap(),
-                                );
-                                temp_buffers
-                            };
-
                             // Вызываем GPU-обработку, получаем GPU-градиент
                             let out_gpu = process_backward_gpu_buffered(
                                 &gpu,
-                                &segment_buffers,
                                 proc,
                                 slices,
                                 ctxs_slice,
@@ -129,7 +109,7 @@ impl MixedModel {
 
                             // Конвертируем результат обратно в CPU handle
                             let out_mat = gpu.download_gpu_handle_to_mat(&out_gpu);
-                            let mut cpu_handle = pool.acquire(out_mat.nrows(), out_mat.ncols());
+                            let cpu_handle = pool.acquire(out_mat.nrows(), out_mat.ncols());
                             {
                                 let mut guard = cpu_handle.write();
                                 let dst = guard.as_slice_mut().expect("CPU buffer");
@@ -174,8 +154,8 @@ impl MixedModel {
                     let delta_b = stream_gradients[1].clone();
 
                     // SplitterConnector просто пропускает градиенты без изменений
-                    let mut in_a = pool.acquire(delta_a.rows(), delta_a.cols());
-                    let mut in_b = pool.acquire(delta_b.rows(), delta_b.cols());
+                    let in_a = pool.acquire(delta_a.rows(), delta_a.cols());
+                    let in_b = pool.acquire(delta_b.rows(), delta_b.cols());
                     copy_handle_data(&delta_a, &in_a);
                     copy_handle_data(&delta_b, &in_b);
 
@@ -240,8 +220,6 @@ impl MixedModel {
                         for c in 0..n {
                             let mut sum = 0.0;
                             for k in 0..p {
-                                // d_pre_a: column-major => d_pre_a_vec[k * batch + r]
-                                // wa: row-major => wa_vec[k * n + c]
                                 sum += d_pre_a_vec[k * batch + r] * wa_vec[k * n + c];
                             }
                             for k in 0..q {

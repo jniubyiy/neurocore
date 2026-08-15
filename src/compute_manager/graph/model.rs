@@ -10,9 +10,7 @@ use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::gpu::GpuCompute;
-use crate::compute_manager::gpu::param_store::GpuParamStore;
 use crate::compute_manager::memory_executor::MemoryExecutor;
-use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::compute_manager::adaptive_planner::ProfilingData;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::DevicePlan;
@@ -22,7 +20,6 @@ use crate::optimizer_plan::{OptimizerExpr, OptimizerChain, OptimizerDesc, cubes:
 use crate::linalg;
 
 pub(crate) struct DevicePlacementState {
-    pub(crate) segment_buffers: Vec<Option<SegmentPersistentBuffers>>,
     pub(crate) profiling_data: ProfilingData,
     pub(crate) placements: Vec<SegmentPlacement>,
 }
@@ -35,7 +32,6 @@ pub struct MixedModel {
     pub(crate) scheduler: Mutex<Scheduler>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) gpu_compute: Option<Mutex<GpuCompute>>,
-    pub(crate) gpu_param_store: Option<Mutex<GpuParamStore>>,
     #[allow(dead_code)]
     pub(crate) layer_infos: Vec<Vec<LayerInfo>>,
     pub(crate) input_stream_count: usize,
@@ -95,7 +91,7 @@ impl MixedModel {
             if state.placements.is_empty() {
                 let initial = self.segment_placement.clone();
                 drop(state);
-                self.allocate_and_set_placements(initial, batch_size);
+                self.allocate_and_set_placements(initial);
                 return;
             }
             let mut profiling = state.profiling_data.clone();
@@ -115,50 +111,15 @@ impl MixedModel {
                 );
                 placements
             };
-            self.allocate_and_set_placements(new_placements, batch_size);
+            self.allocate_and_set_placements(new_placements);
         }
     }
 
-    fn allocate_and_set_placements(&mut self, new_placements: Vec<SegmentPlacement>, batch_size: usize) {
-        if new_placements.is_empty() {
-            return;
-        }
-
+    fn allocate_and_set_placements(&mut self, new_placements: Vec<SegmentPlacement>) {
         let mut state = self.placement_state.lock().unwrap();
-        let n = self.segments.len();
-        let mut old_buffers = std::mem::replace(&mut state.segment_buffers, vec![None; n]);
-        if old_buffers.len() != n {
-            old_buffers.resize(n, None);
-        }
-
-        let old_placements = std::mem::replace(&mut state.placements, new_placements.clone());
-        let mut new_buffers = vec![None; n];
-
-        let mut executor = self.memory_executor.lock().unwrap();
-
-        for idx in 0..n {
-            let old_pl = old_placements.get(idx);
-            let new_pl = &new_placements[idx];
-            if Some(new_pl) == old_pl {
-                new_buffers[idx] = old_buffers[idx].clone();
-            } else {
-                if let Some(old_buf) = old_buffers[idx].clone() {
-                    old_buf.release(&mut executor);
-                }
-                let buf = SegmentPersistentBuffers::for_segment(
-                    &self.segments[idx],
-                    &new_pl.compute_device,
-                    batch_size,
-                    &mut executor,
-                );
-                new_buffers[idx] = Some(buf);
-            }
-        }
-
-        state.segment_buffers = new_buffers;
-        state.placements = new_placements;
+        state.placements = new_placements.clone();
         state.profiling_data = ProfilingData::new();
-        self.segment_placement = state.placements.clone();
+        self.segment_placement = new_placements;
     }
 
     pub(crate) fn record_segment_timing(
@@ -170,10 +131,6 @@ impl MixedModel {
         if let Ok(mut state) = self.placement_state.lock() {
             state.profiling_data.add(seg_index, device.clone(), duration_ns);
         }
-    }
-
-    pub(crate) fn get_segment_buffers(&self, seg_index: usize) -> Option<SegmentPersistentBuffers> {
-        self.placement_state.lock().ok()?.segment_buffers[seg_index].clone()
     }
 
     pub fn create_optimizer(&self, chain: OptimizerChain) -> OptimizerExpr {
@@ -192,87 +149,6 @@ impl MixedModel {
         let mut params = store.all_params_vec();
         opt.step(&mut params, grads);
         store.set_all_params(&params);
-    }
-
-    pub fn update_params_gpu(&self, desc: OptimizerDesc, step: usize) {
-        let gpu_store = self.gpu_param_store
-            .as_ref()
-            .expect("GPU param store is not available");
-        let gpu_compute_mutex = self.gpu_compute
-            .as_ref()
-            .expect("GPU compute is not available");
-        let gpu_compute = gpu_compute_mutex.lock().unwrap();
-        let mut store = gpu_store.lock().unwrap();
-
-        let total = store.num_params;
-        let chain = desc.build_chain();
-        let cubes = chain.cubes();
-
-        let required_state_per_param = chain.total_state_size_per_param();
-        if required_state_per_param > 0 {
-            let total_state_elems = total * required_state_per_param;
-            let need_new = match &store.opt_state {
-                None => true,
-                Some(buf) => buf.len() < (total_state_elems as u64),
-            };
-            if need_new {
-                let (new_state_buf, _state_id) = gpu_compute.create_buffer(
-                    total_state_elems,
-                    vulkano::buffer::BufferUsage::STORAGE_BUFFER | vulkano::buffer::BufferUsage::TRANSFER_DST,
-                );
-                store.opt_state = Some(new_state_buf);
-            }
-        }
-
-        let mut state_offset = 0;
-
-        for cube in cubes.iter() {
-            let size_per_param = cube.state_size_per_param();
-
-            let state_slice = store.opt_state.as_ref().map(|full_state| {
-                let elem_size = std::mem::size_of::<f32>() as u64;
-                let start_byte = (state_offset * total) as u64 * elem_size;
-                let len_elems = size_per_param * total;
-                let end_byte = start_byte + len_elems as u64 * elem_size;
-                full_state.clone().slice(start_byte..end_byte)
-            });
-
-            if let Some(cube) = cube.as_any().downcast_ref::<ScaleGradient>() {
-                gpu_compute.run_scale_gradient(&store.grads, cube.factor, total);
-            } else if let Some(cube) = cube.as_any().downcast_ref::<AddWeightDecay>() {
-                gpu_compute.run_weight_decay(&store.params, &store.grads, cube.decay, total);
-            } else if let Some(cube) = cube.as_any().downcast_ref::<GradientClip>() {
-                let min_val = cube.min.unwrap_or(f32::NEG_INFINITY);
-                let max_val = cube.max.unwrap_or(f32::INFINITY);
-                gpu_compute.run_gradient_clip(&store.grads, min_val, max_val, total);
-            } else if let Some(cube) = cube.as_any().downcast_ref::<Momentum>() {
-                if let Some(ref state) = state_slice {
-                    gpu_compute.run_momentum(&store.grads, state, cube.beta, total);
-                }
-            } else if let Some(cube) = cube.as_any().downcast_ref::<NesterovMomentum>() {
-                if let Some(ref state) = state_slice {
-                    gpu_compute.run_nesterov_momentum(&store.grads, state, cube.beta, total);
-                }
-            } else if let Some(cube) = cube.as_any().downcast_ref::<AdamTransform>() {
-                if let Some(ref state) = state_slice {
-                    gpu_compute.run_adam(
-                        &store.grads,
-                        state,
-                        cube.beta1,
-                        cube.beta2,
-                        cube.eps,
-                        step,
-                        total,
-                    );
-                }
-            } else if cube.as_any().is::<ApplyUpdate>() {
-                gpu_compute.run_apply_update(&store.params, &store.grads, total);
-            } else {
-                panic!("Unsupported optimizer cube for GPU: {:?}", std::any::type_name_of_val(cube));
-            }
-
-            state_offset += size_per_param;
-        }
     }
 
     // ===================================================================

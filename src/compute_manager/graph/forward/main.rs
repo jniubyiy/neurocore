@@ -6,20 +6,14 @@ use crate::compute_manager::dim_change;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
-use crate::compute_manager::persistent_buffer::SegmentPersistentBuffers;
 use crate::compute_manager::gpu::processor::process_forward_gpu_buffered;
 use crate::device_plan::plan::ComputeDevice;
 
 impl MixedModel {
     // -----------------------------------------------------------------------
-    // Новый метод: прямой проход с управляемыми буферами через TempMatrixPool
+    // Прямой проход с управляемыми буферами через TempMatrixPool
     // -----------------------------------------------------------------------
 
-    /// Прямой проход с использованием [`MatrixBufferHandle`] и пула [`TempMatrixPool`].
-    ///
-    /// Этот метод полностью заменяет старый Mat‑путь в новом CPU/GPU‑пути.
-    /// Все промежуточные матрицы выделяются через пул дескрипторов, что позволяет
-    /// `MemoryExecutor` отслеживать и переиспользовать память.
     pub fn forward_mat_multi_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -79,21 +73,6 @@ impl MixedModel {
                     if let Some(ref gpu_compute_mutex) = self.gpu_compute {
                         let gpu = gpu_compute_mutex.lock().unwrap();
 
-                        // Получаем или создаём persistent buffers для сегмента
-                        let segment_buffers_opt = self.get_segment_buffers(seg_index);
-                        let temp_buffers;
-                        let segment_buffers = if let Some(b) = segment_buffers_opt {
-                            b
-                        } else {
-                            temp_buffers = SegmentPersistentBuffers::for_segment(
-                                seg,
-                                &self.segment_placement[seg_index].compute_device,
-                                batch_size,
-                                &mut self.memory_executor.lock().unwrap(),
-                            );
-                            temp_buffers
-                        };
-
                         for &stream_idx in &active_indices {
                             let input_buf = stream_buffers[stream_idx].clone();
 
@@ -111,7 +90,6 @@ impl MixedModel {
 
                             let (out_gpu, layer_ctxs) = process_forward_gpu_buffered(
                                 &gpu,
-                                &segment_buffers,
                                 proc,
                                 slices,
                                 &params,

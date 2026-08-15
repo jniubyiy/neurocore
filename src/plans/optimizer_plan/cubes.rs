@@ -25,12 +25,6 @@ impl OptimizerCube for ScaleGradient {
         0
     }
 
-    fn apply(&self, _params: &mut [f32], grads: &mut [f32], _state: &mut [f32]) {
-        for g in grads.iter_mut() {
-            *g *= self.factor;
-        }
-    }
-
     fn apply_buffered_handle(
         &self,
         _params: &MatrixBufferHandle,
@@ -67,12 +61,6 @@ impl AddWeightDecay {
 impl OptimizerCube for AddWeightDecay {
     fn state_size_per_param(&self) -> usize {
         0
-    }
-
-    fn apply(&self, params: &mut [f32], grads: &mut [f32], _state: &mut [f32]) {
-        for (p, g) in params.iter().zip(grads.iter_mut()) {
-            *g += self.decay * *p;
-        }
     }
 
     fn apply_buffered_handle(
@@ -116,17 +104,6 @@ impl GradientClip {
 impl OptimizerCube for GradientClip {
     fn state_size_per_param(&self) -> usize {
         0
-    }
-
-    fn apply(&self, _params: &mut [f32], grads: &mut [f32], _state: &mut [f32]) {
-        for g in grads.iter_mut() {
-            if let Some(min_val) = self.min {
-                *g = g.max(min_val);
-            }
-            if let Some(max_val) = self.max {
-                *g = g.min(max_val);
-            }
-        }
     }
 
     fn apply_buffered_handle(
@@ -173,15 +150,6 @@ impl OptimizerCube for Momentum {
         1
     }
 
-    fn apply(&self, _params: &mut [f32], grads: &mut [f32], state: &mut [f32]) {
-        let n = grads.len();
-        for i in 0..n {
-            let v = self.beta * state[i] + grads[i];
-            state[i] = v;
-            grads[i] = v;
-        }
-    }
-
     fn apply_buffered_handle(
         &self,
         _params: &MatrixBufferHandle,
@@ -225,17 +193,6 @@ impl NesterovMomentum {
 impl OptimizerCube for NesterovMomentum {
     fn state_size_per_param(&self) -> usize {
         1
-    }
-
-    fn apply(&self, _params: &mut [f32], grads: &mut [f32], state: &mut [f32]) {
-        let n = grads.len();
-        for i in 0..n {
-            let v_old = state[i];
-            let v_new = self.beta * v_old + grads[i];
-            // Классический NAG: градиент корректируется с учётом предстоящего шага.
-            grads[i] += self.beta * v_new;
-            state[i] = v_new;
-        }
     }
 
     fn apply_buffered_handle(
@@ -293,26 +250,6 @@ impl OptimizerCube for AdamTransform {
         2
     }
 
-    fn apply(&self, _params: &mut [f32], grads: &mut [f32], state: &mut [f32]) {
-        let n = grads.len();
-        let (m_slice, v_slice) = state.split_at_mut(n);
-
-        let t = self.step_counter.fetch_add(1, Ordering::SeqCst) + 1;
-
-        let bias_correction1 = 1.0 - self.beta1.powi(t as i32);
-        let bias_correction2 = 1.0 - self.beta2.powi(t as i32);
-
-        for i in 0..n {
-            m_slice[i] = self.beta1 * m_slice[i] + (1.0 - self.beta1) * grads[i];
-            v_slice[i] = self.beta2 * v_slice[i] + (1.0 - self.beta2) * grads[i] * grads[i];
-
-            let m_hat = m_slice[i] / bias_correction1;
-            let v_hat = v_slice[i] / bias_correction2;
-
-            grads[i] = m_hat / (v_hat.sqrt() + self.eps);
-        }
-    }
-
     fn apply_buffered_handle(
         &self,
         _params: &MatrixBufferHandle,
@@ -367,12 +304,6 @@ impl ApplyUpdate {
 impl OptimizerCube for ApplyUpdate {
     fn state_size_per_param(&self) -> usize {
         0
-    }
-
-    fn apply(&self, params: &mut [f32], grads: &mut [f32], _state: &mut [f32]) {
-        for (p, g) in params.iter_mut().zip(grads.iter()) {
-            *p -= *g;
-        }
     }
 
     fn apply_buffered_handle(

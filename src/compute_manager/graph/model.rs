@@ -15,7 +15,7 @@ use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::DevicePlan;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::{BufferedParamStore, ParamStore};
-use crate::optimizer_plan::{OptimizerExpr, OptimizerChain, OptimizerDesc};
+use crate::optimizer_plan::{OptimizerExpr, OptimizerDesc};
 use crate::linalg;
 
 pub(crate) struct DevicePlacementState {
@@ -125,24 +125,6 @@ impl MixedModel {
         if let Ok(mut state) = self.placement_state.lock() {
             state.profiling_data.add(seg_index, device.clone(), duration_ns);
         }
-    }
-
-    pub fn create_optimizer(&self, chain: OptimizerChain) -> OptimizerExpr {
-        let num_params = self.store.lock().unwrap().len();
-        OptimizerExpr::new(num_params, chain)
-    }
-
-    /// Устаревший метод обновления параметров на CPU через срезы `Vec<f32>`.
-    /// Оставлен для обратной совместимости; рекомендуется использовать
-    /// `update_params_buffered`.
-    #[deprecated(note = "Use update_params_buffered for MemoryExecutor integration")]
-    pub fn update_params(&mut self, desc: OptimizerDesc, grads: &[f32]) {
-        let chain = desc.build_chain();
-        let mut opt = self.create_optimizer(chain);
-        let mut store = self.store.lock().unwrap();
-        let mut params = store.all_params_vec();
-        opt.step(&mut params, grads);
-        store.set_all_params(&params);
     }
 
     // ===================================================================
@@ -285,32 +267,6 @@ impl MixedModel {
         crate::plans::loss_plan::execution::compute_loss_mat_buffered(
             &expr, &pred, &target, pool,
         )
-    }
-
-    #[deprecated(note = "Use compute_loss (DynamicTensor) or compute_loss_handle internally")]
-    pub fn compute_loss_mat(
-        &self,
-        expr: Arc<LossExpr>,
-        pred: &Mat<f32>,
-        target: &Mat<f32>,
-    ) -> (f32, Mat<f32>) {
-        let pool_arc = self.temp_matrix_pool.clone();
-        let mut pool = pool_arc.lock().unwrap();
-
-        let pred_buf = self.mat_to_matrix_buffer_handle(pred, &mut pool);
-        let target_buf = self.mat_to_matrix_buffer_handle(target, &mut pool);
-
-        let (loss, grad_buf) = self.compute_loss_handle(expr, pred_buf, target_buf, &mut pool);
-
-        let grad_mat = if grad_buf.is_gpu() {
-            let gpu = self.gpu_compute.as_ref().expect("GPU compute not available").lock().unwrap();
-            gpu.download_gpu_handle_to_mat(&grad_buf)
-        } else {
-            let guard = grad_buf.read();
-            let slice = guard.as_slice().expect("CPU buffer");
-            Mat::from_fn(grad_buf.rows(), grad_buf.cols(), |r, c| slice[c * grad_buf.rows() + r])
-        };
-        (loss, grad_mat)
     }
 
     // ===================================================================

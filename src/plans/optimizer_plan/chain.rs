@@ -34,27 +34,6 @@ impl OptimizerChain {
         self.cubes.iter().map(|c| c.state_size_per_param()).sum()
     }
 
-    /// Применяет все кубики последовательно, используя обычные срезы `[f32]`.
-    ///
-    /// # Аргументы
-    /// * `params` - все параметры модели (мутабельный срез).
-    /// * `grads`  - градиенты (мутабельный срез, изменяется кубиками).
-    /// * `state`  - полное состояние цепочки (мутабельный срез).
-    ///   Длина должна быть `params.len() * total_state_size_per_param()`.
-    #[deprecated(note = "Use apply_all_buffered_handle for MemoryExecutor integration")]
-    #[allow(deprecated)]
-    pub fn apply_all(&self, params: &mut [f32], grads: &mut [f32], state: &mut [f32]) {
-        let num_params = params.len();
-        let mut offset = 0;
-        for cube in &self.cubes {
-            let size_per_param = cube.state_size_per_param();
-            let state_len = num_params * size_per_param;
-            let state_slice = &mut state[offset..offset + state_len];
-            cube.apply(params, grads, state_slice);
-            offset += state_len;
-        }
-    }
-
     /// Применяет все кубики последовательно, работая с дескрипторами
     /// `MatrixBufferHandle`.
     ///

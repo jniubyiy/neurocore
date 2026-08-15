@@ -1,8 +1,7 @@
-// src/optimizer_plan/mod.rs
+// src/plans/optimizer_plan/mod.rs
 
 pub mod cube;
 pub mod chain;
-pub mod state;
 pub mod expr;
 pub mod cubes;
 

@@ -6,39 +6,18 @@ use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
 use super::chain::OptimizerChain;
-use super::state::OptimizerState;
 
 /// Интерпретатор оптимизатора, объединяющий цепочку кубиков и их состояние.
 ///
-/// Поддерживает два пути выполнения:
-/// - Legacy: использует `OptimizerState` и срезы `[f32]` (через `step`).
-/// - Buffered: использует вектор `MatrixBufferHandle` для состояний
-///   (через `step_buffered_handle`), без копирования в `Vec<f32>`.
+/// Работает полностью на `MatrixBufferHandle` через буферизованный путь.
 pub struct OptimizerExpr {
     chain: OptimizerChain,
-    /// Состояния для каждого кубика в новом буферизованном пути.
+    /// Состояния для каждого кубика в буферизованном пути.
     states: Vec<MatrixBufferHandle>,
-    /// Состояние для legacy‑пути (если используется `new`).
-    legacy_state: OptimizerState,
     step_counter: usize,
 }
 
 impl OptimizerExpr {
-    /// Создаёт новый оптимизатор для заданного количества параметров и цепочки кубиков.
-    ///
-    /// Использует legacy‑состояние `OptimizerState`. Для работы через
-    /// `MatrixBufferHandle` используйте [`new_buffered_handle`].
-    #[deprecated(note = "Use new_buffered_handle for MemoryExecutor integration")]
-    pub fn new(num_params: usize, chain: OptimizerChain) -> Self {
-        let total_state = chain.total_state_size_per_param();
-        Self {
-            chain,
-            states: Vec::new(),
-            legacy_state: OptimizerState::new(num_params, total_state),
-            step_counter: 0,
-        }
-    }
-
     /// Создаёт оптимизатор, который работает полностью на `MatrixBufferHandle`.
     ///
     /// Для каждого кубика выделяется отдельный `MatrixBufferHandle` через
@@ -72,24 +51,8 @@ impl OptimizerExpr {
         Self {
             chain,
             states,
-            legacy_state: OptimizerState::new(0, 0),
             step_counter: 0,
         }
-    }
-
-    /// Выполняет один шаг оптимизации, изменяя параметры in‑place.
-    ///
-    /// # Аргументы
-    /// * `params` – мутабельный срез всех параметров модели.
-    /// * `grads`  – срез градиентов. Кубики могут изменять градиенты
-    ///   во временном буфере, но исходный `grads` не изменяется.
-    #[deprecated(note = "Use step_buffered_handle for MemoryExecutor integration")]
-    #[allow(deprecated)]
-    pub fn step(&mut self, params: &mut [f32], grads: &[f32]) {
-        let mut grads_mut = grads.to_vec();
-        self.chain
-            .apply_all(params, &mut grads_mut, self.legacy_state.as_mut_slice());
-        self.step_counter += 1;
     }
 
     /// Выполняет один шаг оптимизации, работая полностью с `MatrixBufferHandle`.
@@ -122,4 +85,4 @@ impl OptimizerExpr {
     pub fn current_step(&self) -> usize {
         self.step_counter
     }
-}  
+}

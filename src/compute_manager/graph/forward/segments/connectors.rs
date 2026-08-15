@@ -289,12 +289,3 @@ fn handle_to_vec(handle: &MatrixBufferHandle) -> Vec<f32> {
     let guard = handle.read();
     guard.as_slice().expect("CPU buffer").to_vec()
 }
-
-/// Записывает Vec<f32> в CPU handle (column-major порядок).
-fn vec_to_handle(data: &[f32], handle: &mut MatrixBufferHandle) {
-    assert!(!handle.is_gpu(), "vec_to_handle supports only CPU buffers");
-    let mut guard = handle.write();
-    let dst = guard.as_slice_mut().expect("CPU buffer");
-    assert_eq!(data.len(), dst.len());
-    dst.copy_from_slice(data);
-}

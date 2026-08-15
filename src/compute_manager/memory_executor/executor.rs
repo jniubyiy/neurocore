@@ -13,7 +13,7 @@ use super::super::device_spec::{DeviceId, DeviceSpec, DeviceKind};
 use super::pool::MemoryPool;
 use super::ssd_cache::SsdCacheManager;
 use super::types::MemoryDeviceKind;
-use super::policy::{BufferPriority, MemoryPolicy};
+use super::policy::BufferPriority;
 use super::raw_buffer::RawBufferRegistry;
 use super::temp_pool::TempBufferPool;
 use super::data_mover;
@@ -39,7 +39,6 @@ pub struct MemoryExecutor {
     pools: HashMap<MemoryDeviceKind, MemoryPool>,
     gpu_contexts: HashMap<DeviceId, Arc<GpuContext>>,
     ssd_cache: Option<SsdCacheManager>,
-    policy: MemoryPolicy,
     raw_registry: RawBufferRegistry,
     temp_pool: TempBufferPool,
     matrix_entries: HashMap<MatrixBufferId, MatrixEntry>,
@@ -54,7 +53,6 @@ impl MemoryExecutor {
             pools: HashMap::new(),
             gpu_contexts: HashMap::new(),
             ssd_cache: None,
-            policy: MemoryPolicy::default(),
             raw_registry: RawBufferRegistry::new(),
             temp_pool: TempBufferPool::new(),
             matrix_entries: HashMap::new(),
@@ -150,10 +148,6 @@ impl MemoryExecutor {
         );
         self.ssd_cache = Some(manager);
         Ok(())
-    }
-
-    pub fn set_policy(&mut self, policy: MemoryPolicy) {
-        self.policy = policy;
     }
 
     pub fn current_usage(&self, kind: MemoryDeviceKind) -> usize {
@@ -461,38 +455,5 @@ impl MemoryExecutor {
         );
 
         Ok((buffer, raw_id))
-    }
-
-    pub fn select_matrix_location(
-        &self,
-        elements: usize,
-        preferred: MemoryDeviceKind,
-        _priority: BufferPriority,
-    ) -> MemoryDeviceKind {
-        if self.can_allocate(preferred, elements) {
-            return preferred;
-        }
-
-        if preferred != MemoryDeviceKind::HostRam
-            && self.can_allocate(MemoryDeviceKind::HostRam, elements)
-        {
-            return MemoryDeviceKind::HostRam;
-        }
-
-        if preferred != MemoryDeviceKind::SsdCache
-            && self.ssd_cache.is_some()
-            && self.can_allocate(MemoryDeviceKind::SsdCache, elements)
-        {
-            return MemoryDeviceKind::SsdCache;
-        }
-
-        preferred
-    }
-
-    fn can_allocate(&self, kind: MemoryDeviceKind, elements: usize) -> bool {
-        self.pools
-            .get(&kind)
-            .map(|p| p.can_allocate(elements))
-            .unwrap_or(false)
     }
 }

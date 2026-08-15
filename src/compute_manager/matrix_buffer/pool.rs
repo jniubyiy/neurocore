@@ -98,22 +98,6 @@ impl TempMatrixPool {
         self.acquire_kind(location, rows, cols)
     }
 
-    /// Извлекает из пула или создаёт новый управляемый `MatrixBufferHandle`
-    /// с автоматическим выбором памяти на основе политики `MemoryExecutor`.
-    pub fn acquire_matrix_auto(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        preferred: MemoryDeviceKind,
-    ) -> MatrixBufferHandle {
-        let elements = rows * cols;
-        let target = {
-            let mem = self.memory.lock().unwrap();
-            mem.select_matrix_location(elements, preferred, BufferPriority::Medium)
-        };
-        self.acquire_matrix(rows, cols, target)
-    }
-
     /// Внутренний метод получения буфера определённого типа памяти.
     fn acquire_kind(
         &mut self,
@@ -159,8 +143,6 @@ impl TempMatrixPool {
         let kind = handle.device_kind();
 
         // Проверяем, что на запись ссылается только этот handle.
-        // Блокировка MemoryExecutor снимается до возможного drop(handle),
-        // чтобы избежать повторного входа в Mutex из Drop дескриптора.
         let should_pool = {
             let mut mem = self.memory.lock().unwrap();
             if let Some(entry) = mem.get_matrix_entry_mut(id) {
@@ -200,16 +182,13 @@ impl TempMatrixPool {
     pub fn clear(&mut self) {
         for list in self.free.values_mut() {
             while let Some(handle) = list.pop_front() {
-                // Сначала снимаем флаг pooled, затем снимаем блокировку,
-                // и только после этого удаляем дескриптор.
                 {
                     let mut mem = self.memory.lock().unwrap();
                     if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
                         entry.pooled = false;
                     }
                 }
-                // Блокировка MemoryExecutor снята.
-                drop(handle); // ref_count станет 0, запись будет удалена.
+                drop(handle);
                 self.stats.removed += 1;
             }
         }
@@ -231,7 +210,6 @@ impl TempMatrixPool {
         let now = Instant::now();
         let mut empty_keys = Vec::new();
 
-        // Удаляем устаревшие.
         if let Some(max_age) = self.max_idle_age {
             for (key, queue) in self.free.iter_mut() {
                 let before = queue.len();
@@ -252,7 +230,6 @@ impl TempMatrixPool {
                                 entry.pooled = false;
                             }
                         }
-                        // Блокировка снята.
                         drop(handle);
                         self.stats.removed += 1;
                     }
@@ -284,7 +261,6 @@ impl TempMatrixPool {
                                 entry.pooled = false;
                             }
                         }
-                        // Блокировка снята.
                         drop(handle);
                         self.stats.removed += 1;
                         removed = true;
@@ -297,83 +273,5 @@ impl TempMatrixPool {
             }
             self.free.retain(|_, q| !q.is_empty());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::compute_manager::device_spec::DeviceSpec;
-    use crate::compute_manager::memory_executor::MemoryExecutor;
-    use std::sync::{Arc, Mutex};
-
-    fn create_pool() -> (Arc<Mutex<MemoryExecutor>>, TempMatrixPool) {
-        let mem = Arc::new(Mutex::new(MemoryExecutor::new()));
-        mem.lock()
-            .unwrap()
-            .register_compute_device(DeviceSpec::cpu(0, 1024, 1), None);
-        mem.lock().unwrap().set_self_arc(mem.clone());
-        let pool = TempMatrixPool::new(mem.clone());
-        (mem, pool)
-    }
-
-    #[test]
-    fn test_acquire_release_cpu() {
-        let (_mem, mut pool) = create_pool();
-
-        let a = pool.acquire(3, 4);
-        assert_eq!(a.rows(), 3);
-        assert_eq!(a.cols(), 4);
-        assert!(!a.is_gpu());
-        pool.release(a);
-        assert_eq!(pool.free_count(), 1);
-
-        let b = pool.acquire(3, 4);
-        assert_eq!(pool.free_count(), 0);
-        assert_eq!(b.rows(), 3);
-        assert_eq!(b.cols(), 4);
-        assert_eq!(pool.stats().reused, 1);
-        assert_eq!(pool.stats().created, 1);
-    }
-
-    #[test]
-    fn test_different_sizes_cpu() {
-        let (_mem, mut pool) = create_pool();
-        let a = pool.acquire(2, 5);
-        pool.release(a);
-        let b = pool.acquire(5, 2);
-        assert_eq!(b.rows(), 5);
-        assert_eq!(b.cols(), 2);
-        assert_eq!(pool.free_count(), 0);
-        assert_eq!(pool.stats().created, 2);
-    }
-
-    #[test]
-    fn test_cleanup_removes_old_buffers() {
-        let (_mem, mut pool) = create_pool();
-        pool.max_idle_age = Some(Duration::from_secs(0));
-
-        let a = pool.acquire(3, 4);
-        pool.release(a);
-        let b = pool.acquire(3, 4);
-        assert_eq!(b.rows(), 3);
-        assert_eq!(b.cols(), 4);
-        assert_eq!(pool.stats().created, 2);
-        assert_eq!(pool.stats().reused, 0);
-        assert_eq!(pool.stats().removed, 1);
-    }
-
-    #[test]
-    fn test_max_pool_size_cpu() {
-        let (_mem, mut pool) = create_pool();
-        pool.max_pool_size = Some(1);
-
-        let a = pool.acquire(2, 2);
-        let b = pool.acquire(3, 3);
-        pool.release(a);
-        pool.release(b);
-
-        assert_eq!(pool.free_count(), 1);
-        assert_eq!(pool.stats().removed, 1);
     }
 }

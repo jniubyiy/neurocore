@@ -99,9 +99,7 @@ impl UniversalLayerBuffered for Memory {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        let bc = match ctx {
-            DynamicContext::Buffered(bc) => bc,
-        };
+        let DynamicContext::Buffered(bc) = ctx;
         let _input_handle = match bc {
             BufferedContext::Memory { input } => input,
             _ => panic!("Expected Memory context"),

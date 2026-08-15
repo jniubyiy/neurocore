@@ -3,8 +3,7 @@
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
-use crate::layers::UniversalLayer;
-use crate::layers::UniversalLayerBuffered;
+use crate::layers::{UniversalLayer, UniversalLayerBuffered};
 use crate::model_plan::param_store::ParamSlice;
 
 pub struct ReLU;
@@ -50,11 +49,7 @@ impl UniversalLayerBuffered for ReLU {
         _params: &[f32],
         _slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Извлекаем буферизованный контекст
-        let bc = match ctx {
-            DynamicContext::Buffered(bc) => bc,
-            _ => panic!("Expected Buffered context"),
-        };
+        let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::ReLU { input } => input,
             _ => panic!("Expected ReLU context"),

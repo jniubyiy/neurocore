@@ -79,10 +79,7 @@ impl UniversalLayerBuffered for Linear {
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
-        // Извлекаем буферизованный контекст
-        let bc = match ctx {
-            DynamicContext::Buffered(bc) => bc,
-        };
+        let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::Linear { input } => input,
             _ => panic!("Expected Linear context"),
@@ -92,8 +89,8 @@ impl UniversalLayerBuffered for Linear {
         let x_slice = input_guard.as_slice().expect("Linear backward: expected CPU buffer");
 
         let in_rows = grad_input.rows();
-        let in_cols = grad_input.cols();      // == self.in_features
-        let out_cols = grad_output.cols();    // == self.out_features
+        let in_cols = grad_input.cols();
+        let out_cols = grad_output.cols();
 
         let go_guard = grad_output.read();
         let go_slice = go_guard.as_slice().expect("Linear backward: expected CPU buffer");
@@ -105,7 +102,6 @@ impl UniversalLayerBuffered for Linear {
         debug_assert_eq!(gi_slice.len(), in_rows * in_cols);
 
         let w_start = slice.start;
-        let b_start = w_start + in_cols * out_cols;
 
         // dx = grad_output * weight
         for r in 0..in_rows {
@@ -140,7 +136,6 @@ impl UniversalLayerBuffered for Linear {
             db[c] = sum;
         }
 
-        // Собираем градиенты параметров: сначала dw, затем db
         let mut grad = Vec::with_capacity(self.in_features * self.out_features + self.out_features);
         grad.extend_from_slice(&dw);
         grad.extend_from_slice(&db);

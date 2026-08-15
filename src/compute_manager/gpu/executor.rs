@@ -1,7 +1,5 @@
 // src/compute_manager/gpu/executor.rs
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 use crate::compute_manager::executor::Executor;
 use super::init::GpuContext;
@@ -11,17 +9,11 @@ use super::init::GpuContext;
 const GPU_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
-pub struct GpuExecutor {
-    context: Arc<GpuContext>,
-    active_tasks: Arc<AtomicUsize>,
-}
+pub struct GpuExecutor;
 
 impl GpuExecutor {
-    pub fn new(context: GpuContext) -> Self {
-        Self {
-            context: Arc::new(context),
-            active_tasks: Arc::new(AtomicUsize::new(0)),
-        }
+    pub fn new(_context: GpuContext) -> Self {
+        Self
     }
 }
 

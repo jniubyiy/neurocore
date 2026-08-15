@@ -111,7 +111,6 @@ fn build_pipeline(
     shader: Arc<ShaderModule>,
     ds_layout: Arc<DescriptorSetLayout>,
     push_constants: Option<PushConstantRange>,
-    name: &str,
 ) -> Arc<ComputePipeline> {
     let ranges = push_constants.into_iter().collect();
     let layout = PipelineLayout::new(
@@ -329,57 +328,57 @@ impl PipelineCache {
         let push_splitter_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 16 };
 
         // ==================== Сборка пайплайнов ====================
-        let mat_mul = build_pipeline(device.clone(), mat_mul_mod, mat_mul_ds, Some(push_mat_mul), "mat_mul");
-        let activation = build_pipeline(device.clone(), activation_mod, activation_ds, Some(push_act), "activation");
-        let activation_backward = build_pipeline(device.clone(), activation_bw_mod, activation_bw_ds, Some(push_act_bw), "activation_backward");
-        let linear_fwd = build_pipeline(device.clone(), linear_fwd_mod, linear_fwd_ds, Some(push_linear), "linear_fwd");
-        let linear_bwd = build_pipeline(device.clone(), linear_bwd_mod, linear_bwd_ds, Some(push_linear), "linear_bwd");
-        let softmax = build_pipeline(device.clone(), softmax_mod, softmax_ds, Some(push_softmax), "softmax");
-        let softmax_backward = build_pipeline(device.clone(), softmax_bw_mod, softmax_bw_ds, Some(push_softmax_bw), "softmax_backward");
-        let reduce = build_pipeline(device.clone(), reduce_mod, reduce_ds, Some(push_reduce), "reduce");
-        let unsqueeze = build_pipeline(device.clone(), unsqueeze_mod, unsqueeze_ds, None, "unsqueeze");
+        let mat_mul = build_pipeline(device.clone(), mat_mul_mod, mat_mul_ds, Some(push_mat_mul));
+        let activation = build_pipeline(device.clone(), activation_mod, activation_ds, Some(push_act));
+        let activation_backward = build_pipeline(device.clone(), activation_bw_mod, activation_bw_ds, Some(push_act_bw));
+        let linear_fwd = build_pipeline(device.clone(), linear_fwd_mod, linear_fwd_ds, Some(push_linear));
+        let linear_bwd = build_pipeline(device.clone(), linear_bwd_mod, linear_bwd_ds, Some(push_linear));
+        let softmax = build_pipeline(device.clone(), softmax_mod, softmax_ds, Some(push_softmax));
+        let softmax_backward = build_pipeline(device.clone(), softmax_bw_mod, softmax_bw_ds, Some(push_softmax_bw));
+        let reduce = build_pipeline(device.clone(), reduce_mod, reduce_ds, Some(push_reduce));
+        let unsqueeze = build_pipeline(device.clone(), unsqueeze_mod, unsqueeze_ds, None);
 
-        let sub_fwd = build_pipeline(device.clone(), sub_fwd_mod, sub_fwd_ds, Some(push_total), "sub_fwd");
-        let sub_bwd = build_pipeline(device.clone(), sub_bwd_mod, sub_bwd_ds, Some(push_total), "sub_bwd");
-        let square_fwd = build_pipeline(device.clone(), square_fwd_mod, square_fwd_ds, Some(push_total), "square_fwd");
-        let square_bwd = build_pipeline(device.clone(), square_bwd_mod, square_bwd_ds, Some(push_total), "square_bwd");
-        let abs_fwd = build_pipeline(device.clone(), abs_fwd_mod, abs_fwd_ds, Some(push_total), "abs_fwd");
-        let abs_bwd = build_pipeline(device.clone(), abs_bwd_mod, abs_bwd_ds, Some(push_total), "abs_bwd");
-        let log1p_fwd = build_pipeline(device.clone(), log1p_fwd_mod, log1p_fwd_ds, Some(push_total), "log1p_fwd");
-        let log1p_bwd = build_pipeline(device.clone(), log1p_bwd_mod, log1p_bwd_ds, Some(push_total), "log1p_bwd");
-        let absdiff_fwd = build_pipeline(device.clone(), absdiff_fwd_mod, absdiff_fwd_ds, Some(push_total), "absdiff_fwd");
-        let absdiff_bwd = build_pipeline(device.clone(), absdiff_bwd_mod, absdiff_bwd_ds, Some(push_total), "absdiff_bwd");
-        let log_fwd = build_pipeline(device.clone(), log_fwd_mod, log_fwd_ds, Some(push_total), "log_fwd");
-        let log_bwd = build_pipeline(device.clone(), log_bwd_mod, log_bwd_ds, Some(push_total), "log_bwd");
-        let neg_fwd = build_pipeline(device.clone(), neg_fwd_mod, neg_fwd_ds, Some(push_total), "neg_fwd");
-        let neg_bwd = build_pipeline(device.clone(), neg_bwd_mod, neg_bwd_ds, Some(push_total), "neg_bwd");
-        let mul_fwd = build_pipeline(device.clone(), mul_fwd_mod, mul_fwd_ds, Some(push_total), "mul_fwd");
-        let mul_bwd = build_pipeline(device.clone(), mul_bwd_mod, mul_bwd_ds, Some(push_total), "mul_bwd");
-        let addscalar_fwd = build_pipeline(device.clone(), addscalar_fwd_mod, addscalar_fwd_ds, Some(push_total_scalar), "addscalar_fwd");
-        let addscalar_bwd = build_pipeline(device.clone(), addscalar_bwd_mod, addscalar_bwd_ds, Some(push_total), "addscalar_bwd");
-        let cross_entropy_fwd = build_pipeline(device.clone(), ce_fwd_mod, ce_fwd_ds, Some(push_ce), "cross_entropy_fwd");
-        let cross_entropy_bwd = build_pipeline(device.clone(), ce_bwd_mod, ce_bwd_ds, Some(push_ce), "cross_entropy_bwd");
+        let sub_fwd = build_pipeline(device.clone(), sub_fwd_mod, sub_fwd_ds, Some(push_total));
+        let sub_bwd = build_pipeline(device.clone(), sub_bwd_mod, sub_bwd_ds, Some(push_total));
+        let square_fwd = build_pipeline(device.clone(), square_fwd_mod, square_fwd_ds, Some(push_total));
+        let square_bwd = build_pipeline(device.clone(), square_bwd_mod, square_bwd_ds, Some(push_total));
+        let abs_fwd = build_pipeline(device.clone(), abs_fwd_mod, abs_fwd_ds, Some(push_total));
+        let abs_bwd = build_pipeline(device.clone(), abs_bwd_mod, abs_bwd_ds, Some(push_total));
+        let log1p_fwd = build_pipeline(device.clone(), log1p_fwd_mod, log1p_fwd_ds, Some(push_total));
+        let log1p_bwd = build_pipeline(device.clone(), log1p_bwd_mod, log1p_bwd_ds, Some(push_total));
+        let absdiff_fwd = build_pipeline(device.clone(), absdiff_fwd_mod, absdiff_fwd_ds, Some(push_total));
+        let absdiff_bwd = build_pipeline(device.clone(), absdiff_bwd_mod, absdiff_bwd_ds, Some(push_total));
+        let log_fwd = build_pipeline(device.clone(), log_fwd_mod, log_fwd_ds, Some(push_total));
+        let log_bwd = build_pipeline(device.clone(), log_bwd_mod, log_bwd_ds, Some(push_total));
+        let neg_fwd = build_pipeline(device.clone(), neg_fwd_mod, neg_fwd_ds, Some(push_total));
+        let neg_bwd = build_pipeline(device.clone(), neg_bwd_mod, neg_bwd_ds, Some(push_total));
+        let mul_fwd = build_pipeline(device.clone(), mul_fwd_mod, mul_fwd_ds, Some(push_total));
+        let mul_bwd = build_pipeline(device.clone(), mul_bwd_mod, mul_bwd_ds, Some(push_total));
+        let addscalar_fwd = build_pipeline(device.clone(), addscalar_fwd_mod, addscalar_fwd_ds, Some(push_total_scalar));
+        let addscalar_bwd = build_pipeline(device.clone(), addscalar_bwd_mod, addscalar_bwd_ds, Some(push_total));
+        let cross_entropy_fwd = build_pipeline(device.clone(), ce_fwd_mod, ce_fwd_ds, Some(push_ce));
+        let cross_entropy_bwd = build_pipeline(device.clone(), ce_bwd_mod, ce_bwd_ds, Some(push_ce));
 
-        let scale_grad = build_pipeline(device.clone(), scale_grad_mod, scale_grad_ds, Some(push_factor_total), "scale_grad");
-        let weight_decay = build_pipeline(device.clone(), weight_decay_mod, weight_decay_ds, Some(push_decay_total), "weight_decay");
-        let grad_clip = build_pipeline(device.clone(), grad_clip_mod, grad_clip_ds, Some(push_clip), "grad_clip");
-        let momentum = build_pipeline(device.clone(), momentum_mod, momentum_ds.clone(), Some(push_beta), "momentum");
-        let nesterov_momentum = build_pipeline(device.clone(), nesterov_momentum_mod, momentum_ds, Some(push_beta), "nesterov_momentum");
-        let adam = build_pipeline(device.clone(), adam_mod, adam_ds, Some(push_adam), "adam");
-        let apply_update = build_pipeline(device.clone(), apply_update_mod, apply_update_ds, Some(push_optim_total), "apply_update");
+        let scale_grad = build_pipeline(device.clone(), scale_grad_mod, scale_grad_ds, Some(push_factor_total));
+        let weight_decay = build_pipeline(device.clone(), weight_decay_mod, weight_decay_ds, Some(push_decay_total));
+        let grad_clip = build_pipeline(device.clone(), grad_clip_mod, grad_clip_ds, Some(push_clip));
+        let momentum = build_pipeline(device.clone(), momentum_mod, momentum_ds.clone(), Some(push_beta));
+        let nesterov_momentum = build_pipeline(device.clone(), nesterov_momentum_mod, momentum_ds, Some(push_beta));
+        let adam = build_pipeline(device.clone(), adam_mod, adam_ds, Some(push_adam));
+        let apply_update = build_pipeline(device.clone(), apply_update_mod, apply_update_ds, Some(push_optim_total));
 
-        let memory_fwd = build_pipeline(device.clone(), memory_fwd_mod, memory_fwd_ds, Some(push_memory_fwd), "memory_fwd");
-        let memory_bwd = build_pipeline(device.clone(), memory_bwd_mod, memory_bwd_ds, Some(push_memory_bwd), "memory_bwd");
-        let softsparse_fwd = build_pipeline(device.clone(), softsparse_fwd_mod, softsparse_fwd_ds, Some(push_softsparse_fwd), "softsparse_fwd");
-        let softsparse_bwd = build_pipeline(device.clone(), softsparse_bwd_mod, softsparse_bwd_ds, Some(push_softsparse_bwd), "softsparse_bwd");
-        let softkeep_fwd = build_pipeline(device.clone(), softkeep_fwd_mod, softkeep_fwd_ds, Some(push_softkeep_fwd), "softkeep_fwd");
-        let softkeep_bwd = build_pipeline(device.clone(), softkeep_bwd_mod, softkeep_bwd_ds, Some(push_softkeep_bwd), "softkeep_bwd");
-        let dualanchor_fwd = build_pipeline(device.clone(), dualanchor_fwd_mod, dualanchor_fwd_ds, Some(push_dualanchor_fwd), "dualanchor_fwd");
-        let dualanchor_bwd = build_pipeline(device.clone(), dualanchor_bwd_mod, dualanchor_bwd_ds, Some(push_dualanchor_bwd), "dualanchor_bwd");
-        let combiner_fwd = build_pipeline(device.clone(), combiner_fwd_mod, combiner_fwd_ds, Some(push_combiner_fwd), "combiner_fwd");
-        let combiner_bwd = build_pipeline(device.clone(), combiner_bwd_mod, combiner_bwd_ds, Some(push_combiner_bwd), "combiner_bwd");
-        let splitter_fwd = build_pipeline(device.clone(), splitter_fwd_mod, splitter_fwd_ds, Some(push_splitter_fwd), "splitter_fwd");
-        let splitter_bwd = build_pipeline(device.clone(), splitter_bwd_mod, splitter_bwd_ds, Some(push_splitter_bwd), "splitter_bwd");
+        let memory_fwd = build_pipeline(device.clone(), memory_fwd_mod, memory_fwd_ds, Some(push_memory_fwd));
+        let memory_bwd = build_pipeline(device.clone(), memory_bwd_mod, memory_bwd_ds, Some(push_memory_bwd));
+        let softsparse_fwd = build_pipeline(device.clone(), softsparse_fwd_mod, softsparse_fwd_ds, Some(push_softsparse_fwd));
+        let softsparse_bwd = build_pipeline(device.clone(), softsparse_bwd_mod, softsparse_bwd_ds, Some(push_softsparse_bwd));
+        let softkeep_fwd = build_pipeline(device.clone(), softkeep_fwd_mod, softkeep_fwd_ds, Some(push_softkeep_fwd));
+        let softkeep_bwd = build_pipeline(device.clone(), softkeep_bwd_mod, softkeep_bwd_ds, Some(push_softkeep_bwd));
+        let dualanchor_fwd = build_pipeline(device.clone(), dualanchor_fwd_mod, dualanchor_fwd_ds, Some(push_dualanchor_fwd));
+        let dualanchor_bwd = build_pipeline(device.clone(), dualanchor_bwd_mod, dualanchor_bwd_ds, Some(push_dualanchor_bwd));
+        let combiner_fwd = build_pipeline(device.clone(), combiner_fwd_mod, combiner_fwd_ds, Some(push_combiner_fwd));
+        let combiner_bwd = build_pipeline(device.clone(), combiner_bwd_mod, combiner_bwd_ds, Some(push_combiner_bwd));
+        let splitter_fwd = build_pipeline(device.clone(), splitter_fwd_mod, splitter_fwd_ds, Some(push_splitter_fwd));
+        let splitter_bwd = build_pipeline(device.clone(), splitter_bwd_mod, splitter_bwd_ds, Some(push_splitter_bwd));
 
         Self {
             device,

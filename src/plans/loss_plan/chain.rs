@@ -124,7 +124,7 @@ fn clone_handle_data(pool: &mut TempMatrixPool, src: &MatrixBufferHandle) -> Mat
     assert!(!src.is_gpu(), "clone_handle_data does not support GPU buffers");
     let rows = src.rows();
     let cols = src.cols();
-    let mut copy = pool.acquire(rows, cols);
+    let copy = pool.acquire(rows, cols);
     {
         let src_guard = src.read();
         let src_slice = src_guard.as_slice().expect("Source must be CPU");

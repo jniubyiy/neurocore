@@ -83,9 +83,7 @@ impl UniversalLayerBuffered for DualAnchor {
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
-        let bc = match ctx {
-            DynamicContext::Buffered(bc) => bc,
-        };
+        let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::DualAnchor1D { input } => input,
             _ => panic!("Expected DualAnchor1D context"),

@@ -2,8 +2,7 @@
 
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::layers::UniversalLayer;
-use crate::layers::UniversalLayerBuffered;
+use crate::layers::{UniversalLayer, UniversalLayerBuffered};
 use crate::model_plan::param_store::ParamSlice;
 
 pub struct Identity;

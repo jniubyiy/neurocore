@@ -309,8 +309,6 @@ impl MixedModel {
             segments,
             segment_placement: segment_placement.clone(),
             store,
-            pool,
-            scheduler: Mutex::new(scheduler),
             executor,
             gpu_compute,
             input_stream_count,

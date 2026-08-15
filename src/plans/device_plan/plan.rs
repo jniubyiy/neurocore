@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use crate::compute_manager::device_spec::DeviceSpec;
 use crate::compute_manager::gpu::init::GpuContext;
 use crate::compute_manager::memory_executor::MemoryExecutor;
-use crate::compute_manager::memory_executor::MemoryPolicy;
 
 // ---------------------------------------------------------------------------
 // Устройства (Compute / Storage)
@@ -281,18 +280,6 @@ impl DevicePlan {
             }
             _ => None,
         });
-
-        // Настройка политики памяти
-        {
-            let policy = MemoryPolicy::new(
-                self.vram_high_watermark,
-                self.vram_low_watermark,
-                self.ssd_eviction_age_secs,
-                self.promotion_threshold,
-                self.max_vram_buffer_elements,
-            );
-            mem_exec.lock().unwrap().set_policy(policy);
-        }
 
         (mem_exec, gpu_ctx)
     }

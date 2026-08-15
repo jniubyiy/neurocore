@@ -80,9 +80,7 @@ impl UniversalLayerBuffered for SoftSparseGate {
         params: &[f32],
         slice: &ParamSlice,
     ) -> Vec<f32> {
-        let bc = match ctx {
-            DynamicContext::Buffered(bc) => bc,
-        };
+        let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::SoftSparseGate { input } => input,
             _ => panic!("Expected SoftSparseGate context"),

@@ -3,7 +3,6 @@
 use std::sync::{Arc, Mutex};
 use faer::Mat;
 
-use crate::compute_manager::cpu::{Scheduler, WorkerPool};
 use crate::compute_manager::device_assignment::SegmentPlacement;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
@@ -27,8 +26,6 @@ pub struct MixedModel {
     pub(crate) segments: Vec<Segment>,
     pub(crate) segment_placement: Vec<SegmentPlacement>,
     pub(crate) store: Arc<Mutex<ParamStore>>,
-    pub(crate) pool: Arc<WorkerPool>,
-    pub(crate) scheduler: Mutex<Scheduler>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) gpu_compute: Option<Mutex<GpuCompute>>,
     pub(crate) input_stream_count: usize,

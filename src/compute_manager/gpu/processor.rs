@@ -8,10 +8,6 @@ use crate::model_plan::param_store::ParamSlice;
 
 use super::compute::GpuCompute;
 
-// ===================================================================
-// БУФЕРИЗОВАННЫЕ ВЕРСИИ ДЛЯ GPU (MatrixBufferHandle)
-// ===================================================================
-
 /// Прямой проход на GPU с использованием MatrixBufferHandle.
 /// Вход и выход — GPU-дескрипторы. Контексты создаются как Buffered.
 pub fn process_forward_gpu_buffered(
@@ -155,7 +151,6 @@ pub fn process_forward_gpu_buffered(
 
 /// Обратный проход на GPU с использованием MatrixBufferHandle.
 /// Входной градиент — GPU-дескриптор, выходной градиент — GPU-дескриптор.
-/// Для всех слоёв используются GPU handle-методы.
 pub fn process_backward_gpu_buffered(
     gpu_compute: &GpuCompute,
     layers: &[Box<dyn UniversalLayer>],
@@ -183,9 +178,9 @@ pub fn process_backward_gpu_buffered(
             let w_start = slice.start;
             let b_start = w_start + in_feat * out_feat;
 
-            // Извлекаем входной handle из контекста
-            let input_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::Linear { input }) => input.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let input_handle = match bc {
+                BufferedContext::Linear { input } => input.clone(),
                 _ => panic!("Expected Linear Buffered context"),
             };
 
@@ -215,8 +210,9 @@ pub fn process_backward_gpu_buffered(
 
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_relu() {
-            let input_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::ReLU { input }) => input.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let input_handle = match bc {
+                BufferedContext::ReLU { input } => input.clone(),
                 _ => panic!("Expected ReLU Buffered context"),
             };
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
@@ -227,8 +223,9 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_sigmoid() {
-            let output_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::Sigmoid { output }) => output.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let output_handle = match bc {
+                BufferedContext::Sigmoid { output } => output.clone(),
                 _ => panic!("Expected Sigmoid Buffered context"),
             };
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
@@ -239,8 +236,9 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_tanh() {
-            let output_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::Tanh { output }) => output.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let output_handle = match bc {
+                BufferedContext::Tanh { output } => output.clone(),
                 _ => panic!("Expected Tanh Buffered context"),
             };
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
@@ -251,8 +249,9 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(leaky) = layer.as_leaky_relu() {
-            let input_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::LeakyReLU { input }) => input.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let input_handle = match bc {
+                BufferedContext::LeakyReLU { input } => input.clone(),
                 _ => panic!("Expected LeakyReLU Buffered context"),
             };
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
@@ -264,8 +263,9 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_softmax() {
-            let output_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::Softmax { output }) => output.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let output_handle = match bc {
+                BufferedContext::Softmax { output } => output.clone(),
                 _ => panic!("Expected Softmax Buffered context"),
             };
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
@@ -288,8 +288,9 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
-            let input_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::SoftSparseGate { input }) => input.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let input_handle = match bc {
+                BufferedContext::SoftSparseGate { input } => input.clone(),
                 _ => panic!("Expected SoftSparseGate Buffered context"),
             };
             let thresholds = &params[slice.start..slice.start + soft_sparse.in_features];
@@ -308,8 +309,9 @@ pub fn process_backward_gpu_buffered(
             }
             current_grad = grad_input_handle;
         } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
-            let input_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::SoftKeepGate { input }) => input.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let input_handle = match bc {
+                BufferedContext::SoftKeepGate { input } => input.clone(),
                 _ => panic!("Expected SoftKeepGate Buffered context"),
             };
             let thresholds = &params[slice.start..slice.start + soft_keep.in_features];
@@ -328,8 +330,9 @@ pub fn process_backward_gpu_buffered(
             }
             current_grad = grad_input_handle;
         } else if let Some(dual) = layer.as_dual_anchor() {
-            let input_handle = match ctx {
-                DynamicContext::Buffered(BufferedContext::DualAnchor1D { input }) => input.clone(),
+            let DynamicContext::Buffered(bc) = ctx;
+            let input_handle = match bc {
+                BufferedContext::DualAnchor1D { input } => input.clone(),
                 _ => panic!("Expected DualAnchor1D Buffered context"),
             };
             let features = dual.features;

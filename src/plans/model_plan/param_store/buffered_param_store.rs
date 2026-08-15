@@ -31,9 +31,6 @@ pub struct BufferedParamStore {
 
     /// Суммарный размер состояния на один параметр.
     pub(crate) state_size_per_param: usize,
-
-    /// Глобальный менеджер памяти.
-    pub(crate) memory: Arc<Mutex<MemoryExecutor>>,
 }
 
 impl BufferedParamStore {
@@ -96,7 +93,6 @@ impl BufferedParamStore {
             opt_state,
             num_params,
             state_size_per_param,
-            memory,
         }
     }
 

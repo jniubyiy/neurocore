@@ -9,7 +9,7 @@ pub mod shape;
 
 pub use blueprint::LayerKind;
 pub use plan::Plan;
-pub use param_store::{ParamSlice, ParamStore};
+pub use param_store::{BufferedParamStore, ParamSlice};
 pub use sequential::Sequential;
 pub use layer_desc::LayerDesc;
 pub use shape::Shape;

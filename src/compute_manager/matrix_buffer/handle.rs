@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::memory_executor::executor::MemoryExecutor;
+use crate::compute_manager::memory_executor::matrix_entry::MatrixStorage;
 use crate::compute_manager::memory_executor::matrix_id::MatrixBufferId;
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
@@ -106,6 +107,88 @@ impl MatrixBufferHandle {
             id: self.id,
             memory: self.memory.clone(),
         }
+    }
+
+    /// Копирует часть данных из буфера в новый вектор.
+    ///
+    /// Для CPU-хранилища выполняется прямое копирование диапазона
+    /// без создания полной временной копии. Для GPU/SSD используется
+    /// fallback на полное чтение.
+    ///
+    /// # Паника
+    /// Паникует, если диапазон выходит за пределы данных.
+    pub fn read_range(&self, start: usize, len: usize) -> Vec<f32> {
+        let mem = self.memory.lock().unwrap();
+        let entry = mem
+            .get_matrix_entry(self.id)
+            .expect("MatrixBufferHandle: entry not found in MemoryExecutor");
+
+        match &entry.storage {
+            MatrixStorage::Cpu(data) => {
+                assert!(
+                    start + len <= data.len(),
+                    "MatrixBufferHandle::read_range: out of bounds (start={}, len={}, total={})",
+                    start,
+                    len,
+                    data.len()
+                );
+                data[start..start + len].to_vec()
+            }
+            _ => {
+                // Освобождаем блокировку перед вызовом read(),
+                // так как read() снова блокирует MemoryExecutor.
+                drop(mem);
+                let guard = self.read();
+                let slice = guard
+                    .as_slice()
+                    .expect("MatrixBufferHandle::read_range: expected CPU-compatible buffer");
+                assert!(
+                    start + len <= slice.len(),
+                    "MatrixBufferHandle::read_range: out of bounds in fallback"
+                );
+                slice[start..start + len].to_vec()
+            }
+        }
+    }
+
+    /// Записывает данные в указанный диапазон буфера.
+    ///
+    /// Для CPU-хранилища выполняется прямая запись в диапазон
+    /// без промежуточного копирования всего буфера. Для GPU/SSD
+    /// используется fallback на полное чтение-модификацию-запись.
+    ///
+    /// # Паника
+    /// Паникует, если диапазон выходит за пределы данных или
+    /// длина `src` не соответствует диапазону.
+    pub fn write_range(&self, start: usize, src: &[f32]) {
+        let mut mem = self.memory.lock().unwrap();
+        if let Some(entry) = mem.get_matrix_entry_mut(self.id) {
+            if let MatrixStorage::Cpu(data) = &mut entry.storage {
+                assert!(
+                    start + src.len() <= data.len(),
+                    "MatrixBufferHandle::write_range: out of bounds (start={}, len={}, total={})",
+                    start,
+                    src.len(),
+                    data.len()
+                );
+                data[start..start + src.len()].copy_from_slice(src);
+                return;
+            }
+        }
+
+        // Освобождаем блокировку перед вызовом write(),
+        // так как write() снова блокирует MemoryExecutor.
+        drop(mem);
+
+        let mut guard = self.write();
+        let slice = guard
+            .as_slice_mut()
+            .expect("MatrixBufferHandle::write_range: expected CPU-compatible buffer");
+        assert!(
+            start + src.len() <= slice.len(),
+            "MatrixBufferHandle::write_range: out of bounds in fallback"
+        );
+        slice[start..start + src.len()].copy_from_slice(src);
     }
 }
 

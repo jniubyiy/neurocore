@@ -68,7 +68,7 @@ impl MixedModel {
                         Some(indices) => indices.clone(),
                         None => (0..stream_buffers.len()).collect(),
                     };
-                    let params = self.store.lock().unwrap().all_params();
+                    let params = self.buffered_param_store.lock().unwrap().get_all_params();
 
                     if let Some(ref gpu_compute_mutex) = self.gpu_compute {
                         let gpu = gpu_compute_mutex.lock().unwrap();

@@ -13,7 +13,7 @@ use crate::compute_manager::adaptive_planner::ProfilingData;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::DevicePlan;
 use crate::loss_plan::{LossDesc, LossExpr};
-use crate::model_plan::param_store::{BufferedParamStore, ParamStore};
+use crate::model_plan::param_store::BufferedParamStore;
 use crate::optimizer_plan::{OptimizerExpr, OptimizerDesc};
 use crate::linalg;
 
@@ -25,7 +25,7 @@ pub(crate) struct DevicePlacementState {
 pub struct MixedModel {
     pub(crate) segments: Vec<Segment>,
     pub(crate) segment_placement: Vec<SegmentPlacement>,
-    pub(crate) store: Arc<Mutex<ParamStore>>,
+    pub(crate) buffered_param_store: Arc<Mutex<BufferedParamStore>>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) gpu_compute: Option<Mutex<GpuCompute>>,
     pub(crate) input_stream_count: usize,
@@ -39,9 +39,6 @@ pub struct MixedModel {
 
     /// Пул временных матриц для управляемого выделения памяти на CPU.
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
-
-    /// Новое буферизованное хранилище параметров и градиентов.
-    pub(crate) buffered_param_store: Option<BufferedParamStore>,
 
     /// Буферизованный интерпретатор оптимизатора с состояниями.
     pub(crate) optimizer_expr: Option<OptimizerExpr>,
@@ -60,8 +57,9 @@ impl MixedModel {
         self.output_stream_count
     }
 
-    pub fn param_store(&self) -> &Arc<Mutex<ParamStore>> {
-        &self.store
+    /// Возвращает доступ к буферизованному хранилищу параметров.
+    pub fn buffered_param_store(&self) -> &Arc<Mutex<BufferedParamStore>> {
+        &self.buffered_param_store
     }
 
     pub fn executor(&self) -> &Box<dyn Executor> {
@@ -342,20 +340,17 @@ impl MixedModel {
         let chain = desc.build_chain();
         let state_size = chain.total_state_size_per_param();
 
-        // Инициализация BufferedParamStore при первом вызове
-        if self.buffered_param_store.is_none() {
-            let num_params = self.store.lock().unwrap().len();
-            let bp = BufferedParamStore::new_cpu(
-                self.memory_executor.clone(),
-                num_params,
-                state_size,
-            );
-            self.buffered_param_store = Some(bp);
-        }
+        let mut bp = self.buffered_param_store.lock().unwrap();
 
-        // Инициализация OptimizerExpr при первом вызове
+        // Гарантируем, что состояние оптимизатора выделено правильно.
+        bp.ensure_opt_state(state_size);
+
+        // Копируем градиенты в управляемый буфер.
+        bp.copy_grads_from_slice(grads);
+
+        // Инициализация OptimizerExpr при первом вызове.
         if self.optimizer_expr.is_none() {
-            let num_params = self.buffered_param_store.as_ref().unwrap().num_params();
+            let num_params = bp.len();
             let pool_arc = self.temp_matrix_pool.clone();
             let mut pool = pool_arc.lock().unwrap();
             let opt_expr = OptimizerExpr::new_buffered_handle(
@@ -367,22 +362,10 @@ impl MixedModel {
             self.optimizer_expr = Some(opt_expr);
         }
 
-        let bp = self.buffered_param_store.as_mut().unwrap();
-
-        // Копируем параметры из ParamStore в управляемый буфер
-        let params_vec = self.store.lock().unwrap().all_params_vec();
-        bp.copy_params_from_slice(&params_vec);
-
-        // Копируем градиенты
-        bp.copy_grads_from_slice(grads);
-
-        // Выполняем шаг оптимизатора
+        // Выполняем шаг оптимизатора над внутренними буферами.
         let opt = self.optimizer_expr.as_mut().unwrap();
-        opt.step_buffered_handle(bp.params_handle(), bp.grads_handle());
+        opt.step_buffered_handle(&bp.params, &bp.grads);
 
-        // Копируем обновлённые параметры обратно в ParamStore
-        let mut updated_params = vec![0.0; bp.num_params()];
-        bp.copy_params_to_slice(&mut updated_params);
-        self.store.lock().unwrap().set_all_params(&updated_params);
+        // Никакого копирования обратно не требуется: параметры уже обновлены.
     }
 }

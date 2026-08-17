@@ -129,7 +129,7 @@ impl MixedModel {
 
         let input_handle = stream_buffers[0].clone();
         let batch = input_handle.rows();
-        let params = self.store.lock().unwrap().all_params();
+        let params = self.buffered_param_store.lock().unwrap().get_all_params();
         let splitter = Splitter::new(input_dim, output_dims.clone());
         let (wa_vec, wb_vec, bias_a_vec, bias_b_vec) =
             splitter.get_weights_and_biases_vec(&params, &slice);
@@ -219,7 +219,7 @@ impl MixedModel {
         let b_handle = stream_buffers[1].clone();
 
         let batch = a_handle.rows();
-        let params = self.store.lock().unwrap().all_params();
+        let params = self.buffered_param_store.lock().unwrap().get_all_params();
         let combiner = Combiner::new(vec![input_dim, input_dim], output_dim);
         let (wa_vec, wb_vec, bias_vec) = combiner.get_weights_and_bias_vec(&params, &slice);
 

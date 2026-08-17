@@ -79,11 +79,11 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
 
     // --- инициализация весов ---
     {
-        let mut store = model.param_store().lock().unwrap();
-        let len = store.len();
+        let mut bp = model.buffered_param_store().lock().unwrap();
+        let len = bp.len();
         match &plan.initializer {
-            Initializer::Zeros => store.set_all_params(&vec![0.0f32; len]),
-            Initializer::Ones => store.set_all_params(&vec![1.0f32; len]),
+            Initializer::Zeros => bp.set_all_params(&vec![0.0f32; len]),
+            Initializer::Ones => bp.set_all_params(&vec![1.0f32; len]),
             Initializer::RandomUniform { min, max } => {
                 let mut rng: Box<dyn rand::RngCore> = if let Some(seed) = plan.seed {
                     Box::new(rand::rngs::StdRng::seed_from_u64(seed))
@@ -94,7 +94,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
                 for p in &mut params {
                     *p = rng.gen_range(*min..*max);
                 }
-                store.set_all_params(&params);
+                bp.set_all_params(&params);
             }
         }
     }

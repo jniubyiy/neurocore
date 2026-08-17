@@ -16,7 +16,7 @@ use crate::device_plan::{ComputeDevice, DevicePlan};
 use crate::layers::UniversalLayer;
 use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::blueprint::LayerKind;
-use crate::model_plan::param_store::{ParamSlice, ParamStore};
+use crate::model_plan::param_store::{ParamSlice, BufferedParamStore};
 
 use super::types::Segment;
 
@@ -101,9 +101,12 @@ impl MixedModel {
             .max(1);
 
         // -----------------------------------------------------------
-        // 3. Параметры и планировщик CPU
+        // 3. Буферизованное хранилище параметров
         // -----------------------------------------------------------
-        let store = Arc::new(Mutex::new(ParamStore::new()));
+        let buffered_param_store = Arc::new(Mutex::new(
+            BufferedParamStore::new(memory_executor.clone(), 0, 0)
+        ));
+
         let cost = CostModel::calibrate();
         let mut scheduler = Scheduler::new_with_cpus(cost, CPU_INFO.clone(), num_cpus);
         scheduler.set_num_workers(cpu_threads);
@@ -190,9 +193,10 @@ impl MixedModel {
                     let input_dim = desc.input_shape.streams[0];
                     let output_dims = desc.output_shape.streams.clone();
                     active_ports = Some(output_dims.clone());
-                    let mut store_lock = store.lock().unwrap();
-                    let slice = store_lock.allocate(desc.param_len());
-                    drop(store_lock);
+                    let slice = {
+                        let mut bp = buffered_param_store.lock().unwrap();
+                        bp.allocate(desc.param_len())
+                    };
                     segments.push(Segment::Splitter {
                         input_dim,
                         output_dims,
@@ -204,9 +208,10 @@ impl MixedModel {
                     finalize_universal!();
                     let input_dim = desc.input_shape.streams[0];
                     let output_dim = desc.output_shape.streams[0];
-                    let mut store_lock = store.lock().unwrap();
-                    let slice = store_lock.allocate(desc.param_len());
-                    drop(store_lock);
+                    let slice = {
+                        let mut bp = buffered_param_store.lock().unwrap();
+                        bp.allocate(desc.param_len())
+                    };
                     segments.push(Segment::Combiner {
                         input_dim,
                         output_dim,
@@ -246,12 +251,14 @@ impl MixedModel {
                         };
                         current_stream_indices = indices;
                     }
-                    let mut store_lock = store.lock().unwrap();
+
                     let layer = desc.create_universal_layer();
-                    let slice = store_lock.allocate(desc.param_len());
+                    let slice = {
+                        let mut bp = buffered_param_store.lock().unwrap();
+                        bp.allocate(desc.param_len())
+                    };
                     current_layers.push(layer);
                     current_slices.push(slice);
-                    drop(store_lock);
                 }
             }
         }
@@ -308,7 +315,7 @@ impl MixedModel {
         let mut model = MixedModel {
             segments,
             segment_placement: segment_placement.clone(),
-            store,
+            buffered_param_store,
             executor,
             gpu_compute,
             input_stream_count,
@@ -321,7 +328,6 @@ impl MixedModel {
                 placements: vec![],
             })),
             temp_matrix_pool,
-            buffered_param_store: None,
             optimizer_expr: None,
         };
 

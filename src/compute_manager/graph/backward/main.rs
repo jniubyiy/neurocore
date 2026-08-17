@@ -30,7 +30,8 @@ impl MixedModel {
             "backward_mat_multi_buffered: expected {} deltas, got {}",
             self.output_stream_count, deltas.len());
 
-        let params = self.store.lock().unwrap().all_params().to_vec();
+        // Получаем все параметры из нового хранилища
+        let params = self.buffered_param_store.lock().unwrap().get_all_params();
         let param_len = params.len();
         let mut total_grad = vec![0.0f32; param_len];
 

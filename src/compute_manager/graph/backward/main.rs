@@ -47,14 +47,24 @@ impl MixedModel {
                 Segment::Unsqueeze(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
-                        new_stream.push(dim_change::reduce_mat_buffered_handle(pool, buf, target_dims));
+                        new_stream.push(dim_change::reduce_mat_buffered_handle(
+                            &self.memory_executor,
+                            pool,
+                            buf,
+                            target_dims,
+                        ));
                     }
                     stream_gradients = new_stream;
                 }
                 Segment::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
-                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims));
+                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(
+                            &self.memory_executor,
+                            pool,
+                            buf,
+                            target_dims,
+                        ));
                     }
                     stream_gradients = new_stream;
                 }

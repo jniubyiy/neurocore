@@ -2,8 +2,10 @@
 
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 use faer::Mat;
+use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::memory_executor::MemoryExecutor;
 
 #[derive(Clone, Debug)]
 pub enum DynamicTensor {
@@ -186,9 +188,12 @@ pub fn reduce_mat(
 
 // ------------------ Буферизованные версии (MatrixBufferHandle) ------------------
 
-/// Версия `unsqueeze_mat` с использованием [`MatrixBufferHandle`] и пула [`TempMatrixPool`].
+/// Версия `unsqueeze_mat` с использованием управляемого `MatrixBufferHandle`.
+/// Теперь выполняется напрямую через `MemoryExecutor::reshape_matrix_handle`,
+/// без промежуточных `Vec<f32>`.
 pub fn unsqueeze_mat_buffered_handle(
-    pool: &mut TempMatrixPool,
+    memory_executor: &Arc<Mutex<MemoryExecutor>>,
+    _pool: &mut TempMatrixPool,
     input: MatrixBufferHandle,
     target_dims: &[usize],
 ) -> MatrixBufferHandle {
@@ -202,46 +207,19 @@ pub fn unsqueeze_mat_buffered_handle(
     let new_rows = batch * remaining_product;
     let new_cols = last_dim;
 
-    // Читаем данные из входного handle
-    let input_guard = input.read();
-    let src = input_guard.as_slice().expect("unsqueeze_mat_buffered_handle: input must be CPU");
-    let data = src.to_vec();
-    drop(input_guard);
-
-    // Возвращаем входной буфер в пул
-    pool.release(input);
-
-    // Создаём выходной буфер
-    let output = pool.acquire(new_rows, new_cols);
-
-    // Записываем данные с перестановкой
-    {
-        let mut output_guard = output.write();
-        let dst = output_guard.as_slice_mut().expect("unsqueeze_mat_buffered_handle: output must be CPU");
-        let mut idx = 0;
-        // column-major обход входного: внешний цикл по c, внутренний по r
-        for c in 0..features {
-            for r in 0..batch {
-                let src_idx = c * batch + r;
-                let dst_r = idx / new_cols;
-                let dst_c = idx % new_cols;
-                let dst_idx = dst_c * new_rows + dst_r; // column-major в выходном
-                dst[dst_idx] = data[src_idx];
-                idx += 1;
-            }
-        }
-    }
-
-    output
+    memory_executor.lock().unwrap()
+        .reshape_matrix_handle(&input, new_rows, new_cols)
+        .expect("unsqueeze_mat_buffered_handle: reshape failed")
 }
 
-/// Версия `reduce_mat` с использованием [`MatrixBufferHandle`] и пула [`TempMatrixPool`].
+/// Версия `reduce_mat` с использованием управляемого `MatrixBufferHandle`.
+/// Выполняется напрямую через `MemoryExecutor::reshape_matrix_handle`.
 pub fn reduce_mat_buffered_handle(
-    pool: &mut TempMatrixPool,
+    memory_executor: &Arc<Mutex<MemoryExecutor>>,
+    _pool: &mut TempMatrixPool,
     input: MatrixBufferHandle,
     target_dims: &[usize],
 ) -> MatrixBufferHandle {
-    // Сохраняем размеры до перемещения
     let input_rows = input.rows();
     let input_cols = input.cols();
     let total = input_rows * input_cols;
@@ -253,35 +231,7 @@ pub fn reduce_mat_buffered_handle(
 
     assert_eq!(total, new_rows * new_cols, "reduce_mat_buffered_handle: element count mismatch");
 
-    // Читаем данные
-    let input_guard = input.read();
-    let src = input_guard.as_slice().expect("reduce_mat_buffered_handle: input must be CPU");
-    let data = src.to_vec();
-    drop(input_guard);
-
-    // Возвращаем входной буфер в пул
-    pool.release(input);
-
-    // Создаём выходной буфер
-    let output = pool.acquire(new_rows, new_cols);
-
-    // Записываем данные с перестановкой
-    {
-        let mut output_guard = output.write();
-        let dst = output_guard.as_slice_mut().expect("reduce_mat_buffered_handle: output must be CPU");
-        let mut idx = 0;
-        // column-major обход входного: внешний цикл по c, внутренний по r
-        for c in 0..input_cols {
-            for r in 0..input_rows {
-                let src_idx = c * input_rows + r;
-                let dst_r = idx / new_cols;
-                let dst_c = idx % new_cols;
-                let dst_idx = dst_c * new_rows + dst_r;
-                dst[dst_idx] = data[src_idx];
-                idx += 1;
-            }
-        }
-    }
-
-    output
+    memory_executor.lock().unwrap()
+        .reshape_matrix_handle(&input, new_rows, new_cols)
+        .expect("reduce_mat_buffered_handle: reshape failed")
 }

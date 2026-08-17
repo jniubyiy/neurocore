@@ -456,4 +456,94 @@ impl MemoryExecutor {
 
         Ok((buffer, raw_id))
     }
+
+    /// Переформатирует управляемый CPU-буфер, создавая новый буфер с другими размерами.
+    ///
+    /// Порядок элементов сохраняется в соответствии с column-major обходом:
+    /// исходная матрица (old_rows x old_cols) преобразуется в новую (new_rows x new_cols),
+    /// при этом общее количество элементов должно совпадать.
+    ///
+    /// Старая запись удаляется из реестра, а её память переиспользуется для нового буфера,
+    /// поэтому старый `src` дескриптор становится недействительным и должен быть отброшен.
+    ///
+    /// # Аргументы
+    /// * `src` – исходный дескриптор (CPU).
+    /// * `new_rows` – количество строк новой матрицы.
+    /// * `new_cols` – количество столбцов новой матрицы.
+    ///
+    /// # Возвращает
+    /// Новый `MatrixBufferHandle` с переставленными данными.
+    pub fn reshape_matrix_handle(
+        &mut self,
+        src: &MatrixBufferHandle,
+        new_rows: usize,
+        new_cols: usize,
+    ) -> Result<MatrixBufferHandle, MemoryError> {
+        let src_id = src.id();
+        let (old_rows, old_cols) = {
+            let entry = self
+                .matrix_entries
+                .get(&src_id)
+                .ok_or(MemoryError::MatrixBufferNotFound(src_id))?;
+            (entry.rows, entry.cols)
+        };
+
+        let total = old_rows * old_cols;
+        if total != new_rows * new_cols {
+            return Err(MemoryError::SsdError(
+                "reshape_matrix_handle: element count mismatch".to_string(),
+            ));
+        }
+
+        // Извлекаем данные, заменяя хранилище пустым Vec
+        let data = {
+            let entry = self
+                .matrix_entries
+                .get_mut(&src_id)
+                .ok_or(MemoryError::MatrixBufferNotFound(src_id))?;
+            match std::mem::replace(&mut entry.storage, MatrixStorage::Cpu(Vec::new())) {
+                MatrixStorage::Cpu(vec) => vec,
+                _ => {
+                    // Восстанавливаем хранилище, если оно было не CPU
+                    entry.storage = MatrixStorage::Cpu(Vec::new());
+                    return Err(MemoryError::SsdError(
+                        "reshape_matrix_handle: source must be CPU".to_string(),
+                    ));
+                }
+            }
+        };
+
+        // Удаляем старую запись и освобождаем память
+        self.matrix_entries.remove(&src_id);
+        self.release_reserved_memory(MemoryDeviceKind::HostRam, total);
+
+        // Создаём новый вектор с перестановкой
+        let mut new_data = vec![0.0f32; total];
+        let mut idx = 0;
+        for c in 0..old_cols {
+            for r in 0..old_rows {
+                let src_idx = c * old_rows + r;
+                let dst_r = idx / new_cols;
+                let dst_c = idx % new_cols;
+                let dst_idx = dst_c * new_rows + dst_r;
+                new_data[dst_idx] = data[src_idx];
+                idx += 1;
+            }
+        }
+
+        // Резервируем память под новый буфер
+        self.reserve_memory(MemoryDeviceKind::HostRam, total)?;
+
+        let new_id = MatrixBufferId(self.next_matrix_id.fetch_add(1, Ordering::SeqCst));
+        let entry = MatrixEntry::new(
+            new_rows,
+            new_cols,
+            MatrixStorage::Cpu(new_data),
+            BufferPriority::Medium,
+        );
+        self.matrix_entries.insert(new_id, entry);
+
+        let arc = self.memory_arc.clone().expect("MemoryExecutor::set_self_arc not called");
+        Ok(MatrixBufferHandle::new(new_id, arc))
+    }
 }

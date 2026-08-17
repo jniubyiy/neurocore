@@ -1,7 +1,6 @@
 // src/compute_manager/graph/model.rs
 
 use std::sync::{Arc, Mutex};
-use faer::Mat;
 
 use crate::compute_manager::device_assignment::SegmentPlacement;
 use crate::compute_manager::dim_change::DynamicTensor;
@@ -15,7 +14,6 @@ use crate::device_plan::DevicePlan;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::BufferedParamStore;
 use crate::optimizer_plan::{OptimizerExpr, OptimizerDesc};
-use crate::linalg;
 
 pub(crate) struct DevicePlacementState {
     pub(crate) profiling_data: ProfilingData,
@@ -133,12 +131,11 @@ impl MixedModel {
         let pool_arc = self.temp_matrix_pool.clone();
         let mut pool = pool_arc.lock().unwrap();
 
-        let mat = self.dynamic_tensor_to_mat(input);
-        let buf = self.mat_to_matrix_buffer_handle(&mat, &mut pool);
+        let buf = self.dynamic_tensor_to_matrix_buffer_handle(&input, &mut pool);
 
         let (out_bufs, ctxs) = self.forward_mat_multi_buffered(&mut pool, vec![buf]);
         let out_buf = out_bufs.into_iter().next().expect("No output buffer");
-        let out_tensor = self.matrix_buffer_handle_to_dynamic_tensor(out_buf, &self.output_shapes[0]);
+        let out_tensor = self.matrix_buffer_handle_to_dynamic_tensor(&out_buf, &self.output_shapes[0], &mut pool);
 
         (out_tensor, ctxs)
     }
@@ -151,8 +148,7 @@ impl MixedModel {
         let pool_arc = self.temp_matrix_pool.clone();
         let mut pool = pool_arc.lock().unwrap();
 
-        let delta_mat = self.dynamic_tensor_to_mat(delta);
-        let delta_buf = self.mat_to_matrix_buffer_handle(&delta_mat, &mut pool);
+        let delta_buf = self.dynamic_tensor_to_matrix_buffer_handle(&delta, &mut pool);
 
         let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, vec![delta_buf]);
 
@@ -163,7 +159,7 @@ impl MixedModel {
         drop(bp);
 
         let in_buf = in_bufs.into_iter().next().expect("No input buffer");
-        let in_tensor = self.matrix_buffer_handle_to_dynamic_tensor(in_buf, &self.input_shapes[0]);
+        let in_tensor = self.matrix_buffer_handle_to_dynamic_tensor(&in_buf, &self.input_shapes[0], &mut pool);
 
         (in_tensor, vec![grads_vec])
     }
@@ -176,19 +172,16 @@ impl MixedModel {
         let mut pool = pool_arc.lock().unwrap();
 
         let bufs: Vec<MatrixBufferHandle> = inputs
-            .into_iter()
-            .map(|tensor| {
-                let mat = self.dynamic_tensor_to_mat(tensor);
-                self.mat_to_matrix_buffer_handle(&mat, &mut pool)
-            })
+            .iter()
+            .map(|tensor| self.dynamic_tensor_to_matrix_buffer_handle(tensor, &mut pool))
             .collect();
 
         let (out_bufs, ctxs) = self.forward_mat_multi_buffered(&mut pool, bufs);
 
         let out_tensors = out_bufs
-            .into_iter()
+            .iter()
             .zip(self.output_shapes.iter())
-            .map(|(buf, shape)| self.matrix_buffer_handle_to_dynamic_tensor(buf, shape))
+            .map(|(buf, shape)| self.matrix_buffer_handle_to_dynamic_tensor(buf, shape, &mut pool))
             .collect();
 
         (out_tensors, ctxs)
@@ -203,11 +196,8 @@ impl MixedModel {
         let mut pool = pool_arc.lock().unwrap();
 
         let delta_bufs: Vec<MatrixBufferHandle> = deltas
-            .into_iter()
-            .map(|tensor| {
-                let mat = self.dynamic_tensor_to_mat(tensor);
-                self.mat_to_matrix_buffer_handle(&mat, &mut pool)
-            })
+            .iter()
+            .map(|tensor| self.dynamic_tensor_to_matrix_buffer_handle(tensor, &mut pool))
             .collect();
 
         let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, delta_bufs);
@@ -219,9 +209,9 @@ impl MixedModel {
         drop(bp);
 
         let in_tensors = in_bufs
-            .into_iter()
+            .iter()
             .zip(self.input_shapes.iter())
-            .map(|(buf, shape)| self.matrix_buffer_handle_to_dynamic_tensor(buf, shape))
+            .map(|(buf, shape)| self.matrix_buffer_handle_to_dynamic_tensor(buf, shape, &mut pool))
             .collect();
 
         (in_tensors, vec![grads_vec])
@@ -236,22 +226,12 @@ impl MixedModel {
         let pool_arc = self.temp_matrix_pool.clone();
         let mut pool = pool_arc.lock().unwrap();
 
-        let pred_mat = self.dynamic_tensor_to_mat(pred.clone());
-        let target_mat = self.dynamic_tensor_to_mat(target.clone());
-        let pred_buf = self.mat_to_matrix_buffer_handle(&pred_mat, &mut pool);
-        let target_buf = self.mat_to_matrix_buffer_handle(&target_mat, &mut pool);
+        let pred_buf = self.dynamic_tensor_to_matrix_buffer_handle(pred, &mut pool);
+        let target_buf = self.dynamic_tensor_to_matrix_buffer_handle(target, &mut pool);
 
         let (loss, grad_buf) = self.compute_loss_handle(desc.build(), pred_buf, target_buf, &mut pool);
 
-        let grad_mat = if grad_buf.is_gpu() {
-            let gpu_compute = self.gpu_compute.as_ref().expect("GPU compute not available").lock().unwrap();
-            gpu_compute.download_gpu_handle_to_mat(&grad_buf)
-        } else {
-            let guard = grad_buf.read();
-            let slice = guard.as_slice().expect("CPU buffer");
-            Mat::from_fn(grad_buf.rows(), grad_buf.cols(), |r, c| slice[c * grad_buf.rows() + r])
-        };
-        let grad_tensor = self.mat_to_dynamic_tensor(grad_mat, &self.output_shapes[0]);
+        let grad_tensor = self.matrix_buffer_handle_to_dynamic_tensor(&grad_buf, &self.output_shapes[0], &mut pool);
         (loss, grad_tensor)
     }
 
@@ -281,56 +261,184 @@ impl MixedModel {
     // Вспомогательные функции конвертации DynamicTensor <-> MatrixBufferHandle
     // ===================================================================
 
-    fn dynamic_tensor_to_mat(&self, tensor: DynamicTensor) -> Mat<f32> {
-        match tensor {
-            DynamicTensor::Dim1(t) => linalg::tensor2d_to_faer(&t),
-            DynamicTensor::Dim2(t) => linalg::tensor3d_to_faer(&t),
-            DynamicTensor::Dim3(t) => linalg::tensor4d_to_faer(&t),
-            DynamicTensor::Dim4(t) => linalg::tensor5d_to_faer(&t),
-        }
-    }
-
-    fn mat_to_dynamic_tensor(&self, mat: Mat<f32>, shape: &[usize]) -> DynamicTensor {
-        let batch = mat.nrows();
-        match shape.len() {
-            1 => DynamicTensor::Dim1(linalg::faer_to_tensor2d(&mat)),
-            2 => DynamicTensor::Dim2(linalg::faer_to_tensor3d(&mat, batch, shape[0], shape[1])),
-            3 => DynamicTensor::Dim3(linalg::faer_to_tensor4d(&mat, batch, shape[0], shape[1], shape[2])),
-            4 => DynamicTensor::Dim4(linalg::faer_to_tensor5d(&mat, batch, shape[0], shape[1], shape[2], shape[3])),
-            _ => panic!("Unsupported tensor dimensionality: {} spatial dims", shape.len()),
-        }
-    }
-
-    fn mat_to_matrix_buffer_handle(&self, mat: &Mat<f32>, pool: &mut TempMatrixPool) -> MatrixBufferHandle {
-        let buf = pool.acquire(mat.nrows(), mat.ncols());
-        {
-            let mut guard = buf.write();
-            let slice = guard.as_slice_mut().expect("CPU buffer");
-            for c in 0..mat.ncols() {
-                for r in 0..mat.nrows() {
-                    slice[c * mat.nrows() + r] = mat[(r, c)];
+    /// Прямое копирование DynamicTensor в новый CPU-буфер без промежуточного faer::Mat.
+    fn dynamic_tensor_to_matrix_buffer_handle(
+        &self,
+        tensor: &DynamicTensor,
+        pool: &mut TempMatrixPool,
+    ) -> MatrixBufferHandle {
+        let rows = tensor.batch_size();
+        let cols = tensor.features();
+        let handle = pool.acquire(rows, cols);
+        handle.with_cpu_data_mut(|dst| {
+            match tensor {
+                DynamicTensor::Dim1(t) => {
+                    for c in 0..cols {
+                        for r in 0..rows {
+                            dst[c * rows + r] = t.data[r][c];
+                        }
+                    }
+                }
+                DynamicTensor::Dim2(t) => {
+                    let d3 = t.dim3;
+                    let d2 = t.dim2;
+                    for c in 0..cols {
+                        let j = c / d3;
+                        let k = c % d3;
+                        for r in 0..rows {
+                            dst[c * rows + r] = t.data[r][j][k];
+                        }
+                    }
+                }
+                DynamicTensor::Dim3(t) => {
+                    let d3 = t.dim3;
+                    let d4 = t.dim4;
+                    for c in 0..cols {
+                        let i2 = c / (d3 * d4);
+                        let rem = c % (d3 * d4);
+                        let i3 = rem / d4;
+                        let i4 = rem % d4;
+                        for r in 0..rows {
+                            dst[c * rows + r] = t.data[r][i2][i3][i4];
+                        }
+                    }
+                }
+                DynamicTensor::Dim4(t) => {
+                    let d3 = t.dim3;
+                    let d4 = t.dim4;
+                    let d5 = t.dim5;
+                    for c in 0..cols {
+                        let i2 = c / (d3 * d4 * d5);
+                        let rem = c % (d3 * d4 * d5);
+                        let i3 = rem / (d4 * d5);
+                        let rem2 = rem % (d4 * d5);
+                        let i4 = rem2 / d5;
+                        let i5 = rem2 % d5;
+                        for r in 0..rows {
+                            dst[c * rows + r] = t.data[r][i2][i3][i4][i5];
+                        }
+                    }
                 }
             }
-        }
-        buf
+        });
+        handle
     }
 
+    /// Прямое преобразование MatrixBufferHandle в DynamicTensor без faer::Mat.
+    /// Принимает пул, чтобы избежать повторной блокировки temp_matrix_pool.
     fn matrix_buffer_handle_to_dynamic_tensor(
         &self,
-        buf: MatrixBufferHandle,
+        buf: &MatrixBufferHandle,
         shape: &[usize],
+        pool: &mut TempMatrixPool,
     ) -> DynamicTensor {
-        let mat = if buf.is_gpu() {
+        let rows = buf.rows();
+        let cols = buf.cols();
+
+        // Если буфер GPU, предварительно копируем в CPU через переданный пул
+        let cpu_buf = if buf.is_gpu() {
             let gpu_compute = self.gpu_compute.as_ref().expect("GPU compute not available").lock().unwrap();
-            gpu_compute.download_gpu_handle_to_mat(&buf)
+            let cpu_handle = pool.acquire(rows, cols);
+            gpu_compute.copy_gpu_to_cpu_handle(buf, &cpu_handle);
+            cpu_handle
         } else {
-            let guard = buf.read();
-            let slice = guard.as_slice().expect("CPU buffer");
-            Mat::from_fn(buf.rows(), buf.cols(), |r, c| slice[c * buf.rows() + r])
+            buf.clone()
         };
 
-        let tensor = self.mat_to_dynamic_tensor(mat, shape);
-        drop(buf);
+        let tensor = cpu_buf.with_cpu_data(|src| {
+            match shape.len() {
+                1 => {
+                    let mut data = Vec::with_capacity(rows);
+                    for r in 0..rows {
+                        let mut row = Vec::with_capacity(cols);
+                        for c in 0..cols {
+                            row.push(src[c * rows + r]);
+                        }
+                        data.push(row);
+                    }
+                    DynamicTensor::Dim1(crate::tensor::Tensor2D::new(data))
+                }
+                2 => {
+                    let d1 = shape[0];
+                    let d2 = shape[1];
+                    assert_eq!(cols, d1 * d2);
+                    let mut data = Vec::with_capacity(rows);
+                    for r in 0..rows {
+                        let mut dim1 = Vec::with_capacity(d1);
+                        for i in 0..d1 {
+                            let mut dim2 = Vec::with_capacity(d2);
+                            for j in 0..d2 {
+                                let c = i * d2 + j;
+                                dim2.push(src[c * rows + r]);
+                            }
+                            dim1.push(dim2);
+                        }
+                        data.push(dim1);
+                    }
+                    DynamicTensor::Dim2(crate::tensor::Tensor3D::new(data))
+                }
+                3 => {
+                    let d1 = shape[0];
+                    let d2 = shape[1];
+                    let d3 = shape[2];
+                    assert_eq!(cols, d1 * d2 * d3);
+                    let mut data = Vec::with_capacity(rows);
+                    for r in 0..rows {
+                        let mut dim1 = Vec::with_capacity(d1);
+                        for i in 0..d1 {
+                            let mut dim2 = Vec::with_capacity(d2);
+                            for j in 0..d2 {
+                                let mut dim3 = Vec::with_capacity(d3);
+                                for k in 0..d3 {
+                                    let c = (i * d2 + j) * d3 + k;
+                                    dim3.push(src[c * rows + r]);
+                                }
+                                dim2.push(dim3);
+                            }
+                            dim1.push(dim2);
+                        }
+                        data.push(dim1);
+                    }
+                    DynamicTensor::Dim3(crate::tensor::Tensor4D::new(data))
+                }
+                4 => {
+                    let d1 = shape[0];
+                    let d2 = shape[1];
+                    let d3 = shape[2];
+                    let d4 = shape[3];
+                    assert_eq!(cols, d1 * d2 * d3 * d4);
+                    let mut data = Vec::with_capacity(rows);
+                    for r in 0..rows {
+                        let mut dim1 = Vec::with_capacity(d1);
+                        for i in 0..d1 {
+                            let mut dim2 = Vec::with_capacity(d2);
+                            for j in 0..d2 {
+                                let mut dim3 = Vec::with_capacity(d3);
+                                for k in 0..d3 {
+                                    let mut dim4 = Vec::with_capacity(d4);
+                                    for l in 0..d4 {
+                                        let c = ((i * d2 + j) * d3 + k) * d4 + l;
+                                        dim4.push(src[c * rows + r]);
+                                    }
+                                    dim3.push(dim4);
+                                }
+                                dim2.push(dim3);
+                            }
+                            dim1.push(dim2);
+                        }
+                        data.push(dim1);
+                    }
+                    DynamicTensor::Dim4(crate::tensor::Tensor5D::new(data))
+                }
+                _ => panic!("Unsupported tensor dimensionality: {} spatial dims", shape.len()),
+            }
+        });
+
+        // Если был GPU, освобождаем временный CPU буфер
+        if buf.is_gpu() {
+            pool.release(cpu_buf);
+        }
+
         tensor
     }
 

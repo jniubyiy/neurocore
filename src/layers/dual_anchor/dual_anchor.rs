@@ -82,7 +82,8 @@ impl UniversalLayerBuffered for DualAnchor {
         grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
-    ) -> Vec<f32> {
+        grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::DualAnchor1D { input } => input,
@@ -110,39 +111,41 @@ impl UniversalLayerBuffered for DualAnchor {
         debug_assert_eq!(go.len(), gi.len());
         debug_assert_eq!(go.len(), x_slice.len());
 
-        let mut d_min_accum = vec![0.0f32; self.features];
-        let mut d_max_accum = vec![0.0f32; self.features];
-        let mut d_alpha = 0.0f32;
+        grad_params.with_cpu_data_mut(|grad_data| {
+            let mut d_alpha = 0.0f32;
 
-        for c in 0..cols {
-            let min_v = min_vals[c];
-            let max_v = max_vals[c];
-            for r in 0..rows {
-                let idx = c * rows + r;
+            for c in 0..cols {
+                let min_v = min_vals[c];
+                let max_v = max_vals[c];
+                let mut d_min = 0.0f32;
+                let mut d_max = 0.0f32;
 
-                let x_val = x_slice[idx];
-                let d_min_abs = (x_val - min_v).abs();
-                let d_max_abs = (x_val - max_v).abs();
-                let is_min = d_min_abs <= d_max_abs;
-                let gout = go[idx];
+                for r in 0..rows {
+                    let idx = c * rows + r;
 
-                gi[idx] = gout * (1.0 - alpha);
+                    let x_val = x_slice[idx];
+                    let d_min_abs = (x_val - min_v).abs();
+                    let d_max_abs = (x_val - max_v).abs();
+                    let is_min = d_min_abs <= d_max_abs;
+                    let gout = go[idx];
 
-                if is_min {
-                    d_min_accum[c] += gout * alpha;
-                    d_alpha += gout * (min_v - x_val);
-                } else {
-                    d_max_accum[c] += gout * alpha;
-                    d_alpha += gout * (max_v - x_val);
+                    gi[idx] = gout * (1.0 - alpha);
+
+                    if is_min {
+                        d_min += gout * alpha;
+                        d_alpha += gout * (min_v - x_val);
+                    } else {
+                        d_max += gout * alpha;
+                        d_alpha += gout * (max_v - x_val);
+                    }
                 }
-            }
-        }
 
-        let mut grad = Vec::with_capacity(2 * self.features + 1);
-        grad.extend_from_slice(&d_min_accum);
-        grad.extend_from_slice(&d_max_accum);
-        grad.push(d_alpha);
-        grad
+                grad_data[base + c] = d_min;
+                grad_data[base + self.features + c] = d_max;
+            }
+
+            grad_data[base + 2 * self.features] = d_alpha;
+        });
     }
 
     fn param_len(&self) -> usize {

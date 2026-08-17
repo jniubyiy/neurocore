@@ -73,7 +73,8 @@ impl UniversalLayerBuffered for Softmax {
         grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
-    ) -> Vec<f32> {
+        _grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let output_handle = match bc {
             BufferedContext::Softmax { output } => output,
@@ -112,8 +113,6 @@ impl UniversalLayerBuffered for Softmax {
                 gi[idx] = y_val * (go[idx] - dot);
             }
         }
-
-        Vec::new()
     }
 
     fn param_len(&self) -> usize {

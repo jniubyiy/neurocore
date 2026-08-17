@@ -25,15 +25,14 @@ impl MixedModel {
         pool: &mut TempMatrixPool,
         contexts: &[Vec<DynamicContext>],
         deltas: Vec<MatrixBufferHandle>,
-    ) -> (Vec<MatrixBufferHandle>, Vec<Vec<f32>>) {
+    ) -> Vec<MatrixBufferHandle> {
         assert_eq!(deltas.len(), self.output_stream_count,
             "backward_mat_multi_buffered: expected {} deltas, got {}",
             self.output_stream_count, deltas.len());
 
-        // Получаем все параметры из нового хранилища
+        // Получаем параметры и глобальный буфер градиентов
         let params = self.buffered_param_store.lock().unwrap().get_all_params();
-        let param_len = params.len();
-        let mut total_grad = vec![0.0f32; param_len];
+        let grad_params_handle = self.buffered_param_store.lock().unwrap().grads_handle().clone();
 
         let mut stream_gradients = deltas;
         let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
@@ -85,7 +84,6 @@ impl MixedModel {
                             // GPU-ветка
                             let gpu = self.gpu_compute.as_ref().unwrap().lock().unwrap();
 
-                            // Гарантируем, что входной градиент находится на GPU
                             let delta_gpu_handle = if delta_handle.is_gpu() {
                                 delta_handle.clone()
                             } else {
@@ -97,7 +95,6 @@ impl MixedModel {
                                 gpu_handle
                             };
 
-                            // Вызываем GPU-обработку, получаем GPU-градиент
                             let out_gpu = process_backward_gpu_buffered(
                                 &gpu,
                                 proc,
@@ -105,10 +102,9 @@ impl MixedModel {
                                 ctxs_slice,
                                 &params,
                                 delta_gpu_handle,
-                                &mut total_grad,
+                                &grad_params_handle,
                             );
 
-                            // Конвертируем результат обратно в CPU handle
                             let out_mat = gpu.download_gpu_handle_to_mat(&out_gpu);
                             let cpu_handle = pool.acquire(out_mat.nrows(), out_mat.ncols());
                             {
@@ -130,13 +126,12 @@ impl MixedModel {
                                 &layer_ctxs,
                                 delta_handle,
                                 &params,
-                                &mut total_grad,
+                                &grad_params_handle,
                             );
                             new_gradients[stream_idx] = Some(in_delta_handle);
                         }
                     }
 
-                    // Заполняем пропущенные потоки клонами исходных градиентов
                     let mut final_grads = Vec::with_capacity(stream_gradients.len());
                     for i in 0..stream_gradients.len() {
                         if let Some(handle) = new_gradients[i].take() {
@@ -154,7 +149,6 @@ impl MixedModel {
                     let delta_a = stream_gradients[0].clone();
                     let delta_b = stream_gradients[1].clone();
 
-                    // SplitterConnector просто пропускает градиенты без изменений
                     let in_a = pool.acquire(delta_a.rows(), delta_a.cols());
                     let in_b = pool.acquire(delta_b.rows(), delta_b.cols());
                     copy_handle_data(&delta_a, &in_a);
@@ -167,7 +161,6 @@ impl MixedModel {
                     ctx_pos -= 1;
                 }
                 Segment::CombinerConnector { .. } => {
-                    // Прозрачный проход: градиенты не меняются
                     ctx_pos -= 1;
                 }
                 Segment::Splitter {
@@ -189,7 +182,6 @@ impl MixedModel {
                     let da_handle = stream_gradients[0].clone();
                     let db_handle = stream_gradients[1].clone();
 
-                    // Читаем данные в Vec<f32>
                     let x_vec = handle_to_vec(&x_handle);
                     let da_vec = handle_to_vec(&da_handle);
                     let db_vec = handle_to_vec(&db_handle);
@@ -199,13 +191,11 @@ impl MixedModel {
                     let splitter = crate::layers::Splitter::new(*input_dim, output_dims.clone());
                     let (wa_vec, wb_vec, _, _) = splitter.get_weights_and_biases_vec(&params, slice);
 
-                    // Вычисляем градиенты
                     let batch = x_handle.rows();
                     let n = *input_dim;
                     let p = output_dims[0];
                     let q = output_dims[1];
 
-                    // d_pre_a = relu_backward(pre_a, da), d_pre_b = relu_backward(pre_b, db)
                     let mut d_pre_a_vec = vec![0.0f32; batch * p];
                     let mut d_pre_b_vec = vec![0.0f32; batch * q];
                     for i in 0..batch * p {
@@ -215,7 +205,6 @@ impl MixedModel {
                         d_pre_b_vec[i] = if pre_b_vec[i] > 0.0 { db_vec[i] } else { 0.0 };
                     }
 
-                    // dx = d_pre_a * wa + d_pre_b * wb
                     let mut dx_vec = vec![0.0f32; batch * n];
                     for r in 0..batch {
                         for c in 0..n {
@@ -230,57 +219,55 @@ impl MixedModel {
                         }
                     }
 
-                    // Градиенты весов и смещений
-                    let mut d_wa_vec = vec![0.0f32; p * n];
-                    let mut d_wb_vec = vec![0.0f32; q * n];
-                    for out_idx in 0..p {
-                        for in_idx in 0..n {
+                    // Записываем градиенты параметров прямо в глобальный буфер
+                    grad_params_handle.with_cpu_data_mut(|grad_data| {
+                        // d_wa
+                        for out_idx in 0..p {
+                            for in_idx in 0..n {
+                                let mut sum = 0.0;
+                                for r in 0..batch {
+                                    sum += d_pre_a_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                                }
+                                grad_data[slice.start + out_idx * n + in_idx] = sum;
+                            }
+                        }
+
+                        // d_wb
+                        let offset = slice.start + p * n;
+                        for out_idx in 0..q {
+                            for in_idx in 0..n {
+                                let mut sum = 0.0;
+                                for r in 0..batch {
+                                    sum += d_pre_b_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                                }
+                                grad_data[offset + out_idx * n + in_idx] = sum;
+                            }
+                        }
+
+                        // d_bias_a
+                        let offset = offset + q * n;
+                        for c in 0..p {
                             let mut sum = 0.0;
                             for r in 0..batch {
-                                sum += d_pre_a_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                                sum += d_pre_a_vec[c * batch + r];
                             }
-                            d_wa_vec[out_idx * n + in_idx] = sum;
+                            grad_data[offset + c] = sum;
                         }
-                    }
-                    for out_idx in 0..q {
-                        for in_idx in 0..n {
+
+                        // d_bias_b
+                        let offset = offset + p;
+                        for c in 0..q {
                             let mut sum = 0.0;
                             for r in 0..batch {
-                                sum += d_pre_b_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                                sum += d_pre_b_vec[c * batch + r];
                             }
-                            d_wb_vec[out_idx * n + in_idx] = sum;
+                            grad_data[offset + c] = sum;
                         }
-                    }
+                    });
 
-                    let d_bias_a_vec: Vec<f32> = (0..p)
-                        .map(|c| (0..batch).map(|r| d_pre_a_vec[c * batch + r]).sum())
-                        .collect();
-                    let d_bias_b_vec: Vec<f32> = (0..q)
-                        .map(|c| (0..batch).map(|r| d_pre_b_vec[c * batch + r]).sum())
-                        .collect();
-
-                    // Записываем градиенты параметров в total_grad
-                    for (i, &g) in d_wa_vec.iter().enumerate() {
-                        total_grad[slice.start + i] += g;
-                    }
-                    let offset = slice.start + p * n;
-                    for (i, &g) in d_wb_vec.iter().enumerate() {
-                        total_grad[offset + i] += g;
-                    }
-                    let offset = offset + q * n;
-                    for (i, &g) in d_bias_a_vec.iter().enumerate() {
-                        total_grad[offset + i] += g;
-                    }
-                    let offset = offset + p;
-                    for (i, &g) in d_bias_b_vec.iter().enumerate() {
-                        total_grad[offset + i] += g;
-                    }
-
-                    // Создаём выходной градиент dx
                     let mut dx_handle = pool.acquire(batch, n);
                     vec_to_handle(&dx_vec, &mut dx_handle);
 
-                    // Освобождаем входные градиенты и контекстные буферы
                     pool.release(da_handle);
                     pool.release(db_handle);
                     pool.release(x_handle);
@@ -308,7 +295,6 @@ impl MixedModel {
 
                     let dout_handle = stream_gradients[0].clone();
 
-                    // Читаем данные
                     let a_vec = handle_to_vec(&a_handle);
                     let b_vec = handle_to_vec(&b_handle);
                     let pre_vec = handle_to_vec(&pre_handle);
@@ -321,13 +307,11 @@ impl MixedModel {
                     let n = *input_dim;
                     let m = *output_dim;
 
-                    // d_pre = dout * relu'(pre)
                     let mut d_pre_vec = vec![0.0f32; batch * m];
                     for i in 0..batch * m {
                         d_pre_vec[i] = if pre_vec[i] > 0.0 { dout_vec[i] } else { 0.0 };
                     }
 
-                    // da = d_pre * wa^T, db = d_pre * wb^T
                     let mut da_vec = vec![0.0f32; batch * n];
                     let mut db_vec = vec![0.0f32; batch * n];
                     for r in 0..batch {
@@ -343,46 +327,47 @@ impl MixedModel {
                         }
                     }
 
-                    // Градиенты весов и смещений
-                    let mut d_wa_vec = vec![0.0f32; m * n];
-                    let mut d_wb_vec = vec![0.0f32; m * n];
-                    for out_idx in 0..m {
-                        for in_idx in 0..n {
-                            let mut sum_a = 0.0;
-                            let mut sum_b = 0.0;
-                            for r in 0..batch {
-                                sum_a += d_pre_vec[out_idx * batch + r] * a_vec[in_idx * batch + r];
-                                sum_b += d_pre_vec[out_idx * batch + r] * b_vec[in_idx * batch + r];
+                    // Записываем градиенты параметров прямо в глобальный буфер
+                    grad_params_handle.with_cpu_data_mut(|grad_data| {
+                        // d_wa
+                        for out_idx in 0..m {
+                            for in_idx in 0..n {
+                                let mut sum = 0.0;
+                                for r in 0..batch {
+                                    sum += d_pre_vec[out_idx * batch + r] * a_vec[in_idx * batch + r];
+                                }
+                                grad_data[slice.start + out_idx * n + in_idx] = sum;
                             }
-                            d_wa_vec[out_idx * n + in_idx] = sum_a;
-                            d_wb_vec[out_idx * n + in_idx] = sum_b;
                         }
-                    }
 
-                    let d_bias_vec: Vec<f32> = (0..m)
-                        .map(|c| (0..batch).map(|r| d_pre_vec[c * batch + r]).sum())
-                        .collect();
+                        // d_wb
+                        let offset = slice.start + m * n;
+                        for out_idx in 0..m {
+                            for in_idx in 0..n {
+                                let mut sum = 0.0;
+                                for r in 0..batch {
+                                    sum += d_pre_vec[out_idx * batch + r] * b_vec[in_idx * batch + r];
+                                }
+                                grad_data[offset + out_idx * n + in_idx] = sum;
+                            }
+                        }
 
-                    // Записываем градиенты параметров
-                    for (i, &g) in d_wa_vec.iter().enumerate() {
-                        total_grad[slice.start + i] += g;
-                    }
-                    let offset = slice.start + m * n;
-                    for (i, &g) in d_wb_vec.iter().enumerate() {
-                        total_grad[offset + i] += g;
-                    }
-                    let offset = offset + m * n;
-                    for (i, &g) in d_bias_vec.iter().enumerate() {
-                        total_grad[offset + i] += g;
-                    }
+                        // d_bias
+                        let offset = offset + m * n;
+                        for c in 0..m {
+                            let mut sum = 0.0;
+                            for r in 0..batch {
+                                sum += d_pre_vec[c * batch + r];
+                            }
+                            grad_data[offset + c] = sum;
+                        }
+                    });
 
-                    // Создаём выходные градиенты da, db
                     let mut da_handle = pool.acquire(batch, n);
                     let mut db_handle = pool.acquire(batch, n);
                     vec_to_handle(&da_vec, &mut da_handle);
                     vec_to_handle(&db_vec, &mut db_handle);
 
-                    // Освобождаем входные данные
                     pool.release(dout_handle);
                     pool.release(a_handle);
                     pool.release(b_handle);
@@ -402,7 +387,7 @@ impl MixedModel {
         }
 
         assert_eq!(stream_gradients.len(), self.input_stream_count);
-        (stream_gradients, vec![total_grad])
+        stream_gradients
     }
 
     /// Универсальный обратный проход через слои с использованием MatrixBufferHandle
@@ -414,7 +399,7 @@ impl MixedModel {
         ctxs: &[&DynamicContext],
         grad_out: MatrixBufferHandle,
         params: &[f32],
-        total_grad: &mut Vec<f32>,
+        grad_params_handle: &MatrixBufferHandle,
     ) -> MatrixBufferHandle {
         let mut current_grad = grad_out;
         for i in (0..layers.len()).rev() {
@@ -422,7 +407,6 @@ impl MixedModel {
             let slice = &slices[i];
             let ctx = ctxs[i];
 
-            // Определяем входные размеры
             let in_features = if let Some(l) = layer.as_linear() {
                 <dyn UniversalLayerBuffered>::input_features(l)
             } else if layer.as_relu().is_some()
@@ -438,66 +422,21 @@ impl MixedModel {
             {
                 current_grad.cols()
             } else {
-                current_grad.cols() // fallback, но не должно использоваться
+                current_grad.cols()
             };
 
             let batch = current_grad.rows();
             let mut grad_input = pool.acquire(batch, in_features);
 
-            let grad_params = if let Some(linear) = layer.as_linear() {
-                <Linear as UniversalLayerBuffered>::backward_buffered(
-                    linear, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(relu) = layer.as_relu() {
-                <ReLU as UniversalLayerBuffered>::backward_buffered(
-                    relu, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(sigmoid) = layer.as_sigmoid() {
-                <Sigmoid as UniversalLayerBuffered>::backward_buffered(
-                    sigmoid, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(tanh) = layer.as_tanh() {
-                <Tanh as UniversalLayerBuffered>::backward_buffered(
-                    tanh, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(leaky) = layer.as_leaky_relu() {
-                <LeakyReLU as UniversalLayerBuffered>::backward_buffered(
-                    leaky, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(identity) = layer.as_identity() {
-                <Identity as UniversalLayerBuffered>::backward_buffered(
-                    identity, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(softmax) = layer.as_softmax() {
-                <Softmax as UniversalLayerBuffered>::backward_buffered(
-                    softmax, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(memory) = layer.as_memory() {
-                <Memory as UniversalLayerBuffered>::backward_buffered(
-                    memory, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
-                <SoftSparseGate as UniversalLayerBuffered>::backward_buffered(
-                    soft_sparse, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
-                <SoftKeepGate as UniversalLayerBuffered>::backward_buffered(
-                    soft_keep, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else if let Some(dual_anchor) = layer.as_dual_anchor() {
-                <DualAnchor as UniversalLayerBuffered>::backward_buffered(
-                    dual_anchor, ctx, &current_grad, &mut grad_input, params, slice
-                )
-            } else {
-                unreachable!(
-                    "Layer {:?} does not have a buffered backward implementation",
-                    std::any::type_name_of_val(layer.as_ref())
-                );
-            };
-
-            for (idx, &g) in grad_params.iter().enumerate() {
-                total_grad[slice.start + idx] += g;
-            }
+            call_backward_buffered(
+                layer,
+                ctx,
+                &current_grad,
+                &mut grad_input,
+                params,
+                slice,
+                grad_params_handle,
+            );
 
             pool.release(current_grad);
             current_grad = grad_input;
@@ -532,4 +471,66 @@ fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
     let dst_slice = dst_guard.as_slice_mut().expect("copy_handle_data: destination must be CPU");
     assert_eq!(src_slice.len(), dst_slice.len());
     dst_slice.copy_from_slice(src_slice);
+}
+
+/// Вызывает `backward_buffered` для конкретного слоя с учётом новой сигнатуры.
+fn call_backward_buffered(
+    layer: &Box<dyn UniversalLayer>,
+    ctx: &DynamicContext,
+    grad_output: &MatrixBufferHandle,
+    grad_input: &mut MatrixBufferHandle,
+    params: &[f32],
+    slice: &ParamSlice,
+    grad_params_handle: &MatrixBufferHandle,
+) {
+    if let Some(linear) = layer.as_linear() {
+        <Linear as UniversalLayerBuffered>::backward_buffered(
+            linear, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(relu) = layer.as_relu() {
+        <ReLU as UniversalLayerBuffered>::backward_buffered(
+            relu, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(sigmoid) = layer.as_sigmoid() {
+        <Sigmoid as UniversalLayerBuffered>::backward_buffered(
+            sigmoid, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(tanh) = layer.as_tanh() {
+        <Tanh as UniversalLayerBuffered>::backward_buffered(
+            tanh, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(leaky) = layer.as_leaky_relu() {
+        <LeakyReLU as UniversalLayerBuffered>::backward_buffered(
+            leaky, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(identity) = layer.as_identity() {
+        <Identity as UniversalLayerBuffered>::backward_buffered(
+            identity, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(softmax) = layer.as_softmax() {
+        <Softmax as UniversalLayerBuffered>::backward_buffered(
+            softmax, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(memory) = layer.as_memory() {
+        <Memory as UniversalLayerBuffered>::backward_buffered(
+            memory, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
+        <SoftSparseGate as UniversalLayerBuffered>::backward_buffered(
+            soft_sparse, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
+        <SoftKeepGate as UniversalLayerBuffered>::backward_buffered(
+            soft_keep, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(dual_anchor) = layer.as_dual_anchor() {
+        <DualAnchor as UniversalLayerBuffered>::backward_buffered(
+            dual_anchor, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else {
+        unreachable!(
+            "Layer {:?} does not have a buffered backward implementation",
+            std::any::type_name_of_val(layer.as_ref())
+        );
+    }
 }

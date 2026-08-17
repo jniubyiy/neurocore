@@ -48,7 +48,8 @@ impl UniversalLayerBuffered for ReLU {
         grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
-    ) -> Vec<f32> {
+        _grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::ReLU { input } => input,
@@ -70,8 +71,6 @@ impl UniversalLayerBuffered for ReLU {
         for idx in 0..go.len() {
             gi[idx] = if x_slice[idx] > 0.0 { go[idx] } else { 0.0 };
         }
-
-        Vec::new()
     }
 
     fn param_len(&self) -> usize {

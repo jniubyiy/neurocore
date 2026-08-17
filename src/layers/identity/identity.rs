@@ -44,7 +44,8 @@ impl UniversalLayerBuffered for Identity {
         grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
-    ) -> Vec<f32> {
+        _grad_params: &MatrixBufferHandle,
+    ) {
         let go_guard = grad_output.read();
         let go = go_guard.as_slice().expect("Identity backward: expected CPU buffer");
 
@@ -53,8 +54,6 @@ impl UniversalLayerBuffered for Identity {
 
         debug_assert_eq!(go.len(), gi.len());
         gi.copy_from_slice(go);
-
-        Vec::new()
     }
 
     fn param_len(&self) -> usize {

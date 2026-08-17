@@ -79,7 +79,8 @@ impl UniversalLayerBuffered for SoftSparseGate {
         grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
-    ) -> Vec<f32> {
+        grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::SoftSparseGate { input } => input,
@@ -105,28 +106,29 @@ impl UniversalLayerBuffered for SoftSparseGate {
         debug_assert_eq!(go.len(), gi.len());
         debug_assert_eq!(go.len(), x_slice.len());
 
-        let mut d_thr = vec![0.0f32; self.in_features];
+        // Вычисляем градиент по входу и записываем пороговые градиенты напрямую в grad_params
+        grad_params.with_cpu_data_mut(|grad_data| {
+            for c in 0..cols {
+                let threshold = thresholds[c];
+                let mut d_thr = 0.0f32;
+                for r in 0..rows {
+                    let idx = c * rows + r;
 
-        for c in 0..cols {
-            let threshold = thresholds[c];
-            for r in 0..rows {
-                let idx = c * rows + r;
+                    let x_val = x_slice[idx];
+                    let abs_x = x_val.abs();
+                    let z = (abs_x - threshold) / tmp;
+                    let s = 1.0 / (1.0 + (-z).exp());
+                    let ds = s * (1.0 - s) / tmp;
+                    let df_dx = s + abs_x * ds;
 
-                let x_val = x_slice[idx];
-                let abs_x = x_val.abs();
-                let z = (abs_x - threshold) / tmp;
-                let s = 1.0 / (1.0 + (-z).exp());
-                let ds = s * (1.0 - s) / tmp;
-                let df_dx = s + abs_x * ds;
+                    gi[idx] = go[idx] * df_dx;
 
-                gi[idx] = go[idx] * df_dx;
-
-                // Градиент по порогам: d_s_dthr = -ds
-                d_thr[c] += -go[idx] * x_val * ds;
+                    // Градиент по порогам: d_s_dthr = -ds
+                    d_thr += -go[idx] * x_val * ds;
+                }
+                grad_data[slice.start + c] = d_thr;
             }
-        }
-
-        d_thr
+        });
     }
 
     fn param_len(&self) -> usize {

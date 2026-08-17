@@ -154,11 +154,18 @@ impl MixedModel {
         let delta_mat = self.dynamic_tensor_to_mat(delta);
         let delta_buf = self.mat_to_matrix_buffer_handle(&delta_mat, &mut pool);
 
-        let (in_bufs, grads) = self.backward_mat_multi_buffered(&mut pool, contexts, vec![delta_buf]);
+        let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, vec![delta_buf]);
+
+        // Получаем градиенты параметров из BufferedParamStore
+        let bp = self.buffered_param_store.lock().unwrap();
+        let mut grads_vec = vec![0.0f32; bp.len()];
+        bp.copy_grads_to_slice(&mut grads_vec);
+        drop(bp);
+
         let in_buf = in_bufs.into_iter().next().expect("No input buffer");
         let in_tensor = self.matrix_buffer_handle_to_dynamic_tensor(in_buf, &self.input_shapes[0]);
 
-        (in_tensor, grads)
+        (in_tensor, vec![grads_vec])
     }
 
     pub fn forward_multi(
@@ -203,7 +210,13 @@ impl MixedModel {
             })
             .collect();
 
-        let (in_bufs, grads) = self.backward_mat_multi_buffered(&mut pool, contexts, delta_bufs);
+        let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, delta_bufs);
+
+        // Получаем градиенты параметров из BufferedParamStore
+        let bp = self.buffered_param_store.lock().unwrap();
+        let mut grads_vec = vec![0.0f32; bp.len()];
+        bp.copy_grads_to_slice(&mut grads_vec);
+        drop(bp);
 
         let in_tensors = in_bufs
             .into_iter()
@@ -211,7 +224,7 @@ impl MixedModel {
             .map(|(buf, shape)| self.matrix_buffer_handle_to_dynamic_tensor(buf, shape))
             .collect();
 
-        (in_tensors, grads)
+        (in_tensors, vec![grads_vec])
     }
 
     pub fn compute_loss(

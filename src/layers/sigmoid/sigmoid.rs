@@ -48,7 +48,8 @@ impl UniversalLayerBuffered for Sigmoid {
         grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
-    ) -> Vec<f32> {
+        _grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let output_handle = match bc {
             BufferedContext::Sigmoid { output } => output,
@@ -71,8 +72,6 @@ impl UniversalLayerBuffered for Sigmoid {
             let y_val = y_slice[idx];
             gi[idx] = go[idx] * y_val * (1.0 - y_val);
         }
-
-        Vec::new()
     }
 
     fn param_len(&self) -> usize {

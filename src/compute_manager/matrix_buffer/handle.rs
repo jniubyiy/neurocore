@@ -90,6 +90,44 @@ impl MatrixBufferHandle {
         MatrixWriteGuard::new(&self.memory, self.id)
     }
 
+    /// Выполняет замыкание с неизменяемым доступом к внутренним данным CPU‑буфера.
+    ///
+    /// Этот метод предоставляет прямой доступ к данным без создания копии,
+    /// в отличие от [`read()`]. Блокировка `MemoryExecutor` удерживается
+    /// на время выполнения замыкания, поэтому внутри замыкания нельзя
+    /// вызывать `read()`/`write()` для этого же буфера (это приведёт к дедлоку).
+    ///
+    /// # Паника
+    /// Паникует, если буфер не находится в CPU-хранилище.
+    pub fn with_cpu_data<T>(&self, f: impl FnOnce(&[f32]) -> T) -> T {
+        let mem = self.memory.lock().unwrap();
+        let entry = mem
+            .get_matrix_entry(self.id)
+            .expect("MatrixBufferHandle: entry not found in MemoryExecutor");
+        match &entry.storage {
+            MatrixStorage::Cpu(data) => f(data),
+            _ => panic!("MatrixBufferHandle::with_cpu_data: buffer is not CPU"),
+        }
+    }
+
+    /// Выполняет замыкание с мутабельным доступом к внутренним данным CPU‑буфера.
+    ///
+    /// Аналогично [`with_cpu_data`], но предоставляет изменяемую ссылку.
+    /// Блокировка `MemoryExecutor` удерживается на время выполнения замыкания.
+    ///
+    /// # Паника
+    /// Паникует, если буфер не находится в CPU-хранилище.
+    pub fn with_cpu_data_mut<T>(&self, f: impl FnOnce(&mut [f32]) -> T) -> T {
+        let mut mem = self.memory.lock().unwrap();
+        let entry = mem
+            .get_matrix_entry_mut(self.id)
+            .expect("MatrixBufferHandle: entry not found in MemoryExecutor");
+        match &mut entry.storage {
+            MatrixStorage::Cpu(data) => f(data),
+            _ => panic!("MatrixBufferHandle::with_cpu_data_mut: buffer is not CPU"),
+        }
+    }
+
     /// Возвращает клонированную ссылку на `MemoryExecutor`.
     ///
     /// Используется внутри системы, в частности для создания слабых ссылок.

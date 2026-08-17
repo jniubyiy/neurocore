@@ -50,7 +50,8 @@ impl UniversalLayerBuffered for LeakyReLU {
         grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
-    ) -> Vec<f32> {
+        _grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::LeakyReLU { input } => input,
@@ -74,8 +75,6 @@ impl UniversalLayerBuffered for LeakyReLU {
             let derivative = if x_val > 0.0 { 1.0 } else { self.alpha };
             gi[idx] = go[idx] * derivative;
         }
-
-        Vec::new()
     }
 
     fn param_len(&self) -> usize {

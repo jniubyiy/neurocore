@@ -151,6 +151,7 @@ pub fn process_forward_gpu_buffered(
 
 /// Обратный проход на GPU с использованием MatrixBufferHandle.
 /// Входной градиент — GPU-дескриптор, выходной градиент — GPU-дескриптор.
+/// Градиенты параметров записываются напрямую в глобальный буфер `grad_params_handle`.
 pub fn process_backward_gpu_buffered(
     gpu_compute: &GpuCompute,
     layers: &[Box<dyn UniversalLayer>],
@@ -158,7 +159,7 @@ pub fn process_backward_gpu_buffered(
     contexts: &[DynamicContext],
     params: &[f32],
     grad_output: MatrixBufferHandle,
-    total_grad: &mut [f32],
+    grad_params_handle: &MatrixBufferHandle,
 ) -> MatrixBufferHandle {
     assert!(grad_output.is_gpu(), "Grad output must be GPU handle");
     let num_layers = layers.len();
@@ -201,12 +202,16 @@ pub fn process_backward_gpu_buffered(
             );
 
             let grad_weight_vec = gpu_compute.download_gpu_handle_to_vec(&grad_weight_handle);
-            for (i, &g) in grad_weight_vec.iter().enumerate() {
-                total_grad[w_start + i] += g;
-            }
-            for (i, &g) in grad_bias.iter().enumerate() {
-                total_grad[b_start + i] += g;
-            }
+
+            // Записываем градиенты весов и смещений в глобальный буфер
+            grad_params_handle.with_cpu_data_mut(|grad_data| {
+                for (i, &g) in grad_weight_vec.iter().enumerate() {
+                    grad_data[w_start + i] += g;
+                }
+                for (i, &g) in grad_bias.iter().enumerate() {
+                    grad_data[b_start + i] += g;
+                }
+            });
 
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_relu() {
@@ -304,9 +309,14 @@ pub fn process_backward_gpu_buffered(
                 &grad_input_handle,
                 &grad_thresh_handle,
             );
-            for (i, &g) in grad_thresh_vec.iter().enumerate() {
-                total_grad[slice.start + i] += g;
-            }
+
+            // Записываем градиенты порогов
+            grad_params_handle.with_cpu_data_mut(|grad_data| {
+                for (i, &g) in grad_thresh_vec.iter().enumerate() {
+                    grad_data[slice.start + i] += g;
+                }
+            });
+
             current_grad = grad_input_handle;
         } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
             let DynamicContext::Buffered(bc) = ctx;
@@ -325,9 +335,14 @@ pub fn process_backward_gpu_buffered(
                 &grad_input_handle,
                 &grad_thresh_handle,
             );
-            for (i, &g) in grad_thresh_vec.iter().enumerate() {
-                total_grad[slice.start + i] += g;
-            }
+
+            // Записываем градиенты порогов
+            grad_params_handle.with_cpu_data_mut(|grad_data| {
+                for (i, &g) in grad_thresh_vec.iter().enumerate() {
+                    grad_data[slice.start + i] += g;
+                }
+            });
+
             current_grad = grad_input_handle;
         } else if let Some(dual) = layer.as_dual_anchor() {
             let DynamicContext::Buffered(bc) = ctx;
@@ -354,9 +369,14 @@ pub fn process_backward_gpu_buffered(
                 &grad_max_handle,
                 &grad_alpha_handle,
             );
-            for (i, &g) in grad_vec.iter().enumerate() {
-                total_grad[slice.start + i] += g;
-            }
+
+            // Записываем градиенты параметров
+            grad_params_handle.with_cpu_data_mut(|grad_data| {
+                for (i, &g) in grad_vec.iter().enumerate() {
+                    grad_data[slice.start + i] += g;
+                }
+            });
+
             current_grad = grad_input_handle;
         } else {
             panic!(

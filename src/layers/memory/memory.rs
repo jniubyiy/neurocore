@@ -98,7 +98,8 @@ impl UniversalLayerBuffered for Memory {
         grad_input: &MatrixBufferHandle,
         _params: &[f32],
         _slice: &ParamSlice,
-    ) -> Vec<f32> {
+        _grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let _input_handle = match bc {
             BufferedContext::Memory { input } => input,
@@ -117,8 +118,6 @@ impl UniversalLayerBuffered for Memory {
         for (out, &in_val) in gi.iter_mut().zip(go.iter()) {
             *out = in_val * factor;
         }
-
-        Vec::new()
     }
 
     fn param_len(&self) -> usize {

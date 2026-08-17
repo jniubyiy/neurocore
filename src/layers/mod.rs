@@ -69,7 +69,8 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
         grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
-    ) -> Vec<f32>;
+        grad_params: &MatrixBufferHandle,
+    );
 
     fn param_len(&self) -> usize;
 

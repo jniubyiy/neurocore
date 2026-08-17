@@ -78,7 +78,8 @@ impl UniversalLayerBuffered for Linear {
         grad_input: &MatrixBufferHandle,
         params: &[f32],
         slice: &ParamSlice,
-    ) -> Vec<f32> {
+        grad_params: &MatrixBufferHandle,
+    ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::Linear { input } => input,
@@ -102,6 +103,7 @@ impl UniversalLayerBuffered for Linear {
         debug_assert_eq!(gi_slice.len(), in_rows * in_cols);
 
         let w_start = slice.start;
+        let b_start = w_start + in_cols * out_cols;
 
         // dx = grad_output * weight
         for r in 0..in_rows {
@@ -114,32 +116,28 @@ impl UniversalLayerBuffered for Linear {
             }
         }
 
-        // dw = grad_output^T * x
-        let mut dw = vec![0.0f32; in_cols * out_cols];
-        for out_idx in 0..out_cols {
-            for in_idx in 0..in_cols {
+        // Записываем градиенты весов и смещений прямо в глобальный буфер градиентов
+        grad_params.with_cpu_data_mut(|grad_data| {
+            // dw = grad_output^T * x
+            for out_idx in 0..out_cols {
+                for in_idx in 0..in_cols {
+                    let mut sum = 0.0;
+                    for r in 0..in_rows {
+                        sum += go_slice[out_idx * in_rows + r] * x_slice[in_idx * in_rows + r];
+                    }
+                    grad_data[w_start + out_idx * in_cols + in_idx] = sum;
+                }
+            }
+
+            // db = сумма по строкам grad_output
+            for c in 0..out_cols {
                 let mut sum = 0.0;
                 for r in 0..in_rows {
-                    sum += go_slice[out_idx * in_rows + r] * x_slice[in_idx * in_rows + r];
+                    sum += go_slice[c * in_rows + r];
                 }
-                dw[out_idx * in_cols + in_idx] = sum;
+                grad_data[b_start + c] = sum;
             }
-        }
-
-        // db = сумма по строкам grad_output
-        let mut db = vec![0.0f32; out_cols];
-        for c in 0..out_cols {
-            let mut sum = 0.0;
-            for r in 0..in_rows {
-                sum += go_slice[c * in_rows + r];
-            }
-            db[c] = sum;
-        }
-
-        let mut grad = Vec::with_capacity(self.in_features * self.out_features + self.out_features);
-        grad.extend_from_slice(&dw);
-        grad.extend_from_slice(&db);
-        grad
+        });
     }
 
     fn param_len(&self) -> usize {

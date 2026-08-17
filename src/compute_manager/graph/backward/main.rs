@@ -151,8 +151,20 @@ impl MixedModel {
 
                     let in_a = pool.acquire(delta_a.rows(), delta_a.cols());
                     let in_b = pool.acquire(delta_b.rows(), delta_b.cols());
-                    copy_handle_data(&delta_a, &in_a);
-                    copy_handle_data(&delta_b, &in_b);
+                    {
+                        let src_guard = delta_a.read();
+                        let src = src_guard.as_slice().expect("CPU buffer");
+                        let mut dst_guard = in_a.write();
+                        let dst = dst_guard.as_slice_mut().expect("CPU buffer");
+                        dst.copy_from_slice(src);
+                    }
+                    {
+                        let src_guard = delta_b.read();
+                        let src = src_guard.as_slice().expect("CPU buffer");
+                        let mut dst_guard = in_b.write();
+                        let dst = dst_guard.as_slice_mut().expect("CPU buffer");
+                        dst.copy_from_slice(src);
+                    }
 
                     pool.release(delta_a);
                     pool.release(delta_b);
@@ -182,11 +194,17 @@ impl MixedModel {
                     let da_handle = stream_gradients[0].clone();
                     let db_handle = stream_gradients[1].clone();
 
-                    let x_vec = handle_to_vec(&x_handle);
-                    let da_vec = handle_to_vec(&da_handle);
-                    let db_vec = handle_to_vec(&db_handle);
-                    let pre_a_vec = handle_to_vec(&pre_a_handle);
-                    let pre_b_vec = handle_to_vec(&pre_b_handle);
+                    // Читаем входные данные через MatrixBufferHandle::read()
+                    let x_guard = x_handle.read();
+                    let x_slice = x_guard.as_slice().expect("CPU buffer");
+                    let da_guard = da_handle.read();
+                    let da_slice = da_guard.as_slice().expect("CPU buffer");
+                    let db_guard = db_handle.read();
+                    let db_slice = db_guard.as_slice().expect("CPU buffer");
+                    let pre_a_guard = pre_a_handle.read();
+                    let pre_a_slice = pre_a_guard.as_slice().expect("CPU buffer");
+                    let pre_b_guard = pre_b_handle.read();
+                    let pre_b_slice = pre_b_guard.as_slice().expect("CPU buffer");
 
                     let splitter = crate::layers::Splitter::new(*input_dim, output_dims.clone());
                     let (wa_vec, wb_vec, _, _) = splitter.get_weights_and_biases_vec(&params, slice);
@@ -196,37 +214,59 @@ impl MixedModel {
                     let p = output_dims[0];
                     let q = output_dims[1];
 
-                    let mut d_pre_a_vec = vec![0.0f32; batch * p];
-                    let mut d_pre_b_vec = vec![0.0f32; batch * q];
-                    for i in 0..batch * p {
-                        d_pre_a_vec[i] = if pre_a_vec[i] > 0.0 { da_vec[i] } else { 0.0 };
-                    }
-                    for i in 0..batch * q {
-                        d_pre_b_vec[i] = if pre_b_vec[i] > 0.0 { db_vec[i] } else { 0.0 };
-                    }
+                    // Создаём промежуточные управляемые буферы
+                    let d_pre_a = pool.acquire(batch, p);
+                    let d_pre_b = pool.acquire(batch, q);
+                    let dx_handle = pool.acquire(batch, n);
 
-                    let mut dx_vec = vec![0.0f32; batch * n];
-                    for r in 0..batch {
-                        for c in 0..n {
-                            let mut sum = 0.0;
-                            for k in 0..p {
-                                sum += d_pre_a_vec[k * batch + r] * wa_vec[k * n + c];
-                            }
-                            for k in 0..q {
-                                sum += d_pre_b_vec[k * batch + r] * wb_vec[k * n + c];
-                            }
-                            dx_vec[c * batch + r] = sum;
+                    // Заполняем d_pre_a и d_pre_b
+                    {
+                        let mut d_pre_a_guard = d_pre_a.write();
+                        let d_pre_a_slice = d_pre_a_guard.as_slice_mut().expect("CPU buffer");
+                        for i in 0..batch * p {
+                            d_pre_a_slice[i] = if pre_a_slice[i] > 0.0 { da_slice[i] } else { 0.0 };
+                        }
+                    }
+                    {
+                        let mut d_pre_b_guard = d_pre_b.write();
+                        let d_pre_b_slice = d_pre_b_guard.as_slice_mut().expect("CPU buffer");
+                        for i in 0..batch * q {
+                            d_pre_b_slice[i] = if pre_b_slice[i] > 0.0 { db_slice[i] } else { 0.0 };
                         }
                     }
 
-                    // Записываем градиенты параметров прямо в глобальный буфер
+                    // Получаем ссылки на d_pre_a и d_pre_b для вычислений
+                    let d_pre_a_guard = d_pre_a.read();
+                    let d_pre_a_slice = d_pre_a_guard.as_slice().expect("CPU buffer");
+                    let d_pre_b_guard = d_pre_b.read();
+                    let d_pre_b_slice = d_pre_b_guard.as_slice().expect("CPU buffer");
+
+                    // Вычисляем dx и записываем в dx_handle
+                    {
+                        let mut dx_guard = dx_handle.write();
+                        let dx_slice = dx_guard.as_slice_mut().expect("CPU buffer");
+                        for r in 0..batch {
+                            for c in 0..n {
+                                let mut sum = 0.0;
+                                for k in 0..p {
+                                    sum += d_pre_a_slice[k * batch + r] * wa_vec[k * n + c];
+                                }
+                                for k in 0..q {
+                                    sum += d_pre_b_slice[k * batch + r] * wb_vec[k * n + c];
+                                }
+                                dx_slice[c * batch + r] = sum;
+                            }
+                        }
+                    }
+
+                    // Записываем градиенты параметров в глобальный буфер
                     grad_params_handle.with_cpu_data_mut(|grad_data| {
                         // d_wa
                         for out_idx in 0..p {
                             for in_idx in 0..n {
                                 let mut sum = 0.0;
                                 for r in 0..batch {
-                                    sum += d_pre_a_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                                    sum += d_pre_a_slice[out_idx * batch + r] * x_slice[in_idx * batch + r];
                                 }
                                 grad_data[slice.start + out_idx * n + in_idx] = sum;
                             }
@@ -238,7 +278,7 @@ impl MixedModel {
                             for in_idx in 0..n {
                                 let mut sum = 0.0;
                                 for r in 0..batch {
-                                    sum += d_pre_b_vec[out_idx * batch + r] * x_vec[in_idx * batch + r];
+                                    sum += d_pre_b_slice[out_idx * batch + r] * x_slice[in_idx * batch + r];
                                 }
                                 grad_data[offset + out_idx * n + in_idx] = sum;
                             }
@@ -249,7 +289,7 @@ impl MixedModel {
                         for c in 0..p {
                             let mut sum = 0.0;
                             for r in 0..batch {
-                                sum += d_pre_a_vec[c * batch + r];
+                                sum += d_pre_a_slice[c * batch + r];
                             }
                             grad_data[offset + c] = sum;
                         }
@@ -259,15 +299,15 @@ impl MixedModel {
                         for c in 0..q {
                             let mut sum = 0.0;
                             for r in 0..batch {
-                                sum += d_pre_b_vec[c * batch + r];
+                                sum += d_pre_b_slice[c * batch + r];
                             }
                             grad_data[offset + c] = sum;
                         }
                     });
 
-                    let mut dx_handle = pool.acquire(batch, n);
-                    vec_to_handle(&dx_vec, &mut dx_handle);
-
+                    // Освобождаем временные буферы
+                    pool.release(d_pre_a);
+                    pool.release(d_pre_b);
                     pool.release(da_handle);
                     pool.release(db_handle);
                     pool.release(x_handle);
@@ -295,10 +335,15 @@ impl MixedModel {
 
                     let dout_handle = stream_gradients[0].clone();
 
-                    let a_vec = handle_to_vec(&a_handle);
-                    let b_vec = handle_to_vec(&b_handle);
-                    let pre_vec = handle_to_vec(&pre_handle);
-                    let dout_vec = handle_to_vec(&dout_handle);
+                    // Читаем входные данные
+                    let a_guard = a_handle.read();
+                    let a_slice = a_guard.as_slice().expect("CPU buffer");
+                    let b_guard = b_handle.read();
+                    let b_slice = b_guard.as_slice().expect("CPU buffer");
+                    let pre_guard = pre_handle.read();
+                    let pre_slice = pre_guard.as_slice().expect("CPU buffer");
+                    let dout_guard = dout_handle.read();
+                    let dout_slice = dout_guard.as_slice().expect("CPU buffer");
 
                     let combiner = crate::layers::Combiner::new(vec![*input_dim, *input_dim], *output_dim);
                     let (wa_vec, wb_vec, _) = combiner.get_weights_and_bias_vec(&params, slice);
@@ -307,34 +352,52 @@ impl MixedModel {
                     let n = *input_dim;
                     let m = *output_dim;
 
-                    let mut d_pre_vec = vec![0.0f32; batch * m];
-                    for i in 0..batch * m {
-                        d_pre_vec[i] = if pre_vec[i] > 0.0 { dout_vec[i] } else { 0.0 };
-                    }
+                    // Промежуточные управляемые буферы
+                    let d_pre_handle = pool.acquire(batch, m);
+                    let da_handle = pool.acquire(batch, n);
+                    let db_handle = pool.acquire(batch, n);
 
-                    let mut da_vec = vec![0.0f32; batch * n];
-                    let mut db_vec = vec![0.0f32; batch * n];
-                    for r in 0..batch {
-                        for c in 0..n {
-                            let mut sum_a = 0.0;
-                            let mut sum_b = 0.0;
-                            for k in 0..m {
-                                sum_a += d_pre_vec[k * batch + r] * wa_vec[k * n + c];
-                                sum_b += d_pre_vec[k * batch + r] * wb_vec[k * n + c];
-                            }
-                            da_vec[c * batch + r] = sum_a;
-                            db_vec[c * batch + r] = sum_b;
+                    // Заполняем d_pre
+                    {
+                        let mut d_pre_guard = d_pre_handle.write();
+                        let d_pre_slice = d_pre_guard.as_slice_mut().expect("CPU buffer");
+                        for i in 0..batch * m {
+                            d_pre_slice[i] = if pre_slice[i] > 0.0 { dout_slice[i] } else { 0.0 };
                         }
                     }
 
-                    // Записываем градиенты параметров прямо в глобальный буфер
+                    // Получаем ссылку на d_pre
+                    let d_pre_guard = d_pre_handle.read();
+                    let d_pre_slice = d_pre_guard.as_slice().expect("CPU buffer");
+
+                    // Вычисляем da и db
+                    {
+                        let mut da_guard = da_handle.write();
+                        let da_slice = da_guard.as_slice_mut().expect("CPU buffer");
+                        let mut db_guard = db_handle.write();
+                        let db_slice = db_guard.as_slice_mut().expect("CPU buffer");
+                        for r in 0..batch {
+                            for c in 0..n {
+                                let mut sum_a = 0.0;
+                                let mut sum_b = 0.0;
+                                for k in 0..m {
+                                    sum_a += d_pre_slice[k * batch + r] * wa_vec[k * n + c];
+                                    sum_b += d_pre_slice[k * batch + r] * wb_vec[k * n + c];
+                                }
+                                da_slice[c * batch + r] = sum_a;
+                                db_slice[c * batch + r] = sum_b;
+                            }
+                        }
+                    }
+
+                    // Записываем градиенты параметров
                     grad_params_handle.with_cpu_data_mut(|grad_data| {
                         // d_wa
                         for out_idx in 0..m {
                             for in_idx in 0..n {
                                 let mut sum = 0.0;
                                 for r in 0..batch {
-                                    sum += d_pre_vec[out_idx * batch + r] * a_vec[in_idx * batch + r];
+                                    sum += d_pre_slice[out_idx * batch + r] * a_slice[in_idx * batch + r];
                                 }
                                 grad_data[slice.start + out_idx * n + in_idx] = sum;
                             }
@@ -346,7 +409,7 @@ impl MixedModel {
                             for in_idx in 0..n {
                                 let mut sum = 0.0;
                                 for r in 0..batch {
-                                    sum += d_pre_vec[out_idx * batch + r] * b_vec[in_idx * batch + r];
+                                    sum += d_pre_slice[out_idx * batch + r] * b_slice[in_idx * batch + r];
                                 }
                                 grad_data[offset + out_idx * n + in_idx] = sum;
                             }
@@ -357,17 +420,14 @@ impl MixedModel {
                         for c in 0..m {
                             let mut sum = 0.0;
                             for r in 0..batch {
-                                sum += d_pre_vec[c * batch + r];
+                                sum += d_pre_slice[c * batch + r];
                             }
                             grad_data[offset + c] = sum;
                         }
                     });
 
-                    let mut da_handle = pool.acquire(batch, n);
-                    let mut db_handle = pool.acquire(batch, n);
-                    vec_to_handle(&da_vec, &mut da_handle);
-                    vec_to_handle(&db_vec, &mut db_handle);
-
+                    // Освобождаем временные буферы
+                    pool.release(d_pre_handle);
                     pool.release(dout_handle);
                     pool.release(a_handle);
                     pool.release(b_handle);
@@ -443,34 +503,6 @@ impl MixedModel {
         }
         current_grad
     }
-}
-
-// Вспомогательные функции для работы с CPU-буферами
-
-/// Читает данные из CPU handle в Vec<f32> (column-major порядок).
-fn handle_to_vec(handle: &MatrixBufferHandle) -> Vec<f32> {
-    assert!(!handle.is_gpu(), "handle_to_vec supports only CPU buffers");
-    let guard = handle.read();
-    guard.as_slice().expect("CPU buffer").to_vec()
-}
-
-/// Записывает Vec<f32> в CPU handle (column-major порядок).
-fn vec_to_handle(data: &[f32], handle: &mut MatrixBufferHandle) {
-    assert!(!handle.is_gpu(), "vec_to_handle supports only CPU buffers");
-    let mut guard = handle.write();
-    let dst = guard.as_slice_mut().expect("CPU buffer");
-    assert_eq!(data.len(), dst.len());
-    dst.copy_from_slice(data);
-}
-
-/// Копирует данные между двумя CPU handle.
-fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
-    let src_guard = src.read();
-    let src_slice = src_guard.as_slice().expect("copy_handle_data: source must be CPU");
-    let mut dst_guard = dst.write();
-    let dst_slice = dst_guard.as_slice_mut().expect("copy_handle_data: destination must be CPU");
-    assert_eq!(src_slice.len(), dst_slice.len());
-    dst_slice.copy_from_slice(src_slice);
 }
 
 /// Вызывает `backward_buffered` для конкретного слоя с учётом новой сигнатуры.

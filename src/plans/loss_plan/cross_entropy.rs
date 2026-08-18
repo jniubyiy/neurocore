@@ -1,7 +1,6 @@
 // src/plans/loss_plan/cross_entropy.rs
 
 use std::any::Any;
-use faer::Mat;
 use super::cubes::ElemCube;
 use super::cubes::BufferedElemCube;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -34,65 +33,6 @@ impl ElemCube for CrossEntropyWithLogits {
 
     fn out_features(&self) -> usize {
         1
-    }
-
-    fn forward_batch(&self, input: &Mat<f32>) -> Mat<f32> {
-        let batch = input.nrows();
-        let nclass = self.num_classes;
-
-        let loss = Mat::from_fn(batch, 1, |i, _| {
-            let class_idx = input[(i, nclass)] as usize;
-
-            let mut max_val = f32::NEG_INFINITY;
-            for c in 0..nclass {
-                max_val = max_val.max(input[(i, c)]);
-            }
-
-            let mut exp_sum = 0.0f32;
-            for c in 0..nclass {
-                exp_sum += (input[(i, c)] - max_val).exp();
-            }
-
-            -input[(i, class_idx)] + max_val + exp_sum.ln()
-        });
-
-        loss
-    }
-
-    fn backward_batch(
-        &self,
-        input: &Mat<f32>,
-        _output_cache: &Mat<f32>,
-        grad_out: &Mat<f32>,
-    ) -> Mat<f32> {
-        let batch = input.nrows();
-        let nclass = self.num_classes;
-
-        let mut grad = Mat::zeros(batch, nclass + 1);
-
-        for i in 0..batch {
-            let class_idx = input[(i, nclass)] as usize;
-            let g = grad_out[(i, 0)];
-
-            let mut max_val = f32::NEG_INFINITY;
-            for c in 0..nclass {
-                max_val = max_val.max(input[(i, c)]);
-            }
-
-            let mut exp_sum = 0.0f32;
-            for c in 0..nclass {
-                exp_sum += (input[(i, c)] - max_val).exp();
-            }
-
-            for j in 0..nclass {
-                let softmax_j = ((input[(i, j)] - max_val).exp()) / exp_sum;
-                let indicator = if j == class_idx { 1.0 } else { 0.0 };
-                grad[(i, j)] = g * (softmax_j - indicator);
-            }
-            grad[(i, nclass)] = 0.0;
-        }
-
-        grad
     }
 
     fn as_any(&self) -> &dyn Any {

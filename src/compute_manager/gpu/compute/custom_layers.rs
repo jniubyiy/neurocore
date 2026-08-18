@@ -114,9 +114,11 @@ impl GpuCompute {
         temperature: f32,
         grad_input: &MatrixBufferHandle,
         grad_thresh: &MatrixBufferHandle,
-    ) -> Vec<f32> {
+        grad_thresh_cpu: &MatrixBufferHandle,
+    ) {
         assert!(input.is_gpu() && grad_out.is_gpu(), "Handles must be GPU");
         assert!(grad_input.is_gpu() && grad_thresh.is_gpu(), "Grad handles must be GPU");
+        assert!(!grad_thresh_cpu.is_gpu(), "grad_thresh_cpu must be CPU");
         let batch = input.rows();
         let features = input.cols();
         let total = batch * features;
@@ -126,6 +128,8 @@ impl GpuCompute {
         assert_eq!(grad_input.cols(), features);
         assert_eq!(grad_thresh.rows(), 1);
         assert_eq!(grad_thresh.cols(), features);
+        assert_eq!(grad_thresh_cpu.rows(), 1);
+        assert_eq!(grad_thresh_cpu.cols(), features);
 
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
@@ -150,8 +154,8 @@ impl GpuCompute {
 
         self.release_temp_buffer(thresh_buf, th_raw);
 
-        let gthresh_vec = self.download_gpu_handle_to_vec(grad_thresh);
-        gthresh_vec
+        // Копируем градиент порогов из GPU в CPU-буфер
+        self.copy_gpu_to_cpu_handle(grad_thresh, grad_thresh_cpu);
     }
 
     // ===================================================================
@@ -196,9 +200,11 @@ impl GpuCompute {
         temperature: f32,
         grad_input: &MatrixBufferHandle,
         grad_thresh: &MatrixBufferHandle,
-    ) -> Vec<f32> {
+        grad_thresh_cpu: &MatrixBufferHandle,
+    ) {
         assert!(input.is_gpu() && grad_out.is_gpu(), "Handles must be GPU");
         assert!(grad_input.is_gpu() && grad_thresh.is_gpu(), "Grad handles must be GPU");
+        assert!(!grad_thresh_cpu.is_gpu(), "grad_thresh_cpu must be CPU");
         let batch = input.rows();
         let features = input.cols();
         let total = batch * features;
@@ -208,6 +214,8 @@ impl GpuCompute {
         assert_eq!(grad_input.cols(), features);
         assert_eq!(grad_thresh.rows(), 1);
         assert_eq!(grad_thresh.cols(), features);
+        assert_eq!(grad_thresh_cpu.rows(), 1);
+        assert_eq!(grad_thresh_cpu.cols(), features);
 
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
@@ -232,8 +240,8 @@ impl GpuCompute {
 
         self.release_temp_buffer(thresh_buf, th_raw);
 
-        let gthresh_vec = self.download_gpu_handle_to_vec(grad_thresh);
-        gthresh_vec
+        // Копируем градиент порогов из GPU в CPU-буфер
+        self.copy_gpu_to_cpu_handle(grad_thresh, grad_thresh_cpu);
     }
 
     // ===================================================================
@@ -289,10 +297,15 @@ impl GpuCompute {
         grad_min: &MatrixBufferHandle,
         grad_max: &MatrixBufferHandle,
         grad_alpha: &MatrixBufferHandle,
-    ) -> Vec<f32> {
+        grad_min_cpu: &MatrixBufferHandle,
+        grad_max_cpu: &MatrixBufferHandle,
+        grad_alpha_cpu: &MatrixBufferHandle,
+    ) {
         assert!(input.is_gpu() && grad_out.is_gpu(), "Handles must be GPU");
         assert!(grad_input.is_gpu() && grad_min.is_gpu() && grad_max.is_gpu() && grad_alpha.is_gpu(),
             "Gradient handles must be GPU");
+        assert!(!grad_min_cpu.is_gpu() && !grad_max_cpu.is_gpu() && !grad_alpha_cpu.is_gpu(),
+            "CPU gradient handles must not be GPU");
         let batch = input.rows();
         let features = input.cols();
         let total = batch * features;
@@ -306,6 +319,12 @@ impl GpuCompute {
         assert_eq!(grad_max.cols(), features);
         assert_eq!(grad_alpha.rows(), 1);
         assert_eq!(grad_alpha.cols(), 1);
+        assert_eq!(grad_min_cpu.rows(), 1);
+        assert_eq!(grad_min_cpu.cols(), features);
+        assert_eq!(grad_max_cpu.rows(), 1);
+        assert_eq!(grad_max_cpu.cols(), features);
+        assert_eq!(grad_alpha_cpu.rows(), 1);
+        assert_eq!(grad_alpha_cpu.cols(), 1);
 
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
@@ -337,13 +356,9 @@ impl GpuCompute {
         self.release_temp_buffer(min_buf, min_raw);
         self.release_temp_buffer(max_buf, max_raw);
 
-        let grad_min_vec = self.download_gpu_handle_to_vec(grad_min);
-        let grad_max_vec = self.download_gpu_handle_to_vec(grad_max);
-        let grad_alpha_vec = self.download_gpu_handle_to_vec(grad_alpha);
-        let mut combined = Vec::with_capacity(2 * features + 1);
-        combined.extend_from_slice(&grad_min_vec);
-        combined.extend_from_slice(&grad_max_vec);
-        combined.extend_from_slice(&grad_alpha_vec);
-        combined
+        // Копируем градиенты параметров из GPU в CPU-буферы
+        self.copy_gpu_to_cpu_handle(grad_min, grad_min_cpu);
+        self.copy_gpu_to_cpu_handle(grad_max, grad_max_cpu);
+        self.copy_gpu_to_cpu_handle(grad_alpha, grad_alpha_cpu);
     }
 }

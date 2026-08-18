@@ -57,7 +57,7 @@ impl GpuCompute {
     /// Обратный проход Linear на GPU с использованием MatrixBufferHandle.
     /// Входные данные, веса, градиент выхода и все градиентные буферы должны быть GPU-буферами.
     /// `grad_weight` и `grad_bias_handle` будут обнулены перед накоплением.
-    /// Возвращает градиент смещения как Vec<f32>.
+    /// Градиент смещения копируется в `grad_bias_cpu` (CPU-буфер), не возвращая Vec.
     pub fn run_linear_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -66,7 +66,8 @@ impl GpuCompute {
         grad_input: &MatrixBufferHandle,
         grad_weight: &MatrixBufferHandle,
         grad_bias_handle: &MatrixBufferHandle,
-    ) -> Vec<f32> {
+        grad_bias_cpu: &MatrixBufferHandle,
+    ) {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(weight.is_gpu(), "Weight handle must be GPU");
         assert!(grad_output.is_gpu(), "grad_output handle must be GPU");
@@ -86,6 +87,9 @@ impl GpuCompute {
         assert_eq!(grad_output.cols(), out_features, "grad_output cols mismatch");
         assert_eq!(grad_bias_handle.rows(), 1, "grad_bias_handle rows must be 1");
         assert_eq!(grad_bias_handle.cols(), out_features, "grad_bias_handle cols mismatch");
+        assert!(!grad_bias_cpu.is_gpu(), "grad_bias_cpu must be CPU");
+        assert_eq!(grad_bias_cpu.rows(), 1, "grad_bias_cpu rows must be 1");
+        assert_eq!(grad_bias_cpu.cols(), out_features, "grad_bias_cpu cols mismatch");
 
         let x_buf = self.get_gpu_subbuffer_from_handle(input);
         let w_buf = self.get_gpu_subbuffer_from_handle(weight);
@@ -115,7 +119,7 @@ impl GpuCompute {
             [((batch + 255) / 256) as u32, 1, 1],
         );
 
-        // Скачиваем градиент смещения как Vec<f32>
-        self.download_gpu_handle_to_vec(grad_bias_handle)
+        // Копируем градиент смещения из GPU в CPU-буфер
+        self.copy_gpu_to_cpu_handle(grad_bias_handle, grad_bias_cpu);
     }
 }

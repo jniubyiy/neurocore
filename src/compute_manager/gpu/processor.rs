@@ -199,25 +199,29 @@ pub fn process_backward_gpu_buffered(
             let grad_weight_handle = gpu_compute.allocate_gpu_matrix_handle(out_feat, in_feat);
             let grad_bias_handle = gpu_compute.allocate_gpu_matrix_handle(1, out_feat);
 
-            let grad_bias = gpu_compute.run_linear_backward_buffered_handle(
+            // Выделяем CPU-буферы для градиентов весов и смещений
+            let grad_weight_cpu = gpu_compute.allocate_cpu_matrix_handle(out_feat, in_feat);
+            let grad_bias_cpu = gpu_compute.allocate_cpu_matrix_handle(1, out_feat);
+
+            gpu_compute.run_linear_backward_buffered_handle(
                 &input_handle,
                 &weight_gpu,
                 &current_grad,
                 &grad_input_handle,
                 &grad_weight_handle,
                 &grad_bias_handle,
+                &grad_bias_cpu,
             );
 
-            let grad_weight_vec = gpu_compute.download_gpu_handle_to_vec(&grad_weight_handle);
+            // Копируем градиенты весов из GPU в CPU
+            gpu_compute.copy_gpu_to_cpu_handle(&grad_weight_handle, &grad_weight_cpu);
 
-            // Записываем градиенты весов и смещений в глобальный буфер
+            // Переносим данные в общий буфер градиентов
+            let weight_data = grad_weight_cpu.read().as_slice().unwrap().to_vec();
+            let bias_data = grad_bias_cpu.read().as_slice().unwrap().to_vec();
             grad_params_handle.with_cpu_data_mut(|grad_data| {
-                for (i, &g) in grad_weight_vec.iter().enumerate() {
-                    grad_data[w_start + i] += g;
-                }
-                for (i, &g) in grad_bias.iter().enumerate() {
-                    grad_data[b_start + i] += g;
-                }
+                grad_data[w_start..w_start + weight_data.len()].copy_from_slice(&weight_data);
+                grad_data[b_start..b_start + bias_data.len()].copy_from_slice(&bias_data);
             });
 
             current_grad = grad_input_handle;
@@ -308,20 +312,22 @@ pub fn process_backward_gpu_buffered(
             let thresholds = params.read_range(slice.start, soft_sparse.in_features);
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             let grad_thresh_handle = gpu_compute.allocate_gpu_matrix_handle(1, soft_sparse.in_features);
-            let grad_thresh_vec = gpu_compute.run_softsparse_backward_buffered_handle(
+            let grad_thresh_cpu = gpu_compute.allocate_cpu_matrix_handle(1, soft_sparse.in_features);
+
+            gpu_compute.run_softsparse_backward_buffered_handle(
                 &input_handle,
                 &current_grad,
                 &thresholds,
                 soft_sparse.temperature,
                 &grad_input_handle,
                 &grad_thresh_handle,
+                &grad_thresh_cpu,
             );
 
-            // Записываем градиенты порогов
+            // Переносим данные в общий буфер
+            let thresh_data = grad_thresh_cpu.read().as_slice().unwrap().to_vec();
             grad_params_handle.with_cpu_data_mut(|grad_data| {
-                for (i, &g) in grad_thresh_vec.iter().enumerate() {
-                    grad_data[slice.start + i] += g;
-                }
+                grad_data[slice.start..slice.start + thresh_data.len()].copy_from_slice(&thresh_data);
             });
 
             current_grad = grad_input_handle;
@@ -334,20 +340,22 @@ pub fn process_backward_gpu_buffered(
             let thresholds = params.read_range(slice.start, soft_keep.in_features);
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             let grad_thresh_handle = gpu_compute.allocate_gpu_matrix_handle(1, soft_keep.in_features);
-            let grad_thresh_vec = gpu_compute.run_softkeep_backward_buffered_handle(
+            let grad_thresh_cpu = gpu_compute.allocate_cpu_matrix_handle(1, soft_keep.in_features);
+
+            gpu_compute.run_softkeep_backward_buffered_handle(
                 &input_handle,
                 &current_grad,
                 &thresholds,
                 soft_keep.temperature,
                 &grad_input_handle,
                 &grad_thresh_handle,
+                &grad_thresh_cpu,
             );
 
-            // Записываем градиенты порогов
+            // Переносим данные в общий буфер
+            let thresh_data = grad_thresh_cpu.read().as_slice().unwrap().to_vec();
             grad_params_handle.with_cpu_data_mut(|grad_data| {
-                for (i, &g) in grad_thresh_vec.iter().enumerate() {
-                    grad_data[slice.start + i] += g;
-                }
+                grad_data[slice.start..slice.start + thresh_data.len()].copy_from_slice(&thresh_data);
             });
 
             current_grad = grad_input_handle;
@@ -367,7 +375,12 @@ pub fn process_backward_gpu_buffered(
             let grad_min_handle = gpu_compute.allocate_gpu_matrix_handle(1, features);
             let grad_max_handle = gpu_compute.allocate_gpu_matrix_handle(1, features);
             let grad_alpha_handle = gpu_compute.allocate_gpu_matrix_handle(1, 1);
-            let grad_vec = gpu_compute.run_dualanchor_backward_buffered_handle(
+
+            let grad_min_cpu = gpu_compute.allocate_cpu_matrix_handle(1, features);
+            let grad_max_cpu = gpu_compute.allocate_cpu_matrix_handle(1, features);
+            let grad_alpha_cpu = gpu_compute.allocate_cpu_matrix_handle(1, 1);
+
+            gpu_compute.run_dualanchor_backward_buffered_handle(
                 &input_handle,
                 &current_grad,
                 &min_vals,
@@ -377,13 +390,19 @@ pub fn process_backward_gpu_buffered(
                 &grad_min_handle,
                 &grad_max_handle,
                 &grad_alpha_handle,
+                &grad_min_cpu,
+                &grad_max_cpu,
+                &grad_alpha_cpu,
             );
 
-            // Записываем градиенты параметров
+            // Переносим данные в общий буфер
+            let min_data = grad_min_cpu.read().as_slice().unwrap().to_vec();
+            let max_data = grad_max_cpu.read().as_slice().unwrap().to_vec();
+            let alpha_data = grad_alpha_cpu.read().as_slice().unwrap().to_vec();
             grad_params_handle.with_cpu_data_mut(|grad_data| {
-                for (i, &g) in grad_vec.iter().enumerate() {
-                    grad_data[slice.start + i] += g;
-                }
+                grad_data[slice.start..slice.start + features].copy_from_slice(&min_data);
+                grad_data[slice.start + features..slice.start + 2 * features].copy_from_slice(&max_data);
+                grad_data[slice.start + 2 * features] = alpha_data[0];
             });
 
             current_grad = grad_input_handle;

@@ -220,6 +220,7 @@ impl GpuCompute {
     // МЕТОДЫ ДЛЯ РАБОТЫ С MatrixBufferHandle
     // ===================================================================
 
+    /// Выделяет GPU-буфер через MemoryExecutor (DeviceVram).
     pub fn allocate_gpu_matrix_handle(&self, rows: usize, cols: usize) -> MatrixBufferHandle {
         let mut mem = self.memory_executor.lock().unwrap();
         mem.acquire_matrix_handle(
@@ -229,6 +230,18 @@ impl GpuCompute {
             BufferPriority::Medium,
         )
         .expect("Failed to allocate GPU MatrixBufferHandle")
+    }
+
+    /// Выделяет CPU-буфер через MemoryExecutor (HostRam).
+    pub fn allocate_cpu_matrix_handle(&self, rows: usize, cols: usize) -> MatrixBufferHandle {
+        let mut mem = self.memory_executor.lock().unwrap();
+        mem.acquire_matrix_handle(
+            rows,
+            cols,
+            MemoryDeviceKind::HostRam,
+            BufferPriority::Medium,
+        )
+        .expect("Failed to allocate CPU MatrixBufferHandle")
     }
 
     pub fn upload_vec_to_gpu_handle(
@@ -305,10 +318,20 @@ impl GpuCompute {
         let elements = src.rows() * src.cols();
         assert_eq!(elements, dst.rows() * dst.cols(), "Buffer sizes must match");
 
-        let data_vec = self.download_gpu_handle_to_vec(src);
-        let mut dst_guard = dst.write();
-        let dst_slice = dst_guard.as_slice_mut().expect("Destination is not CPU");
-        dst_slice.copy_from_slice(&data_vec);
+        let gpu_buf = self.get_gpu_subbuffer_from_handle(src);
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+
+        self.copy_buffer_sync(gpu_buf, staging_buf.clone());
+
+        {
+            let staging_guard = staging_buf.read().expect("read staging buffer");
+            let mut dst_guard = dst.write();
+            let dst_slice = dst_guard.as_slice_mut().expect("Destination is not CPU");
+            // ВАЖНО: ограничиваем до elements, так как staging-буфер может быть больше
+            dst_slice.copy_from_slice(&staging_guard[..elements]);
+        }
+
+        self.release_staging_buffer(staging_buf, staging_raw);
     }
 
     pub fn copy_gpu_handle_to_gpu_handle(

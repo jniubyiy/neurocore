@@ -37,6 +37,7 @@ impl MixedModel {
 
         assert_eq!(stream_buffers.len(), 2, "SplitterConnector buffered: expected 2 input streams");
 
+        // Извлекаем входные дескрипторы
         let input_a = stream_buffers[0].clone();
         let input_b = stream_buffers[1].clone();
 
@@ -45,12 +46,15 @@ impl MixedModel {
         let rows_b = input_b.rows();
         let cols_b = input_b.cols();
 
+        // Создаём выходные буферы того же размера
         let out_a = pool.acquire(rows_a, cols_a);
         let out_b = pool.acquire(rows_b, cols_b);
 
+        // Копируем данные
         copy_handle_data(&input_a, &out_a);
         copy_handle_data(&input_b, &out_b);
 
+        // Сохраняем контекст (Buffered)
         let ctx = DynamicContext::Buffered(BufferedContext::SplitterConnector {
             input: input_a.clone(),
         });
@@ -58,6 +62,7 @@ impl MixedModel {
             sample_ctxs.push(ctx.clone());
         }
 
+        // Возвращаем входные буферы в пул
         pool.release(input_a);
         pool.release(input_b);
 
@@ -89,6 +94,7 @@ impl MixedModel {
             "CombinerConnector buffered: expected {} input streams, got {}",
             n, stream_buffers.len());
 
+        // Сохраняем контекст со всеми входными дескрипторами
         let inputs = stream_buffers.clone();
         let ctx = DynamicContext::Buffered(BufferedContext::CombinerConnector {
             inputs,
@@ -128,18 +134,18 @@ impl MixedModel {
         let (wa_vec, wb_vec, bias_a_vec, bias_b_vec) =
             splitter.get_weights_and_biases_vec(&params, &slice);
 
-        // Прямой доступ к входным данным через read()
-        let input_guard = input_handle.read();
-        let x_slice = input_guard.as_slice().expect("Splitter forward: expected CPU buffer");
+        let x_vec = handle_to_vec(&input_handle);
 
         let p = output_dims[0];
         let q = output_dims[1];
 
+        // Выделяем буферы для выходов и pre-активаций
         let out_a = pool.acquire(batch, p);
         let out_b = pool.acquire(batch, q);
         let pre_a = pool.acquire(batch, p);
         let pre_b = pool.acquire(batch, q);
 
+        // Вычисляем
         {
             let mut out_a_guard = out_a.write();
             let out_a_slice = out_a_guard.as_slice_mut().expect("CPU buffer");
@@ -154,7 +160,7 @@ impl MixedModel {
                 for c in 0..p {
                     let mut sum = bias_a_vec[c];
                     for k in 0..input_dim {
-                        sum += x_slice[k * batch + r] * wa_vec[c * input_dim + k];
+                        sum += x_vec[k * batch + r] * wa_vec[c * input_dim + k];
                     }
                     pre_a_slice[c * batch + r] = sum;
                     out_a_slice[c * batch + r] = sum.max(0.0);
@@ -162,7 +168,7 @@ impl MixedModel {
                 for c in 0..q {
                     let mut sum = bias_b_vec[c];
                     for k in 0..input_dim {
-                        sum += x_slice[k * batch + r] * wb_vec[c * input_dim + k];
+                        sum += x_vec[k * batch + r] * wb_vec[c * input_dim + k];
                     }
                     pre_b_slice[c * batch + r] = sum;
                     out_b_slice[c * batch + r] = sum.max(0.0);
@@ -170,6 +176,7 @@ impl MixedModel {
             }
         }
 
+        // Сохраняем контекст
         let ctx = DynamicContext::Buffered(BufferedContext::Splitter {
             input: input_handle.clone(),
             pre_a: pre_a.clone(),
@@ -179,6 +186,7 @@ impl MixedModel {
             sample_ctxs.push(ctx.clone());
         }
 
+        // Возвращаем входной дескриптор в пул
         pool.release(input_handle);
 
         *stream_buffers = vec![out_a, out_b];
@@ -215,15 +223,14 @@ impl MixedModel {
         let combiner = Combiner::new(vec![input_dim, input_dim], output_dim);
         let (wa_vec, wb_vec, bias_vec) = combiner.get_weights_and_bias_vec(&params, &slice);
 
-        // Прямой доступ к входным данным через read()
-        let a_guard = a_handle.read();
-        let a_slice = a_guard.as_slice().expect("Combiner forward: expected CPU buffer");
-        let b_guard = b_handle.read();
-        let b_slice = b_guard.as_slice().expect("Combiner forward: expected CPU buffer");
+        let a_vec = handle_to_vec(&a_handle);
+        let b_vec = handle_to_vec(&b_handle);
 
+        // Выделяем буферы для выхода и pre-активации
         let out_handle = pool.acquire(batch, output_dim);
         let pre_handle = pool.acquire(batch, output_dim);
 
+        // Вычисляем
         {
             let mut out_guard = out_handle.write();
             let out_slice = out_guard.as_slice_mut().expect("CPU buffer");
@@ -234,8 +241,8 @@ impl MixedModel {
                 for c in 0..output_dim {
                     let mut sum = bias_vec[c];
                     for k in 0..input_dim {
-                        sum += a_slice[k * batch + r] * wa_vec[c * input_dim + k];
-                        sum += b_slice[k * batch + r] * wb_vec[c * input_dim + k];
+                        sum += a_vec[k * batch + r] * wa_vec[c * input_dim + k];
+                        sum += b_vec[k * batch + r] * wb_vec[c * input_dim + k];
                     }
                     pre_slice[c * batch + r] = sum;
                     out_slice[c * batch + r] = sum.max(0.0);
@@ -243,6 +250,7 @@ impl MixedModel {
             }
         }
 
+        // Сохраняем контекст
         let ctx = DynamicContext::Buffered(BufferedContext::Combiner {
             input_a: a_handle.clone(),
             input_b: b_handle.clone(),
@@ -252,6 +260,7 @@ impl MixedModel {
             sample_ctxs.push(ctx.clone());
         }
 
+        // Возвращаем входные дескрипторы в пул
         pool.release(a_handle);
         pool.release(b_handle);
 
@@ -262,7 +271,9 @@ impl MixedModel {
     }
 }
 
-// Вспомогательная функция для копирования данных между CPU-буферами
+// Вспомогательные функции для работы с CPU-буферами
+
+/// Копирует данные между двумя дескрипторами (оба должны быть CPU).
 fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
     let src_guard = src.read();
     let src_slice = src_guard.as_slice().expect("Source must be CPU");
@@ -270,4 +281,11 @@ fn copy_handle_data(src: &MatrixBufferHandle, dst: &MatrixBufferHandle) {
     let dst_slice = dst_guard.as_slice_mut().expect("Destination must be CPU");
     assert_eq!(src_slice.len(), dst_slice.len());
     dst_slice.copy_from_slice(src_slice);
+}
+
+/// Читает данные из CPU handle в Vec<f32> (column-major порядок).
+fn handle_to_vec(handle: &MatrixBufferHandle) -> Vec<f32> {
+    assert!(!handle.is_gpu(), "handle_to_vec supports only CPU buffers");
+    let guard = handle.read();
+    guard.as_slice().expect("CPU buffer").to_vec()
 }

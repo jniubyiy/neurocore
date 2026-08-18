@@ -1,6 +1,5 @@
 // src/lib.rs
 
-pub mod linalg;
 pub mod tensor;
 pub mod layers;
 pub mod logging;

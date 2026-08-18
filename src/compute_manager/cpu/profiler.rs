@@ -41,20 +41,30 @@ impl HardwareProfile {
             elapsed / (n_iters * x.len()) as f64
         };
 
-        // 2. Время линейного слоя (эталон)
+        // 2. Время линейного слоя (эталон) без внешних зависимостей
         let linear_layer_time_ns = {
-            // Эмуляция небольшого линейного слоя
-            let rows = 64;
-            let in_dim = 128;
-            let out_dim = 64;
-            let data = vec![vec![1.0f32; in_dim]; rows];
-            let input = crate::tensor::Tensor2D::new(data);
-            let w = vec![0.1f32; in_dim * out_dim];
+            let rows = 64usize;
+            let in_dim = 128usize;
+            let out_dim = 64usize;
+
+            let input = vec![1.0f32; rows * in_dim];
+            let weight = vec![0.1f32; in_dim * out_dim];
+            let mut output = vec![0.0f32; rows * out_dim];
+
             let start = Instant::now();
             let n_iters = 500;
             for _ in 0..n_iters {
-                let m = crate::linalg::tensor2d_to_faer(&input);
-                let _ = &m * &faer::Mat::from_fn(in_dim, out_dim, |r, c| w[r * out_dim + c]);
+                for r in 0..rows {
+                    for c in 0..out_dim {
+                        let mut sum = 0.0f32;
+                        for k in 0..in_dim {
+                            sum += input[r * in_dim + k] * weight[k * out_dim + c];
+                        }
+                        output[r * out_dim + c] = sum;
+                    }
+                }
+                // предотвращаем оптимизацию
+                black_box(&output);
             }
             let elapsed = start.elapsed().as_secs_f64() * 1e9;
             elapsed / n_iters as f64

@@ -1,7 +1,6 @@
 // src/compute_manager/dim_change.rs
 
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
-use faer::Mat;
 
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
@@ -132,58 +131,6 @@ impl DynamicTensor {
     }
 }
 
-// ------------------ Вспомогательные функции ------------------
-
-fn reshape_matrix(src: &Mat<f32>, new_rows: usize, new_cols: usize) -> Mat<f32> {
-    let total = src.nrows() * src.ncols();
-    assert_eq!(total, new_rows * new_cols,
-        "reshape_matrix: total element count mismatch");
-    let mut dst = Mat::zeros(new_rows, new_cols);
-    let mut idx = 0;
-    for c in 0..src.ncols() {
-        for r in 0..src.nrows() {
-            let dst_r = idx / new_cols;
-            let dst_c = idx % new_cols;
-            dst[(dst_r, dst_c)] = src[(r, c)];
-            idx += 1;
-        }
-    }
-    dst
-}
-
-// ------------------ Матричные версии (используются внутри графа) ------------------
-
-pub fn unsqueeze_mat(
-    mat: &Mat<f32>,
-    target_dims: &[usize],
-) -> Mat<f32> {
-    let batch = mat.nrows();
-    let features = mat.ncols();
-    let total_new = target_dims.iter().product::<usize>();
-    assert_eq!(features, total_new, "unsqueeze_mat: features mismatch");
-
-    let last_dim = target_dims[target_dims.len() - 1];
-    let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
-    let new_rows = batch * remaining_product;
-    let new_cols = last_dim;
-
-    reshape_matrix(mat, new_rows, new_cols)
-}
-
-pub fn reduce_mat(
-    mat: &Mat<f32>,
-    target_dims: &[usize],
-) -> Mat<f32> {
-    let total = mat.nrows() * mat.ncols();
-    let remaining_product: usize = target_dims[..target_dims.len()-1].iter().product();
-    let batch = mat.nrows() / remaining_product;
-    let new_rows = batch;
-    let new_cols = total / new_rows;
-
-    assert_eq!(total, new_rows * new_cols, "reduce_mat: element count mismatch");
-    reshape_matrix(mat, new_rows, new_cols)
-}
-
 // ------------------ Буферизованные версии (MatrixBufferHandle) ------------------
 
 /// Версия `unsqueeze_mat` с использованием [`MatrixBufferHandle`] и пула [`TempMatrixPool`].
@@ -202,10 +149,8 @@ pub fn unsqueeze_mat_buffered_handle(
     let new_rows = batch * remaining_product;
     let new_cols = last_dim;
 
-    // Создаём выходной буфер
     let output = pool.acquire(new_rows, new_cols);
 
-    // Выполняем переупорядочивание без промежуточного Vec
     {
         let ids = [input.id(), output.id()];
         input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
@@ -213,13 +158,12 @@ pub fn unsqueeze_mat_buffered_handle(
             let src: &[f32] = &*first[0];
             let dst: &mut [f32] = &mut *rest[0];
             let mut idx = 0;
-            // column-major обход входного: внешний цикл по c, внутренний по r
             for c in 0..features {
                 for r in 0..batch {
                     let src_idx = c * batch + r;
                     let dst_r = idx / new_cols;
                     let dst_c = idx % new_cols;
-                    let dst_idx = dst_c * new_rows + dst_r; // column-major в выходном
+                    let dst_idx = dst_c * new_rows + dst_r;
                     dst[dst_idx] = src[src_idx];
                     idx += 1;
                 }
@@ -227,7 +171,6 @@ pub fn unsqueeze_mat_buffered_handle(
         });
     }
 
-    // Возвращаем входной буфер в пул
     pool.release(input);
 
     output
@@ -239,7 +182,6 @@ pub fn reduce_mat_buffered_handle(
     input: MatrixBufferHandle,
     target_dims: &[usize],
 ) -> MatrixBufferHandle {
-    // Сохраняем размеры до перемещения
     let input_rows = input.rows();
     let input_cols = input.cols();
     let total = input_rows * input_cols;
@@ -251,10 +193,8 @@ pub fn reduce_mat_buffered_handle(
 
     assert_eq!(total, new_rows * new_cols, "reduce_mat_buffered_handle: element count mismatch");
 
-    // Создаём выходной буфер
     let output = pool.acquire(new_rows, new_cols);
 
-    // Выполняем переупорядочивание без промежуточного Vec
     {
         let ids = [input.id(), output.id()];
         input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
@@ -262,7 +202,6 @@ pub fn reduce_mat_buffered_handle(
             let src: &[f32] = &*first[0];
             let dst: &mut [f32] = &mut *rest[0];
             let mut idx = 0;
-            // column-major обход входного: внешний цикл по c, внутренний по r
             for c in 0..input_cols {
                 for r in 0..input_rows {
                     let src_idx = c * input_rows + r;
@@ -276,7 +215,6 @@ pub fn reduce_mat_buffered_handle(
         });
     }
 
-    // Возвращаем входной буфер в пул
     pool.release(input);
 
     output

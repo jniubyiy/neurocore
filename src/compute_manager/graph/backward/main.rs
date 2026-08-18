@@ -102,17 +102,10 @@ impl MixedModel {
                                 &grad_params_handle,
                             );
 
-                            let out_mat = gpu.download_gpu_handle_to_mat(&out_gpu);
-                            let cpu_handle = pool.acquire(out_mat.nrows(), out_mat.ncols());
-                            {
-                                let mut guard = cpu_handle.write();
-                                let dst = guard.as_slice_mut().expect("CPU buffer");
-                                for c in 0..out_mat.ncols() {
-                                    for r in 0..out_mat.nrows() {
-                                        dst[c * out_mat.nrows() + r] = out_mat[(r, c)];
-                                    }
-                                }
-                            }
+                            // Новый способ: прямое копирование GPU->CPU без faer::Mat
+                            let cpu_handle = pool.acquire(out_gpu.rows(), out_gpu.cols());
+                            gpu.copy_gpu_to_cpu_handle(&out_gpu, &cpu_handle);
+
                             new_gradients[stream_idx] = Some(cpu_handle);
                         } else {
                             let in_delta_handle = self.backward_universal_batch_buffered_handle(

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use faer::Mat;
 use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::{
     allocator::StandardCommandBufferAllocator,
@@ -273,13 +272,6 @@ impl GpuCompute {
         };
         self.release_staging_buffer(staging_buf, staging_raw);
         data
-    }
-
-    pub fn download_gpu_handle_to_mat(&self, handle: &MatrixBufferHandle) -> Mat<f32> {
-        let rows = handle.rows();
-        let cols = handle.cols();
-        let vec = self.download_gpu_handle_to_vec(handle);
-        Mat::from_fn(rows, cols, |r, c| vec[c * rows + r])
     }
 
     pub fn fill_gpu_handle(&self, handle: &MatrixBufferHandle, value: f32) {

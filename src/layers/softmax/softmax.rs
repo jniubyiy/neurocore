@@ -25,45 +25,41 @@ impl UniversalLayerBuffered for Softmax {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
     ) {
-        let src_guard = input.read();
-        let src = src_guard.as_slice().expect("Softmax forward: expected CPU buffer");
+        let ids = [input.id(), output.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let y: &mut [f32] = &mut *rest[0];
+            let rows = input.rows();
+            let cols = input.cols();
 
-        let mut dst_guard = output.write();
-        let dst = dst_guard.as_slice_mut().expect("Softmax forward: expected CPU buffer");
+            for r in 0..rows {
+                // 1. Находим максимум
+                let mut max_val = f32::NEG_INFINITY;
+                for c in 0..cols {
+                    let idx = c * rows + r;
+                    if x[idx] > max_val {
+                        max_val = x[idx];
+                    }
+                }
 
-        let rows = input.rows();
-        let cols = input.cols();
+                // 2. Считаем сумму экспонент
+                let mut sum_exp = 0.0f32;
+                for c in 0..cols {
+                    let idx = c * rows + r;
+                    sum_exp += (x[idx] - max_val).exp();
+                }
 
-        debug_assert_eq!(src.len(), rows * cols);
-        debug_assert_eq!(dst.len(), rows * cols);
-
-        // Для каждой строки (batch) вычисляем stable softmax
-        for r in 0..rows {
-            // 1. Находим максимум
-            let mut max_val = f32::NEG_INFINITY;
-            for c in 0..cols {
-                let idx = c * rows + r;
-                if src[idx] > max_val {
-                    max_val = src[idx];
+                // 3. Записываем нормализованные значения
+                for c in 0..cols {
+                    let idx = c * rows + r;
+                    y[idx] = (x[idx] - max_val).exp() / sum_exp;
                 }
             }
-
-            // 2. Считаем сумму экспонент
-            let mut sum_exp = 0.0f32;
-            for c in 0..cols {
-                let idx = c * rows + r;
-                sum_exp += (src[idx] - max_val).exp();
-            }
-
-            // 3. Записываем нормализованные значения
-            for c in 0..cols {
-                let idx = c * rows + r;
-                dst[idx] = (src[idx] - max_val).exp() / sum_exp;
-            }
-        }
+        });
     }
 
     fn backward_buffered(
@@ -71,7 +67,7 @@ impl UniversalLayerBuffered for Softmax {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
         _grad_params: &MatrixBufferHandle,
     ) {
@@ -81,38 +77,32 @@ impl UniversalLayerBuffered for Softmax {
             _ => panic!("Expected Softmax context"),
         };
 
-        let output_guard = output_handle.read();
-        let y_slice = output_guard.as_slice().expect("Softmax backward: expected CPU buffer");
+        let ids = [output_handle.id(), grad_output.id(), grad_input.id()];
+        output_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let y: &[f32] = &*first[0];
+            let (second, rest) = rest.split_at_mut(1);
+            let go: &[f32] = &*second[0];
+            let gi: &mut [f32] = &mut *rest[0];
+            let rows = grad_output.rows();
+            let cols = grad_output.cols();
 
-        let go_guard = grad_output.read();
-        let go = go_guard.as_slice().expect("Softmax backward: expected CPU buffer");
+            for r in 0..rows {
+                // Вычисляем dot = sum(y * grad_output) по строке
+                let mut dot = 0.0f32;
+                for c in 0..cols {
+                    let idx = c * rows + r;
+                    dot += y[idx] * go[idx];
+                }
 
-        let mut gi_guard = grad_input.write();
-        let gi = gi_guard.as_slice_mut().expect("Softmax backward: expected CPU buffer");
-
-        let rows = grad_output.rows();
-        let cols = grad_output.cols();
-
-        debug_assert_eq!(go.len(), rows * cols);
-        debug_assert_eq!(gi.len(), rows * cols);
-        debug_assert_eq!(y_slice.len(), rows * cols);
-
-        // Для каждой строки
-        for r in 0..rows {
-            // Вычисляем dot = sum(y * grad_output) по строке
-            let mut dot = 0.0f32;
-            for c in 0..cols {
-                let idx = c * rows + r;
-                dot += y_slice[idx] * go[idx];
+                // Вычисляем градиент
+                for c in 0..cols {
+                    let idx = c * rows + r;
+                    let y_val = y[idx];
+                    gi[idx] = y_val * (go[idx] - dot);
+                }
             }
-
-            // Вычисляем градиент
-            for c in 0..cols {
-                let idx = c * rows + r;
-                let y_val = y_slice[idx];
-                gi[idx] = y_val * (go[idx] - dot);
-            }
-        }
+        });
     }
 
     fn param_len(&self) -> usize {

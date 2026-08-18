@@ -40,35 +40,35 @@ impl UniversalLayerBuffered for Linear {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
     ) {
         let in_rows = input.rows();
         let in_cols = input.cols();
         let out_cols = self.out_features;
 
-        let input_guard = input.read();
-        let input_slice = input_guard.as_slice().expect("Linear forward: expected CPU buffer");
+        let ids = [input.id(), output.id(), params.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, rest) = rest.split_at_mut(1);
+            let y: &mut [f32] = &mut *second[0];
+            let p: &[f32] = &*rest[0];
 
-        let mut output_guard = output.write();
-        let output_slice = output_guard.as_slice_mut().expect("Linear forward: expected CPU buffer");
+            let w_start = slice.start;
+            let b_start = w_start + in_cols * out_cols;
 
-        debug_assert_eq!(input_slice.len(), in_rows * in_cols);
-        debug_assert_eq!(output_slice.len(), in_rows * out_cols);
-
-        let w_start = slice.start;
-        let b_start = w_start + in_cols * out_cols;
-
-        // output[r, c] = bias[c] + sum_k input[r, k] * weight[c, k]
-        for r in 0..in_rows {
-            for c in 0..out_cols {
-                let mut sum = params[b_start + c];
-                for k in 0..in_cols {
-                    sum += input_slice[k * in_rows + r] * params[w_start + c * in_cols + k];
+            // output[r, c] = bias[c] + sum_k input[r, k] * weight[c, k]
+            for r in 0..in_rows {
+                for c in 0..out_cols {
+                    let mut sum = p[b_start + c];
+                    for k in 0..in_cols {
+                        sum += x[k * in_rows + r] * p[w_start + c * in_cols + k];
+                    }
+                    y[c * in_rows + r] = sum;
                 }
-                output_slice[c * in_rows + r] = sum;
             }
-        }
+        });
     }
 
     fn backward_buffered(
@@ -76,7 +76,7 @@ impl UniversalLayerBuffered for Linear {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
         grad_params: &MatrixBufferHandle,
     ) {
@@ -86,46 +86,50 @@ impl UniversalLayerBuffered for Linear {
             _ => panic!("Expected Linear context"),
         };
 
-        let input_guard = input_handle.read();
-        let x_slice = input_guard.as_slice().expect("Linear backward: expected CPU buffer");
-
         let in_rows = grad_input.rows();
         let in_cols = grad_input.cols();
         let out_cols = grad_output.cols();
 
-        let go_guard = grad_output.read();
-        let go_slice = go_guard.as_slice().expect("Linear backward: expected CPU buffer");
+        let ids = [
+            input_handle.id(),
+            grad_output.id(),
+            grad_input.id(),
+            params.id(),
+            grad_params.id(),
+        ];
+        input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, rest) = rest.split_at_mut(1);
+            let go: &[f32] = &*second[0];
+            let (third, rest) = rest.split_at_mut(1);
+            let gi: &mut [f32] = &mut *third[0];
+            let (fourth, rest) = rest.split_at_mut(1);
+            let p: &[f32] = &*fourth[0];
+            let gp: &mut [f32] = &mut *rest[0];
 
-        let mut gi_guard = grad_input.write();
-        let gi_slice = gi_guard.as_slice_mut().expect("Linear backward: expected CPU buffer");
+            let w_start = slice.start;
+            let b_start = w_start + in_cols * out_cols;
 
-        debug_assert_eq!(go_slice.len(), in_rows * out_cols);
-        debug_assert_eq!(gi_slice.len(), in_rows * in_cols);
-
-        let w_start = slice.start;
-        let b_start = w_start + in_cols * out_cols;
-
-        // dx = grad_output * weight
-        for r in 0..in_rows {
-            for c in 0..in_cols {
-                let mut sum = 0.0;
-                for k in 0..out_cols {
-                    sum += go_slice[k * in_rows + r] * params[w_start + k * in_cols + c];
+            // dx = grad_output * weight
+            for r in 0..in_rows {
+                for c in 0..in_cols {
+                    let mut sum = 0.0;
+                    for k in 0..out_cols {
+                        sum += go[k * in_rows + r] * p[w_start + k * in_cols + c];
+                    }
+                    gi[c * in_rows + r] = sum;
                 }
-                gi_slice[c * in_rows + r] = sum;
             }
-        }
 
-        // Записываем градиенты весов и смещений прямо в глобальный буфер градиентов
-        grad_params.with_cpu_data_mut(|grad_data| {
             // dw = grad_output^T * x
             for out_idx in 0..out_cols {
                 for in_idx in 0..in_cols {
                     let mut sum = 0.0;
                     for r in 0..in_rows {
-                        sum += go_slice[out_idx * in_rows + r] * x_slice[in_idx * in_rows + r];
+                        sum += go[out_idx * in_rows + r] * x[in_idx * in_rows + r];
                     }
-                    grad_data[w_start + out_idx * in_cols + in_idx] = sum;
+                    gp[w_start + out_idx * in_cols + in_idx] = sum;
                 }
             }
 
@@ -133,9 +137,9 @@ impl UniversalLayerBuffered for Linear {
             for c in 0..out_cols {
                 let mut sum = 0.0;
                 for r in 0..in_rows {
-                    sum += go_slice[c * in_rows + r];
+                    sum += go[c * in_rows + r];
                 }
-                grad_data[b_start + c] = sum;
+                gp[b_start + c] = sum;
             }
         });
     }

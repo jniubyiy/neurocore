@@ -284,6 +284,100 @@ impl MemoryExecutor {
         self.matrix_entries.get_mut(&id)
     }
 
+    // ===================================================================
+    // БЕСКОПИЙНЫЙ ДОСТУП К CPU-БУФЕРАМ
+    // ===================================================================
+
+    /// Предоставляет одновременный доступ на чтение к нескольким CPU-буферам.
+    pub fn with_cpu_slices<T>(
+        &self,
+        ids: &[MatrixBufferId],
+        f: impl FnOnce(&[&[f32]]) -> T,
+    ) -> T {
+        let mut slices: Vec<&[f32]> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let entry = self.matrix_entries.get(id)
+                .expect("with_cpu_slices: entry not found");
+            match &entry.storage {
+                MatrixStorage::Cpu(data) => slices.push(data.as_slice()),
+                _ => panic!("with_cpu_slices: buffer is not CPU"),
+            }
+        }
+        f(&slices)
+    }
+
+    /// Предоставляет одновременный доступ на чтение/запись к нескольким уникальным CPU-буферам.
+    pub fn with_cpu_slices_mut<T>(
+        &mut self,
+        ids: &[MatrixBufferId],
+        f: impl FnOnce(&mut [&mut [f32]]) -> T,
+    ) -> T {
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i], ids[j], "with_cpu_slices_mut: duplicate MatrixBufferId");
+            }
+        }
+
+        let mut ptrs: Vec<*mut [f32]> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let entry = self.matrix_entries.get_mut(id)
+                .expect("with_cpu_slices_mut: entry not found");
+            match &mut entry.storage {
+                MatrixStorage::Cpu(data) => {
+                    let slice: &mut [f32] = data.as_mut_slice();
+                    ptrs.push(slice as *mut [f32]);
+                }
+                _ => panic!("with_cpu_slices_mut: buffer is not CPU"),
+            }
+        }
+
+        let mut slices: Vec<&mut [f32]> = ptrs
+            .iter()
+            .map(|&p| unsafe { &mut *p })
+            .collect();
+
+        f(&mut slices)
+    }
+
+    /// Копирует данные из одного CPU-буфера в другой без промежуточного Vec.
+    pub fn copy_cpu_buffer(&mut self, src_id: MatrixBufferId, dst_id: MatrixBufferId) {
+        assert_ne!(src_id, dst_id, "copy_cpu_buffer: source and destination must be different");
+
+        let src_len = {
+            let src_entry = self.matrix_entries.get(&src_id)
+                .expect("copy_cpu_buffer: source entry not found");
+            match &src_entry.storage {
+                MatrixStorage::Cpu(data) => data.len(),
+                _ => panic!("copy_cpu_buffer: source is not CPU"),
+            }
+        };
+        let dst_len = {
+            let dst_entry = self.matrix_entries.get(&dst_id)
+                .expect("copy_cpu_buffer: destination entry not found");
+            match &dst_entry.storage {
+                MatrixStorage::Cpu(data) => data.len(),
+                _ => panic!("copy_cpu_buffer: destination is not CPU"),
+            }
+        };
+        assert_eq!(src_len, dst_len, "copy_cpu_buffer: size mismatch");
+
+        let src_ptr = {
+            let entry = self.matrix_entries.get(&src_id).unwrap();
+            if let MatrixStorage::Cpu(data) = &entry.storage {
+                data.as_ptr()
+            } else { unreachable!() }
+        };
+        let dst_ptr = {
+            let entry = self.matrix_entries.get_mut(&dst_id).unwrap();
+            if let MatrixStorage::Cpu(data) = &mut entry.storage {
+                data.as_mut_ptr()
+            } else { unreachable!() }
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, src_len);
+        }
+    }
+
     pub fn move_matrix_handle(
         &mut self,
         id: MatrixBufferId,

@@ -41,35 +41,34 @@ impl UniversalLayerBuffered for SoftSparseGate {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
     ) {
-        let input_guard = input.read();
-        let src = input_guard.as_slice().expect("SoftSparseGate forward: expected CPU buffer");
-
-        let mut output_guard = output.write();
-        let dst = output_guard.as_slice_mut().expect("SoftSparseGate forward: expected CPU buffer");
-
         let rows = input.rows();
         let cols = input.cols();
-        debug_assert_eq!(cols, self.in_features);
+        let ids = [input.id(), output.id(), params.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, third) = rest.split_at_mut(1);
+            let y: &mut [f32] = &mut *second[0];
+            let p: &[f32] = &*third[0];
 
-        let thresholds = &params[slice.start..slice.start + self.in_features];
-        let tmp = self.temperature;
+            let thresholds = &p[slice.start..slice.start + self.in_features];
+            let tmp = self.temperature;
 
-        debug_assert_eq!(src.len(), dst.len());
-
-        for c in 0..cols {
-            let threshold = thresholds[c];
-            for r in 0..rows {
-                let idx = c * rows + r;
-                let x = src[idx];
-                let abs_x = x.abs();
-                let z = (abs_x - threshold) / tmp;
-                let s = 1.0 / (1.0 + (-z).exp());
-                dst[idx] = x * s;
+            for c in 0..cols {
+                let threshold = thresholds[c];
+                for r in 0..rows {
+                    let idx = c * rows + r;
+                    let x_val = x[idx];
+                    let abs_x = x_val.abs();
+                    let z = (abs_x - threshold) / tmp;
+                    let s = 1.0 / (1.0 + (-z).exp());
+                    y[idx] = x_val * s;
+                }
             }
-        }
+        });
     }
 
     fn backward_buffered(
@@ -77,7 +76,7 @@ impl UniversalLayerBuffered for SoftSparseGate {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
         grad_params: &MatrixBufferHandle,
     ) {
@@ -87,34 +86,35 @@ impl UniversalLayerBuffered for SoftSparseGate {
             _ => panic!("Expected SoftSparseGate context"),
         };
 
-        let input_guard = input_handle.read();
-        let x_slice = input_guard.as_slice().expect("SoftSparseGate backward: expected CPU buffer");
-
-        let go_guard = grad_output.read();
-        let go = go_guard.as_slice().expect("SoftSparseGate backward: expected CPU buffer");
-
-        let mut gi_guard = grad_input.write();
-        let gi = gi_guard.as_slice_mut().expect("SoftSparseGate backward: expected CPU buffer");
-
         let rows = grad_output.rows();
         let cols = grad_output.cols();
-        debug_assert_eq!(cols, self.in_features);
+        let ids = [
+            input_handle.id(),
+            grad_output.id(),
+            grad_input.id(),
+            params.id(),
+            grad_params.id(),
+        ];
+        input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, rest) = rest.split_at_mut(1);
+            let go: &[f32] = &*second[0];
+            let (third, rest) = rest.split_at_mut(1);
+            let gi: &mut [f32] = &mut *third[0];
+            let (fourth, fifth) = rest.split_at_mut(1);
+            let p: &[f32] = &*fourth[0];
+            let gp: &mut [f32] = &mut *fifth[0];
 
-        let thresholds = &params[slice.start..slice.start + self.in_features];
-        let tmp = self.temperature;
+            let thresholds = &p[slice.start..slice.start + self.in_features];
+            let tmp = self.temperature;
 
-        debug_assert_eq!(go.len(), gi.len());
-        debug_assert_eq!(go.len(), x_slice.len());
-
-        // Вычисляем градиент по входу и записываем пороговые градиенты напрямую в grad_params
-        grad_params.with_cpu_data_mut(|grad_data| {
             for c in 0..cols {
                 let threshold = thresholds[c];
                 let mut d_thr = 0.0f32;
                 for r in 0..rows {
                     let idx = c * rows + r;
-
-                    let x_val = x_slice[idx];
+                    let x_val = x[idx];
                     let abs_x = x_val.abs();
                     let z = (abs_x - threshold) / tmp;
                     let s = 1.0 / (1.0 + (-z).exp());
@@ -126,7 +126,7 @@ impl UniversalLayerBuffered for SoftSparseGate {
                     // Градиент по порогам: d_s_dthr = -ds
                     d_thr += -go[idx] * x_val * ds;
                 }
-                grad_data[slice.start + c] = d_thr;
+                gp[slice.start + c] = d_thr;
             }
         });
     }

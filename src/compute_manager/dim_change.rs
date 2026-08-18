@@ -202,35 +202,33 @@ pub fn unsqueeze_mat_buffered_handle(
     let new_rows = batch * remaining_product;
     let new_cols = last_dim;
 
-    // Читаем данные из входного handle
-    let input_guard = input.read();
-    let src = input_guard.as_slice().expect("unsqueeze_mat_buffered_handle: input must be CPU");
-    let data = src.to_vec();
-    drop(input_guard);
-
-    // Возвращаем входной буфер в пул
-    pool.release(input);
-
     // Создаём выходной буфер
     let output = pool.acquire(new_rows, new_cols);
 
-    // Записываем данные с перестановкой
+    // Выполняем переупорядочивание без промежуточного Vec
     {
-        let mut output_guard = output.write();
-        let dst = output_guard.as_slice_mut().expect("unsqueeze_mat_buffered_handle: output must be CPU");
-        let mut idx = 0;
-        // column-major обход входного: внешний цикл по c, внутренний по r
-        for c in 0..features {
-            for r in 0..batch {
-                let src_idx = c * batch + r;
-                let dst_r = idx / new_cols;
-                let dst_c = idx % new_cols;
-                let dst_idx = dst_c * new_rows + dst_r; // column-major в выходном
-                dst[dst_idx] = data[src_idx];
-                idx += 1;
+        let ids = [input.id(), output.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let src: &[f32] = &*first[0];
+            let dst: &mut [f32] = &mut *rest[0];
+            let mut idx = 0;
+            // column-major обход входного: внешний цикл по c, внутренний по r
+            for c in 0..features {
+                for r in 0..batch {
+                    let src_idx = c * batch + r;
+                    let dst_r = idx / new_cols;
+                    let dst_c = idx % new_cols;
+                    let dst_idx = dst_c * new_rows + dst_r; // column-major в выходном
+                    dst[dst_idx] = src[src_idx];
+                    idx += 1;
+                }
             }
-        }
+        });
     }
+
+    // Возвращаем входной буфер в пул
+    pool.release(input);
 
     output
 }
@@ -253,35 +251,33 @@ pub fn reduce_mat_buffered_handle(
 
     assert_eq!(total, new_rows * new_cols, "reduce_mat_buffered_handle: element count mismatch");
 
-    // Читаем данные
-    let input_guard = input.read();
-    let src = input_guard.as_slice().expect("reduce_mat_buffered_handle: input must be CPU");
-    let data = src.to_vec();
-    drop(input_guard);
-
-    // Возвращаем входной буфер в пул
-    pool.release(input);
-
     // Создаём выходной буфер
     let output = pool.acquire(new_rows, new_cols);
 
-    // Записываем данные с перестановкой
+    // Выполняем переупорядочивание без промежуточного Vec
     {
-        let mut output_guard = output.write();
-        let dst = output_guard.as_slice_mut().expect("reduce_mat_buffered_handle: output must be CPU");
-        let mut idx = 0;
-        // column-major обход входного: внешний цикл по c, внутренний по r
-        for c in 0..input_cols {
-            for r in 0..input_rows {
-                let src_idx = c * input_rows + r;
-                let dst_r = idx / new_cols;
-                let dst_c = idx % new_cols;
-                let dst_idx = dst_c * new_rows + dst_r;
-                dst[dst_idx] = data[src_idx];
-                idx += 1;
+        let ids = [input.id(), output.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let src: &[f32] = &*first[0];
+            let dst: &mut [f32] = &mut *rest[0];
+            let mut idx = 0;
+            // column-major обход входного: внешний цикл по c, внутренний по r
+            for c in 0..input_cols {
+                for r in 0..input_rows {
+                    let src_idx = c * input_rows + r;
+                    let dst_r = idx / new_cols;
+                    let dst_c = idx % new_cols;
+                    let dst_idx = dst_c * new_rows + dst_r;
+                    dst[dst_idx] = src[src_idx];
+                    idx += 1;
+                }
             }
-        }
+        });
     }
+
+    // Возвращаем входной буфер в пул
+    pool.release(input);
 
     output
 }

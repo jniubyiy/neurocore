@@ -27,20 +27,18 @@ impl UniversalLayerBuffered for LeakyReLU {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
     ) {
-        let src_guard = input.read();
-        let src = src_guard.as_slice().expect("LeakyReLU forward: expected CPU buffer");
-
-        let mut dst_guard = output.write();
-        let dst = dst_guard.as_slice_mut().expect("LeakyReLU forward: expected CPU buffer");
-
-        debug_assert_eq!(src.len(), dst.len());
-
-        for (o, &x) in dst.iter_mut().zip(src.iter()) {
-            *o = if x > 0.0 { x } else { self.alpha * x };
-        }
+        let ids = [input.id(), output.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let y: &mut [f32] = &mut *rest[0];
+            for i in 0..x.len() {
+                y[i] = if x[i] > 0.0 { x[i] } else { self.alpha * x[i] };
+            }
+        });
     }
 
     fn backward_buffered(
@@ -48,7 +46,7 @@ impl UniversalLayerBuffered for LeakyReLU {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
         _grad_params: &MatrixBufferHandle,
     ) {
@@ -58,23 +56,18 @@ impl UniversalLayerBuffered for LeakyReLU {
             _ => panic!("Expected LeakyReLU context"),
         };
 
-        let input_guard = input_handle.read();
-        let x_slice = input_guard.as_slice().expect("LeakyReLU backward: expected CPU buffer");
-
-        let go_guard = grad_output.read();
-        let go = go_guard.as_slice().expect("LeakyReLU backward: expected CPU buffer");
-
-        let mut gi_guard = grad_input.write();
-        let gi = gi_guard.as_slice_mut().expect("LeakyReLU backward: expected CPU buffer");
-
-        debug_assert_eq!(go.len(), gi.len());
-        debug_assert_eq!(go.len(), x_slice.len());
-
-        for idx in 0..go.len() {
-            let x_val = x_slice[idx];
-            let derivative = if x_val > 0.0 { 1.0 } else { self.alpha };
-            gi[idx] = go[idx] * derivative;
-        }
+        let ids = [input_handle.id(), grad_output.id(), grad_input.id()];
+        input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, rest) = rest.split_at_mut(1);
+            let go: &[f32] = &*second[0];
+            let gi: &mut [f32] = &mut *rest[0];
+            for i in 0..go.len() {
+                let derivative = if x[i] > 0.0 { 1.0 } else { self.alpha };
+                gi[i] = go[i] * derivative;
+            }
+        });
     }
 
     fn param_len(&self) -> usize {

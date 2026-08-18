@@ -52,43 +52,45 @@ impl UniversalLayerBuffered for Memory {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
     ) {
-        let input_guard = input.read();
-        let src = input_guard.as_slice().expect("Memory forward: expected CPU buffer");
+        let ids = [input.id(), output.id()];
+        let mut cells_guard = self.cells.lock().unwrap();
+        let cells = &mut *cells_guard;
 
-        let mut output_guard = output.write();
-        let dst = output_guard.as_slice_mut().expect("Memory forward: expected CPU buffer");
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let y: &mut [f32] = &mut *rest[0];
+            let rows = input.rows();
+            let features = self.features;
 
-        let features = self.features;
-        let mut cells = self.cells.lock().unwrap();
+            for r in 0..rows {
+                for c in 0..features {
+                    let idx = c * rows + r;
+                    let x_val = x[idx];
+                    let min_idx = c;
+                    let max_idx = features + c;
+                    let min_val = cells[min_idx];
+                    let max_val = cells[max_idx];
 
-        debug_assert_eq!(src.len(), dst.len());
+                    let d_min = (x_val - min_val).abs();
+                    let d_max = (x_val - max_val).abs();
+                    let closest = if d_min <= d_max { min_val } else { max_val };
+                    y[idx] = x_val + self.alpha * (closest - x_val);
 
-        for idx in 0..src.len() {
-            let c = idx / input.rows(); // column index (feature)
-
-            let x = src[idx];
-            let min_idx = c;
-            let max_idx = features + c;
-            let min_val = cells[min_idx];
-            let max_val = cells[max_idx];
-
-            let d_min = (x - min_val).abs();
-            let d_max = (x - max_val).abs();
-            let closest = if d_min <= d_max { min_val } else { max_val };
-            dst[idx] = x + self.alpha * (closest - x);
-
-            if x > max_val {
-                cells[max_idx] += self.alpha * (x - max_val);
-            } else if x < min_val {
-                cells[min_idx] += self.alpha * (x - min_val);
-            } else {
-                cells[min_idx] += self.alpha * (x - min_val);
-                cells[max_idx] += self.alpha * (x - max_val);
+                    if x_val > max_val {
+                        cells[max_idx] += self.alpha * (x_val - max_val);
+                    } else if x_val < min_val {
+                        cells[min_idx] += self.alpha * (x_val - min_val);
+                    } else {
+                        cells[min_idx] += self.alpha * (x_val - min_val);
+                        cells[max_idx] += self.alpha * (x_val - max_val);
+                    }
+                }
             }
-        }
+        });
     }
 
     fn backward_buffered(
@@ -96,7 +98,7 @@ impl UniversalLayerBuffered for Memory {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
         _grad_params: &MatrixBufferHandle,
     ) {
@@ -107,17 +109,15 @@ impl UniversalLayerBuffered for Memory {
         };
 
         let factor = 1.0 - self.alpha;
-        let go_guard = grad_output.read();
-        let go = go_guard.as_slice().expect("Memory backward: expected CPU buffer");
-
-        let mut gi_guard = grad_input.write();
-        let gi = gi_guard.as_slice_mut().expect("Memory backward: expected CPU buffer");
-
-        debug_assert_eq!(go.len(), gi.len());
-
-        for (out, &in_val) in gi.iter_mut().zip(go.iter()) {
-            *out = in_val * factor;
-        }
+        let ids = [grad_output.id(), grad_input.id()];
+        grad_output.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let go: &[f32] = &*first[0];
+            let gi: &mut [f32] = &mut *rest[0];
+            for i in 0..go.len() {
+                gi[i] = go[i] * factor;
+            }
+        });
     }
 
     fn param_len(&self) -> usize {

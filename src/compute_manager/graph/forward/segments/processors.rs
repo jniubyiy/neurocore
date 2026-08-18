@@ -17,7 +17,7 @@ impl MixedModel {
         proc: &Arc<Vec<Box<dyn UniversalLayer>>>,
         slices: &[ParamSlice],
         _seg_index: usize,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         stream_buffers: &mut Vec<MatrixBufferHandle>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
         stream_indices: &Option<Vec<usize>>,
@@ -113,7 +113,7 @@ fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,
     output: &MatrixBufferHandle,
-    params: &[f32],
+    params: &MatrixBufferHandle,
     slice: &ParamSlice,
 ) {
     if let Some(l) = layer.as_linear() {

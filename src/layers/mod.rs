@@ -58,7 +58,7 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
     );
 
@@ -67,7 +67,7 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
         grad_params: &MatrixBufferHandle,
     );

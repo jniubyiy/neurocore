@@ -41,38 +41,37 @@ impl UniversalLayerBuffered for DualAnchor {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
     ) {
-        let input_guard = input.read();
-        let src = input_guard.as_slice().expect("DualAnchor forward: expected CPU buffer");
-
-        let mut output_guard = output.write();
-        let dst = output_guard.as_slice_mut().expect("DualAnchor forward: expected CPU buffer");
-
         let rows = input.rows();
         let cols = input.cols();
-        debug_assert_eq!(cols, self.features);
+        let ids = [input.id(), output.id(), params.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, third) = rest.split_at_mut(1);
+            let y: &mut [f32] = &mut *second[0];
+            let p: &[f32] = &*third[0];
 
-        let base = slice.start;
-        let min_vals = &params[base..base + self.features];
-        let max_vals = &params[base + self.features..base + 2 * self.features];
-        let alpha = params[base + 2 * self.features];
+            let base = slice.start;
+            let min_vals = &p[base..base + self.features];
+            let max_vals = &p[base + self.features..base + 2 * self.features];
+            let alpha = p[base + 2 * self.features];
 
-        debug_assert_eq!(src.len(), dst.len());
-
-        for c in 0..cols {
-            let min_v = min_vals[c];
-            let max_v = max_vals[c];
-            for r in 0..rows {
-                let idx = c * rows + r;
-                let x = src[idx];
-                let d_min = (x - min_v).abs();
-                let d_max = (x - max_v).abs();
-                let closest = if d_min <= d_max { min_v } else { max_v };
-                dst[idx] = x + alpha * (closest - x);
+            for c in 0..cols {
+                let min_v = min_vals[c];
+                let max_v = max_vals[c];
+                for r in 0..rows {
+                    let idx = c * rows + r;
+                    let x_val = x[idx];
+                    let d_min = (x_val - min_v).abs();
+                    let d_max = (x_val - max_v).abs();
+                    let closest = if d_min <= d_max { min_v } else { max_v };
+                    y[idx] = x_val + alpha * (closest - x_val);
+                }
             }
-        }
+        });
     }
 
     fn backward_buffered(
@@ -80,7 +79,7 @@ impl UniversalLayerBuffered for DualAnchor {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        params: &[f32],
+        params: &MatrixBufferHandle,
         slice: &ParamSlice,
         grad_params: &MatrixBufferHandle,
     ) {
@@ -90,40 +89,42 @@ impl UniversalLayerBuffered for DualAnchor {
             _ => panic!("Expected DualAnchor1D context"),
         };
 
-        let input_guard = input_handle.read();
-        let x_slice = input_guard.as_slice().expect("DualAnchor backward: expected CPU buffer");
-
         let rows = grad_output.rows();
         let cols = grad_output.cols();
-        debug_assert_eq!(cols, self.features);
+        let ids = [
+            input_handle.id(),
+            grad_output.id(),
+            grad_input.id(),
+            params.id(),
+            grad_params.id(),
+        ];
+        input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, rest) = rest.split_at_mut(1);
+            let go: &[f32] = &*second[0];
+            let (third, rest) = rest.split_at_mut(1);
+            let gi: &mut [f32] = &mut *third[0];
+            let (fourth, fifth) = rest.split_at_mut(1);
+            let p: &[f32] = &*fourth[0];
+            let gp: &mut [f32] = &mut *fifth[0];
 
-        let base = slice.start;
-        let min_vals = &params[base..base + self.features];
-        let max_vals = &params[base + self.features..base + 2 * self.features];
-        let alpha = params[base + 2 * self.features];
+            let base = slice.start;
+            let min_vals = &p[base..base + self.features];
+            let max_vals = &p[base + self.features..base + 2 * self.features];
+            let alpha = p[base + 2 * self.features];
 
-        let go_guard = grad_output.read();
-        let go = go_guard.as_slice().expect("DualAnchor backward: expected CPU buffer");
-
-        let mut gi_guard = grad_input.write();
-        let gi = gi_guard.as_slice_mut().expect("DualAnchor backward: expected CPU buffer");
-
-        debug_assert_eq!(go.len(), gi.len());
-        debug_assert_eq!(go.len(), x_slice.len());
-
-        grad_params.with_cpu_data_mut(|grad_data| {
-            let mut d_alpha = 0.0f32;
+            let mut d_alpha_total = 0.0f32;
 
             for c in 0..cols {
                 let min_v = min_vals[c];
                 let max_v = max_vals[c];
-                let mut d_min = 0.0f32;
-                let mut d_max = 0.0f32;
+                let mut d_min_acc = 0.0f32;
+                let mut d_max_acc = 0.0f32;
 
                 for r in 0..rows {
                     let idx = c * rows + r;
-
-                    let x_val = x_slice[idx];
+                    let x_val = x[idx];
                     let d_min_abs = (x_val - min_v).abs();
                     let d_max_abs = (x_val - max_v).abs();
                     let is_min = d_min_abs <= d_max_abs;
@@ -132,19 +133,19 @@ impl UniversalLayerBuffered for DualAnchor {
                     gi[idx] = gout * (1.0 - alpha);
 
                     if is_min {
-                        d_min += gout * alpha;
-                        d_alpha += gout * (min_v - x_val);
+                        d_min_acc += gout * alpha;
+                        d_alpha_total += gout * (min_v - x_val);
                     } else {
-                        d_max += gout * alpha;
-                        d_alpha += gout * (max_v - x_val);
+                        d_max_acc += gout * alpha;
+                        d_alpha_total += gout * (max_v - x_val);
                     }
                 }
 
-                grad_data[base + c] = d_min;
-                grad_data[base + self.features + c] = d_max;
+                gp[base + c] = d_min_acc;
+                gp[base + self.features + c] = d_max_acc;
             }
 
-            grad_data[base + 2 * self.features] = d_alpha;
+            gp[base + 2 * self.features] = d_alpha_total;
         });
     }
 

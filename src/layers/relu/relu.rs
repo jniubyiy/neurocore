@@ -25,20 +25,18 @@ impl UniversalLayerBuffered for ReLU {
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
     ) {
-        let src_guard = input.read();
-        let src = src_guard.as_slice().expect("ReLU forward: expected CPU buffer");
-
-        let mut dst_guard = output.write();
-        let dst = dst_guard.as_slice_mut().expect("ReLU forward: expected CPU buffer");
-
-        debug_assert_eq!(src.len(), dst.len());
-
-        for (o, &x) in dst.iter_mut().zip(src.iter()) {
-            *o = x.max(0.0);
-        }
+        let ids = [input.id(), output.id()];
+        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let y: &mut [f32] = &mut *rest[0];
+            for i in 0..x.len() {
+                y[i] = x[i].max(0.0);
+            }
+        });
     }
 
     fn backward_buffered(
@@ -46,7 +44,7 @@ impl UniversalLayerBuffered for ReLU {
         ctx: &DynamicContext,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        _params: &[f32],
+        _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
         _grad_params: &MatrixBufferHandle,
     ) {
@@ -56,21 +54,17 @@ impl UniversalLayerBuffered for ReLU {
             _ => panic!("Expected ReLU context"),
         };
 
-        let input_guard = input_handle.read();
-        let x_slice = input_guard.as_slice().expect("ReLU backward: expected CPU buffer");
-
-        let go_guard = grad_output.read();
-        let go = go_guard.as_slice().expect("ReLU backward: expected CPU buffer");
-
-        let mut gi_guard = grad_input.write();
-        let gi = gi_guard.as_slice_mut().expect("ReLU backward: expected CPU buffer");
-
-        debug_assert_eq!(go.len(), gi.len());
-        debug_assert_eq!(go.len(), x_slice.len());
-
-        for idx in 0..go.len() {
-            gi[idx] = if x_slice[idx] > 0.0 { go[idx] } else { 0.0 };
-        }
+        let ids = [input_handle.id(), grad_output.id(), grad_input.id()];
+        input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            let (first, rest) = slices.split_at_mut(1);
+            let x: &[f32] = &*first[0];
+            let (second, rest) = rest.split_at_mut(1);
+            let go: &[f32] = &*second[0];
+            let gi: &mut [f32] = &mut *rest[0];
+            for i in 0..go.len() {
+                gi[i] = if x[i] > 0.0 { go[i] } else { 0.0 };
+            }
+        });
     }
 
     fn param_len(&self) -> usize {

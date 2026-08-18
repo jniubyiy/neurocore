@@ -217,18 +217,6 @@ impl GpuCompute {
         self.run_compute_shader_with_dispatch(pipeline, buffers, push_constants, dispatch_dim);
     }
 
-    pub fn mat_to_flat(mat: &Mat<f32>) -> Vec<f32> {
-        let rows = mat.nrows();
-        let cols = mat.ncols();
-        let mut flat = Vec::with_capacity(rows * cols);
-        for r in 0..rows {
-            for c in 0..cols {
-                flat.push(mat[(r, c)]);
-            }
-        }
-        flat
-    }
-
     // ===================================================================
     // МЕТОДЫ ДЛЯ РАБОТЫ С MatrixBufferHandle
     // ===================================================================

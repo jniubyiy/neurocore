@@ -14,10 +14,12 @@ pub fn process_forward_gpu_buffered(
     gpu_compute: &GpuCompute,
     layers: &[Box<dyn UniversalLayer>],
     slices: &[ParamSlice],
-    params: &[f32],
+    params: &MatrixBufferHandle,
     input: MatrixBufferHandle,
 ) -> (MatrixBufferHandle, Vec<DynamicContext>) {
     assert!(input.is_gpu(), "Input must be GPU handle");
+    assert!(!params.is_gpu(), "process_forward_gpu_buffered: params must be CPU handle");
+
     let mut current = input;
     let mut ctxs = Vec::with_capacity(layers.len());
 
@@ -28,16 +30,16 @@ pub fn process_forward_gpu_buffered(
             let w_start = slice.start;
             let b_start = w_start + in_feat * out_feat;
 
-            // Загружаем веса на GPU как дескриптор
-            let weight_vec = &params[w_start..w_start + in_feat * out_feat];
-            let weight_gpu = gpu_compute.upload_vec_to_gpu_handle(weight_vec, out_feat, in_feat);
-            let bias = &params[b_start..b_start + out_feat];
+            // Читаем только веса и bias текущего слоя
+            let weight_vec = params.read_range(w_start, in_feat * out_feat);
+            let bias = params.read_range(b_start, out_feat);
+            let weight_gpu = gpu_compute.upload_vec_to_gpu_handle(&weight_vec, out_feat, in_feat);
 
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), out_feat);
             gpu_compute.run_linear_forward_buffered_handle(
                 &current,
                 &weight_gpu,
-                bias,
+                &bias,
                 &out_handle,
             );
 
@@ -96,11 +98,11 @@ pub fn process_forward_gpu_buffered(
             }));
             current = out_handle;
         } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
-            let thresholds = &params[slice.start..slice.start + soft_sparse.in_features];
+            let thresholds = params.read_range(slice.start, soft_sparse.in_features);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
             gpu_compute.run_softsparse_forward_buffered_handle(
                 &current,
-                thresholds,
+                &thresholds,
                 soft_sparse.temperature,
                 &out_handle,
             );
@@ -109,11 +111,11 @@ pub fn process_forward_gpu_buffered(
             }));
             current = out_handle;
         } else if let Some(soft_keep) = layer.as_soft_keep_gate() {
-            let thresholds = &params[slice.start..slice.start + soft_keep.in_features];
+            let thresholds = params.read_range(slice.start, soft_keep.in_features);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
             gpu_compute.run_softkeep_forward_buffered_handle(
                 &current,
-                thresholds,
+                &thresholds,
                 soft_keep.temperature,
                 &out_handle,
             );
@@ -123,14 +125,16 @@ pub fn process_forward_gpu_buffered(
             current = out_handle;
         } else if let Some(dual) = layer.as_dual_anchor() {
             let features = dual.features;
-            let min_vals = &params[slice.start..slice.start + features];
-            let max_vals = &params[slice.start + features..slice.start + 2 * features];
-            let alpha = params[slice.start + 2 * features];
+            let min_vals = params.read_range(slice.start, features);
+            let max_vals = params.read_range(slice.start + features, features);
+            let alpha_vec = params.read_range(slice.start + 2 * features, 1);
+            let alpha = alpha_vec[0];
+
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
             gpu_compute.run_dualanchor_forward_buffered_handle(
                 &current,
-                min_vals,
-                max_vals,
+                &min_vals,
+                &max_vals,
                 alpha,
                 &out_handle,
             );
@@ -157,11 +161,13 @@ pub fn process_backward_gpu_buffered(
     layers: &[Box<dyn UniversalLayer>],
     slices: &[ParamSlice],
     contexts: &[DynamicContext],
-    params: &[f32],
+    params: &MatrixBufferHandle,
     grad_output: MatrixBufferHandle,
     grad_params_handle: &MatrixBufferHandle,
 ) -> MatrixBufferHandle {
     assert!(grad_output.is_gpu(), "Grad output must be GPU handle");
+    assert!(!params.is_gpu(), "process_backward_gpu_buffered: params must be CPU handle");
+
     let num_layers = layers.len();
     assert_eq!(contexts.len(), num_layers);
     assert_eq!(slices.len(), num_layers);
@@ -185,8 +191,9 @@ pub fn process_backward_gpu_buffered(
                 _ => panic!("Expected Linear Buffered context"),
             };
 
-            let weight_vec = &params[w_start..w_start + in_feat * out_feat];
-            let weight_gpu = gpu_compute.upload_vec_to_gpu_handle(weight_vec, out_feat, in_feat);
+            // Читаем только веса текущего слоя
+            let weight_vec = params.read_range(w_start, in_feat * out_feat);
+            let weight_gpu = gpu_compute.upload_vec_to_gpu_handle(&weight_vec, out_feat, in_feat);
 
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), in_feat);
             let grad_weight_handle = gpu_compute.allocate_gpu_matrix_handle(out_feat, in_feat);
@@ -298,13 +305,13 @@ pub fn process_backward_gpu_buffered(
                 BufferedContext::SoftSparseGate { input } => input.clone(),
                 _ => panic!("Expected SoftSparseGate Buffered context"),
             };
-            let thresholds = &params[slice.start..slice.start + soft_sparse.in_features];
+            let thresholds = params.read_range(slice.start, soft_sparse.in_features);
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             let grad_thresh_handle = gpu_compute.allocate_gpu_matrix_handle(1, soft_sparse.in_features);
             let grad_thresh_vec = gpu_compute.run_softsparse_backward_buffered_handle(
                 &input_handle,
                 &current_grad,
-                thresholds,
+                &thresholds,
                 soft_sparse.temperature,
                 &grad_input_handle,
                 &grad_thresh_handle,
@@ -324,13 +331,13 @@ pub fn process_backward_gpu_buffered(
                 BufferedContext::SoftKeepGate { input } => input.clone(),
                 _ => panic!("Expected SoftKeepGate Buffered context"),
             };
-            let thresholds = &params[slice.start..slice.start + soft_keep.in_features];
+            let thresholds = params.read_range(slice.start, soft_keep.in_features);
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             let grad_thresh_handle = gpu_compute.allocate_gpu_matrix_handle(1, soft_keep.in_features);
             let grad_thresh_vec = gpu_compute.run_softkeep_backward_buffered_handle(
                 &input_handle,
                 &current_grad,
-                thresholds,
+                &thresholds,
                 soft_keep.temperature,
                 &grad_input_handle,
                 &grad_thresh_handle,
@@ -351,9 +358,11 @@ pub fn process_backward_gpu_buffered(
                 _ => panic!("Expected DualAnchor1D Buffered context"),
             };
             let features = dual.features;
-            let min_vals = &params[slice.start..slice.start + features];
-            let max_vals = &params[slice.start + features..slice.start + 2 * features];
-            let alpha = params[slice.start + 2 * features];
+            let min_vals = params.read_range(slice.start, features);
+            let max_vals = params.read_range(slice.start + features, features);
+            let alpha_vec = params.read_range(slice.start + 2 * features, 1);
+            let alpha = alpha_vec[0];
+
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             let grad_min_handle = gpu_compute.allocate_gpu_matrix_handle(1, features);
             let grad_max_handle = gpu_compute.allocate_gpu_matrix_handle(1, features);
@@ -361,8 +370,8 @@ pub fn process_backward_gpu_buffered(
             let grad_vec = gpu_compute.run_dualanchor_backward_buffered_handle(
                 &input_handle,
                 &current_grad,
-                min_vals,
-                max_vals,
+                &min_vals,
+                &max_vals,
                 alpha,
                 &grad_input_handle,
                 &grad_min_handle,

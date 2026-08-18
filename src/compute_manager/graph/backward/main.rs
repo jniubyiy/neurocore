@@ -79,7 +79,6 @@ impl MixedModel {
 
                         if self.gpu_compute.is_some() {
                             let gpu = self.gpu_compute.as_ref().unwrap().lock().unwrap();
-                            let params_vec = self.buffered_param_store.lock().unwrap().get_all_params();
 
                             let delta_gpu_handle = if delta_handle.is_gpu() {
                                 delta_handle.clone()
@@ -97,7 +96,7 @@ impl MixedModel {
                                 proc,
                                 slices,
                                 ctxs_slice,
-                                &params_vec,
+                                &params_handle,
                                 delta_gpu_handle,
                                 &grad_params_handle,
                             );

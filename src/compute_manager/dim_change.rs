@@ -34,9 +34,9 @@ impl DynamicTensor {
     pub fn features(&self) -> usize {
         match self {
             DynamicTensor::Dim1(t) => t.dim2,
-            DynamicTensor::Dim2(t) => t.dim3,
-            DynamicTensor::Dim3(t) => t.dim4,
-            DynamicTensor::Dim4(t) => t.dim5,
+            DynamicTensor::Dim2(t) => t.dim2 * t.dim3,
+            DynamicTensor::Dim3(t) => t.dim2 * t.dim3 * t.dim4,
+            DynamicTensor::Dim4(t) => t.dim2 * t.dim3 * t.dim4 * t.dim5,
         }
     }
 

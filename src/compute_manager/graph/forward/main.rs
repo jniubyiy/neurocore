@@ -69,20 +69,11 @@ impl MixedModel {
                         None => (0..stream_buffers.len()).collect(),
                     };
 
-                    // Для CPU нам нужен handle параметров, для GPU - Vec<f32>
-                    let (params_handle, params_vec) = {
-                        if self.gpu_compute.is_some() {
-                            let params_vec = self.buffered_param_store.lock().unwrap().get_all_params();
-                            (None, Some(params_vec))
-                        } else {
-                            let handle = self.buffered_param_store.lock().unwrap().params_handle().clone();
-                            (Some(handle), None)
-                        }
-                    };
+                    // Единый дескриптор параметров для CPU и GPU.
+                    let params_handle = self.buffered_param_store.lock().unwrap().params_handle().clone();
 
                     if let Some(ref gpu_compute_mutex) = self.gpu_compute {
                         let gpu = gpu_compute_mutex.lock().unwrap();
-                        let params_vec = params_vec.as_ref().expect("params_vec must be Some for GPU");
 
                         for &stream_idx in &active_indices {
                             let input_buf = stream_buffers[stream_idx].clone();
@@ -103,7 +94,7 @@ impl MixedModel {
                                 &gpu,
                                 proc,
                                 slices,
-                                params_vec,
+                                &params_handle,
                                 input_gpu,
                             );
 
@@ -117,13 +108,12 @@ impl MixedModel {
                         }
                     } else {
                         // CPU-путь
-                        let params_handle = params_handle.as_ref().expect("params_handle must be Some for CPU");
                         self.process_universal_processor_forward_buffered(
                             pool,
                             proc,
                             slices,
                             seg_index,
-                            params_handle,
+                            &params_handle,
                             &mut stream_buffers,
                             &mut all_ctxs,
                             stream_indices,

@@ -168,25 +168,46 @@ impl MixedModel {
             match &desc.kind {
                 LayerKind::SplitterConnector => {
                     finalize_universal!();
-                    let dims = &desc.output_shape.streams;
-                    assert_eq!(dims.len(), 2);
-                    segments.push(Segment::SplitterConnector {
-                        dim_a: dims[0],
-                        dim_b: dims[1],
-                    });
-                    active_ports = Some(dims.clone());
-                    current_branch = Some(0);
+
+                    // Определяем, какие порты заданы.
+                    // В конце модели они могут быть заданы через .input(...),
+                    // в начале следующей — через .output(...).
+                    let dims: Vec<usize> = if !desc.output_shape.streams.is_empty() {
+                        desc.output_shape.streams.clone()
+                    } else {
+                        desc.input_shape.streams.clone()
+                    };
+
+                    if dims.len() == 1 {
+                        // Одиночный порт: выбираем соответствующую ветку.
+                        // Текущие active_ports должны быть уже установлены (например, после Splitter).
+                        if let Some(ref ports) = active_ports {
+                            if let Some(pos) = ports.iter().position(|&p| p == dims[0]) {
+                                current_branch = Some(pos);
+                            } else {
+                                // Если порт не найден, считаем, что это единственная ветка.
+                                current_branch = Some(0);
+                            }
+                        } else {
+                            // Если active_ports ещё не заданы (например, в начале модели),
+                            // то просто устанавливаем этот порт как единственный.
+                            active_ports = Some(vec![dims[0]]);
+                            current_branch = Some(0);
+                        }
+                    } else {
+                        // Несколько портов: объявляем доступные потоки.
+                        // Обычно это происходит после Splitter или перед Combiner.
+                        active_ports = Some(dims.clone());
+                        current_branch = None;
+                    }
+                    // Сегмент для коннектора не создаём, он не выполняет вычислений.
                 }
                 LayerKind::CombinerConnector => {
-                    finalize_universal!();
-                    let input_dims = &desc.input_shape.streams;
-                    let output_dim = desc.output_shape.streams[0];
-                    segments.push(Segment::CombinerConnector {
-                        input_dims: input_dims.clone(),
-                        output_dim,
-                    });
-                    active_ports = Some(vec![output_dim]);
-                    current_branch = None;
+                    // CombinerConnector используется для маркировки окончания ветки.
+                    // Он не влияет на граф вычислений, поэтому просто пропускаем его.
+                    // Однако, если после него идёт обычный слой, это уже обработается в следующей итерации.
+                    // Никаких действий не требуется.
+                    continue;
                 }
                 LayerKind::Splitter => {
                     finalize_universal!();
@@ -348,6 +369,7 @@ impl MixedModel {
     }
 
     /// Сборка модели с планом устройств (вызывается из публичного API).
+    #[allow(dead_code)]
     pub(crate) fn build_with_device_plan(
         plan: crate::model_plan::plan::Plan,
         device_plan: DevicePlan,
@@ -356,6 +378,7 @@ impl MixedModel {
     }
 
     /// Сборка модели с планом устройств и указанием размера батча.
+    #[allow(dead_code)]
     pub(crate) fn build_with_device_plan_and_batch(
         plan: crate::model_plan::plan::Plan,
         device_plan: DevicePlan,

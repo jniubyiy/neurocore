@@ -3,20 +3,19 @@
 
 use neurocore::tensor::Tensor3D;
 
-mod models {
+mod model {
     use neurocore::model_plan::{LayerKind, LayerDesc};
-    use neurocore::shape;
     pub fn autoencoder() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input(shape!(batch, A[4], B[4]))
-                .output(shape!(batch, A[2], B[2])),
+                .input((batch, A[4], B[4]))
+                .output((batch, A[2], B[2])),
             LayerDesc::new(LayerKind::Sigmoid)
-                .input(shape!(batch, A[2], B[2]))
-                .output(shape!(batch, A[2], B[2])),
+                .input((batch, A[2], B[2]))
+                .output((batch, A[2], B[2])),
             LayerDesc::new(LayerKind::Linear)
-                .input(shape!(batch, A[2], B[2]))
-                .output(shape!(batch, A[4], B[4])),
+                .input((batch, A[2], B[2]))
+                .output((batch, A[4], B[4])),
         ]
     }
 }

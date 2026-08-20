@@ -7,15 +7,14 @@ use neurocore::tensor::Tensor2D;
 use neurocore::training_plan::ProfileMode;
 
 // ═══════════════ Модель ═══════════════
-mod models {
+mod model {
     use neurocore::model_plan::{LayerKind, LayerDesc};
-    use neurocore::shape;
 
     pub fn classifier() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input(shape!(batch, A[2]))
-                .output(shape!(batch, A[2])),
+                .input((batch, A[2]))
+                .output((batch, A[2])),
         ]
     }
 }

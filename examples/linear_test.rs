@@ -5,14 +5,13 @@
 use neurocore::tensor::Tensor2D;
 
 // ─── Модель ────────────────────────────────────────────────────────
-mod models {
+mod model {
     use neurocore::model_plan::{LayerKind, LayerDesc};
-    use neurocore::shape;
 
     pub fn linear_model() -> Vec<LayerDesc> {
         vec![LayerDesc::new(LayerKind::Linear)
-            .input(shape!(batch, A[4]))
-            .output(shape!(batch, A[4]))]
+            .input((batch, A[4]))
+            .output((batch, A[4]))]
     }
 }
 

@@ -4,15 +4,14 @@
 
 use neurocore::tensor::Tensor5D;
 
-mod models {
+mod model {
     use neurocore::model_plan::{LayerKind, LayerDesc};
-    use neurocore::shape;
 
     pub fn classifier() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input(shape!(batch, A[2], B[2], C[2], D[2]))   // 2*2*2*2 = 16 признаков
-                .output(shape!(batch, A[2])),                     // 2 логита
+                .input((batch, A[2], B[2], C[2], D[2]))   // 2*2*2*2 = 16 признаков
+                .output((batch, A[2])),                     // 2 логита
         ]
     }
 }

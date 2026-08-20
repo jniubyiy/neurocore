@@ -9,14 +9,13 @@ mod device_plan {
     pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192) }
 }
 
-mod models {
+mod model {
     use neurocore::model_plan::{LayerKind, LayerDesc};
-    use neurocore::shape;
     pub fn linear_model() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input(shape!(batch, A[4], B[4], C[4], D[4]))
-                .output(shape!(batch, A[4], B[4], C[4], D[4])),
+                .input((batch, A[4], B[4], C[4], D[4]))
+                .output((batch, A[4], B[4], C[4], D[4])),
         ]
     }
 }

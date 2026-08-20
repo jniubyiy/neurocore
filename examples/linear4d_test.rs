@@ -1,6 +1,5 @@
 // examples/linear4d_test.rs
 // Полноценное обучение автоэнкодера 256 -> 256 (Tensor5D) через TrainingPlan.
-// Данные нормированы в [0, 1] для стабильности.
 
 use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
 
@@ -9,13 +8,14 @@ mod device_plan {
     pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192) }
 }
 
-mod model {
+mod models {
     use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
     pub fn linear_model() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input((batch, A[4], B[4], C[4], D[4]))
-                .output((batch, A[4], B[4], C[4], D[4])),
+                .input(shape!(batch, A[4], B[4], C[4], D[4]))
+                .output(shape!(batch, A[4], B[4], C[4], D[4])),
         ]
     }
 }
@@ -48,7 +48,6 @@ mod training_plan {
     use neurocore::tensor::Tensor5D;
 
     pub fn plan() -> TrainingPlan {
-        // Нормированные значения в [0, 1]
         let values: Vec<f32> = (0..256).map(|i| i as f32 / 256.0).collect();
         let mut data = Vec::with_capacity(1);
         let mut dim2 = Vec::with_capacity(4);

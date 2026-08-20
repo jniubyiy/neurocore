@@ -4,14 +4,15 @@
 
 use neurocore::tensor::Tensor3D;
 
-mod model {
+mod models {
     use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
 
     pub fn classifier() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input((batch, A[2], B[2]))   // 2*2 = 4 признака
-                .output((batch, A[2])),       // 2 логита
+                .input(shape!(batch, A[2], B[2]))   // 2*2 = 4 признака
+                .output(shape!(batch, A[2])),       // 2 логита
         ]
     }
 }
@@ -39,7 +40,6 @@ mod optimizers {
     }
 }
 
-// Данные: два сэмпла, каждый размерности [2,2] = 4 признака
 fn train_data() -> Tensor3D {
     Tensor3D::new(vec![
         vec![
@@ -53,7 +53,6 @@ fn train_data() -> Tensor3D {
     ])
 }
 
-// Целевые метки: [0, 1] в Tensor3D формы [2,1,1]
 fn target_data() -> Tensor3D {
     Tensor3D::new(vec![
         vec![vec![0.0]],

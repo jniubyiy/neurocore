@@ -71,22 +71,34 @@ impl Plan {
             let prev = &descs[i - 1];
             let curr = &descs[i];
 
-            // Unsqueeze и ReduceMean меняют размерность – их совместимость определяется сохранением числа элементов
-            if matches!(prev.kind, LayerKind::Unsqueeze | LayerKind::ReduceMean)
-                || matches!(curr.kind, LayerKind::Unsqueeze | LayerKind::ReduceMean)
-            {
+            // Пропускаем проверку для коннекторов и операций размерности.
+            // Они задают только форму потоков и не требуют точного соответствия
+            // размеров соседних тензоров, так как служат для маршрутизации.
+            if matches!(
+                prev.kind,
+                LayerKind::Unsqueeze
+                    | LayerKind::ReduceMean
+                    | LayerKind::SplitterConnector
+                    | LayerKind::CombinerConnector
+            ) || matches!(
+                curr.kind,
+                LayerKind::Unsqueeze
+                    | LayerKind::ReduceMean
+                    | LayerKind::SplitterConnector
+                    | LayerKind::CombinerConnector
+            ) {
                 continue;
             }
 
             let prev_out = &prev.output_shape.streams;
             let curr_in = &curr.input_shape.streams;
 
-            // Splitter / SplitterConnector → ожидается несколько выходов
+            // Splitter → ожидается несколько выходов
             let prev_is_splitter = matches!(
                 prev.kind,
                 LayerKind::SplitterConnector | LayerKind::Splitter
             );
-            // Combiner / CombinerConnector → ожидается несколько входов
+            // Combiner → ожидается несколько входов
             let curr_is_combiner = matches!(
                 curr.kind,
                 LayerKind::CombinerConnector | LayerKind::Combiner

@@ -4,14 +4,15 @@
 
 use neurocore::tensor::Tensor5D;
 
-mod model {
+mod models {
     use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
 
     pub fn classifier() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input((batch, A[2], B[2], C[2], D[2]))   // 2*2*2*2 = 16 признаков
-                .output((batch, A[2])),                     // 2 логита
+                .input(shape!(batch, A[2], B[2], C[2], D[2]))   // 2*2*2*2 = 16 признаков
+                .output(shape!(batch, A[2])),                     // 2 логита
         ]
     }
 }
@@ -39,7 +40,6 @@ mod optimizers {
     }
 }
 
-// Данные: два сэмпла, каждый размерности [2,2,2,2] = 16 признаков
 fn train_data() -> Tensor5D {
     Tensor5D::new(vec![
         vec![
@@ -89,7 +89,6 @@ fn train_data() -> Tensor5D {
     ])
 }
 
-// Целевые метки: Tensor5D формы [2,1,1,1,1]
 fn target_data() -> Tensor5D {
     Tensor5D::new(vec![
         vec![vec![vec![vec![0.0]]]],
@@ -136,7 +135,6 @@ fn main() {
         result.final_loss, result.training_time_secs, result.best_epoch
     );
 }
-
 
 
 

@@ -4,14 +4,15 @@
 
 use neurocore::tensor::Tensor4D;
 
-mod model {
+mod models {
     use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
 
     pub fn classifier() -> Vec<LayerDesc> {
         vec![
             LayerDesc::new(LayerKind::Linear)
-                .input((batch, A[2], B[2], C[2]))   // 2*2*2 = 8 признаков
-                .output((batch, A[2])),               // 2 логита
+                .input(shape!(batch, A[2], B[2], C[2]))   // 2*2*2 = 8 признаков
+                .output(shape!(batch, A[2])),               // 2 логита
         ]
     }
 }
@@ -39,7 +40,6 @@ mod optimizers {
     }
 }
 
-// Данные: два сэмпла, каждый размерности [2,2,2] = 8 признаков
 fn train_data() -> Tensor4D {
     Tensor4D::new(vec![
         vec![
@@ -65,7 +65,6 @@ fn train_data() -> Tensor4D {
     ])
 }
 
-// Целевые метки: Tensor4D формы [2,1,1,1]
 fn target_data() -> Tensor4D {
     Tensor4D::new(vec![
         vec![vec![vec![0.0]]],

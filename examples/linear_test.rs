@@ -1,21 +1,19 @@
 // examples/linear_test.rs
 // Демонстрация семи вариантов обучения автоэнкодера 4 -> 4 через run_training!.
-// Вариант 7 включает профилирование (ProfileMode::Full).
 
 use neurocore::tensor::Tensor2D;
 
-// ─── Модель ────────────────────────────────────────────────────────
-mod model {
+mod models {
     use neurocore::model_plan::{LayerKind, LayerDesc};
+    use neurocore::shape;
 
     pub fn linear_model() -> Vec<LayerDesc> {
         vec![LayerDesc::new(LayerKind::Linear)
-            .input((batch, A[4]))
-            .output((batch, A[4]))]
+            .input(shape!(batch, A[4]))
+            .output(shape!(batch, A[4]))]
     }
 }
 
-// ─── Функция потерь ────────────────────────────────────────────────
 mod losses {
     use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub, SumColumns};
     pub fn mse() -> LossDesc {
@@ -27,7 +25,6 @@ mod losses {
     }
 }
 
-// ─── Оптимизатор ───────────────────────────────────────────────────
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
     pub fn sgd() -> OptimizerDesc {
@@ -37,12 +34,10 @@ mod optimizers {
     }
 }
 
-// ─── Данные (вход = цель) ─────────────────────────────────────────
 fn data() -> Tensor2D {
     Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0]])
 }
 
-// ─── Общий план обучения (общий для всех вариантов) ─────────────
 fn base_training() -> neurocore::training_plan::TrainingPlan {
     use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
     TrainingPlan::new()
@@ -57,9 +52,6 @@ fn base_training() -> neurocore::training_plan::TrainingPlan {
         .output_tensors(vec!["prediction".to_string()])
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Варианты 1-6
-// ═══════════════════════════════════════════════════════════════════
 mod training_plan_v1 {
     use neurocore::training_plan::TrainingPlan;
     pub fn plan() -> TrainingPlan { super::base_training() }
@@ -117,7 +109,6 @@ mod device_plan_v6 {
     pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192).ssd(0, "neurocore_ssd_cache", 5000) }
 }
 
-// Вариант 7 – с профилированием
 mod training_plan_v7 {
     use neurocore::training_plan::{TrainingPlan, ProfileMode};
     pub fn plan() -> TrainingPlan {

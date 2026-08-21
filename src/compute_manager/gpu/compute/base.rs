@@ -1,5 +1,6 @@
 // src/compute_manager/gpu/compute/base.rs
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -35,8 +36,9 @@ pub struct GpuCompute {
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub memory_executor: Arc<Mutex<MemoryExecutor>>,
     pub gpu_device_id: DeviceId,
-    pub memory_state: Option<Subbuffer<[f32]>>,
-    pub memory_state_id: Option<RawBufferId>,
+    /// Хранилище состояний для каждого слоя Memory по индексу (memory_idx).
+    /// Позволяет нескольким слоям Memory работать независимо на GPU.
+    pub memory_states: Mutex<HashMap<usize, (Subbuffer<[f32]>, RawBufferId)>>,
 }
 
 impl GpuCompute {
@@ -59,8 +61,7 @@ impl GpuCompute {
             command_buffer_allocator,
             memory_executor,
             gpu_device_id,
-            memory_state: None,
-            memory_state_id: None,
+            memory_states: Mutex::new(HashMap::new()),
         }
     }
 

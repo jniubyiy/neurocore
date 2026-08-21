@@ -22,6 +22,7 @@ pub fn process_forward_gpu_buffered(
 
     let mut current = input;
     let mut ctxs = Vec::with_capacity(layers.len());
+    let mut memory_idx = 0usize; // счётчик слоёв Memory
 
     for (layer, slice) in layers.iter().zip(slices.iter()) {
         if let Some(linear) = layer.as_linear() {
@@ -92,7 +93,13 @@ pub fn process_forward_gpu_buffered(
             current = out_handle;
         } else if let Some(memory) = layer.as_memory() {
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
-            gpu_compute.run_memory_forward_buffered_handle(&current, &out_handle, memory.alpha);
+            gpu_compute.run_memory_forward_buffered_handle(
+                &current,
+                &out_handle,
+                memory.alpha,
+                memory_idx,
+            );
+            memory_idx += 1;
             ctxs.push(DynamicContext::Buffered(BufferedContext::Memory {
                 input: current.clone(),
             }));

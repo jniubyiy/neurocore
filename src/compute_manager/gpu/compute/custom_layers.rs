@@ -8,22 +8,15 @@ impl GpuCompute {
     // Memory
     // ===================================================================
 
-    /// Инициализирует внутреннее состояние слоя Memory.
-    /// Вызывается один раз перед первым использованием.
-    pub fn init_memory_state(&mut self, features: usize, _alpha: f32) {
-        let mut state = Vec::with_capacity(2 * features);
-        state.resize(features, f32::MAX);
-        state.resize(2 * features, f32::MIN);
-        let (buf, raw_id) = self.upload_to_temp_buffer(&state);
-        self.memory_state = Some(buf);
-        self.memory_state_id = Some(raw_id);
-    }
-
+    /// Прямой проход слоя Memory на GPU с использованием MatrixBufferHandle.
+    /// `memory_idx` – уникальный индекс слоя Memory в модели, используется
+    /// для раздельного хранения состояния каждого слоя.
     pub fn run_memory_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
         alpha: f32,
+        memory_idx: usize,
     ) {
         assert!(input.is_gpu() && output.is_gpu(), "Handles must be GPU");
         let batch = input.rows();
@@ -33,19 +26,42 @@ impl GpuCompute {
         assert_eq!(output.cols(), features);
 
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
-        let state = self.memory_state.as_ref().expect("Memory state not initialized");
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
+
+        // Получаем или инициализируем состояние для данного индекса слоя.
+        let state = {
+            let mut states = self.memory_states.lock().unwrap();
+            if let Some((buf, _)) = states.get(&memory_idx) {
+                buf.clone()
+            } else {
+                // Инициализация: для каждого признака берём первое входное значение
+                let input_vec = self.download_gpu_handle_to_vec(input);
+                let mut state_vec = Vec::with_capacity(2 * features);
+                for c in 0..features {
+                    let first_val = input_vec[c * batch];
+                    state_vec.push(first_val);
+                }
+                for c in 0..features {
+                    let first_val = input_vec[c * batch];
+                    state_vec.push(first_val);
+                }
+                let (state_buf, raw_id) = self.upload_to_temp_buffer(&state_vec);
+                states.insert(memory_idx, (state_buf.clone(), raw_id));
+                state_buf
+            }
+        };
 
         let pipeline = self.pipeline_cache.memory_fwd.clone();
         let push = [batch as u32, features as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,
-            &[(0, in_buf), (1, state.clone()), (2, out_buf)],
+            &[(0, in_buf), (1, state), (2, out_buf)],
             &push,
             total,
         );
     }
 
+    /// Обратный проход слоя Memory на GPU (не требует состояния).
     pub fn run_memory_backward_buffered_handle(
         &self,
         grad_out: &MatrixBufferHandle,

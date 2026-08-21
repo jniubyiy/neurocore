@@ -134,6 +134,7 @@ impl MixedModel {
         let buf = self.dynamic_tensor_to_buffer(&mut pool, input);
 
         let (out_bufs, ctxs) = self.forward_mat_multi_buffered(&mut pool, vec![buf]);
+
         let out_buf = out_bufs.into_iter().next().expect("No output buffer");
         let out_tensor = self.buffer_to_dynamic_tensor(out_buf, &self.output_shapes[0]);
 

@@ -11,7 +11,7 @@ use crate::model_plan::param_store::ParamSlice;
 pub struct Memory {
     features: usize,
     pub alpha: f32,
-    cells: Mutex<Vec<f32>>,
+    cells: Mutex<Vec<Option<f32>>>, // None означает, что якорь ещё не инициализирован
 }
 
 impl Memory {
@@ -19,8 +19,7 @@ impl Memory {
         assert_eq!(in_features, out_features,
             "Memory: in_features must equal out_features");
         let mut cells = Vec::with_capacity(2 * in_features);
-        cells.resize(in_features, f32::MAX);
-        cells.resize(2 * in_features, f32::MIN);
+        cells.resize(2 * in_features, None);
         Self {
             features: in_features,
             alpha: 0.1,
@@ -55,7 +54,11 @@ impl UniversalLayerBuffered for Memory {
         _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
     ) {
+        // ВАЖНО: вычисляем размеры ДО блокировки MemoryExecutor
+        let rows = input.rows();
+        let features = self.features;
         let ids = [input.id(), output.id()];
+
         let mut cells_guard = self.cells.lock().unwrap();
         let cells = &mut *cells_guard;
 
@@ -63,8 +66,6 @@ impl UniversalLayerBuffered for Memory {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let y: &mut [f32] = &mut *rest[0];
-            let rows = input.rows();
-            let features = self.features;
 
             for r in 0..rows {
                 for c in 0..features {
@@ -72,21 +73,29 @@ impl UniversalLayerBuffered for Memory {
                     let x_val = x[idx];
                     let min_idx = c;
                     let max_idx = features + c;
-                    let min_val = cells[min_idx];
-                    let max_val = cells[max_idx];
+
+                    // Инициализация якорей первым значением
+                    if cells[min_idx].is_none() {
+                        cells[min_idx] = Some(x_val);
+                        cells[max_idx] = Some(x_val);
+                    }
+
+                    let min_val = cells[min_idx].unwrap();
+                    let max_val = cells[max_idx].unwrap();
 
                     let d_min = (x_val - min_val).abs();
                     let d_max = (x_val - max_val).abs();
                     let closest = if d_min <= d_max { min_val } else { max_val };
                     y[idx] = x_val + self.alpha * (closest - x_val);
 
+                    // Обновление якорей
                     if x_val > max_val {
-                        cells[max_idx] += self.alpha * (x_val - max_val);
+                        cells[max_idx] = Some(max_val + self.alpha * (x_val - max_val));
                     } else if x_val < min_val {
-                        cells[min_idx] += self.alpha * (x_val - min_val);
+                        cells[min_idx] = Some(min_val + self.alpha * (x_val - min_val));
                     } else {
-                        cells[min_idx] += self.alpha * (x_val - min_val);
-                        cells[max_idx] += self.alpha * (x_val - max_val);
+                        cells[min_idx] = Some(min_val + self.alpha * (x_val - min_val));
+                        cells[max_idx] = Some(max_val + self.alpha * (x_val - max_val));
                     }
                 }
             }

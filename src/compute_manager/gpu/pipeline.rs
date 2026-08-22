@@ -143,10 +143,10 @@ impl PipelineCache {
         let mat_mul_spv         = include_spv!("shaders/common/mat_mul.spv");
         let activation_spv      = include_spv!("shaders/common/activation.spv");
         let activation_bw_spv   = include_spv!("shaders/common/activation_backward.spv");
-        let linear_fwd_spv      = include_spv!("shaders/layers/linear_fwd.spv");
-        let linear_bwd_spv      = include_spv!("shaders/layers/linear_bwd.spv");
-        let softmax_spv         = include_spv!("shaders/common/softmax.spv");
-        let softmax_bw_spv      = include_spv!("shaders/common/softmax_backward.spv");
+        let linear_fwd_spv      = include_spv!("../../layers/linear/gpu/vulkan/shaders/linear_fwd.spv");
+        let linear_bwd_spv      = include_spv!("../../layers/linear/gpu/vulkan/shaders/linear_bwd.spv");
+        let softmax_spv         = include_spv!("../../layers/softmax/gpu/vulkan/shaders/softmax.spv");
+        let softmax_bw_spv      = include_spv!("../../layers/softmax/gpu/vulkan/shaders/softmax_backward.spv");
         let reduce_spv          = include_spv!("shaders/common/reduce.spv");
         let unsqueeze_spv       = include_spv!("shaders/common/unsqueeze.spv");
 
@@ -179,18 +179,18 @@ impl PipelineCache {
         let adam_spv            = include_spv!("shaders/optim/adam.spv");
         let apply_update_spv    = include_spv!("shaders/optim/apply_update.spv");
 
-        let memory_fwd_spv      = include_spv!("shaders/layers/memory_fwd.spv");
-        let memory_bwd_spv      = include_spv!("shaders/layers/memory_bwd.spv");
-        let softsparse_fwd_spv  = include_spv!("shaders/layers/softsparse_fwd.spv");
-        let softsparse_bwd_spv  = include_spv!("shaders/layers/softsparse_bwd.spv");
-        let softkeep_fwd_spv    = include_spv!("shaders/layers/softkeep_fwd.spv");
-        let softkeep_bwd_spv    = include_spv!("shaders/layers/softkeep_bwd.spv");
-        let dualanchor_fwd_spv  = include_spv!("shaders/layers/dualanchor_fwd.spv");
-        let dualanchor_bwd_spv  = include_spv!("shaders/layers/dualanchor_bwd.spv");
-        let combiner_fwd_spv    = include_spv!("shaders/layers/combiner_fwd.spv");
-        let combiner_bwd_spv    = include_spv!("shaders/layers/combiner_bwd.spv");
-        let splitter_fwd_spv    = include_spv!("shaders/layers/splitter_fwd.spv");
-        let splitter_bwd_spv    = include_spv!("shaders/layers/splitter_bwd.spv");
+        let memory_fwd_spv      = include_spv!("../../layers/memory/gpu/vulkan/shaders/memory_fwd.spv");
+        let memory_bwd_spv      = include_spv!("../../layers/memory/gpu/vulkan/shaders/memory_bwd.spv");
+        let softsparse_fwd_spv  = include_spv!("../../layers/soft_sparse_gate/gpu/vulkan/shaders/softsparse_fwd.spv");
+        let softsparse_bwd_spv  = include_spv!("../../layers/soft_sparse_gate/gpu/vulkan/shaders/softsparse_bwd.spv");
+        let softkeep_fwd_spv    = include_spv!("../../layers/soft_keep_gate/gpu/vulkan/shaders/softkeep_fwd.spv");
+        let softkeep_bwd_spv    = include_spv!("../../layers/soft_keep_gate/gpu/vulkan/shaders/softkeep_bwd.spv");
+        let dualanchor_fwd_spv  = include_spv!("../../layers/dual_anchor/gpu/vulkan/shaders/dualanchor_fwd.spv");
+        let dualanchor_bwd_spv  = include_spv!("../../layers/dual_anchor/gpu/vulkan/shaders/dualanchor_bwd.spv");
+        let combiner_fwd_spv    = include_spv!("../../layers/combiner/gpu/vulkan/shaders/combiner_fwd.spv");
+        let combiner_bwd_spv    = include_spv!("../../layers/combiner/gpu/vulkan/shaders/combiner_bwd.spv");
+        let splitter_fwd_spv    = include_spv!("../../layers/splitter/gpu/vulkan/shaders/splitter_fwd.spv");
+        let splitter_bwd_spv    = include_spv!("../../layers/splitter/gpu/vulkan/shaders/splitter_bwd.spv");
 
         // ==================== Шейдерные модули ====================
         let mat_mul_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(mat_mul_spv)).expect("mat_mul") };

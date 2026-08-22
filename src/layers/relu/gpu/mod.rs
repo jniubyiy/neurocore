@@ -1,5 +1,3 @@
-// src/layers/relu/gpu/mod.rs
-
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
@@ -9,7 +7,21 @@ impl GpuCompute {
         input: &MatrixBufferHandle,
         output: &MatrixBufferHandle,
     ) {
-        self.run_activation_forward_buffered_handle(input, output, 0, 0.0)
+        assert!(input.is_gpu() && output.is_gpu(), "Handles must be GPU");
+        let total = input.rows() * input.cols();
+        assert_eq!(total, output.rows() * output.cols(), "Shape mismatch");
+
+        let in_buf = self.get_gpu_subbuffer_from_handle(input);
+        let out_buf = self.get_gpu_subbuffer_from_handle(output);
+
+        let pipeline = self.pipeline_cache.relu_fwd.clone();
+        let push = [total as u32];
+        self.run_compute_shader(
+            pipeline,
+            &[(0, in_buf), (1, out_buf)],
+            &push,
+            total,
+        );
     }
 
     pub fn run_relu_backward_buffered_handle(
@@ -18,6 +30,22 @@ impl GpuCompute {
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
     ) {
-        self.run_activation_backward_buffered_handle(input, grad_output, grad_input, 0, 0.0)
+        assert!(input.is_gpu() && grad_output.is_gpu() && grad_input.is_gpu(), "Handles must be GPU");
+        let total = input.rows() * input.cols();
+        assert_eq!(total, grad_output.rows() * grad_output.cols(), "grad_output shape mismatch");
+        assert_eq!(total, grad_input.rows() * grad_input.cols(), "grad_input shape mismatch");
+
+        let in_buf = self.get_gpu_subbuffer_from_handle(input);
+        let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
+        let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
+
+        let pipeline = self.pipeline_cache.relu_bwd.clone();
+        let push = [total as u32];
+        self.run_compute_shader(
+            pipeline,
+            &[(0, in_buf), (1, go_buf), (2, gi_buf)],
+            &push,
+            total,
+        );
     }
 }

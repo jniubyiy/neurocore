@@ -4,6 +4,9 @@ pub mod expand_dim;
 pub use reduce_dim::ReduceMean;
 pub use expand_dim::Unsqueeze;
 
+mod cpu;
+mod gpu;
+
 /// Трейт для уменьшения размерности (без якобианов, без параметров).
 pub trait DimReduce<InputTensor, OutputTensor> {
     fn reduce(&self, input: &InputTensor) -> OutputTensor;

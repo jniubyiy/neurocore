@@ -3,3 +3,6 @@
 pub mod memory;
 
 pub use memory::Memory;
+
+mod cpu;
+mod gpu;

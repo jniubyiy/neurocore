@@ -3,3 +3,6 @@
 pub mod linear;
 
 pub use linear::Linear;
+
+mod cpu;
+mod gpu;

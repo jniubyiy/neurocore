@@ -1,5 +1,8 @@
+// src/layers/dual_anchor/mod.rs
+
 pub mod dual_anchor;
-pub use dual_anchor::DualAnchor;
 
 mod cpu;
 mod gpu;
+
+pub use dual_anchor::DualAnchor;

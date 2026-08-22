@@ -86,7 +86,7 @@ pub fn process_forward_gpu_buffered(
             current = out_handle;
         } else if let Some(_) = layer.as_identity() {
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), current.cols());
-            gpu_compute.copy_gpu_handle_to_gpu_handle(&current, &out_handle);
+            gpu_compute.run_identity_forward_buffered_handle(&current, &out_handle);
             ctxs.push(DynamicContext::Buffered(BufferedContext::Identity {
                 input: current.clone(),
             }));
@@ -300,7 +300,10 @@ pub fn process_backward_gpu_buffered(
             current_grad = grad_input_handle;
         } else if let Some(_) = layer.as_identity() {
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
-            gpu_compute.copy_gpu_handle_to_gpu_handle(&current_grad, &grad_input_handle);
+            gpu_compute.run_identity_backward_buffered_handle(
+                &current_grad,
+                &grad_input_handle,
+            );
             current_grad = grad_input_handle;
         } else if let Some(memory) = layer.as_memory() {
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());

@@ -2,7 +2,7 @@
 
 pub mod softmax;
 
-pub use softmax::Softmax;
-
 mod cpu;
 mod gpu;
+
+pub use softmax::Softmax;

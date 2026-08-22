@@ -2,7 +2,7 @@
 
 pub mod tanh;
 
-pub use tanh::Tanh;
-
 mod cpu;
 mod gpu;
+
+pub use tanh::Tanh;

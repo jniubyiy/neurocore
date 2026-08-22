@@ -2,7 +2,7 @@
 
 pub mod sigmoid;
 
-pub use sigmoid::Sigmoid;
-
 mod cpu;
 mod gpu;
+
+pub use sigmoid::Sigmoid;

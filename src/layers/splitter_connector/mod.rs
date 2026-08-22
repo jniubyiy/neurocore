@@ -2,7 +2,7 @@
 
 pub mod splitter_connector;
 
-pub use splitter_connector::SplitterConnector;
-
 mod cpu;
 mod gpu;
+
+pub use splitter_connector::SplitterConnector;

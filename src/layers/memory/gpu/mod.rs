@@ -1,4 +1,4 @@
-// src/layers/memory/gpu/mod.rs
+pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -42,7 +42,8 @@ impl GpuCompute {
             }
         };
 
-        let pipeline = self.pipeline_cache.memory_fwd.clone();
+        // Используем новый пайплайн из собственной структуры Memory
+        let pipeline = self.memory_pipelines().forward.clone();
         let push = [batch as u32, features as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,
@@ -68,7 +69,8 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.pipeline_cache.memory_bwd.clone();
+        // Используем новый пайплайн из собственной структуры Memory
+        let pipeline = self.memory_pipelines().backward.clone();
         let push = [total as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,

@@ -2,7 +2,8 @@
 
 pub mod splitter;
 
+pub mod gpu;   // <-- делаем модуль gpu публичным
+
 mod cpu;
-mod gpu;
 
 pub use splitter::Splitter;

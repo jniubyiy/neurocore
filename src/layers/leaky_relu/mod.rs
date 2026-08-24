@@ -2,7 +2,8 @@
 
 pub mod leaky_relu;
 
+pub mod gpu;   // <-- делаем модуль gpu публичным
+
 mod cpu;
-mod gpu;
 
 pub use leaky_relu::LeakyReLU;

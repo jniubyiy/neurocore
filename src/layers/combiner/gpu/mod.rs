@@ -1,4 +1,4 @@
-// src/layers/combiner/gpu/mod.rs
+pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -36,7 +36,8 @@ impl GpuCompute {
 
         let (bias_buf, bias_raw) = self.upload_to_temp_buffer(bias);
 
-        let pipeline = self.pipeline_cache.combiner_fwd.clone();
+        // Используем новый пайплайн из собственной структуры Combiner
+        let pipeline = self.combiner_pipelines().forward.clone();
         let push = [batch as u32, n as u32, m as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,
@@ -111,7 +112,8 @@ impl GpuCompute {
         self.fill_gpu_handle(d_wb, 0.0);
         self.fill_gpu_handle(d_bias, 0.0);
 
-        let pipeline = self.pipeline_cache.combiner_bwd.clone();
+        // Используем новый пайплайн из собственной структуры Combiner
+        let pipeline = self.combiner_pipelines().backward.clone();
         let push = [batch as u32, n as u32, m as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,

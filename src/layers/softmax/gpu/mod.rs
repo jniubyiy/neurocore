@@ -1,4 +1,4 @@
-// src/layers/softmax/gpu/mod.rs
+pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -20,7 +20,8 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let pipeline = self.pipeline_cache.softmax_pipeline();
+        // Используем новый пайплайн из собственной структуры Softmax
+        let pipeline = self.softmax_pipelines().forward.clone();
         let push: [u32; 2] = [batch as u32, cols as u32];
 
         self.run_compute_shader_with_dispatch(
@@ -52,7 +53,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.pipeline_cache.softmax_backward_pipeline();
+        let pipeline = self.softmax_pipelines().backward.clone();
         let push: [u32; 2] = [batch as u32, cols as u32];
 
         self.run_compute_shader_with_dispatch(

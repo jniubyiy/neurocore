@@ -1,4 +1,4 @@
-// src/layers/dual_anchor/gpu/mod.rs
+pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -24,7 +24,8 @@ impl GpuCompute {
         let (max_buf, max_raw) = self.upload_to_temp_buffer(max_vals);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let pipeline = self.pipeline_cache.dualanchor_fwd.clone();
+        // Используем новый пайплайн из собственной структуры DualAnchor
+        let pipeline = self.dual_anchor_pipelines().forward.clone();
         let push = [total as u32, features as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,
@@ -91,7 +92,8 @@ impl GpuCompute {
         let gmax_buf = self.get_gpu_subbuffer_from_handle(grad_max);
         let galpha_buf = self.get_gpu_subbuffer_from_handle(grad_alpha);
 
-        let pipeline = self.pipeline_cache.dualanchor_bwd.clone();
+        // Используем новый пайплайн из собственной структуры DualAnchor
+        let pipeline = self.dual_anchor_pipelines().backward.clone();
         let push = [total as u32, features as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,

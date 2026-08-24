@@ -1,3 +1,5 @@
+pub mod pipeline;   // <-- новый модуль
+
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
@@ -14,7 +16,8 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let pipeline = self.pipeline_cache.sigmoid_fwd.clone();
+        // Используем новый пайплайн из собственной структуры Sigmoid
+        let pipeline = self.sigmoid_pipelines().forward.clone();
         let push = [total as u32];
         self.run_compute_shader(
             pipeline,
@@ -39,7 +42,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.pipeline_cache.sigmoid_bwd.clone();
+        let pipeline = self.sigmoid_pipelines().backward.clone();
         let push = [total as u32];
         self.run_compute_shader(
             pipeline,

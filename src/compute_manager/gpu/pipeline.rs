@@ -27,22 +27,12 @@ macro_rules! include_spv {
 pub struct PipelineCache {
     device: Arc<Device>,
 
+    // Общие пайплайны
     pub mat_mul: Arc<ComputePipeline>,
-    pub relu_fwd: Arc<ComputePipeline>,
-    pub relu_bwd: Arc<ComputePipeline>,
-    pub sigmoid_fwd: Arc<ComputePipeline>,
-    pub sigmoid_bwd: Arc<ComputePipeline>,
-    pub tanh_fwd: Arc<ComputePipeline>,
-    pub tanh_bwd: Arc<ComputePipeline>,
-    pub leaky_relu_fwd: Arc<ComputePipeline>,
-    pub leaky_relu_bwd: Arc<ComputePipeline>,
-    pub linear_fwd: Arc<ComputePipeline>,
-    pub linear_bwd: Arc<ComputePipeline>,
-    pub softmax: Arc<ComputePipeline>,
-    pub softmax_backward: Arc<ComputePipeline>,
     pub reduce: Arc<ComputePipeline>,
     pub unsqueeze: Arc<ComputePipeline>,
 
+    // Loss-пайплайны
     pub sub_fwd: Arc<ComputePipeline>,
     pub sub_bwd: Arc<ComputePipeline>,
     pub square_fwd: Arc<ComputePipeline>,
@@ -64,6 +54,7 @@ pub struct PipelineCache {
     pub cross_entropy_fwd: Arc<ComputePipeline>,
     pub cross_entropy_bwd: Arc<ComputePipeline>,
 
+    // Optimizer-пайплайны
     pub scale_grad: Arc<ComputePipeline>,
     pub weight_decay: Arc<ComputePipeline>,
     pub grad_clip: Arc<ComputePipeline>,
@@ -71,22 +62,8 @@ pub struct PipelineCache {
     pub nesterov_momentum: Arc<ComputePipeline>,
     pub adam: Arc<ComputePipeline>,
     pub apply_update: Arc<ComputePipeline>,
-
-    pub memory_fwd: Arc<ComputePipeline>,
-    pub memory_bwd: Arc<ComputePipeline>,
-    pub softsparse_fwd: Arc<ComputePipeline>,
-    pub softsparse_bwd: Arc<ComputePipeline>,
-    pub softkeep_fwd: Arc<ComputePipeline>,
-    pub softkeep_bwd: Arc<ComputePipeline>,
-    pub dualanchor_fwd: Arc<ComputePipeline>,
-    pub dualanchor_bwd: Arc<ComputePipeline>,
-    pub combiner_fwd: Arc<ComputePipeline>,
-    pub combiner_bwd: Arc<ComputePipeline>,
-    pub splitter_fwd: Arc<ComputePipeline>,
-    pub splitter_bwd: Arc<ComputePipeline>,
 }
 
-// Вспомогательная функция для создания layout с ТОЧНЫМ числом storage-буферов.
 fn create_ds_layout_n(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
     let mut bindings = BTreeMap::new();
     for binding in 0..n {
@@ -147,18 +124,6 @@ impl PipelineCache {
     pub fn new(device: Arc<Device>) -> Self {
         // ==================== Загрузка SPIR‑V ====================
         let mat_mul_spv         = include_spv!("shaders/common/mat_mul.spv");
-        let relu_fwd_spv        = include_spv!("../../layers/relu/gpu/vulkan/shaders/relu_fwd.spv");
-        let relu_bwd_spv        = include_spv!("../../layers/relu/gpu/vulkan/shaders/relu_bwd.spv");
-        let sigmoid_fwd_spv     = include_spv!("../../layers/sigmoid/gpu/vulkan/shaders/sigmoid_fwd.spv");
-        let sigmoid_bwd_spv     = include_spv!("../../layers/sigmoid/gpu/vulkan/shaders/sigmoid_bwd.spv");
-        let tanh_fwd_spv        = include_spv!("../../layers/tanh/gpu/vulkan/shaders/tanh_fwd.spv");
-        let tanh_bwd_spv        = include_spv!("../../layers/tanh/gpu/vulkan/shaders/tanh_bwd.spv");
-        let leaky_relu_fwd_spv  = include_spv!("../../layers/leaky_relu/gpu/vulkan/shaders/leaky_relu_fwd.spv");
-        let leaky_relu_bwd_spv  = include_spv!("../../layers/leaky_relu/gpu/vulkan/shaders/leaky_relu_bwd.spv");
-        let linear_fwd_spv      = include_spv!("../../layers/linear/gpu/vulkan/shaders/linear_fwd.spv");
-        let linear_bwd_spv      = include_spv!("../../layers/linear/gpu/vulkan/shaders/linear_bwd.spv");
-        let softmax_spv         = include_spv!("../../layers/softmax/gpu/vulkan/shaders/softmax.spv");
-        let softmax_bw_spv      = include_spv!("../../layers/softmax/gpu/vulkan/shaders/softmax_backward.spv");
         let reduce_spv          = include_spv!("shaders/common/reduce.spv");
         let unsqueeze_spv       = include_spv!("shaders/common/unsqueeze.spv");
 
@@ -191,33 +156,8 @@ impl PipelineCache {
         let adam_spv            = include_spv!("shaders/optim/adam.spv");
         let apply_update_spv    = include_spv!("shaders/optim/apply_update.spv");
 
-        let memory_fwd_spv      = include_spv!("../../layers/memory/gpu/vulkan/shaders/memory_fwd.spv");
-        let memory_bwd_spv      = include_spv!("../../layers/memory/gpu/vulkan/shaders/memory_bwd.spv");
-        let softsparse_fwd_spv  = include_spv!("../../layers/soft_sparse_gate/gpu/vulkan/shaders/softsparse_fwd.spv");
-        let softsparse_bwd_spv  = include_spv!("../../layers/soft_sparse_gate/gpu/vulkan/shaders/softsparse_bwd.spv");
-        let softkeep_fwd_spv    = include_spv!("../../layers/soft_keep_gate/gpu/vulkan/shaders/softkeep_fwd.spv");
-        let softkeep_bwd_spv    = include_spv!("../../layers/soft_keep_gate/gpu/vulkan/shaders/softkeep_bwd.spv");
-        let dualanchor_fwd_spv  = include_spv!("../../layers/dual_anchor/gpu/vulkan/shaders/dualanchor_fwd.spv");
-        let dualanchor_bwd_spv  = include_spv!("../../layers/dual_anchor/gpu/vulkan/shaders/dualanchor_bwd.spv");
-        let combiner_fwd_spv    = include_spv!("../../layers/combiner/gpu/vulkan/shaders/combiner_fwd.spv");
-        let combiner_bwd_spv    = include_spv!("../../layers/combiner/gpu/vulkan/shaders/combiner_bwd.spv");
-        let splitter_fwd_spv    = include_spv!("../../layers/splitter/gpu/vulkan/shaders/splitter_fwd.spv");
-        let splitter_bwd_spv    = include_spv!("../../layers/splitter/gpu/vulkan/shaders/splitter_bwd.spv");
-
         // ==================== Шейдерные модули ====================
         let mat_mul_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(mat_mul_spv)).expect("mat_mul") };
-        let relu_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(relu_fwd_spv)).expect("relu_fwd") };
-        let relu_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(relu_bwd_spv)).expect("relu_bwd") };
-        let sigmoid_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(sigmoid_fwd_spv)).expect("sigmoid_fwd") };
-        let sigmoid_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(sigmoid_bwd_spv)).expect("sigmoid_bwd") };
-        let tanh_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(tanh_fwd_spv)).expect("tanh_fwd") };
-        let tanh_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(tanh_bwd_spv)).expect("tanh_bwd") };
-        let leaky_relu_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(leaky_relu_fwd_spv)).expect("leaky_relu_fwd") };
-        let leaky_relu_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(leaky_relu_bwd_spv)).expect("leaky_relu_bwd") };
-        let linear_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(linear_fwd_spv)).expect("linear_fwd") };
-        let linear_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(linear_bwd_spv)).expect("linear_bwd") };
-        let softmax_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softmax_spv)).expect("softmax") };
-        let softmax_bw_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softmax_bw_spv)).expect("softmax_backward") };
         let reduce_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(reduce_spv)).expect("reduce") };
         let unsqueeze_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(unsqueeze_spv)).expect("unsqueeze") };
 
@@ -250,33 +190,8 @@ impl PipelineCache {
         let adam_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(adam_spv)).expect("adam") };
         let apply_update_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(apply_update_spv)).expect("apply_update") };
 
-        let memory_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(memory_fwd_spv)).expect("memory_fwd") };
-        let memory_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(memory_bwd_spv)).expect("memory_bwd") };
-        let softsparse_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softsparse_fwd_spv)).expect("softsparse_fwd") };
-        let softsparse_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softsparse_bwd_spv)).expect("softsparse_bwd") };
-        let softkeep_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softkeep_fwd_spv)).expect("softkeep_fwd") };
-        let softkeep_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(softkeep_bwd_spv)).expect("softkeep_bwd") };
-        let dualanchor_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(dualanchor_fwd_spv)).expect("dualanchor_fwd") };
-        let dualanchor_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(dualanchor_bwd_spv)).expect("dualanchor_bwd") };
-        let combiner_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(combiner_fwd_spv)).expect("combiner_fwd") };
-        let combiner_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(combiner_bwd_spv)).expect("combiner_bwd") };
-        let splitter_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(splitter_fwd_spv)).expect("splitter_fwd") };
-        let splitter_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(splitter_bwd_spv)).expect("splitter_bwd") };
-
-        // ==================== Создание layout'ов ====================
+        // ==================== Layout'ы ====================
         let mat_mul_ds = create_ds_layout_n(device.clone(), 3);
-        let relu_fwd_ds = create_ds_layout_n(device.clone(), 2);
-        let relu_bwd_ds = create_ds_layout_n(device.clone(), 3);
-        let sigmoid_fwd_ds = create_ds_layout_n(device.clone(), 2);
-        let sigmoid_bwd_ds = create_ds_layout_n(device.clone(), 3);
-        let tanh_fwd_ds = create_ds_layout_n(device.clone(), 2);
-        let tanh_bwd_ds = create_ds_layout_n(device.clone(), 3);
-        let leaky_relu_fwd_ds = create_ds_layout_n(device.clone(), 2);
-        let leaky_relu_bwd_ds = create_ds_layout_n(device.clone(), 3);
-        let linear_fwd_ds = create_ds_layout_n(device.clone(), 4);
-        let linear_bwd_ds = create_ds_layout_n(device.clone(), 6);
-        let softmax_ds = create_ds_layout_n(device.clone(), 2);
-        let softmax_bw_ds = create_ds_layout_n(device.clone(), 3);
         let reduce_ds = create_ds_layout_n(device.clone(), 2);
         let unsqueeze_ds = create_ds_layout_n(device.clone(), 2);
 
@@ -308,33 +223,11 @@ impl PipelineCache {
         let adam_ds = create_ds_layout_n(device.clone(), 2);
         let apply_update_ds = create_ds_layout_n(device.clone(), 2);
 
-        let memory_fwd_ds = create_ds_layout_n(device.clone(), 3);
-        let memory_bwd_ds = create_ds_layout_n(device.clone(), 2);
-        let softsparse_fwd_ds = create_ds_layout_n(device.clone(), 3);
-        let softsparse_bwd_ds = create_ds_layout_n(device.clone(), 5);
-        let softkeep_fwd_ds = create_ds_layout_n(device.clone(), 3);
-        let softkeep_bwd_ds = create_ds_layout_n(device.clone(), 5);
-        let dualanchor_fwd_ds = create_ds_layout_n(device.clone(), 4);
-        let dualanchor_bwd_ds = create_ds_layout_n(device.clone(), 8);
-        let combiner_fwd_ds = create_ds_layout_n(device.clone(), 7);
-        let combiner_bwd_ds = create_ds_layout_n(device.clone(), 11);
-        let splitter_fwd_ds = create_ds_layout_n(device.clone(), 9);
-        let splitter_bwd_ds = create_ds_layout_n(device.clone(), 12);
-
-        // ==================== Push‑константы ====================
+        // ==================== Push-константы ====================
         let push_mat_mul = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_relu_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        let push_relu_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        let push_sigmoid_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        let push_sigmoid_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        let push_tanh_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        let push_tanh_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        let push_leaky_relu_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_leaky_relu_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_linear = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_softmax = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_softmax_bw = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_reduce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
+        // Для unsqueeze push-констант нет (None), поэтому передаём None
+
         let push_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
         let push_total_scalar = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_ce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
@@ -344,33 +237,9 @@ impl PipelineCache {
         let push_beta = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_adam = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 24 };
         let push_optim_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        let push_memory_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_memory_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_softsparse_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_softsparse_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_softkeep_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_softkeep_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_dualanchor_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_dualanchor_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_combiner_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_combiner_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_splitter_fwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 16 };
-        let push_splitter_bwd = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 16 };
 
         // ==================== Сборка пайплайнов ====================
         let mat_mul = build_pipeline(device.clone(), mat_mul_mod, mat_mul_ds, Some(push_mat_mul));
-        let relu_fwd = build_pipeline(device.clone(), relu_fwd_mod, relu_fwd_ds, Some(push_relu_fwd));
-        let relu_bwd = build_pipeline(device.clone(), relu_bwd_mod, relu_bwd_ds, Some(push_relu_bwd));
-        let sigmoid_fwd = build_pipeline(device.clone(), sigmoid_fwd_mod, sigmoid_fwd_ds, Some(push_sigmoid_fwd));
-        let sigmoid_bwd = build_pipeline(device.clone(), sigmoid_bwd_mod, sigmoid_bwd_ds, Some(push_sigmoid_bwd));
-        let tanh_fwd = build_pipeline(device.clone(), tanh_fwd_mod, tanh_fwd_ds, Some(push_tanh_fwd));
-        let tanh_bwd = build_pipeline(device.clone(), tanh_bwd_mod, tanh_bwd_ds, Some(push_tanh_bwd));
-        let leaky_relu_fwd = build_pipeline(device.clone(), leaky_relu_fwd_mod, leaky_relu_fwd_ds, Some(push_leaky_relu_fwd));
-        let leaky_relu_bwd = build_pipeline(device.clone(), leaky_relu_bwd_mod, leaky_relu_bwd_ds, Some(push_leaky_relu_bwd));
-        let linear_fwd = build_pipeline(device.clone(), linear_fwd_mod, linear_fwd_ds, Some(push_linear));
-        let linear_bwd = build_pipeline(device.clone(), linear_bwd_mod, linear_bwd_ds, Some(push_linear));
-        let softmax = build_pipeline(device.clone(), softmax_mod, softmax_ds, Some(push_softmax));
-        let softmax_backward = build_pipeline(device.clone(), softmax_bw_mod, softmax_bw_ds, Some(push_softmax_bw));
         let reduce = build_pipeline(device.clone(), reduce_mod, reduce_ds, Some(push_reduce));
         let unsqueeze = build_pipeline(device.clone(), unsqueeze_mod, unsqueeze_ds, None);
 
@@ -403,34 +272,9 @@ impl PipelineCache {
         let adam = build_pipeline(device.clone(), adam_mod, adam_ds, Some(push_adam));
         let apply_update = build_pipeline(device.clone(), apply_update_mod, apply_update_ds, Some(push_optim_total));
 
-        let memory_fwd = build_pipeline(device.clone(), memory_fwd_mod, memory_fwd_ds, Some(push_memory_fwd));
-        let memory_bwd = build_pipeline(device.clone(), memory_bwd_mod, memory_bwd_ds, Some(push_memory_bwd));
-        let softsparse_fwd = build_pipeline(device.clone(), softsparse_fwd_mod, softsparse_fwd_ds, Some(push_softsparse_fwd));
-        let softsparse_bwd = build_pipeline(device.clone(), softsparse_bwd_mod, softsparse_bwd_ds, Some(push_softsparse_bwd));
-        let softkeep_fwd = build_pipeline(device.clone(), softkeep_fwd_mod, softkeep_fwd_ds, Some(push_softkeep_fwd));
-        let softkeep_bwd = build_pipeline(device.clone(), softkeep_bwd_mod, softkeep_bwd_ds, Some(push_softkeep_bwd));
-        let dualanchor_fwd = build_pipeline(device.clone(), dualanchor_fwd_mod, dualanchor_fwd_ds, Some(push_dualanchor_fwd));
-        let dualanchor_bwd = build_pipeline(device.clone(), dualanchor_bwd_mod, dualanchor_bwd_ds, Some(push_dualanchor_bwd));
-        let combiner_fwd = build_pipeline(device.clone(), combiner_fwd_mod, combiner_fwd_ds, Some(push_combiner_fwd));
-        let combiner_bwd = build_pipeline(device.clone(), combiner_bwd_mod, combiner_bwd_ds, Some(push_combiner_bwd));
-        let splitter_fwd = build_pipeline(device.clone(), splitter_fwd_mod, splitter_fwd_ds, Some(push_splitter_fwd));
-        let splitter_bwd = build_pipeline(device.clone(), splitter_bwd_mod, splitter_bwd_ds, Some(push_splitter_bwd));
-
         Self {
             device,
             mat_mul,
-            relu_fwd,
-            relu_bwd,
-            sigmoid_fwd,
-            sigmoid_bwd,
-            tanh_fwd,
-            tanh_bwd,
-            leaky_relu_fwd,
-            leaky_relu_bwd,
-            linear_fwd,
-            linear_bwd,
-            softmax,
-            softmax_backward,
             reduce,
             unsqueeze,
             sub_fwd,
@@ -460,34 +304,10 @@ impl PipelineCache {
             nesterov_momentum,
             adam,
             apply_update,
-            memory_fwd,
-            memory_bwd,
-            softsparse_fwd,
-            softsparse_bwd,
-            softkeep_fwd,
-            softkeep_bwd,
-            dualanchor_fwd,
-            dualanchor_bwd,
-            combiner_fwd,
-            combiner_bwd,
-            splitter_fwd,
-            splitter_bwd,
         }
     }
 
     pub fn mat_mul_pipeline(&self) -> Arc<ComputePipeline> { self.mat_mul.clone() }
-    pub fn relu_fwd_pipeline(&self) -> Arc<ComputePipeline> { self.relu_fwd.clone() }
-    pub fn relu_bwd_pipeline(&self) -> Arc<ComputePipeline> { self.relu_bwd.clone() }
-    pub fn sigmoid_fwd_pipeline(&self) -> Arc<ComputePipeline> { self.sigmoid_fwd.clone() }
-    pub fn sigmoid_bwd_pipeline(&self) -> Arc<ComputePipeline> { self.sigmoid_bwd.clone() }
-    pub fn tanh_fwd_pipeline(&self) -> Arc<ComputePipeline> { self.tanh_fwd.clone() }
-    pub fn tanh_bwd_pipeline(&self) -> Arc<ComputePipeline> { self.tanh_bwd.clone() }
-    pub fn leaky_relu_fwd_pipeline(&self) -> Arc<ComputePipeline> { self.leaky_relu_fwd.clone() }
-    pub fn leaky_relu_bwd_pipeline(&self) -> Arc<ComputePipeline> { self.leaky_relu_bwd.clone() }
-    pub fn linear_fwd_pipeline(&self) -> Arc<ComputePipeline> { self.linear_fwd.clone() }
-    pub fn linear_bwd_pipeline(&self) -> Arc<ComputePipeline> { self.linear_bwd.clone() }
-    pub fn softmax_pipeline(&self) -> Arc<ComputePipeline> { self.softmax.clone() }
-    pub fn softmax_backward_pipeline(&self) -> Arc<ComputePipeline> { self.softmax_backward.clone() }
     pub fn reduce_pipeline(&self) -> Arc<ComputePipeline> { self.reduce.clone() }
     pub fn unsqueeze_pipeline(&self) -> Arc<ComputePipeline> { self.unsqueeze.clone() }
     pub fn device(&self) -> Arc<Device> { self.device.clone() }

@@ -2,7 +2,8 @@
 
 pub mod soft_keep_gate;
 
+pub mod gpu;   // <-- делаем модуль gpu публичным
+
 mod cpu;
-mod gpu;
 
 pub use soft_keep_gate::SoftKeepGate;

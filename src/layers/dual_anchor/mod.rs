@@ -2,7 +2,8 @@
 
 pub mod dual_anchor;
 
+pub mod gpu;   // <-- делаем модуль gpu публичным
+
 mod cpu;
-mod gpu;
 
 pub use dual_anchor::DualAnchor;

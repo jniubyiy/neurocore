@@ -1,3 +1,5 @@
+pub mod pipeline;   // <-- новый модуль
+
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
@@ -15,7 +17,8 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let pipeline = self.pipeline_cache.leaky_relu_fwd.clone();
+        // Используем новый пайплайн из собственной структуры LeakyReLU
+        let pipeline = self.leaky_relu_pipelines().forward.clone();
         let push = [total as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,
@@ -41,7 +44,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.pipeline_cache.leaky_relu_bwd.clone();
+        let pipeline = self.leaky_relu_pipelines().backward.clone();
         let push = [total as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,

@@ -2,7 +2,8 @@
 
 pub mod tanh;
 
+pub mod gpu;   // <-- делаем модуль gpu публичным
+
 mod cpu;
-mod gpu;
 
 pub use tanh::Tanh;

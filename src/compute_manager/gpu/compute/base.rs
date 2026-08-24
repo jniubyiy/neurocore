@@ -1,8 +1,7 @@
 // src/compute_manager/gpu/compute/base.rs
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::{
@@ -28,6 +27,18 @@ use crate::compute_manager::memory_executor::matrix_entry::MatrixStorage;
 
 use super::super::init::GpuContext;
 use super::super::pipeline::PipelineCache;
+use crate::layers::relu::gpu::pipeline::ReLUPipelines;
+use crate::layers::sigmoid::gpu::pipeline::SigmoidPipelines;
+use crate::layers::tanh::gpu::pipeline::TanhPipelines;
+use crate::layers::leaky_relu::gpu::pipeline::LeakyReLUPipelines;
+use crate::layers::linear::gpu::pipeline::LinearPipelines;
+use crate::layers::soft_sparse_gate::gpu::pipeline::SoftSparseGatePipelines;
+use crate::layers::soft_keep_gate::gpu::pipeline::SoftKeepGatePipelines;
+use crate::layers::dual_anchor::gpu::pipeline::DualAnchorPipelines;
+use crate::layers::softmax::gpu::pipeline::SoftmaxPipelines;
+use crate::layers::memory::gpu::pipeline::MemoryPipelines;
+use crate::layers::splitter::gpu::pipeline::SplitterPipelines;
+use crate::layers::combiner::gpu::pipeline::CombinerPipelines;
 
 pub struct GpuCompute {
     pub context: Arc<GpuContext>,
@@ -37,8 +48,31 @@ pub struct GpuCompute {
     pub memory_executor: Arc<Mutex<MemoryExecutor>>,
     pub gpu_device_id: DeviceId,
     /// Хранилище состояний для каждого слоя Memory по индексу (memory_idx).
-    /// Позволяет нескольким слоям Memory работать независимо на GPU.
     pub memory_states: Mutex<HashMap<usize, (Subbuffer<[f32]>, RawBufferId)>>,
+    /// Пайплайны ReLU (ленивая инициализация)
+    relu_pipelines: OnceLock<ReLUPipelines>,
+    /// Пайплайны Sigmoid (ленивая инициализация)
+    sigmoid_pipelines: OnceLock<SigmoidPipelines>,
+    /// Пайплайны Tanh (ленивая инициализация)
+    tanh_pipelines: OnceLock<TanhPipelines>,
+    /// Пайплайны LeakyReLU (ленивая инициализация)
+    leaky_relu_pipelines: OnceLock<LeakyReLUPipelines>,
+    /// Пайплайны Linear (ленивая инициализация)
+    linear_pipelines: OnceLock<LinearPipelines>,
+    /// Пайплайны SoftSparseGate (ленивая инициализация)
+    soft_sparse_gate_pipelines: OnceLock<SoftSparseGatePipelines>,
+    /// Пайплайны SoftKeepGate (ленивая инициализация)
+    soft_keep_gate_pipelines: OnceLock<SoftKeepGatePipelines>,
+    /// Пайплайны DualAnchor (ленивая инициализация)
+    dual_anchor_pipelines: OnceLock<DualAnchorPipelines>,
+    /// Пайплайны Softmax (ленивая инициализация)
+    softmax_pipelines: OnceLock<SoftmaxPipelines>,
+    /// Пайплайны Memory (ленивая инициализация)
+    memory_pipelines: OnceLock<MemoryPipelines>,
+    /// Пайплайны Splitter (ленивая инициализация)
+    splitter_pipelines: OnceLock<SplitterPipelines>,
+    /// Пайплайны Combiner (ленивая инициализация)
+    combiner_pipelines: OnceLock<CombinerPipelines>,
 }
 
 impl GpuCompute {
@@ -62,7 +96,91 @@ impl GpuCompute {
             memory_executor,
             gpu_device_id,
             memory_states: Mutex::new(HashMap::new()),
+            relu_pipelines: OnceLock::new(),
+            sigmoid_pipelines: OnceLock::new(),
+            tanh_pipelines: OnceLock::new(),
+            leaky_relu_pipelines: OnceLock::new(),
+            linear_pipelines: OnceLock::new(),
+            soft_sparse_gate_pipelines: OnceLock::new(),
+            soft_keep_gate_pipelines: OnceLock::new(),
+            dual_anchor_pipelines: OnceLock::new(),
+            softmax_pipelines: OnceLock::new(),
+            memory_pipelines: OnceLock::new(),
+            splitter_pipelines: OnceLock::new(),
+            combiner_pipelines: OnceLock::new(),
         }
+    }
+
+    /// Получить пайплайны ReLU
+    pub fn relu_pipelines(&self) -> &ReLUPipelines {
+        self.relu_pipelines
+            .get_or_init(|| ReLUPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны Sigmoid
+    pub fn sigmoid_pipelines(&self) -> &SigmoidPipelines {
+        self.sigmoid_pipelines
+            .get_or_init(|| SigmoidPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны Tanh
+    pub fn tanh_pipelines(&self) -> &TanhPipelines {
+        self.tanh_pipelines
+            .get_or_init(|| TanhPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны LeakyReLU
+    pub fn leaky_relu_pipelines(&self) -> &LeakyReLUPipelines {
+        self.leaky_relu_pipelines
+            .get_or_init(|| LeakyReLUPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны Linear
+    pub fn linear_pipelines(&self) -> &LinearPipelines {
+        self.linear_pipelines
+            .get_or_init(|| LinearPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны SoftSparseGate
+    pub fn soft_sparse_gate_pipelines(&self) -> &SoftSparseGatePipelines {
+        self.soft_sparse_gate_pipelines
+            .get_or_init(|| SoftSparseGatePipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны SoftKeepGate
+    pub fn soft_keep_gate_pipelines(&self) -> &SoftKeepGatePipelines {
+        self.soft_keep_gate_pipelines
+            .get_or_init(|| SoftKeepGatePipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны DualAnchor
+    pub fn dual_anchor_pipelines(&self) -> &DualAnchorPipelines {
+        self.dual_anchor_pipelines
+            .get_or_init(|| DualAnchorPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны Softmax
+    pub fn softmax_pipelines(&self) -> &SoftmaxPipelines {
+        self.softmax_pipelines
+            .get_or_init(|| SoftmaxPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны Memory
+    pub fn memory_pipelines(&self) -> &MemoryPipelines {
+        self.memory_pipelines
+            .get_or_init(|| MemoryPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны Splitter
+    pub fn splitter_pipelines(&self) -> &SplitterPipelines {
+        self.splitter_pipelines
+            .get_or_init(|| SplitterPipelines::new(self.context.device.clone()))
+    }
+
+    /// Получить пайплайны Combiner
+    pub fn combiner_pipelines(&self) -> &CombinerPipelines {
+        self.combiner_pipelines
+            .get_or_init(|| CombinerPipelines::new(self.context.device.clone()))
     }
 
     // --- Временные буферы ---
@@ -328,7 +446,6 @@ impl GpuCompute {
             let staging_guard = staging_buf.read().expect("read staging buffer");
             let mut dst_guard = dst.write();
             let dst_slice = dst_guard.as_slice_mut().expect("Destination is not CPU");
-            // ВАЖНО: ограничиваем до elements, так как staging-буфер может быть больше
             dst_slice.copy_from_slice(&staging_guard[..elements]);
         }
 

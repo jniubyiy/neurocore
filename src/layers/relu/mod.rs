@@ -2,7 +2,8 @@
 
 pub mod relu;
 
+pub mod gpu;   // <-- делаем модуль gpu публичным
+
 mod cpu;
-mod gpu;
 
 pub use relu::ReLU;

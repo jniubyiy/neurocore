@@ -1,4 +1,4 @@
-// src/layers/soft_keep_gate/gpu/mod.rs
+pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -22,7 +22,8 @@ impl GpuCompute {
         let (thresh_buf, th_raw) = self.upload_to_temp_buffer(thresholds);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let pipeline = self.pipeline_cache.softkeep_fwd.clone();
+        // Используем новый пайплайн из собственной структуры SoftKeepGate
+        let pipeline = self.soft_keep_gate_pipelines().forward.clone();
         let push = [total as u32, temperature.to_bits(), features as u32];
         self.run_compute_shader(
             pipeline,
@@ -65,7 +66,8 @@ impl GpuCompute {
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
         let gthresh_buf = self.get_gpu_subbuffer_from_handle(grad_thresh);
 
-        let pipeline = self.pipeline_cache.softkeep_bwd.clone();
+        // Используем новый пайплайн из собственной структуры SoftKeepGate
+        let pipeline = self.soft_keep_gate_pipelines().backward.clone();
         let push = [total as u32, temperature.to_bits(), features as u32];
         self.run_compute_shader(
             pipeline,

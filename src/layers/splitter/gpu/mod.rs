@@ -1,4 +1,4 @@
-// src/layers/splitter/gpu/mod.rs
+pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -43,7 +43,8 @@ impl GpuCompute {
         let (bias_a_buf, bias_a_raw) = self.upload_to_temp_buffer(bias_a);
         let (bias_b_buf, bias_b_raw) = self.upload_to_temp_buffer(bias_b);
 
-        let pipeline = self.pipeline_cache.splitter_fwd.clone();
+        // Используем новый пайплайн из собственной структуры Splitter
+        let pipeline = self.splitter_pipelines().forward.clone();
         let push = [batch as u32, n as u32, p as u32, q as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,
@@ -120,7 +121,8 @@ impl GpuCompute {
         self.fill_gpu_handle(d_bias_a, 0.0);
         self.fill_gpu_handle(d_bias_b, 0.0);
 
-        let pipeline = self.pipeline_cache.splitter_bwd.clone();
+        // Используем новый пайплайн из собственной структуры Splitter
+        let pipeline = self.splitter_pipelines().backward.clone();
         let push = [batch as u32, n as u32, p as u32, q as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,

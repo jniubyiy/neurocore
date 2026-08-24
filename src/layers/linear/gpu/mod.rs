@@ -1,4 +1,4 @@
-// src/layers/linear/gpu/mod.rs
+pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
@@ -29,7 +29,8 @@ impl GpuCompute {
 
         let (bias_buf, bias_raw) = self.upload_to_temp_buffer(bias);
 
-        let pipeline = self.pipeline_cache.linear_fwd.clone();
+        // Используем новый пайплайн из собственной структуры Linear
+        let pipeline = self.linear_pipelines().forward.clone();
         let push = [batch as u32, in_features as u32, out_features as u32];
 
         self.run_compute_shader_with_dispatch(
@@ -90,7 +91,8 @@ impl GpuCompute {
         self.fill_gpu_handle(grad_weight, 0.0);
         self.fill_gpu_handle(grad_bias_handle, 0.0);
 
-        let pipeline = self.pipeline_cache.linear_bwd.clone();
+        // Используем новый пайплайн из собственной структуры Linear
+        let pipeline = self.linear_pipelines().backward.clone();
         let push = [batch as u32, in_features as u32, out_features as u32];
 
         self.run_compute_shader_with_dispatch(

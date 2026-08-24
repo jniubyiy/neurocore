@@ -2,7 +2,8 @@
 
 pub mod soft_sparse_gate;
 
+pub mod gpu;   // <-- делаем модуль gpu публичным
+
 mod cpu;
-mod gpu;
 
 pub use soft_sparse_gate::SoftSparseGate;

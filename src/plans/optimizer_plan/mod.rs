@@ -3,12 +3,10 @@
 pub mod cube;
 pub mod chain;
 pub mod expr;
-pub mod cubes;
 
 pub use cube::OptimizerCube;
 pub use chain::OptimizerChain;
 pub use expr::OptimizerExpr;
-pub use cubes::*;
 
 // =========== План оптимизатора ===========
 

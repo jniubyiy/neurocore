@@ -40,6 +40,15 @@ use crate::layers::memory::gpu::pipeline::MemoryPipelines;
 use crate::layers::splitter::gpu::pipeline::SplitterPipelines;
 use crate::layers::combiner::gpu::pipeline::CombinerPipelines;
 
+// Новые пайплайны оптимизаторов
+use crate::optimizers::scale_gradient::gpu::pipeline::ScaleGradientPipelines;
+use crate::optimizers::add_weight_decay::gpu::pipeline::AddWeightDecayPipelines;
+use crate::optimizers::gradient_clip::gpu::pipeline::GradientClipPipelines;
+use crate::optimizers::momentum::gpu::pipeline::MomentumPipelines;
+use crate::optimizers::nesterov_momentum::gpu::pipeline::NesterovMomentumPipelines;
+use crate::optimizers::adam::gpu::pipeline::AdamPipelines;
+use crate::optimizers::apply_update::gpu::pipeline::ApplyUpdatePipelines;
+
 pub struct GpuCompute {
     pub context: Arc<GpuContext>,
     pub pipeline_cache: Arc<PipelineCache>,
@@ -49,30 +58,29 @@ pub struct GpuCompute {
     pub gpu_device_id: DeviceId,
     /// Хранилище состояний для каждого слоя Memory по индексу (memory_idx).
     pub memory_states: Mutex<HashMap<usize, (Subbuffer<[f32]>, RawBufferId)>>,
-    /// Пайплайны ReLU (ленивая инициализация)
+
+    // Пайплайны слоёв (ленивая инициализация)
     relu_pipelines: OnceLock<ReLUPipelines>,
-    /// Пайплайны Sigmoid (ленивая инициализация)
     sigmoid_pipelines: OnceLock<SigmoidPipelines>,
-    /// Пайплайны Tanh (ленивая инициализация)
     tanh_pipelines: OnceLock<TanhPipelines>,
-    /// Пайплайны LeakyReLU (ленивая инициализация)
     leaky_relu_pipelines: OnceLock<LeakyReLUPipelines>,
-    /// Пайплайны Linear (ленивая инициализация)
     linear_pipelines: OnceLock<LinearPipelines>,
-    /// Пайплайны SoftSparseGate (ленивая инициализация)
     soft_sparse_gate_pipelines: OnceLock<SoftSparseGatePipelines>,
-    /// Пайплайны SoftKeepGate (ленивая инициализация)
     soft_keep_gate_pipelines: OnceLock<SoftKeepGatePipelines>,
-    /// Пайплайны DualAnchor (ленивая инициализация)
     dual_anchor_pipelines: OnceLock<DualAnchorPipelines>,
-    /// Пайплайны Softmax (ленивая инициализация)
     softmax_pipelines: OnceLock<SoftmaxPipelines>,
-    /// Пайплайны Memory (ленивая инициализация)
     memory_pipelines: OnceLock<MemoryPipelines>,
-    /// Пайплайны Splitter (ленивая инициализация)
     splitter_pipelines: OnceLock<SplitterPipelines>,
-    /// Пайплайны Combiner (ленивая инициализация)
     combiner_pipelines: OnceLock<CombinerPipelines>,
+
+    // Пайплайны оптимизаторов (ленивая инициализация)
+    scale_gradient_pipelines: OnceLock<ScaleGradientPipelines>,
+    add_weight_decay_pipelines: OnceLock<AddWeightDecayPipelines>,
+    gradient_clip_pipelines: OnceLock<GradientClipPipelines>,
+    momentum_pipelines: OnceLock<MomentumPipelines>,
+    nesterov_momentum_pipelines: OnceLock<NesterovMomentumPipelines>,
+    adam_pipelines: OnceLock<AdamPipelines>,
+    apply_update_pipelines: OnceLock<ApplyUpdatePipelines>,
 }
 
 impl GpuCompute {
@@ -108,79 +116,113 @@ impl GpuCompute {
             memory_pipelines: OnceLock::new(),
             splitter_pipelines: OnceLock::new(),
             combiner_pipelines: OnceLock::new(),
+            scale_gradient_pipelines: OnceLock::new(),
+            add_weight_decay_pipelines: OnceLock::new(),
+            gradient_clip_pipelines: OnceLock::new(),
+            momentum_pipelines: OnceLock::new(),
+            nesterov_momentum_pipelines: OnceLock::new(),
+            adam_pipelines: OnceLock::new(),
+            apply_update_pipelines: OnceLock::new(),
         }
     }
 
-    /// Получить пайплайны ReLU
+    // ================ Методы доступа к пайплайнам слоёв ================
+
     pub fn relu_pipelines(&self) -> &ReLUPipelines {
         self.relu_pipelines
             .get_or_init(|| ReLUPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны Sigmoid
     pub fn sigmoid_pipelines(&self) -> &SigmoidPipelines {
         self.sigmoid_pipelines
             .get_or_init(|| SigmoidPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны Tanh
     pub fn tanh_pipelines(&self) -> &TanhPipelines {
         self.tanh_pipelines
             .get_or_init(|| TanhPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны LeakyReLU
     pub fn leaky_relu_pipelines(&self) -> &LeakyReLUPipelines {
         self.leaky_relu_pipelines
             .get_or_init(|| LeakyReLUPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны Linear
     pub fn linear_pipelines(&self) -> &LinearPipelines {
         self.linear_pipelines
             .get_or_init(|| LinearPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны SoftSparseGate
     pub fn soft_sparse_gate_pipelines(&self) -> &SoftSparseGatePipelines {
         self.soft_sparse_gate_pipelines
             .get_or_init(|| SoftSparseGatePipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны SoftKeepGate
     pub fn soft_keep_gate_pipelines(&self) -> &SoftKeepGatePipelines {
         self.soft_keep_gate_pipelines
             .get_or_init(|| SoftKeepGatePipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны DualAnchor
     pub fn dual_anchor_pipelines(&self) -> &DualAnchorPipelines {
         self.dual_anchor_pipelines
             .get_or_init(|| DualAnchorPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны Softmax
     pub fn softmax_pipelines(&self) -> &SoftmaxPipelines {
         self.softmax_pipelines
             .get_or_init(|| SoftmaxPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны Memory
     pub fn memory_pipelines(&self) -> &MemoryPipelines {
         self.memory_pipelines
             .get_or_init(|| MemoryPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны Splitter
     pub fn splitter_pipelines(&self) -> &SplitterPipelines {
         self.splitter_pipelines
             .get_or_init(|| SplitterPipelines::new(self.context.device.clone()))
     }
 
-    /// Получить пайплайны Combiner
     pub fn combiner_pipelines(&self) -> &CombinerPipelines {
         self.combiner_pipelines
             .get_or_init(|| CombinerPipelines::new(self.context.device.clone()))
+    }
+
+    // ================ Методы доступа к пайплайнам оптимизаторов ================
+
+    pub fn scale_gradient_pipelines(&self) -> &ScaleGradientPipelines {
+        self.scale_gradient_pipelines
+            .get_or_init(|| ScaleGradientPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn add_weight_decay_pipelines(&self) -> &AddWeightDecayPipelines {
+        self.add_weight_decay_pipelines
+            .get_or_init(|| AddWeightDecayPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn gradient_clip_pipelines(&self) -> &GradientClipPipelines {
+        self.gradient_clip_pipelines
+            .get_or_init(|| GradientClipPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn momentum_pipelines(&self) -> &MomentumPipelines {
+        self.momentum_pipelines
+            .get_or_init(|| MomentumPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn nesterov_momentum_pipelines(&self) -> &NesterovMomentumPipelines {
+        self.nesterov_momentum_pipelines
+            .get_or_init(|| NesterovMomentumPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn adam_pipelines(&self) -> &AdamPipelines {
+        self.adam_pipelines
+            .get_or_init(|| AdamPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn apply_update_pipelines(&self) -> &ApplyUpdatePipelines {
+        self.apply_update_pipelines
+            .get_or_init(|| ApplyUpdatePipelines::new(self.context.device.clone()))
     }
 
     // --- Временные буферы ---
@@ -339,7 +381,6 @@ impl GpuCompute {
     // МЕТОДЫ ДЛЯ РАБОТЫ С MatrixBufferHandle
     // ===================================================================
 
-    /// Выделяет GPU-буфер через MemoryExecutor (DeviceVram).
     pub fn allocate_gpu_matrix_handle(&self, rows: usize, cols: usize) -> MatrixBufferHandle {
         let mut mem = self.memory_executor.lock().unwrap();
         mem.acquire_matrix_handle(
@@ -351,7 +392,6 @@ impl GpuCompute {
         .expect("Failed to allocate GPU MatrixBufferHandle")
     }
 
-    /// Выделяет CPU-буфер через MemoryExecutor (HostRam).
     pub fn allocate_cpu_matrix_handle(&self, rows: usize, cols: usize) -> MatrixBufferHandle {
         let mut mem = self.memory_executor.lock().unwrap();
         mem.acquire_matrix_handle(
@@ -464,7 +504,6 @@ impl GpuCompute {
         self.copy_buffer_sync(src_buf, dst_buf);
     }
 
-    /// Копирует регион GPU-буфера с указанием байтовых смещений.
     pub fn copy_gpu_handle_region(
         &self,
         src: &MatrixBufferHandle,
@@ -484,11 +523,9 @@ impl GpuCompute {
         let src_full = self.get_gpu_subbuffer_from_handle(src);
         let dst_full = self.get_gpu_subbuffer_from_handle(dst);
 
-        // Преобразуем в Subbuffer<[u8]> с помощью into_bytes()
         let src_u8 = src_full.into_bytes();
         let dst_u8 = dst_full.into_bytes();
 
-        // Создаём регион копирования с приватным полем _ne через Default
         let region = BufferCopy {
             src_offset: src_start_byte,
             dst_offset: dst_start_byte,
@@ -496,7 +533,6 @@ impl GpuCompute {
             ..Default::default()
         };
 
-        // Создаём CopyBufferInfo через buffers() и заменяем регионы
         let mut info = CopyBufferInfo::buffers(src_u8, dst_u8);
         info.regions = vec![region].into();
 

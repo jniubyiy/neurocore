@@ -1,8 +1,8 @@
 // src/optimizers/apply_update/gpu/mod.rs
 
+pub mod pipeline;
+
 use vulkano::buffer::Subbuffer;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::Pipeline;
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 
@@ -14,29 +14,12 @@ impl GpuCompute {
         total: usize,
     ) {
         let push = [total as u32];
-        let set_layout = self
-            .pipeline_cache
-            .apply_update
-            .layout()
-            .set_layouts()
-            .get(0)
-            .unwrap()
-            .clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, params.clone()),
-                WriteDescriptorSet::buffer(1, grads.clone()),
-            ],
-            [],
-        )
-        .expect("apply_update descriptor set");
-
-        self.run_optimizer_with_ds(
-            self.pipeline_cache.apply_update.clone(),
-            descriptor_set,
+        let pipeline = self.apply_update_pipelines().forward.clone();
+        self.run_compute_shader(
+            pipeline,
+            &[(0, params.clone()), (1, grads.clone())],
             &push,
+            total,
         );
     }
 }

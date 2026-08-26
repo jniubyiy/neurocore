@@ -1,8 +1,8 @@
 // src/optimizers/add_weight_decay/gpu/mod.rs
 
+pub mod pipeline;
+
 use vulkano::buffer::Subbuffer;
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::Pipeline;
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 
@@ -15,29 +15,12 @@ impl GpuCompute {
         total: usize,
     ) {
         let push = [decay.to_bits(), total as u32];
-        let set_layout = self
-            .pipeline_cache
-            .weight_decay
-            .layout()
-            .set_layouts()
-            .get(0)
-            .unwrap()
-            .clone();
-        let descriptor_set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            set_layout.clone(),
-            [
-                WriteDescriptorSet::buffer(0, params.clone()),
-                WriteDescriptorSet::buffer(1, grads.clone()),
-            ],
-            [],
-        )
-        .expect("weight_decay descriptor set");
-
-        self.run_optimizer_with_ds(
-            self.pipeline_cache.weight_decay.clone(),
-            descriptor_set,
+        let pipeline = self.add_weight_decay_pipelines().forward.clone();
+        self.run_compute_shader(
+            pipeline,
+            &[(0, params.clone()), (1, grads.clone())],
             &push,
+            total,
         );
     }
 }

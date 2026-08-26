@@ -56,15 +56,6 @@ pub struct PipelineCache {
     // Новые пайплайны для SumColumns
     pub sum_columns_fwd: Arc<ComputePipeline>,
     pub sum_columns_bwd: Arc<ComputePipeline>,
-
-    // Optimizer-пайплайны
-    pub scale_grad: Arc<ComputePipeline>,
-    pub weight_decay: Arc<ComputePipeline>,
-    pub grad_clip: Arc<ComputePipeline>,
-    pub momentum: Arc<ComputePipeline>,
-    pub nesterov_momentum: Arc<ComputePipeline>,
-    pub adam: Arc<ComputePipeline>,
-    pub apply_update: Arc<ComputePipeline>,
 }
 
 fn create_ds_layout_n(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
@@ -156,15 +147,6 @@ impl PipelineCache {
         let cross_entropy_fwd_spv = include_spv!("../../losses/cross_entropy/gpu/shaders/cross_entropy_fwd.spv");
         let cross_entropy_bwd_spv = include_spv!("../../losses/cross_entropy/gpu/shaders/cross_entropy_bwd.spv");
 
-        // Optimizer-шейдеры
-        let scale_grad_spv      = include_spv!("shaders/optim/scale_grad.spv");
-        let weight_decay_spv    = include_spv!("shaders/optim/weight_decay.spv");
-        let grad_clip_spv       = include_spv!("shaders/optim/grad_clip.spv");
-        let momentum_spv        = include_spv!("shaders/optim/momentum.spv");
-        let nesterov_momentum_spv = include_spv!("shaders/optim/nesterov_momentum.spv");
-        let adam_spv            = include_spv!("shaders/optim/adam.spv");
-        let apply_update_spv    = include_spv!("shaders/optim/apply_update.spv");
-
         // ==================== Шейдерные модули ====================
         let mat_mul_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(mat_mul_spv)).expect("mat_mul") };
         let reduce_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(reduce_spv)).expect("reduce") };
@@ -193,14 +175,6 @@ impl PipelineCache {
         let addscalar_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(addscalar_bwd_spv)).expect("addscalar_bwd") };
         let ce_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(cross_entropy_fwd_spv)).expect("cross_entropy_fwd") };
         let ce_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(cross_entropy_bwd_spv)).expect("cross_entropy_bwd") };
-
-        let scale_grad_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(scale_grad_spv)).expect("scale_grad") };
-        let weight_decay_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(weight_decay_spv)).expect("weight_decay") };
-        let grad_clip_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(grad_clip_spv)).expect("grad_clip") };
-        let momentum_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(momentum_spv)).expect("momentum") };
-        let nesterov_momentum_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(nesterov_momentum_spv)).expect("nesterov_momentum") };
-        let adam_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(adam_spv)).expect("adam") };
-        let apply_update_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(apply_update_spv)).expect("apply_update") };
 
         // ==================== Layout'ы ====================
         let mat_mul_ds = create_ds_layout_n(device.clone(), 3);
@@ -231,13 +205,6 @@ impl PipelineCache {
         let ce_fwd_ds = create_ds_layout_n(device.clone(), 2);
         let ce_bwd_ds = create_ds_layout_n(device.clone(), 3);
 
-        let scale_grad_ds = create_ds_layout_n(device.clone(), 1);
-        let weight_decay_ds = create_ds_layout_n(device.clone(), 2);
-        let grad_clip_ds = create_ds_layout_n(device.clone(), 1);
-        let momentum_ds = create_ds_layout_n(device.clone(), 2);
-        let adam_ds = create_ds_layout_n(device.clone(), 2);
-        let apply_update_ds = create_ds_layout_n(device.clone(), 2);
-
         // ==================== Push-константы ====================
         let push_mat_mul = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_reduce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
@@ -245,12 +212,6 @@ impl PipelineCache {
         let push_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
         let push_total_scalar = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_ce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_factor_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_decay_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_clip = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
-        let push_beta = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
-        let push_adam = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 24 };
-        let push_optim_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
 
         // ==================== Сборка пайплайнов ====================
         let mat_mul = build_pipeline(device.clone(), mat_mul_mod, mat_mul_ds, Some(push_mat_mul));
@@ -281,14 +242,6 @@ impl PipelineCache {
         let cross_entropy_fwd = build_pipeline(device.clone(), ce_fwd_mod, ce_fwd_ds, Some(push_ce));
         let cross_entropy_bwd = build_pipeline(device.clone(), ce_bwd_mod, ce_bwd_ds, Some(push_ce));
 
-        let scale_grad = build_pipeline(device.clone(), scale_grad_mod, scale_grad_ds, Some(push_factor_total));
-        let weight_decay = build_pipeline(device.clone(), weight_decay_mod, weight_decay_ds, Some(push_decay_total));
-        let grad_clip = build_pipeline(device.clone(), grad_clip_mod, grad_clip_ds, Some(push_clip));
-        let momentum = build_pipeline(device.clone(), momentum_mod, momentum_ds.clone(), Some(push_beta));
-        let nesterov_momentum = build_pipeline(device.clone(), nesterov_momentum_mod, momentum_ds, Some(push_beta));
-        let adam = build_pipeline(device.clone(), adam_mod, adam_ds, Some(push_adam));
-        let apply_update = build_pipeline(device.clone(), apply_update_mod, apply_update_ds, Some(push_optim_total));
-
         Self {
             device,
             mat_mul,
@@ -316,13 +269,6 @@ impl PipelineCache {
             cross_entropy_bwd,
             sum_columns_fwd,
             sum_columns_bwd,
-            scale_grad,
-            weight_decay,
-            grad_clip,
-            momentum,
-            nesterov_momentum,
-            adam,
-            apply_update,
         }
     }
 

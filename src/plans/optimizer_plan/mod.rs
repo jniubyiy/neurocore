@@ -53,25 +53,25 @@ impl OptimizerDesc {
         for cube in &self.cubes {
             match cube {
                 OptCubeDesc::ScaleGradient(lr) => {
-                    chain = chain.add(Box::new(ScaleGradient::new(*lr)));
+                    chain = chain.add(Box::new(crate::optimizers::scale_gradient::ScaleGradient::new(*lr)));
                 }
                 OptCubeDesc::AddWeightDecay(decay) => {
-                    chain = chain.add(Box::new(AddWeightDecay::new(*decay)));
+                    chain = chain.add(Box::new(crate::optimizers::add_weight_decay::AddWeightDecay::new(*decay)));
                 }
                 OptCubeDesc::Momentum(beta) => {
-                    chain = chain.add(Box::new(Momentum::new(*beta)));
+                    chain = chain.add(Box::new(crate::optimizers::momentum::Momentum::new(*beta)));
                 }
                 OptCubeDesc::NesterovMomentum(beta) => {
-                    chain = chain.add(Box::new(NesterovMomentum::new(*beta)));
+                    chain = chain.add(Box::new(crate::optimizers::nesterov_momentum::NesterovMomentum::new(*beta)));
                 }
                 OptCubeDesc::GradientClip { min, max } => {
-                    chain = chain.add(Box::new(GradientClip::new(*min, *max)));
+                    chain = chain.add(Box::new(crate::optimizers::gradient_clip::GradientClip::new(*min, *max)));
                 }
                 OptCubeDesc::Adam { beta1, beta2, eps } => {
-                    chain = chain.add(Box::new(AdamTransform::new(*beta1, *beta2, *eps)));
+                    chain = chain.add(Box::new(crate::optimizers::adam::Adam::new(*beta1, *beta2, *eps)));
                 }
                 OptCubeDesc::ApplyUpdate => {
-                    chain = chain.add(Box::new(ApplyUpdate));
+                    chain = chain.add(Box::new(crate::optimizers::apply_update::ApplyUpdate::new()));
                 }
             }
         }

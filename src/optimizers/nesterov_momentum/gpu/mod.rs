@@ -1,5 +1,8 @@
+// src/optimizers/nesterov_momentum/gpu/mod.rs
+
 use vulkano::buffer::Subbuffer;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::pipeline::Pipeline;
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 

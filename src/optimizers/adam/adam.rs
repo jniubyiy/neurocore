@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+// src/optimizers/adam/adam.rs
+
+use std::sync::atomic::AtomicUsize;
 
 /// Выполняет полное преобразование градиента по алгоритму Adam.
 /// Состояние: два числа на параметр — `m` и `v`.
@@ -7,7 +9,7 @@ pub struct Adam {
     pub beta1: f32,
     pub beta2: f32,
     pub eps: f32,
-    step_counter: AtomicUsize,
+    pub(crate) step_counter: AtomicUsize,
 }
 
 impl Adam {

@@ -108,7 +108,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         .iter()
         .find_map(|cube| {
             cube.as_any()
-                .downcast_ref::<crate::optimizer_plan::cubes::ScaleGradient>()
+                .downcast_ref::<crate::optimizers::scale_gradient::ScaleGradient>()
                 .map(|sg| sg.factor)
         })
         .unwrap_or(0.01);

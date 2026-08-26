@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::{
     allocator::StandardCommandBufferAllocator,
-    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo,
+    AutoCommandBufferBuilder, BufferCopy, CommandBufferUsage, CopyBufferInfo,
 };
 use vulkano::descriptor_set::{
     allocator::StandardDescriptorSetAllocator,
@@ -464,6 +464,7 @@ impl GpuCompute {
         self.copy_buffer_sync(src_buf, dst_buf);
     }
 
+    /// Копирует регион GPU-буфера с указанием байтовых смещений.
     pub fn copy_gpu_handle_region(
         &self,
         src: &MatrixBufferHandle,
@@ -483,10 +484,40 @@ impl GpuCompute {
         let src_full = self.get_gpu_subbuffer_from_handle(src);
         let dst_full = self.get_gpu_subbuffer_from_handle(dst);
 
-        let src_slice = src_full.clone().slice(src_start_byte..(src_start_byte + byte_len));
-        let dst_slice = dst_full.clone().slice(dst_start_byte..(dst_start_byte + byte_len));
+        // Преобразуем в Subbuffer<[u8]> с помощью into_bytes()
+        let src_u8 = src_full.into_bytes();
+        let dst_u8 = dst_full.into_bytes();
 
-        self.copy_buffer_sync(src_slice, dst_slice);
+        // Создаём регион копирования с приватным полем _ne через Default
+        let region = BufferCopy {
+            src_offset: src_start_byte,
+            dst_offset: dst_start_byte,
+            size: byte_len,
+            ..Default::default()
+        };
+
+        // Создаём CopyBufferInfo через buffers() и заменяем регионы
+        let mut info = CopyBufferInfo::buffers(src_u8, dst_u8);
+        info.regions = vec![region].into();
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.command_buffer_allocator.clone(),
+            self.context.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        builder
+            .copy_buffer(info)
+            .unwrap();
+
+        let cb = builder.build().unwrap();
+        let future = sync::now(self.context.device.clone())
+            .then_execute(self.context.queue.clone(), cb)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap();
+        future.wait(None).unwrap();
     }
 
     pub(crate) fn get_gpu_subbuffer_from_handle(&self, handle: &MatrixBufferHandle) -> Subbuffer<[f32]> {

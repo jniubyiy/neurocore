@@ -29,7 +29,6 @@ impl BufferedElemCube for CrossEntropyWithLogits {
         debug_assert_eq!(src.len(), batch * (nclass + 1));
         debug_assert_eq!(dst.len(), batch);
 
-        // входная матрица имеет размер (batch, nclass+1), column-major
         for r in 0..batch {
             let class_idx = src[nclass * batch + r] as usize;
 
@@ -94,3 +93,4 @@ impl BufferedElemCube for CrossEntropyWithLogits {
         }
     }
 }
+

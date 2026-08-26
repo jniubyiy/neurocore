@@ -14,3 +14,4 @@ impl ElemCube for SumColumns {
 }
 
 mod cpu;
+pub mod gpu;

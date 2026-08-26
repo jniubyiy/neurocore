@@ -36,3 +36,4 @@ impl ElemCube for CrossEntropyWithLogits {
 }
 
 mod cpu;
+pub mod gpu;

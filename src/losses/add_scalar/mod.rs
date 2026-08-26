@@ -14,3 +14,4 @@ impl ElemCube for AddScalar {
 }
 
 mod cpu;
+pub mod gpu;

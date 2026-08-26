@@ -35,3 +35,4 @@ impl ElemCube for AbsDiff {
 }
 
 mod cpu;
+pub mod gpu;

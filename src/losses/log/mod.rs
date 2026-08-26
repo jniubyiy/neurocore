@@ -14,3 +14,4 @@ impl ElemCube for Log {
 }
 
 mod cpu;
+pub mod gpu;

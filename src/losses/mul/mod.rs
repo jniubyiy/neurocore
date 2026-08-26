@@ -35,3 +35,4 @@ impl ElemCube for Mul {
 }
 
 mod cpu;
+pub mod gpu;

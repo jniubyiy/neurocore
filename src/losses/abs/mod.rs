@@ -14,3 +14,4 @@ impl ElemCube for Abs {
 }
 
 mod cpu;
+pub mod gpu;

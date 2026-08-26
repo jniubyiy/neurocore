@@ -14,3 +14,4 @@ impl ElemCube for Neg {
 }
 
 mod cpu;
+pub mod gpu;

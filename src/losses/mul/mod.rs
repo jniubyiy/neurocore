@@ -4,6 +4,7 @@ use std::any::Any;
 use crate::losses::ElemCube;
 
 /// Поэлементное умножение двух входов (pred и target).
+#[derive(Debug)]
 pub struct Mul {
     features: usize,
 }
@@ -32,3 +33,5 @@ impl ElemCube for Mul {
 
     fn as_any(&self) -> &dyn Any { self }
 }
+
+mod cpu;

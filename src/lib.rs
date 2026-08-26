@@ -5,6 +5,9 @@ pub mod layers;
 pub mod logging;
 pub mod compute_manager;
 
+// Новый модуль потерь
+pub mod losses;
+
 // Модуль plans теперь определён через src/plans/mod.rs
 pub mod plans;
 

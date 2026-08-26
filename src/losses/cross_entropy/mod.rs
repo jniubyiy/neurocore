@@ -10,6 +10,7 @@ use crate::losses::ElemCube;
 /// индекс правильного класса (как `f32`, который приводится к `usize`).
 ///
 /// Возвращает матрицу `(batch, 1)` со значениями потерь для каждого сэмпла.
+#[derive(Debug)]
 pub struct CrossEntropyWithLogits {
     pub num_classes: usize,
 }
@@ -33,3 +34,5 @@ impl ElemCube for CrossEntropyWithLogits {
         self
     }
 }
+
+mod cpu;

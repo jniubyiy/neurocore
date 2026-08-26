@@ -1,15 +1,20 @@
 // src/plans/loss_plan/mod.rs
 
-pub mod cubes;
-pub mod cross_entropy;
+pub mod cubes;          // оставлен для обратной совместимости (но не используется)
+pub mod cross_entropy;  // оставлен для обратной совместимости (но не используется)
 pub mod chain;
 pub mod expr;
 pub mod desc;
 pub mod execution;
 pub mod gpu_exec;
 
-pub use cubes::{ElemCube, Sub, Square, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff, SumColumns};
-pub use cross_entropy::CrossEntropyWithLogits;
+// Реэкспорт новых кубиков из src/losses
+pub use crate::losses::{
+    ElemCube, BufferedElemCube,
+    Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff,
+    CrossEntropyWithLogits,
+};
+
 pub use chain::ElementChain;
 pub use expr::{Aggregation, LossExpr};
 pub use desc::LossDesc;

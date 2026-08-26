@@ -4,6 +4,7 @@ use std::any::Any;
 use crate::losses::ElemCube;
 
 /// Добавляет скаляр ко всем элементам (поэлементно).
+#[derive(Debug)]
 pub struct AddScalar(pub f32);
 
 impl ElemCube for AddScalar {
@@ -11,3 +12,5 @@ impl ElemCube for AddScalar {
     fn out_features(&self) -> usize { 1 }
     fn as_any(&self) -> &dyn Any { self }
 }
+
+mod cpu;

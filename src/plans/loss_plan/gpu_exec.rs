@@ -2,8 +2,7 @@
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::loss_plan::CrossEntropyWithLogits;
-use super::cubes::*;
+use crate::losses::{ElemCube, Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff, CrossEntropyWithLogits};
 use super::expr::{Aggregation, LossExpr};
 
 /// Вычисляет значение функции потерь и градиент по pred на GPU.

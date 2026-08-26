@@ -4,6 +4,7 @@ use std::any::Any;
 use crate::losses::ElemCube;
 
 /// Унарный минус (поэлементно).
+#[derive(Debug)]
 pub struct Neg;
 
 impl ElemCube for Neg {
@@ -11,3 +12,5 @@ impl ElemCube for Neg {
     fn out_features(&self) -> usize { 1 }
     fn as_any(&self) -> &dyn Any { self }
 }
+
+mod cpu;

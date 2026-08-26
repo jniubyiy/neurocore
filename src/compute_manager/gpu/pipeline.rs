@@ -53,6 +53,9 @@ pub struct PipelineCache {
     pub addscalar_bwd: Arc<ComputePipeline>,
     pub cross_entropy_fwd: Arc<ComputePipeline>,
     pub cross_entropy_bwd: Arc<ComputePipeline>,
+    // Новые пайплайны для SumColumns
+    pub sum_columns_fwd: Arc<ComputePipeline>,
+    pub sum_columns_bwd: Arc<ComputePipeline>,
 
     // Optimizer-пайплайны
     pub scale_grad: Arc<ComputePipeline>,
@@ -127,27 +130,33 @@ impl PipelineCache {
         let reduce_spv          = include_spv!("shaders/common/reduce.spv");
         let unsqueeze_spv       = include_spv!("shaders/common/unsqueeze.spv");
 
-        let sub_fwd_spv         = include_spv!("shaders/loss/sub_fwd.spv");
-        let sub_bwd_spv         = include_spv!("shaders/loss/sub_bwd.spv");
-        let square_fwd_spv      = include_spv!("shaders/loss/square_fwd.spv");
-        let square_bwd_spv      = include_spv!("shaders/loss/square_bwd.spv");
-        let abs_fwd_spv         = include_spv!("shaders/loss/abs_fwd.spv");
-        let abs_bwd_spv         = include_spv!("shaders/loss/abs_bwd.spv");
-        let log1p_fwd_spv       = include_spv!("shaders/loss/log1p_fwd.spv");
-        let log1p_bwd_spv       = include_spv!("shaders/loss/log1p_bwd.spv");
-        let absdiff_fwd_spv     = include_spv!("shaders/loss/absdiff_fwd.spv");
-        let absdiff_bwd_spv     = include_spv!("shaders/loss/absdiff_bwd.spv");
-        let log_fwd_spv         = include_spv!("shaders/loss/log_fwd.spv");
-        let log_bwd_spv         = include_spv!("shaders/loss/log_bwd.spv");
-        let neg_fwd_spv         = include_spv!("shaders/loss/neg_fwd.spv");
-        let neg_bwd_spv         = include_spv!("shaders/loss/neg_bwd.spv");
-        let mul_fwd_spv         = include_spv!("shaders/loss/mul_fwd.spv");
-        let mul_bwd_spv         = include_spv!("shaders/loss/mul_bwd.spv");
-        let addscalar_fwd_spv   = include_spv!("shaders/loss/addscalar_fwd.spv");
-        let addscalar_bwd_spv   = include_spv!("shaders/loss/addscalar_bwd.spv");
-        let cross_entropy_fwd_spv = include_spv!("shaders/loss/cross_entropy_fwd.spv");
-        let cross_entropy_bwd_spv = include_spv!("shaders/loss/cross_entropy_bwd.spv");
+        // Новые шейдеры для SumColumns
+        let sum_columns_fwd_spv = include_spv!("../../losses/sum_columns/gpu/shaders/sum_columns_fwd.spv");
+        let sum_columns_bwd_spv = include_spv!("../../losses/sum_columns/gpu/shaders/sum_columns_bwd.spv");
 
+        // Loss-шейдеры
+        let sub_fwd_spv         = include_spv!("../../losses/sub/gpu/shaders/sub_fwd.spv");
+        let sub_bwd_spv         = include_spv!("../../losses/sub/gpu/shaders/sub_bwd.spv");
+        let square_fwd_spv      = include_spv!("../../losses/square/gpu/shaders/square_fwd.spv");
+        let square_bwd_spv      = include_spv!("../../losses/square/gpu/shaders/square_bwd.spv");
+        let abs_fwd_spv         = include_spv!("../../losses/abs/gpu/shaders/abs_fwd.spv");
+        let abs_bwd_spv         = include_spv!("../../losses/abs/gpu/shaders/abs_bwd.spv");
+        let log1p_fwd_spv       = include_spv!("../../losses/log1p/gpu/shaders/log1p_fwd.spv");
+        let log1p_bwd_spv       = include_spv!("../../losses/log1p/gpu/shaders/log1p_bwd.spv");
+        let absdiff_fwd_spv     = include_spv!("../../losses/abs_diff/gpu/shaders/absdiff_fwd.spv");
+        let absdiff_bwd_spv     = include_spv!("../../losses/abs_diff/gpu/shaders/absdiff_bwd.spv");
+        let log_fwd_spv         = include_spv!("../../losses/log/gpu/shaders/log_fwd.spv");
+        let log_bwd_spv         = include_spv!("../../losses/log/gpu/shaders/log_bwd.spv");
+        let neg_fwd_spv         = include_spv!("../../losses/neg/gpu/shaders/neg_fwd.spv");
+        let neg_bwd_spv         = include_spv!("../../losses/neg/gpu/shaders/neg_bwd.spv");
+        let mul_fwd_spv         = include_spv!("../../losses/mul/gpu/shaders/mul_fwd.spv");
+        let mul_bwd_spv         = include_spv!("../../losses/mul/gpu/shaders/mul_bwd.spv");
+        let addscalar_fwd_spv   = include_spv!("../../losses/add_scalar/gpu/shaders/addscalar_fwd.spv");
+        let addscalar_bwd_spv   = include_spv!("../../losses/add_scalar/gpu/shaders/addscalar_bwd.spv");
+        let cross_entropy_fwd_spv = include_spv!("../../losses/cross_entropy/gpu/shaders/cross_entropy_fwd.spv");
+        let cross_entropy_bwd_spv = include_spv!("../../losses/cross_entropy/gpu/shaders/cross_entropy_bwd.spv");
+
+        // Optimizer-шейдеры
         let scale_grad_spv      = include_spv!("shaders/optim/scale_grad.spv");
         let weight_decay_spv    = include_spv!("shaders/optim/weight_decay.spv");
         let grad_clip_spv       = include_spv!("shaders/optim/grad_clip.spv");
@@ -160,6 +169,9 @@ impl PipelineCache {
         let mat_mul_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(mat_mul_spv)).expect("mat_mul") };
         let reduce_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(reduce_spv)).expect("reduce") };
         let unsqueeze_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(unsqueeze_spv)).expect("unsqueeze") };
+
+        let sum_columns_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(sum_columns_fwd_spv)).expect("sum_columns_fwd") };
+        let sum_columns_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(sum_columns_bwd_spv)).expect("sum_columns_bwd") };
 
         let sub_fwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(sub_fwd_spv)).expect("sub_fwd") };
         let sub_bwd_mod = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(sub_bwd_spv)).expect("sub_bwd") };
@@ -195,6 +207,9 @@ impl PipelineCache {
         let reduce_ds = create_ds_layout_n(device.clone(), 2);
         let unsqueeze_ds = create_ds_layout_n(device.clone(), 2);
 
+        let sum_columns_fwd_ds = create_ds_layout_n(device.clone(), 2);
+        let sum_columns_bwd_ds = create_ds_layout_n(device.clone(), 2);
+
         let sub_fwd_ds = create_ds_layout_n(device.clone(), 3);
         let sub_bwd_ds = create_ds_layout_n(device.clone(), 3);
         let square_fwd_ds = create_ds_layout_n(device.clone(), 2);
@@ -226,8 +241,7 @@ impl PipelineCache {
         // ==================== Push-константы ====================
         let push_mat_mul = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 12 };
         let push_reduce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
-        // Для unsqueeze push-констант нет (None), поэтому передаём None
-
+        let push_sum_columns = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 }; // rows, cols
         let push_total = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 4 };
         let push_total_scalar = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
         let push_ce = PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: 8 };
@@ -242,6 +256,9 @@ impl PipelineCache {
         let mat_mul = build_pipeline(device.clone(), mat_mul_mod, mat_mul_ds, Some(push_mat_mul));
         let reduce = build_pipeline(device.clone(), reduce_mod, reduce_ds, Some(push_reduce));
         let unsqueeze = build_pipeline(device.clone(), unsqueeze_mod, unsqueeze_ds, None);
+
+        let sum_columns_fwd = build_pipeline(device.clone(), sum_columns_fwd_mod, sum_columns_fwd_ds, Some(push_sum_columns));
+        let sum_columns_bwd = build_pipeline(device.clone(), sum_columns_bwd_mod, sum_columns_bwd_ds, Some(push_sum_columns));
 
         let sub_fwd = build_pipeline(device.clone(), sub_fwd_mod, sub_fwd_ds, Some(push_total));
         let sub_bwd = build_pipeline(device.clone(), sub_bwd_mod, sub_bwd_ds, Some(push_total));
@@ -297,6 +314,8 @@ impl PipelineCache {
             addscalar_bwd,
             cross_entropy_fwd,
             cross_entropy_bwd,
+            sum_columns_fwd,
+            sum_columns_bwd,
             scale_grad,
             weight_decay,
             grad_clip,
@@ -310,6 +329,8 @@ impl PipelineCache {
     pub fn mat_mul_pipeline(&self) -> Arc<ComputePipeline> { self.mat_mul.clone() }
     pub fn reduce_pipeline(&self) -> Arc<ComputePipeline> { self.reduce.clone() }
     pub fn unsqueeze_pipeline(&self) -> Arc<ComputePipeline> { self.unsqueeze.clone() }
+    pub fn sum_columns_fwd_pipeline(&self) -> Arc<ComputePipeline> { self.sum_columns_fwd.clone() }
+    pub fn sum_columns_bwd_pipeline(&self) -> Arc<ComputePipeline> { self.sum_columns_bwd.clone() }
     pub fn device(&self) -> Arc<Device> { self.device.clone() }
 }
  

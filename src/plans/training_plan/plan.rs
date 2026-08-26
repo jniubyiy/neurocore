@@ -95,8 +95,8 @@ impl TrainingPlan {
             model_fn: || panic!("Model function not set"),
             loss_desc: LossDesc::from_chain(
                 crate::loss_plan::chain::ElementChain::new()
-                    .add(Box::new(crate::loss_plan::cubes::Sub::new(1)))
-                    .add(Box::new(crate::loss_plan::cubes::Square)),
+                    .add(Box::new(crate::losses::Sub::new(1)))
+                    .add(Box::new(crate::losses::Square)),
                 crate::loss_plan::expr::Aggregation::Mean,
                 0, 0, 0,
             ),

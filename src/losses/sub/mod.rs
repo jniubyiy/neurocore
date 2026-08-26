@@ -6,6 +6,7 @@ use crate::losses::ElemCube;
 /// Вычитание: принимает два входа (pred и target) и возвращает их разность.
 ///
 /// Количество признаков предсказания и цели одинаково (`features`).
+#[derive(Debug)]
 pub struct Sub {
     features: usize,
 }
@@ -34,3 +35,5 @@ impl ElemCube for Sub {
 
     fn as_any(&self) -> &dyn Any { self }
 }
+
+mod cpu;

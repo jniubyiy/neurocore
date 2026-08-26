@@ -18,14 +18,14 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
-        let pipeline = self.pipeline_cache.reduce_pipeline();
-        let push = [rows as u32];
+        let pipeline = self.pipeline_cache.sum_columns_fwd.clone();
+        let push = [rows as u32, cols as u32];
 
         self.run_compute_shader_with_dispatch(
             pipeline,
             &[(0, in_buf), (1, out_buf)],
             &push,
-            [cols as u32, 1, 1],
+            [rows as u32, 1, 1],
         );
     }
 
@@ -40,13 +40,17 @@ impl GpuCompute {
         assert_eq!(gi.rows(), rows);
         assert_eq!(gi.cols(), original_cols);
 
-        let grad_vec = self.download_gpu_handle_to_vec(grad_out);
+        let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
+        let gi_buf = self.get_gpu_subbuffer_from_handle(gi);
 
-        let mut broadcast_vec = Vec::with_capacity(rows * original_cols);
-        for _ in 0..original_cols {
-            broadcast_vec.extend_from_slice(&grad_vec);
-        }
+        let pipeline = self.pipeline_cache.sum_columns_bwd.clone();
+        let push = [rows as u32, original_cols as u32];
 
-        self.copy_slice_to_gpu_handle(gi, &broadcast_vec);
+        self.run_compute_shader_with_dispatch(
+            pipeline,
+            &[(0, go_buf), (1, gi_buf)],
+            &push,
+            [rows as u32, original_cols as u32, 1],
+        );
     }
 }

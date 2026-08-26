@@ -1,7 +1,10 @@
 // src/plans/loss_plan/chain.rs
 
-use super::cubes::BufferedElemCube;
-use super::cubes::ElemCube;
+use crate::losses::{
+    ElemCube, BufferedElemCube,
+    Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff,
+    CrossEntropyWithLogits,
+};
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 
 /// Цепочка элементарных кубиков, выполняющая последовательное преобразование над батчем.
@@ -139,9 +142,6 @@ fn clone_handle_data(pool: &mut TempMatrixPool, src: &MatrixBufferHandle) -> Mat
 /// Преобразует `&Box<dyn ElemCube>` в `&dyn BufferedElemCube`.
 /// Использует downcasting к конкретным типам, которые реализуют оба трейта.
 fn cube_as_buffered(cube: &Box<dyn ElemCube>) -> &dyn BufferedElemCube {
-    use super::cubes::{Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff};
-    use super::cross_entropy::CrossEntropyWithLogits;
-
     if let Some(c) = cube.as_any().downcast_ref::<Sub>() { return c; }
     if let Some(c) = cube.as_any().downcast_ref::<Square>() { return c; }
     if let Some(c) = cube.as_any().downcast_ref::<SumColumns>() { return c; }
@@ -159,7 +159,6 @@ fn cube_as_buffered(cube: &Box<dyn ElemCube>) -> &dyn BufferedElemCube {
 
 /// Возвращает `true`, если кубик сохраняет размерность (поэлементные операции).
 fn cube_preserves_shape(cube: &dyn ElemCube) -> bool {
-    use super::cubes::{Square, Abs, Neg, Log, Log1p, AddScalar};
     cube.as_any().downcast_ref::<Square>().is_some()
         || cube.as_any().downcast_ref::<Abs>().is_some()
         || cube.as_any().downcast_ref::<Neg>().is_some()

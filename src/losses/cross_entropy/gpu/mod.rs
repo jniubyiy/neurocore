@@ -1,5 +1,7 @@
 // src/losses/cross_entropy/gpu/mod.rs
 
+pub mod pipeline;
+
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
@@ -20,8 +22,9 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(logits_and_target);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
+        let pipeline = self.cross_entropy_pipelines().forward.clone();
         self.run_compute_shader_with_dispatch(
-            self.pipeline_cache.cross_entropy_fwd.clone(),
+            pipeline,
             &[(0, in_buf), (1, out_buf)],
             &[batch as u32, num_classes as u32],
             [batch as u32, 1, 1],
@@ -48,8 +51,9 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let gi_buf = self.get_gpu_subbuffer_from_handle(gi);
 
+        let pipeline = self.cross_entropy_pipelines().backward.clone();
         self.run_compute_shader_with_dispatch(
-            self.pipeline_cache.cross_entropy_bwd.clone(),
+            pipeline,
             &[(0, in_buf), (1, go_buf), (2, gi_buf)],
             &[batch as u32, num_classes as u32],
             [batch as u32, 1, 1],

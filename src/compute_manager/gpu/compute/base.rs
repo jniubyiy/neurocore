@@ -49,6 +49,19 @@ use crate::optimizers::nesterov_momentum::gpu::pipeline::NesterovMomentumPipelin
 use crate::optimizers::adam::gpu::pipeline::AdamPipelines;
 use crate::optimizers::apply_update::gpu::pipeline::ApplyUpdatePipelines;
 
+// Новые пайплайны функций потерь
+use crate::losses::sub::gpu::pipeline::SubPipelines;
+use crate::losses::square::gpu::pipeline::SquarePipelines;
+use crate::losses::abs::gpu::pipeline::AbsPipelines;
+use crate::losses::log1p::gpu::pipeline::Log1pPipelines;
+use crate::losses::abs_diff::gpu::pipeline::AbsDiffPipelines;
+use crate::losses::log::gpu::pipeline::LogPipelines;
+use crate::losses::neg::gpu::pipeline::NegPipelines;
+use crate::losses::mul::gpu::pipeline::MulPipelines;
+use crate::losses::add_scalar::gpu::pipeline::AddScalarPipelines;
+use crate::losses::cross_entropy::gpu::pipeline::CrossEntropyPipelines;
+use crate::losses::sum_columns::gpu::pipeline::SumColumnsPipelines;
+
 pub struct GpuCompute {
     pub context: Arc<GpuContext>,
     pub pipeline_cache: Arc<PipelineCache>,
@@ -81,6 +94,19 @@ pub struct GpuCompute {
     nesterov_momentum_pipelines: OnceLock<NesterovMomentumPipelines>,
     adam_pipelines: OnceLock<AdamPipelines>,
     apply_update_pipelines: OnceLock<ApplyUpdatePipelines>,
+
+    // Пайплайны функций потерь (ленивая инициализация)
+    sub_pipelines: OnceLock<SubPipelines>,
+    square_pipelines: OnceLock<SquarePipelines>,
+    abs_pipelines: OnceLock<AbsPipelines>,
+    log1p_pipelines: OnceLock<Log1pPipelines>,
+    abs_diff_pipelines: OnceLock<AbsDiffPipelines>,
+    log_pipelines: OnceLock<LogPipelines>,
+    neg_pipelines: OnceLock<NegPipelines>,
+    mul_pipelines: OnceLock<MulPipelines>,
+    add_scalar_pipelines: OnceLock<AddScalarPipelines>,
+    cross_entropy_pipelines: OnceLock<CrossEntropyPipelines>,
+    sum_columns_pipelines: OnceLock<SumColumnsPipelines>,
 }
 
 impl GpuCompute {
@@ -123,6 +149,17 @@ impl GpuCompute {
             nesterov_momentum_pipelines: OnceLock::new(),
             adam_pipelines: OnceLock::new(),
             apply_update_pipelines: OnceLock::new(),
+            sub_pipelines: OnceLock::new(),
+            square_pipelines: OnceLock::new(),
+            abs_pipelines: OnceLock::new(),
+            log1p_pipelines: OnceLock::new(),
+            abs_diff_pipelines: OnceLock::new(),
+            log_pipelines: OnceLock::new(),
+            neg_pipelines: OnceLock::new(),
+            mul_pipelines: OnceLock::new(),
+            add_scalar_pipelines: OnceLock::new(),
+            cross_entropy_pipelines: OnceLock::new(),
+            sum_columns_pipelines: OnceLock::new(),
         }
     }
 
@@ -223,6 +260,63 @@ impl GpuCompute {
     pub fn apply_update_pipelines(&self) -> &ApplyUpdatePipelines {
         self.apply_update_pipelines
             .get_or_init(|| ApplyUpdatePipelines::new(self.context.device.clone()))
+    }
+
+    // ================ Методы доступа к пайплайнам функций потерь ================
+
+    pub fn sub_pipelines(&self) -> &SubPipelines {
+        self.sub_pipelines
+            .get_or_init(|| SubPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn square_pipelines(&self) -> &SquarePipelines {
+        self.square_pipelines
+            .get_or_init(|| SquarePipelines::new(self.context.device.clone()))
+    }
+
+    pub fn abs_pipelines(&self) -> &AbsPipelines {
+        self.abs_pipelines
+            .get_or_init(|| AbsPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn log1p_pipelines(&self) -> &Log1pPipelines {
+        self.log1p_pipelines
+            .get_or_init(|| Log1pPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn abs_diff_pipelines(&self) -> &AbsDiffPipelines {
+        self.abs_diff_pipelines
+            .get_or_init(|| AbsDiffPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn log_pipelines(&self) -> &LogPipelines {
+        self.log_pipelines
+            .get_or_init(|| LogPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn neg_pipelines(&self) -> &NegPipelines {
+        self.neg_pipelines
+            .get_or_init(|| NegPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn mul_pipelines(&self) -> &MulPipelines {
+        self.mul_pipelines
+            .get_or_init(|| MulPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn add_scalar_pipelines(&self) -> &AddScalarPipelines {
+        self.add_scalar_pipelines
+            .get_or_init(|| AddScalarPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn cross_entropy_pipelines(&self) -> &CrossEntropyPipelines {
+        self.cross_entropy_pipelines
+            .get_or_init(|| CrossEntropyPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn sum_columns_pipelines(&self) -> &SumColumnsPipelines {
+        self.sum_columns_pipelines
+            .get_or_init(|| SumColumnsPipelines::new(self.context.device.clone()))
     }
 
     // --- Временные буферы ---

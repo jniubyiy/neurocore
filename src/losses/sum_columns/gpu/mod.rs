@@ -1,5 +1,7 @@
 // src/losses/sum_columns/gpu/mod.rs
 
+pub mod pipeline;
+
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
@@ -18,9 +20,8 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
-        let pipeline = self.pipeline_cache.sum_columns_fwd.clone();
+        let pipeline = self.sum_columns_pipelines().forward.clone();
         let push = [rows as u32, cols as u32];
-
         self.run_compute_shader_with_dispatch(
             pipeline,
             &[(0, in_buf), (1, out_buf)],
@@ -43,9 +44,8 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let gi_buf = self.get_gpu_subbuffer_from_handle(gi);
 
-        let pipeline = self.pipeline_cache.sum_columns_bwd.clone();
+        let pipeline = self.sum_columns_pipelines().backward.clone();
         let push = [rows as u32, original_cols as u32];
-
         self.run_compute_shader_with_dispatch(
             pipeline,
             &[(0, go_buf), (1, gi_buf)],

@@ -1,5 +1,7 @@
 // src/losses/sub/gpu/mod.rs
 
+pub mod pipeline;
+
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
@@ -23,7 +25,7 @@ impl GpuCompute {
         let b_buf = self.get_gpu_subbuffer_from_handle(target);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
-        let pipeline = self.pipeline_cache.sub_fwd.clone();
+        let pipeline = self.sub_pipelines().forward.clone();
         self.run_compute_shader(
             pipeline,
             &[(0, a_buf), (1, b_buf), (2, out_buf)],
@@ -51,7 +53,7 @@ impl GpuCompute {
         let ga_buf = self.get_gpu_subbuffer_from_handle(ga);
         let gb_buf = self.get_gpu_subbuffer_from_handle(gb);
 
-        let pipeline = self.pipeline_cache.sub_bwd.clone();
+        let pipeline = self.sub_pipelines().backward.clone();
         self.run_compute_shader(
             pipeline,
             &[(0, go_buf), (1, ga_buf), (2, gb_buf)],

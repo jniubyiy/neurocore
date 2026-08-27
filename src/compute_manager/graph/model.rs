@@ -290,7 +290,13 @@ impl MixedModel {
         if buf.is_gpu() {
             let gpu_compute = self.gpu_compute.as_ref()
                 .expect("GPU compute not available").lock().unwrap();
-            let vec = gpu_compute.download_gpu_handle_to_vec(&buf);
+            // Скачиваем в управляемый CPU-буфер и извлекаем данные.
+            let cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(&buf);
+            let vec = {
+                let guard = cpu_handle.read();
+                guard.as_slice().unwrap().to_vec()
+            };
+            // cpu_handle выйдет из области видимости и будет освобождён.
             let batch = buf.rows();
             let features = buf.cols();
             let mut flat = vec![0.0f32; batch * features];

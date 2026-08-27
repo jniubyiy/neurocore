@@ -29,6 +29,11 @@ impl TempBufferPool {
 
     /// Получить временный буфер заданного размера (в элементах f32) из пула или создать новый.
     /// Регистрирует буфер в `raw_registry` и обновляет `pools`.
+    ///
+    /// Если в пуле нет подходящего буфера, перед созданием нового проверяется наличие
+    /// свободной памяти в соответствующем `MemoryPool`. При нехватке предпринимается
+    /// попытка очистки пула от простаивающих буферов. Если после этого памяти всё ещё
+    /// недостаточно, вызывается паника.
     pub fn acquire(
         &mut self,
         kind: MemoryDeviceKind,
@@ -37,15 +42,40 @@ impl TempBufferPool {
         pools: &mut HashMap<MemoryDeviceKind, MemoryPool>,
         raw_registry: &mut RawBufferRegistry,
     ) -> (Subbuffer<[f32]>, RawBufferId) {
-        let queue = self.buffers.entry(kind).or_insert_with(VecDeque::new);
-
-        // Ищем подходящий буфер
-        if let Some(pos) = queue.iter().position(|(buf, _, _)| buf.len() >= elements as u64) {
-            let (buf, raw_id, _) = queue.remove(pos).unwrap();
-            return (buf, raw_id);
+        // 1. Попытка найти подходящий буфер в очереди.
+        if let Some(queue) = self.buffers.get_mut(&kind) {
+            if let Some(pos) = queue.iter().position(|(buf, _, _)| buf.len() >= elements as u64) {
+                let (buf, raw_id, _) = queue.remove(pos).unwrap();
+                return (buf, raw_id);
+            }
         }
 
-        // Определяем параметры создания в зависимости от типа памяти
+        // 2. Проверка доступной памяти перед созданием нового буфера.
+        let required_elements = elements;
+        let pool = pools
+            .get(&kind)
+            .unwrap_or_else(|| panic!("TempBufferPool::acquire: no memory pool for kind {:?}", kind));
+
+        if !pool.can_allocate(required_elements) {
+            // Очищаем все простаивающие буферы (возраст 0 – удаляем все).
+            self.cleanup(Duration::ZERO, pools, raw_registry);
+
+            // Повторная проверка после очистки.
+            let pool = pools
+                .get(&kind)
+                .expect("Pool should still exist after cleanup");
+            if !pool.can_allocate(required_elements) {
+                panic!(
+                    "TempBufferPool::acquire: insufficient memory for kind {:?}, required {} elements ({} bytes), available {} elements",
+                    kind,
+                    required_elements,
+                    required_elements * std::mem::size_of::<f32>(),
+                    pool.free_elements()
+                );
+            }
+        }
+
+        // 3. Определяем параметры создания в зависимости от типа памяти.
         let (device_id, memory_type_filter, buffer_usage) = match kind {
             MemoryDeviceKind::DeviceVram(dev_id) => (
                 dev_id,
@@ -55,7 +85,6 @@ impl TempBufferPool {
             MemoryDeviceKind::HostRam => {
                 // Для host-буферов берём первое попавшееся GPU-устройство, чтобы получить аллокатор.
                 // На практике staging-буферы всегда привязаны к конкретному GPU, но здесь мы используем упрощение.
-                // В реальном коде gpu_contexts будет содержать хотя бы один контекст.
                 let dev_id = gpu_contexts.keys().next().copied().unwrap_or(DeviceId(0));
                 (
                     dev_id,
@@ -85,7 +114,7 @@ impl TempBufferPool {
         )
         .expect("Failed to create temp buffer");
 
-        // Регистрируем как сырой буфер
+        // Регистрируем как сырой буфер (внутри выполняется резервирование памяти в пуле).
         let raw_id = raw_registry.register(device_id, size_bytes, memory_type_filter, pools);
 
         (buffer, raw_id)

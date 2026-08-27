@@ -1,3 +1,5 @@
+// src/layers/memory/gpu/mod.rs
+
 pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
@@ -26,7 +28,14 @@ impl GpuCompute {
             if let Some((buf, _)) = states.get(&memory_idx) {
                 buf.clone()
             } else {
-                let input_vec = self.download_gpu_handle_to_vec(input);
+                // Скачиваем данные во временный CPU-буфер, управляемый MemoryExecutor.
+                let cpu_handle = self.download_gpu_handle_to_cpu_handle(input);
+                let input_vec = {
+                    let guard = cpu_handle.read();
+                    guard.as_slice().unwrap().to_vec()
+                };
+                // cpu_handle выйдет из области видимости и будет освобождён.
+
                 let mut state_vec = Vec::with_capacity(2 * features);
                 for c in 0..features {
                     let first_val = input_vec[c * batch];

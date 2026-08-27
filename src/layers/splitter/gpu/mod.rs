@@ -1,3 +1,5 @@
+// src/layers/splitter/gpu/mod.rs
+
 pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
@@ -145,10 +147,17 @@ impl GpuCompute {
         );
 
         let mut grad = Vec::with_capacity(p * n + q * n + p + q);
-        grad.extend_from_slice(&self.download_gpu_handle_to_vec(d_wa));
-        grad.extend_from_slice(&self.download_gpu_handle_to_vec(d_wb));
-        grad.extend_from_slice(&self.download_gpu_handle_to_vec(d_bias_a));
-        grad.extend_from_slice(&self.download_gpu_handle_to_vec(d_bias_b));
+        grad.extend_from_slice(&gpu_handle_to_vec(self, d_wa));
+        grad.extend_from_slice(&gpu_handle_to_vec(self, d_wb));
+        grad.extend_from_slice(&gpu_handle_to_vec(self, d_bias_a));
+        grad.extend_from_slice(&gpu_handle_to_vec(self, d_bias_b));
         grad
     }
+}
+
+/// Вспомогательная функция: скачивает GPU-данные в CPU-буфер и возвращает Vec<f32>.
+fn gpu_handle_to_vec(gpu: &GpuCompute, handle: &MatrixBufferHandle) -> Vec<f32> {
+    let cpu_handle = gpu.download_gpu_handle_to_cpu_handle(handle);
+    let guard = cpu_handle.read();
+    guard.as_slice().unwrap().to_vec()
 }

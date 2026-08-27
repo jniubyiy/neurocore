@@ -65,6 +65,13 @@ impl MemoryExecutor {
         self.memory_arc = Some(arc);
     }
 
+    /// Проверяет, можно ли выделить `elements` элементов в указанном пуле памяти.
+    pub fn can_allocate(&self, kind: MemoryDeviceKind, elements: usize) -> bool {
+        self.pools.get(&kind)
+            .map(|p| p.can_allocate(elements))
+            .unwrap_or(false)
+    }
+
     // --- Пул временных буферов ---
 
     pub fn acquire_temp_buffer(
@@ -72,6 +79,23 @@ impl MemoryExecutor {
         kind: MemoryDeviceKind,
         elements: usize,
     ) -> (Subbuffer<[f32]>, RawBufferId) {
+        // Проверка доступной памяти перед запросом временного буфера.
+        if kind != MemoryDeviceKind::SsdCache {
+            if let Some(pool) = self.pools.get(&kind) {
+                if !pool.can_allocate(elements) {
+                    panic!(
+                        "MemoryExecutor::acquire_temp_buffer: insufficient memory for kind {:?}: required {} elements, available {} elements",
+                        kind, elements, pool.free_elements()
+                    );
+                }
+            } else {
+                panic!(
+                    "MemoryExecutor::acquire_temp_buffer: no memory pool registered for kind {:?}",
+                    kind
+                );
+            }
+        }
+
         self.temp_pool.acquire(
             kind,
             elements,
@@ -191,14 +215,12 @@ impl MemoryExecutor {
         priority: BufferPriority,
     ) -> Result<MatrixBufferHandle, MemoryError> {
         let elements = rows * cols;
-        if location != MemoryDeviceKind::SsdCache {
-            if let Some(pool) = self.pools.get(&location) {
-                if !pool.can_allocate(elements) {
-                    return Err(MemoryError::OutOfMemory(location));
-                }
-            } else {
-                return Err(MemoryError::DeviceNotFound(location));
+        if let Some(pool) = self.pools.get(&location) {
+            if !pool.can_allocate(elements) {
+                return Err(MemoryError::OutOfMemory(location));
             }
+        } else {
+            return Err(MemoryError::DeviceNotFound(location));
         }
 
         let storage = match location {
@@ -222,6 +244,7 @@ impl MemoryExecutor {
                 let handle = ssd.allocate(elements)?;
                 let zeros = vec![0.0f32; elements];
                 ssd.write(&handle, &zeros)?;
+                self.reserve_memory(MemoryDeviceKind::SsdCache, elements)?;
                 MatrixStorage::Ssd(handle)
             }
         };
@@ -250,6 +273,8 @@ impl MemoryExecutor {
                         if let Some(ssd) = &self.ssd_cache {
                             let _ = ssd.deallocate(handle);
                         }
+                        let elements = handle.elements;
+                        self.release_reserved_memory(MemoryDeviceKind::SsdCache, elements);
                     }
                 }
                 self.matrix_entries.remove(&id);
@@ -399,12 +424,12 @@ impl MemoryExecutor {
             let entry = self.matrix_entries.get(&id).unwrap();
             entry.rows * entry.cols
         };
-        if target != MemoryDeviceKind::SsdCache {
-            let pool = self.pools.get(&target)
-                .ok_or(MemoryError::DeviceNotFound(target))?;
+        if let Some(pool) = self.pools.get(&target) {
             if !pool.can_allocate(elements) {
                 return Err(MemoryError::OutOfMemory(target));
             }
+        } else {
+            return Err(MemoryError::DeviceNotFound(target));
         }
 
         let mut entry = self
@@ -452,6 +477,7 @@ impl MemoryExecutor {
                     .ok_or(MemoryError::DeviceNotFound(MemoryDeviceKind::SsdCache))?;
                 let handle = ssd.allocate(elements)?;
                 ssd.write(&handle, &data)?;
+                self.reserve_memory(MemoryDeviceKind::SsdCache, elements)?;
                 MatrixStorage::Ssd(handle)
             }
         };
@@ -512,6 +538,7 @@ impl MemoryExecutor {
                 if let Some(ssd) = &self.ssd_cache {
                     let _ = ssd.deallocate(handle);
                 }
+                self.release_reserved_memory(MemoryDeviceKind::SsdCache, elements);
             }
         }
     }

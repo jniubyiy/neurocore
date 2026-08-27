@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use vulkano::memory::allocator::MemoryTypeFilter;
+use vulkano::memory::MemoryPropertyFlags;
 
 use crate::compute_manager::device_spec::DeviceId;
 use super::pool::MemoryPool;
@@ -35,6 +36,9 @@ impl RawBufferRegistry {
     }
 
     /// Регистрирует новый сырой буфер и резервирует память в соответствующем пуле.
+    ///
+    /// Перед резервированием выполняется проверка наличия свободного места в пуле.
+    /// Если памяти недостаточно, генерируется паника с подробным сообщением.
     pub fn register(
         &mut self,
         device_id: DeviceId,
@@ -42,6 +46,34 @@ impl RawBufferRegistry {
         memory_type: MemoryTypeFilter,
         pools: &mut HashMap<MemoryDeviceKind, MemoryPool>,
     ) -> RawBufferId {
+        let elements = (size_bytes / 4) as usize; // переводим байты в количество f32
+
+        // Определяем целевой пул на основе флагов памяти.
+        let target_pool_kind = memory_kind_from_filter(memory_type, device_id);
+
+        let pool = pools
+            .get_mut(&target_pool_kind)
+            .unwrap_or_else(|| {
+                panic!(
+                    "RawBufferRegistry::register: no memory pool registered for kind {:?}",
+                    target_pool_kind
+                )
+            });
+
+        if !pool.can_allocate(elements) {
+            panic!(
+                "RawBufferRegistry::register: insufficient memory in pool {:?}: required {} elements ({} bytes), available {} elements",
+                target_pool_kind,
+                elements,
+                size_bytes,
+                pool.free_elements()
+            );
+        }
+
+        // Резервируем память в пуле
+        pool.reserve(elements);
+
+        // Создаём запись в реестре
         let id = RawBufferId(self.next_raw_id.fetch_add(1, Ordering::SeqCst));
         self.raw_buffers.insert(
             id,
@@ -51,25 +83,6 @@ impl RawBufferRegistry {
                 memory_type,
             },
         );
-
-        let elements = (size_bytes / 4) as usize; // переводим байты в количество f32
-
-        // Определяем, к какому пулу относится буфер
-        if memory_type
-            .preferred_flags
-            .contains(MemoryTypeFilter::PREFER_DEVICE.preferred_flags)
-        {
-            if let Some(pool) = pools.get_mut(&MemoryDeviceKind::DeviceVram(device_id)) {
-                pool.reserve(elements);
-            }
-        } else if memory_type
-            .preferred_flags
-            .intersects(MemoryTypeFilter::PREFER_HOST.preferred_flags)
-        {
-            if let Some(pool) = pools.get_mut(&MemoryDeviceKind::HostRam) {
-                pool.reserve(elements);
-            }
-        }
 
         id
     }
@@ -82,22 +95,11 @@ impl RawBufferRegistry {
     ) {
         if let Some(info) = self.raw_buffers.remove(&id) {
             let elements = (info.size_bytes / 4) as usize;
-            if info
-                .memory_type
-                .preferred_flags
-                .contains(MemoryTypeFilter::PREFER_DEVICE.preferred_flags)
-            {
-                if let Some(pool) = pools.get_mut(&MemoryDeviceKind::DeviceVram(info.device_id)) {
-                    pool.deallocate(elements);
-                }
-            } else if info
-                .memory_type
-                .preferred_flags
-                .intersects(MemoryTypeFilter::PREFER_HOST.preferred_flags)
-            {
-                if let Some(pool) = pools.get_mut(&MemoryDeviceKind::HostRam) {
-                    pool.deallocate(elements);
-                }
+
+            let target_pool_kind = memory_kind_from_filter(info.memory_type, info.device_id);
+
+            if let Some(pool) = pools.get_mut(&target_pool_kind) {
+                pool.deallocate(elements);
             }
         }
     }
@@ -110,5 +112,39 @@ impl RawBufferRegistry {
     /// Количество зарегистрированных буферов.
     pub fn len(&self) -> usize {
         self.raw_buffers.len()
+    }
+}
+
+/// Определяет тип пула памяти (`MemoryDeviceKind`) на основе флагов `MemoryTypeFilter`.
+///
+/// Устройство:
+/// - если фильтр явно предпочитает или требует `DEVICE_LOCAL`, это VRAM (DeviceVram);
+/// - если фильтр явно предпочитает или требует `HOST_VISIBLE`, это HostRam.
+///
+/// Если ни один из этих флагов не установлен, по умолчанию используется HostRam.
+fn memory_kind_from_filter(
+    memory_type: MemoryTypeFilter,
+    device_id: DeviceId,
+) -> MemoryDeviceKind {
+    let is_device = memory_type
+        .required_flags
+        .contains(MemoryPropertyFlags::DEVICE_LOCAL)
+        || memory_type
+            .preferred_flags
+            .contains(MemoryPropertyFlags::DEVICE_LOCAL);
+
+    let is_host = memory_type
+        .required_flags
+        .contains(MemoryPropertyFlags::HOST_VISIBLE)
+        || memory_type
+            .preferred_flags
+            .contains(MemoryPropertyFlags::HOST_VISIBLE);
+
+    // Если фильтр помечен как DEVICE_LOCAL, считаем это VRAM.
+    // В противном случае — HostRam (даже если is_host == false, это безопасное значение по умолчанию).
+    if is_device {
+        MemoryDeviceKind::DeviceVram(device_id)
+    } else {
+        MemoryDeviceKind::HostRam
     }
 }

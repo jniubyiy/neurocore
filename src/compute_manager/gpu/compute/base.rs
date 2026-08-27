@@ -524,7 +524,13 @@ impl GpuCompute {
         self.release_staging_buffer(staging_buf, staging_raw);
     }
 
-    pub fn download_gpu_handle_to_vec(&self, handle: &MatrixBufferHandle) -> Vec<f32> {
+    /// Скачивает данные из GPU в управляемый CPU‑буфер.
+    ///
+    /// Вместо создания обычного `Vec<f32>`, не учитываемого менеджером памяти,
+    /// возвращается `MatrixBufferHandle` (CPU), память которого резервируется
+    /// через `MemoryExecutor`. Вызывающий код должен освободить этот дескриптор
+    /// после использования (обычно достаточно, чтобы он вышел из области видимости).
+    pub fn download_gpu_handle_to_cpu_handle(&self, handle: &MatrixBufferHandle) -> MatrixBufferHandle {
         assert!(handle.is_gpu(), "Handle must be GPU");
         let elements = handle.rows() * handle.cols();
 
@@ -532,12 +538,20 @@ impl GpuCompute {
         let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
         self.copy_buffer_sync(gpu_buf, staging_buf.clone());
 
-        let data = {
-            let guard = staging_buf.read().expect("read staging buffer");
-            guard[..elements].to_vec()
-        };
+        // Создаём управляемый CPU‑буфер.
+        let cpu_handle = self.allocate_cpu_matrix_handle(handle.rows(), handle.cols());
+
+        // Копируем данные из staging в CPU‑буфер.
+        {
+            let staging_guard = staging_buf.read().expect("read staging buffer");
+            let staging_slice = &staging_guard[..elements];
+            let mut cpu_guard = cpu_handle.write();
+            let cpu_slice = cpu_guard.as_slice_mut().expect("CPU handle must be CPU");
+            cpu_slice.copy_from_slice(staging_slice);
+        }
+
         self.release_staging_buffer(staging_buf, staging_raw);
-        data
+        cpu_handle
     }
 
     pub fn fill_gpu_handle(&self, handle: &MatrixBufferHandle, value: f32) {

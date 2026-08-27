@@ -55,10 +55,17 @@ pub fn compute_loss_gpu_buffered_handle(
     // Финальный буфер – loss (batch, 1) или (batch, features) если SumColumns не последний
     let final_buf = &buffers[current_idx];
     let loss_vec: Vec<f32> = if final_buf.cols() == 1 {
-        gpu.download_gpu_handle_to_vec(final_buf)
+        // Скачиваем в управляемый CPU-буфер и извлекаем данные.
+        let cpu_handle = gpu.download_gpu_handle_to_cpu_handle(final_buf);
+        let guard = cpu_handle.read();
+        guard.as_slice().unwrap().to_vec()
     } else {
         // Если SumColumns не последний, агрегируем на CPU (нестандартный случай)
-        let raw = gpu.download_gpu_handle_to_vec(final_buf);
+        let cpu_handle = gpu.download_gpu_handle_to_cpu_handle(final_buf);
+        let raw = {
+            let guard = cpu_handle.read();
+            guard.as_slice().unwrap().to_vec()
+        };
         let rows = final_buf.rows();
         let cols = final_buf.cols();
         (0..rows)

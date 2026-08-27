@@ -29,8 +29,13 @@ impl GpuCompute {
         assert_eq!(output.rows(), new_rows, "Output rows mismatch");
         assert_eq!(output.cols(), new_cols, "Output cols mismatch");
 
-        // Скачиваем данные в Vec (column-major исходной матрицы)
-        let old_vec = self.download_gpu_handle_to_vec(input);
+        // Скачиваем данные в управляемый CPU-буфер.
+        let cpu_handle = self.download_gpu_handle_to_cpu_handle(input);
+        let old_vec = {
+            let guard = cpu_handle.read();
+            guard.as_slice().unwrap().to_vec()
+        };
+        // cpu_handle выйдет из области видимости и будет освобождён.
 
         // Переупаковка из column-major старой формы в column-major новой формы
         let mut new_vec = vec![0.0f32; total];

@@ -70,7 +70,9 @@ impl GpuCompute {
             [cols as u32, 1, 1], // одна workgroup на столбец
         );
 
-        // Читаем результат обратно в CPU для возврата
-        self.download_gpu_handle_to_vec(output)
+        // Читаем результат обратно в CPU через управляемый буфер.
+        let cpu_handle = self.download_gpu_handle_to_cpu_handle(output);
+        let guard = cpu_handle.read();
+        guard.as_slice().unwrap().to_vec()
     }
 }

@@ -258,43 +258,84 @@ impl BufferedParamStore {
     }
 
     /// Внутренний метод: увеличивает ёмкость всех буферов до `new_capacity`.
+    ///
+    /// В отличие от предыдущей версии, этот метод расширяет существующие CPU‑векторы
+    /// на месте, избегая одновременного существования старых и новых буферов.
+    /// Память резервируется в `MemoryPool` только для разницы.
     fn resize(&mut self, new_capacity: usize) {
         let old_capacity = self.params.rows();
         if new_capacity <= old_capacity {
             return;
         }
 
-        // Сохраняем логические данные.
-        let old_params = read_range(&self.memory, &self.params, 0, self.total_params);
-        let old_state = self
-            .opt_state
-            .as_ref()
-            .map(|s| read_range(&self.memory, s, 0, s.rows()))
-            .unwrap_or_default();
-
-        // Создаём новые буферы большего размера.
-        let new_params = allocate_handle(&self.memory, new_capacity, 1)
-            .expect("BufferedParamStore::resize: failed to allocate params");
-        let new_grads = allocate_handle(&self.memory, new_capacity, 1)
-            .expect("BufferedParamStore::resize: failed to allocate grads");
-
-        write_range(&self.memory, &new_params, 0, &old_params);
-
-        let new_opt_state = if self.state_size_per_param > 0 {
-            let total_state = new_capacity * self.state_size_per_param;
-            let state = allocate_handle(&self.memory, total_state, 1)
-                .expect("BufferedParamStore::resize: failed to allocate opt_state");
-            write_range(&self.memory, &state, 0, &old_state);
-            Some(state)
+        let delta = new_capacity - old_capacity;
+        // Вычисляем, сколько дополнительной памяти нужно для params и grads.
+        let delta_params_grads = delta * 2;
+        // Для состояния: если оно уже существует, расширяем на delta * state_size_per_param.
+        let delta_state = if self.opt_state.is_some() {
+            delta * self.state_size_per_param
         } else {
-            None
+            0
         };
+        let total_delta = delta_params_grads + delta_state;
 
-        // Заменяем старые буферы. Деструкторы старых дескрипторов уменьшат
-        // счётчики ссылок и освободят память, если она больше не используется.
-        self.params = new_params;
-        self.grads = new_grads;
-        self.opt_state = new_opt_state;
+        // Шаг 1: зарезервировать дополнительную память через публичный метод MemoryExecutor.
+        {
+            let mut mem = self.memory.lock().unwrap();
+            mem.reserve_memory(MemoryDeviceKind::HostRam, total_delta)
+                .expect("BufferedParamStore::resize: insufficient HostRam for expansion");
+
+            // Расширяем params
+            {
+                let params_id = self.params.id();
+                let entry = mem.get_matrix_entry_mut(params_id)
+                    .expect("params entry not found");
+                if let MatrixStorage::Cpu(data) = &mut entry.storage {
+                    data.resize(new_capacity, 0.0);
+                    entry.rows = new_capacity;
+                } else {
+                    panic!("BufferedParamStore::resize: params storage must be CPU");
+                }
+            }
+
+            // Расширяем grads
+            {
+                let grads_id = self.grads.id();
+                let entry = mem.get_matrix_entry_mut(grads_id)
+                    .expect("grads entry not found");
+                if let MatrixStorage::Cpu(data) = &mut entry.storage {
+                    data.resize(new_capacity, 0.0);
+                    entry.rows = new_capacity;
+                } else {
+                    panic!("BufferedParamStore::resize: grads storage must be CPU");
+                }
+            }
+        }
+
+        // Шаг 2: обработать opt_state.
+        let required_state_len = new_capacity * self.state_size_per_param;
+        if self.state_size_per_param > 0 {
+            if let Some(state_handle) = &self.opt_state {
+                // Расширяем существующее состояние.
+                let state_id = state_handle.id();
+                let mut mem = self.memory.lock().unwrap();
+                let entry = mem.get_matrix_entry_mut(state_id)
+                    .expect("opt_state entry not found");
+                if let MatrixStorage::Cpu(data) = &mut entry.storage {
+                    data.resize(required_state_len, 0.0);
+                    entry.rows = required_state_len;
+                } else {
+                    panic!("BufferedParamStore::resize: opt_state storage must be CPU");
+                }
+            } else {
+                // Создаём новое состояние.
+                let new_state = allocate_handle(&self.memory, required_state_len, 1)
+                    .expect("BufferedParamStore::resize: failed to allocate opt_state");
+                self.opt_state = Some(new_state);
+            }
+        } else {
+            self.opt_state = None;
+        }
     }
 }
 

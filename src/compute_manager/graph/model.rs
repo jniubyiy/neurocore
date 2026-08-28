@@ -2,38 +2,28 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::compute_manager::device_assignment::SegmentPlacement;
+use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
-use crate::compute_manager::gpu::GpuCompute;
 use crate::compute_manager::memory_executor::MemoryExecutor;
-use crate::compute_manager::adaptive_planner::ProfilingData;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::device_plan::DevicePlan;
+use crate::device_plan::ComputeDevice;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::BufferedParamStore;
 use crate::optimizer_plan::{OptimizerExpr, OptimizerDesc};
 
-pub(crate) struct DevicePlacementState {
-    pub(crate) profiling_data: ProfilingData,
-    pub(crate) placements: Vec<SegmentPlacement>,
-}
-
 pub struct MixedModel {
     pub(crate) segments: Vec<Segment>,
-    pub(crate) segment_placement: Vec<SegmentPlacement>,
     pub(crate) buffered_param_store: Arc<Mutex<BufferedParamStore>>,
     pub(crate) executor: Box<dyn Executor>,
-    pub(crate) gpu_compute: Option<Mutex<GpuCompute>>,
+    pub(crate) compute_executor: Arc<ComputeExecutor>,
     pub(crate) input_stream_count: usize,
     pub(crate) output_stream_count: usize,
     pub(crate) memory_executor: Arc<Mutex<MemoryExecutor>>,
 
     pub(crate) input_shapes: Vec<Vec<usize>>,
     pub(crate) output_shapes: Vec<Vec<usize>>,
-
-    pub(crate) placement_state: Arc<Mutex<DevicePlacementState>>,
 
     /// Пул временных матриц для управляемого выделения памяти на CPU.
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
@@ -68,56 +58,14 @@ impl MixedModel {
         &self.memory_executor
     }
 
-    pub fn maybe_reassign_devices(&mut self, device_plan: &DevicePlan, batch_size: usize) {
-        if self.segment_placement.is_empty() {
-            return;
-        }
-
-        let (need_reassign, profiling_snapshot) = {
-            let state = self.placement_state.lock().unwrap();
-            if state.placements.is_empty() {
-                let initial = self.segment_placement.clone();
-                drop(state);
-                self.allocate_and_set_placements(initial);
-                return;
-            }
-            let mut profiling = state.profiling_data.clone();
-            let should = profiling.tick_and_should_reassign();
-            (should, if should { Some(profiling) } else { None })
-        };
-
-        if need_reassign {
-            let snapshot = profiling_snapshot.unwrap();
-            let new_placements = {
-                let (placements, _keep) = crate::compute_manager::adaptive_planner::assign_devices_adaptive(
-                    &self.segments,
-                    device_plan,
-                    &mut self.memory_executor.lock().unwrap(),
-                    batch_size,
-                    Some(&snapshot),
-                );
-                placements
-            };
-            self.allocate_and_set_placements(new_placements);
-        }
+    /// Возвращает ссылку на вычислительный исполнитель.
+    pub fn compute_executor(&self) -> &Arc<ComputeExecutor> {
+        &self.compute_executor
     }
 
-    fn allocate_and_set_placements(&mut self, new_placements: Vec<SegmentPlacement>) {
-        let mut state = self.placement_state.lock().unwrap();
-        state.placements = new_placements.clone();
-        state.profiling_data = ProfilingData::new();
-        self.segment_placement = new_placements;
-    }
-
-    pub(crate) fn record_segment_timing(
-        &self,
-        seg_index: usize,
-        device: &crate::device_plan::plan::ComputeDevice,
-        duration_ns: f64,
-    ) {
-        if let Ok(mut state) = self.placement_state.lock() {
-            state.profiling_data.add(seg_index, device.clone(), duration_ns);
-        }
+    /// Возвращает сегменты модели (например, для перераспределения).
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
     }
 
     // ===================================================================
@@ -243,8 +191,8 @@ impl MixedModel {
         target: MatrixBufferHandle,
         pool: &mut TempMatrixPool,
     ) -> (f32, MatrixBufferHandle) {
-        if let Some(ref gpu_compute_mutex) = self.gpu_compute {
-            let gpu = gpu_compute_mutex.lock().unwrap();
+        if self.compute_executor.has_gpu() {
+            let gpu = self.compute_executor.gpu_compute().unwrap();
             if pred.is_gpu() && target.is_gpu() {
                 return crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered_handle(
                     &gpu, &expr, &pred, &target,
@@ -258,7 +206,7 @@ impl MixedModel {
     }
 
     // ===================================================================
-    // Новые методы конвертации DynamicTensor <-> MatrixBufferHandle
+    // Конвертация DynamicTensor <-> MatrixBufferHandle
     // ===================================================================
 
     fn dynamic_tensor_to_buffer(
@@ -288,8 +236,10 @@ impl MixedModel {
         shape: &[usize],
     ) -> DynamicTensor {
         if buf.is_gpu() {
-            let gpu_compute = self.gpu_compute.as_ref()
-                .expect("GPU compute not available").lock().unwrap();
+            let gpu_compute = self
+                .compute_executor
+                .gpu_compute()
+                .expect("GPU compute not available");
             // Скачиваем в управляемый CPU-буфер и извлекаем данные.
             let cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(&buf);
             let vec = {
@@ -342,33 +292,18 @@ impl MixedModel {
     }
 
     // ===================================================================
-    // НОВЫЙ МЕТОД: шаг оптимизации через буферизованное хранилище
+    // Шаг оптимизации через буферизованное хранилище
     // ===================================================================
 
-    /// Выполняет один шаг оптимизации, используя `MatrixBufferHandle` и
-    /// `MemoryExecutor`. Параметры и градиенты передаются через дескрипторы,
-    /// состояние оптимизатора хранится в управляемой памяти.
-    ///
-    /// # Аргументы
-    /// * `desc` – описание оптимизатора (цепочка кубиков).
-    /// * `grads` – плоский срез градиентов для текущего шага.
-    ///
-    /// # Паника
-    /// Паникует, если `grads.len()` не совпадает с числом параметров,
-    /// или если оптимизатор не может быть инициализирован.
     pub fn update_params_buffered(&mut self, desc: OptimizerDesc, grads: &[f32]) {
         let chain = desc.build_chain();
         let state_size = chain.total_state_size_per_param();
 
         let mut bp = self.buffered_param_store.lock().unwrap();
 
-        // Гарантируем, что состояние оптимизатора выделено правильно.
         bp.ensure_opt_state(state_size);
-
-        // Копируем градиенты в управляемый буфер.
         bp.copy_grads_from_slice(grads);
 
-        // Инициализация OptimizerExpr при первом вызове.
         if self.optimizer_expr.is_none() {
             let num_params = bp.len();
             let pool_arc = self.temp_matrix_pool.clone();
@@ -382,10 +317,7 @@ impl MixedModel {
             self.optimizer_expr = Some(opt_expr);
         }
 
-        // Выполняем шаг оптимизатора над внутренними буферами.
         let opt = self.optimizer_expr.as_mut().unwrap();
         opt.step_buffered_handle(&bp.params, &bp.grads);
-
-        // Никакого копирования обратно не требуется: параметры уже обновлены.
     }
 }

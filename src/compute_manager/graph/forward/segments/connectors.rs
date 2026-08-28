@@ -21,10 +21,7 @@ impl MixedModel {
         seg_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.segment_placement
-            .get(seg_index)
-            .map(|p| p.compute_device.clone())
-            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+        let device = self.compute_executor.device_for_segment(seg_index);
 
         assert_eq!(stream_buffers.len(), 2, "SplitterConnector buffered: expected 2 input streams");
 
@@ -58,7 +55,7 @@ impl MixedModel {
         *stream_buffers = vec![out_a, out_b];
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.record_segment_timing(seg_index, &device, duration);
+        self.compute_executor.record_segment_time(seg_index, &device, duration);
     }
 
     pub(crate) fn process_combiner_connector_forward_buffered(
@@ -71,10 +68,7 @@ impl MixedModel {
         seg_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.segment_placement
-            .get(seg_index)
-            .map(|p| p.compute_device.clone())
-            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+        let device = self.compute_executor.device_for_segment(seg_index);
 
         let n = input_dims.len();
         assert_eq!(stream_buffers.len(), n,
@@ -90,7 +84,7 @@ impl MixedModel {
         }
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.record_segment_timing(seg_index, &device, duration);
+        self.compute_executor.record_segment_time(seg_index, &device, duration);
     }
 
     pub(crate) fn process_splitter_forward_buffered(
@@ -105,10 +99,7 @@ impl MixedModel {
         seg_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.segment_placement
-            .get(seg_index)
-            .map(|p| p.compute_device.clone())
-            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+        let device = self.compute_executor.device_for_segment(seg_index);
 
         assert_eq!(stream_buffers.len(), 1, "Splitter buffered: expected 1 input stream");
 
@@ -188,7 +179,7 @@ impl MixedModel {
         *stream_buffers = vec![out_a, out_b];
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.record_segment_timing(seg_index, &device, duration);
+        self.compute_executor.record_segment_time(seg_index, &device, duration);
     }
 
     pub(crate) fn process_combiner_forward_buffered(
@@ -203,10 +194,7 @@ impl MixedModel {
         seg_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.segment_placement
-            .get(seg_index)
-            .map(|p| p.compute_device.clone())
-            .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
+        let device = self.compute_executor.device_for_segment(seg_index);
 
         assert_eq!(stream_buffers.len(), 2, "Combiner buffered: expected 2 input streams");
 
@@ -272,6 +260,6 @@ impl MixedModel {
         *stream_buffers = vec![out_handle];
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.record_segment_timing(seg_index, &device, duration);
+        self.compute_executor.record_segment_time(seg_index, &device, duration);
     }
 }

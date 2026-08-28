@@ -7,7 +7,7 @@ use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::gpu::processor::process_forward_gpu_buffered;
-use crate::device_plan::plan::ComputeDevice;
+use crate::device_plan::ComputeDevice;
 
 impl MixedModel {
     // -----------------------------------------------------------------------
@@ -47,6 +47,7 @@ impl MixedModel {
 
         for (seg_index, seg) in segments.iter().enumerate() {
             let start = Instant::now();
+            let device = self.compute_executor.device_for_segment(seg_index);
 
             match seg {
                 Segment::Unsqueeze(target_dims) => {
@@ -72,9 +73,10 @@ impl MixedModel {
                     // Единый дескриптор параметров для CPU и GPU.
                     let params_handle = self.buffered_param_store.lock().unwrap().params_handle().clone();
 
-                    if let Some(ref gpu_compute_mutex) = self.gpu_compute {
-                        let gpu = gpu_compute_mutex.lock().unwrap();
-
+                    if let ComputeDevice::Gpu { .. } = device {
+                        // GPU-путь
+                        let gpu = self.compute_executor.gpu_compute()
+                            .expect("GPU requested but not available");
                         for &stream_idx in &active_indices {
                             let input_buf = stream_buffers[stream_idx].clone();
 
@@ -176,11 +178,7 @@ impl MixedModel {
             }
 
             let duration = start.elapsed().as_nanos() as f64;
-            let device = self.segment_placement
-                .get(seg_index)
-                .map(|p| p.compute_device.clone())
-                .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
-            self.record_segment_timing(seg_index, &device, duration);
+            self.compute_executor.record_segment_time(seg_index, &device, duration);
         }
 
         assert_eq!(

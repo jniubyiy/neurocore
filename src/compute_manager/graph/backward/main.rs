@@ -7,7 +7,7 @@ use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::gpu::processor::process_backward_gpu_buffered;
-use crate::device_plan::plan::ComputeDevice;
+use crate::device_plan::ComputeDevice;
 use crate::layers::{
     UniversalLayer, UniversalLayerBuffered,
     Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
@@ -39,6 +39,7 @@ impl MixedModel {
 
         for (seg_index, seg) in segments.iter().enumerate().rev() {
             let start = Instant::now();
+            let device = self.compute_executor.device_for_segment(seg_index);
 
             match seg {
                 Segment::Unsqueeze(target_dims) => {
@@ -77,8 +78,10 @@ impl MixedModel {
                         let ctxs_owned: Vec<DynamicContext> = layer_ctxs.iter().map(|&c| c.clone()).collect();
                         let ctxs_slice: &[DynamicContext] = &ctxs_owned;
 
-                        if self.gpu_compute.is_some() {
-                            let gpu = self.gpu_compute.as_ref().unwrap().lock().unwrap();
+                        if let ComputeDevice::Gpu { .. } = device {
+                            // GPU-путь
+                            let gpu = self.compute_executor.gpu_compute()
+                                .expect("GPU requested but not available");
 
                             let delta_gpu_handle = if delta_handle.is_gpu() {
                                 delta_handle.clone()
@@ -101,12 +104,15 @@ impl MixedModel {
                                 &grad_params_handle,
                             );
 
-                            // Новый способ: прямое копирование GPU->CPU без faer::Mat
+                            // Копируем результат из GPU в CPU, так как дальнейшие сегменты
+                            // могут выполняться на CPU (или мы можем оставить на GPU,
+                            // если следующий сегмент тоже GPU, но для простоты всегда
+                            // возвращаем CPU, чтобы не усложнять).
                             let cpu_handle = pool.acquire(out_gpu.rows(), out_gpu.cols());
                             gpu.copy_gpu_to_cpu_handle(&out_gpu, &cpu_handle);
-
                             new_gradients[stream_idx] = Some(cpu_handle);
                         } else {
+                            // CPU-путь
                             let in_delta_handle = self.backward_universal_batch_buffered_handle(
                                 pool,
                                 proc,
@@ -388,11 +394,7 @@ impl MixedModel {
             }
 
             let duration = start.elapsed().as_nanos() as f64;
-            let device = self.segment_placement
-                .get(seg_index)
-                .map(|p| p.compute_device.clone())
-                .unwrap_or(ComputeDevice::Cpu { id: 0, threads: 1 });
-            self.record_segment_timing(seg_index, &device, duration);
+            self.compute_executor.record_segment_time(seg_index, &device, duration);
         }
 
         assert_eq!(stream_gradients.len(), self.input_stream_count);

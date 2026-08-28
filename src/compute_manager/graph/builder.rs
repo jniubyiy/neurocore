@@ -2,20 +2,17 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::cpu::{CostModel, Scheduler, WorkerPool};
 use crate::compute_manager::cpu::hardware::CPU_INFO;
 use crate::compute_manager::device::Device;
-use crate::compute_manager::device_assignment::assign_devices_initial;
-use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::executor::Executor;
-use crate::compute_manager::gpu::pipeline::PipelineCache;
-use crate::compute_manager::gpu::GpuCompute;
-use crate::compute_manager::graph::model::{DevicePlacementState, MixedModel};
+use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::matrix_buffer::TempMatrixPool;
 use crate::device_plan::{ComputeDevice, DevicePlan};
 use crate::layers::UniversalLayer;
-use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::blueprint::LayerKind;
+use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::param_store::{ParamSlice, BufferedParamStore};
 
 use super::types::Segment;
@@ -78,72 +75,47 @@ impl MixedModel {
         batch_size: usize,
     ) -> Result<Self, String> {
         // -----------------------------------------------------------
-        // 1. Создаём MemoryExecutor и получаем GPU-контекст
+        // 1. Создаём MemoryExecutor
         // -----------------------------------------------------------
-        let (memory_executor, gpu_context) = device_plan.build_memory_executor();
-        eprintln!("[BUILDER] gpu_context is_some = {}", gpu_context.is_some());
+        let (memory_executor, _gpu_context) = device_plan.build_memory_executor();
 
         // -----------------------------------------------------------
-        // 2. Суммарное количество потоков CPU
+        // 2. Создаём вычислительный исполнитель (ComputeExecutor)
         // -----------------------------------------------------------
-        let cpu_threads: usize = device_plan.compute_devices.iter()
-            .filter_map(|d| match d {
-                ComputeDevice::Cpu { threads, .. } => Some(*threads),
-                _ => None,
-            })
-            .sum();
-        let cpu_threads = cpu_threads.max(1);
+        let compute_executor = Arc::new(
+            ComputeExecutor::new(device_plan.clone(), memory_executor.clone())
+                .map_err(|e| format!("Failed to create ComputeExecutor: {}", e))?
+        );
 
-        // Количество CPU (для mini‑model)
+        // -----------------------------------------------------------
+        // 3. Суммарное количество потоков CPU
+        // -----------------------------------------------------------
+        let cpu_threads = compute_executor.cpu_threads();
         let num_cpus = device_plan.compute_devices.iter()
             .filter(|d| matches!(d, ComputeDevice::Cpu { .. }))
             .count()
             .max(1);
 
         // -----------------------------------------------------------
-        // 3. Буферизованное хранилище параметров
+        // 4. Буферизованное хранилище параметров
         // -----------------------------------------------------------
         let buffered_param_store = Arc::new(Mutex::new(
             BufferedParamStore::new(memory_executor.clone(), 0, 0)
         ));
 
+        // -----------------------------------------------------------
+        // 5. Создаём CPU-исполнитель (WorkerPool + Scheduler)
+        // -----------------------------------------------------------
         let cost = CostModel::calibrate();
         let mut scheduler = Scheduler::new_with_cpus(cost, CPU_INFO.clone(), num_cpus);
         scheduler.set_num_workers(cpu_threads);
         let pool = Arc::new(WorkerPool::new(cpu_threads));
-        let cpu_executor: Box<dyn Executor> = Box::new(CpuExecutor::new(pool.clone(), Arc::new(Mutex::new(scheduler.clone()))));
+        let cpu_executor: Box<dyn Executor> = Box::new(
+            CpuExecutor::new(pool.clone(), Arc::new(Mutex::new(scheduler.clone())))
+        );
 
         // -----------------------------------------------------------
-        // 4. Настройка исполнителя (CPU или GPU)
-        // -----------------------------------------------------------
-        let mut gpu_compute: Option<Mutex<GpuCompute>> = None;
-        let executor: Box<dyn Executor> = if let Some(gpu_ctx) = gpu_context {
-            let gpu_id = device_plan.compute_devices.iter()
-                .find_map(|d| if let ComputeDevice::Gpu { id } = d { Some(*id) } else { None })
-                .unwrap_or(0);
-            let gpu_executor = crate::compute_manager::gpu::GpuExecutor::new(gpu_ctx.as_ref().clone());
-            let pipeline_cache = Arc::new(PipelineCache::new(gpu_ctx.device.clone()));
-
-            eprintln!("[BUILDER] PipelineCache created successfully");
-
-            let gpu_compute_instance = GpuCompute::new(
-                gpu_ctx,
-                pipeline_cache,
-                memory_executor.clone(),
-                DeviceId(gpu_id),
-            );
-
-            eprintln!("[BUILDER] GpuCompute created successfully");
-
-            gpu_compute = Some(Mutex::new(gpu_compute_instance));
-            Box::new(gpu_executor)
-        } else {
-            eprintln!("[BUILDER] No GPU context, falling back to CPU");
-            cpu_executor.clone_executor()
-        };
-
-        // -----------------------------------------------------------
-        // 5. Строим сегменты модели
+        // 6. Строим сегменты модели
         // -----------------------------------------------------------
         let mut segments: Vec<Segment> = Vec::new();
         let mut current_layers: Vec<Box<dyn UniversalLayer>> = Vec::new();
@@ -169,9 +141,6 @@ impl MixedModel {
                 LayerKind::SplitterConnector => {
                     finalize_universal!();
 
-                    // Определяем, какие порты заданы.
-                    // В конце модели они могут быть заданы через .input(...),
-                    // в начале следующей — через .output(...).
                     let dims: Vec<usize> = if !desc.output_shape.streams.is_empty() {
                         desc.output_shape.streams.clone()
                     } else {
@@ -179,34 +148,22 @@ impl MixedModel {
                     };
 
                     if dims.len() == 1 {
-                        // Одиночный порт: выбираем соответствующую ветку.
-                        // Текущие active_ports должны быть уже установлены (например, после Splitter).
                         if let Some(ref ports) = active_ports {
                             if let Some(pos) = ports.iter().position(|&p| p == dims[0]) {
                                 current_branch = Some(pos);
                             } else {
-                                // Если порт не найден, считаем, что это единственная ветка.
                                 current_branch = Some(0);
                             }
                         } else {
-                            // Если active_ports ещё не заданы (например, в начале модели),
-                            // то просто устанавливаем этот порт как единственный.
                             active_ports = Some(vec![dims[0]]);
                             current_branch = Some(0);
                         }
                     } else {
-                        // Несколько портов: объявляем доступные потоки.
-                        // Обычно это происходит после Splitter или перед Combiner.
                         active_ports = Some(dims.clone());
                         current_branch = None;
                     }
-                    // Сегмент для коннектора не создаём, он не выполняет вычислений.
                 }
                 LayerKind::CombinerConnector => {
-                    // CombinerConnector используется для маркировки окончания ветки.
-                    // Он не влияет на граф вычислений, поэтому просто пропускаем его.
-                    // Однако, если после него идёт обычный слой, это уже обработается в следующей итерации.
-                    // Никаких действий не требуется.
                     continue;
                 }
                 LayerKind::Splitter => {
@@ -252,7 +209,6 @@ impl MixedModel {
                     segments.push(Segment::ReduceMean(target_dims));
                 }
                 _ => {
-                    // Обычный слой: определяем, в каком потоке он выполняется
                     if current_stream_indices.is_none() {
                         let indices = if let Some(ref ports) = active_ports {
                             if let Some(ref mut branch) = current_branch {
@@ -295,12 +251,7 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
-        // 5.5 Получаем начальное размещение без резервирования памяти
-        // -----------------------------------------------------------
-        let segment_placement = assign_devices_initial(&segments, &device_plan, batch_size);
-
-        // -----------------------------------------------------------
-        // 6. Вычисляем ожидаемые формы входных и выходных тензоров
+        // 7. Вычисляем ожидаемые формы входных и выходных тензоров
         // -----------------------------------------------------------
         let input_shapes: Vec<Vec<usize>> = vec![layers.first().unwrap().input_shape.streams.clone()];
         let output_shapes: Vec<Vec<usize>> = if output_stream_count == 1 {
@@ -314,48 +265,36 @@ impl MixedModel {
                 Segment::SplitterConnector { dim_a, dim_b } => {
                     vec![vec![*dim_a], vec![*dim_b]]
                 }
-                _ => {
-                    vec![]
-                }
+                _ => vec![],
             }
         };
 
         // -----------------------------------------------------------
-        // 7. Создаём пул временных матриц
+        // 8. Создаём пул временных матриц
         // -----------------------------------------------------------
         let temp_matrix_pool = Arc::new(Mutex::new(TempMatrixPool::new(memory_executor.clone())));
 
-        eprintln!(
-            "[BUILDER] gpu_compute.is_some() = {}",
-            gpu_compute.is_some()
-        );
+        // -----------------------------------------------------------
+        // 9. Выполняем начальное размещение сегментов
+        // -----------------------------------------------------------
+        compute_executor.redistribute(&segments, batch_size, true);
 
         // -----------------------------------------------------------
-        // 8. Собираем MixedModel с начальным состоянием размещения
+        // 10. Собираем MixedModel
         // -----------------------------------------------------------
-        let mut model = MixedModel {
+        let model = MixedModel {
             segments,
-            segment_placement: segment_placement.clone(),
             buffered_param_store,
-            executor,
-            gpu_compute,
+            executor: cpu_executor,
+            compute_executor,
             input_stream_count,
             output_stream_count,
             memory_executor,
             input_shapes,
             output_shapes,
-            placement_state: Arc::new(Mutex::new(DevicePlacementState {
-                profiling_data: crate::compute_manager::adaptive_planner::ProfilingData::new(),
-                placements: vec![],
-            })),
             temp_matrix_pool,
             optimizer_expr: None,
         };
-
-        // -----------------------------------------------------------
-        // 9. Выделяем постоянные буферы для начального размещения
-        // -----------------------------------------------------------
-        model.maybe_reassign_devices(&device_plan, batch_size);
 
         Ok(model)
     }

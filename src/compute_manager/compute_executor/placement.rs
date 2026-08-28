@@ -1,4 +1,4 @@
-// src/compute_manager/device_assignment.rs
+// src/compute_manager/compute_executor/placement.rs
 
 use crate::compute_manager::graph::types::Segment;
 use crate::device_plan::plan::{ComputeDevice, DevicePlan, StorageDevice};
@@ -18,7 +18,7 @@ pub struct SegmentPlacement {
 
 /// Выполняет начальное назначение вычислительных устройств для сегментов модели
 /// без учёта текущей загрузки памяти (без резервирования).
-/// 
+///
 /// # Аргументы
 /// * `segments` – список сегментов модели.
 /// * `device_plan` – план устройств (вычислительные и хранилища).
@@ -26,7 +26,7 @@ pub struct SegmentPlacement {
 ///
 /// # Возвращает
 /// Вектор `SegmentPlacement` с назначенными устройствами.
-pub fn assign_devices_initial(
+pub fn assign_initial(
     segments: &[Segment],
     device_plan: &DevicePlan,
     _batch_size: usize,
@@ -193,7 +193,7 @@ fn segment_has_params(segment: &Segment) -> bool {
 
 /// Подстраивает размещение коннекторов и операций размерности так,
 /// чтобы они использовали то же устройство, что и соседний вычислительный сегмент.
-fn optimize_connectors(
+pub(crate) fn optimize_connectors(
     segments: &[Segment],
     placements: &mut Vec<SegmentPlacement>,
 ) {

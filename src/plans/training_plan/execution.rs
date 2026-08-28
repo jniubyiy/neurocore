@@ -74,8 +74,9 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     let _ = Plan::from_layer_descs(model_desc.clone())?;
     let mut model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
 
-    // --- первоначальное выделение persistent‑буферов и адаптивное размещение ---
-    model.maybe_reassign_devices(device_plan, plan.batch_size);
+    // --- первоначальное размещение сегментов уже выполнено в конструкторе ---
+    // Теперь при каждой эпохе будем вызывать redistribute с force=true,
+    // чтобы перераспределять на основе накопленной статистики.
 
     // --- инициализация весов ---
     {
@@ -156,8 +157,9 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     let mut zero_loss_epoch: Option<usize> = None;
 
     for epoch in 0..plan.epochs {
-        // Адаптивная реаллокация перед каждой эпохой
-        model.maybe_reassign_devices(device_plan, plan.batch_size);
+        // Перед каждой эпохой перераспределяем сегменты по устройствам
+        // на основе накопленной профилировочной статистики.
+        model.compute_executor().redistribute(model.segments(), plan.batch_size, true);
 
         let mut epoch_loss = 0.0f32;
 

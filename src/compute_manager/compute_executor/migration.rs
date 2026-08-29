@@ -3,8 +3,8 @@
 use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
-use crate::compute_manager::graph::types::Segment;
-use crate::compute_manager::compute_executor::placement::SegmentPlacement;
+use crate::compute_manager::graph::types::Model;
+use crate::compute_manager::compute_executor::placement::ModelPlacement;
 
 /// Перемещает один буфер на целевое устройство хранения.
 ///
@@ -38,14 +38,14 @@ pub fn migrate_buffers_to_device(
     Ok(())
 }
 
-/// Выполняет миграцию данных для сегментов в соответствии с новым размещением.
+/// Выполняет миграцию данных для моделей в соответствии с новым размещением.
 ///
 /// В текущей архитектуре параметры модели хранятся в общем CPU‑буфере,
-/// поэтому перенос на уровне сегментов не требуется. Функция оставлена
-/// для будущих версий, когда у сегментов появятся собственные буферы.
-pub fn migrate_segments(
-    _segments: &[Segment],
-    _new_placement: &[SegmentPlacement],
+/// поэтому перенос на уровне моделей не требуется. Функция оставлена
+/// для будущих версий, когда у моделей появятся собственные буферы.
+pub fn migrate_models(
+    _models: &[Model],
+    _new_placement: &[ModelPlacement],
     _memory_executor: &std::sync::Arc<std::sync::Mutex<MemoryExecutor>>,
 ) {
     // В данной версии не выполняется: параметры общие, миграция не нужна.

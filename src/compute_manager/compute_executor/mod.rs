@@ -6,7 +6,7 @@ use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::memory_executor::MemoryExecutor;
-use crate::compute_manager::graph::types::Segment;
+use crate::compute_manager::graph::types::Model;
 use crate::device_plan::plan::{ComputeDevice, DevicePlan};
 
 pub mod placement;
@@ -14,21 +14,21 @@ pub mod profiling;
 pub mod strategy;
 pub mod migration;
 
-pub use placement::SegmentPlacement;
+pub use placement::ModelPlacement;
 pub use profiling::ProfilingState;
 
 /// Центральный исполнитель для вычислительных устройств.
 ///
-/// Управляет размещением сегментов модели по доступным вычислительным устройствам
-/// (CPU, GPU) с целью максимизации общей производительности. Пересматривает
-/// размещение перед каждой новой эпохой обучения, используя накопленную
-/// профилировочную статистику.
+/// Управляет размещением моделей вычислительного графа по доступным
+/// вычислительным устройствам (CPU, GPU) с целью максимизации общей
+/// производительности. Пересматривает размещение перед каждой новой
+/// эпохой обучения, используя накопленную профилировочную статистику.
 pub struct ComputeExecutor {
     device_plan: DevicePlan,
     gpu_compute: Option<Mutex<GpuCompute>>,
     memory_executor: Arc<Mutex<MemoryExecutor>>,
     profiling: Mutex<ProfilingState>,
-    current_placement: Mutex<Vec<SegmentPlacement>>,
+    current_placement: Mutex<Vec<ModelPlacement>>,
     epoch_counter: Mutex<usize>,
 }
 
@@ -113,25 +113,25 @@ impl ComputeExecutor {
         self.gpu_compute.as_ref().map(|m| m.lock().unwrap())
     }
 
-    /// Вычисляет начальное размещение сегментов (статическая эвристика).
+    /// Вычисляет начальное размещение моделей (статическая эвристика).
     pub fn initial_placement(
         &self,
-        segments: &[Segment],
+        models: &[Model],
         batch_size: usize,
-    ) -> Vec<SegmentPlacement> {
-        placement::assign_initial(segments, &self.device_plan, batch_size)
+    ) -> Vec<ModelPlacement> {
+        placement::assign_initial(models, &self.device_plan, batch_size)
     }
 
-    /// Пересматривает размещение сегментов, если наступила новая эпоха или принудительно.
+    /// Пересматривает размещение моделей, если наступила новая эпоха или принудительно.
     ///
     /// # Аргументы
-    /// * `segments` – список сегментов модели.
+    /// * `models` – список моделей вычислительного графа.
     /// * `batch_size` – текущий размер батча.
     /// * `force` – если `true`, перераспределение выполняется всегда,
     ///   независимо от номера эпохи.
     pub fn redistribute(
         &self,
-        segments: &[Segment],
+        models: &[Model],
         batch_size: usize,
         force: bool,
     ) {
@@ -145,12 +145,9 @@ impl ComputeExecutor {
             || self.profiling.lock().unwrap().should_reassign(current_epoch);
 
         if should_reassign {
-            let new_placement = self.compute_adaptive_placement(segments, batch_size);
-            // Здесь можно выполнить миграцию данных между устройствами,
-            // но поскольку параметры модели хранятся в одном общем CPU‑буфере,
-            // фактическое перемещение не требуется для вычислительного процесса.
-            // В будущем, если появятся сегментно-локальные буферы, здесь будет вызов
-            // migration::migrate_segments(segments, &new_placement, &self.memory_executor);
+            let new_placement = self.compute_adaptive_placement(models, batch_size);
+            // Фактическая миграция вызывается из MixedModel::migrate_parameters
+            // после обновления размещения.
             let mut placement_guard = self.current_placement.lock().unwrap();
             *placement_guard = new_placement.clone();
             self.profiling.lock().unwrap().mark_reassigned(current_epoch);
@@ -162,13 +159,13 @@ impl ComputeExecutor {
     /// Внутренний метод для адаптивного выбора устройств.
     fn compute_adaptive_placement(
         &self,
-        segments: &[Segment],
+        models: &[Model],
         batch_size: usize,
-    ) -> Vec<SegmentPlacement> {
+    ) -> Vec<ModelPlacement> {
         let profiling = self.profiling.lock().unwrap();
         let current = self.current_placement.lock().unwrap();
         strategy::compute_adaptive_placement(
-            segments,
+            models,
             &self.device_plan,
             batch_size,
             &profiling,
@@ -176,11 +173,11 @@ impl ComputeExecutor {
         )
     }
 
-    /// Возвращает вычислительное устройство, назначенное сегменту с указанным индексом.
-    pub fn device_for_segment(&self, seg_index: usize) -> ComputeDevice {
+    /// Возвращает вычислительное устройство, назначенное модели с указанным индексом.
+    pub fn device_for_model(&self, model_index: usize) -> ComputeDevice {
         let placement = self.current_placement.lock().unwrap();
         placement
-            .get(seg_index)
+            .get(model_index)
             .map(|p| p.compute_device.clone())
             .unwrap_or_else(|| {
                 // Если размещение ещё не задано, возвращаем первый CPU или GPU из плана.
@@ -192,21 +189,21 @@ impl ComputeExecutor {
             })
     }
 
-    /// Записывает время выполнения сегмента на заданном устройстве для профилирования.
-    pub fn record_segment_time(
+    /// Записывает время выполнения модели на заданном устройстве для профилирования.
+    pub fn record_model_time(
         &self,
-        seg_index: usize,
+        model_index: usize,
         device: &ComputeDevice,
         duration_ns: f64,
     ) {
         self.profiling
             .lock()
             .unwrap()
-            .add_timing(seg_index, device.clone(), duration_ns);
+            .add_timing(model_index, device.clone(), duration_ns);
     }
 
     /// Возвращает копию текущего размещения.
-    pub fn get_placement(&self) -> Vec<SegmentPlacement> {
+    pub fn get_placement(&self) -> Vec<ModelPlacement> {
         self.current_placement.lock().unwrap().clone()
     }
 

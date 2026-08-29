@@ -1,36 +1,36 @@
 // src/compute_manager/compute_executor/placement.rs
 
-use crate::compute_manager::graph::types::Segment;
+use crate::compute_manager::graph::types::Model;
 use crate::device_plan::plan::{ComputeDevice, DevicePlan, StorageDevice};
 
-/// Информация о размещении одного сегмента модели.
+/// Информация о размещении одной модели вычислительного графа.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentPlacement {
-    /// Индекс сегмента в списке segments модели.
-    pub segment_index: usize,
-    /// На каком вычислительном устройстве исполняется сегмент.
+pub struct ModelPlacement {
+    /// Индекс модели в списке models.
+    pub model_index: usize,
+    /// На каком вычислительном устройстве исполняется модель.
     pub compute_device: ComputeDevice,
-    /// Где хранятся параметры этого сегмента (если есть).
-    /// None — если сегмент не имеет обучаемых параметров
+    /// Где хранятся параметры этой модели (если есть).
+    /// None — если модель не имеет обучаемых параметров
     /// (например, ReLU, Sigmoid, Unsqueeze, коннекторы).
     pub parameter_storage: Option<StorageDevice>,
 }
 
-/// Выполняет начальное назначение вычислительных устройств для сегментов модели
+/// Выполняет начальное назначение вычислительных устройств для моделей
 /// без учёта текущей загрузки памяти (без резервирования).
 ///
 /// # Аргументы
-/// * `segments` – список сегментов модели.
+/// * `models` – список моделей вычислительного графа.
 /// * `device_plan` – план устройств (вычислительные и хранилища).
 /// * `batch_size` – размер батча (пока используется только для информации, не влияет на решение).
 ///
 /// # Возвращает
-/// Вектор `SegmentPlacement` с назначенными устройствами.
+/// Вектор `ModelPlacement` с назначенными устройствами.
 pub fn assign_initial(
-    segments: &[Segment],
+    models: &[Model],
     device_plan: &DevicePlan,
     _batch_size: usize,
-) -> Vec<SegmentPlacement> {
+) -> Vec<ModelPlacement> {
     // Если нет ни одного устройства, возвращаем пустой вектор.
     if device_plan.compute_devices.is_empty() {
         return Vec::new();
@@ -60,15 +60,15 @@ pub fn assign_initial(
             }
         });
 
-    let mut placements = Vec::with_capacity(segments.len());
+    let mut placements = Vec::with_capacity(models.len());
     let mut last_compute = gpu_device.unwrap_or_else(|| default_cpu.clone());
 
-    for (idx, segment) in segments.iter().enumerate() {
-        // Выбираем устройство на основе эвристики «тяжести» сегмента.
-        let compute_device = pick_initial_device(segment, &device_plan.compute_devices, &last_compute);
+    for (idx, model) in models.iter().enumerate() {
+        // Выбираем устройство на основе эвристики «тяжести» модели.
+        let compute_device = pick_initial_device(model, &device_plan.compute_devices, &last_compute);
 
         // Определяем необходимость и место хранения параметров.
-        let has_params = segment_has_params(segment);
+        let has_params = model_has_params(model);
         let parameter_storage = if has_params {
             match &compute_device {
                 ComputeDevice::Gpu { id } => {
@@ -107,8 +107,8 @@ pub fn assign_initial(
             None
         };
 
-        placements.push(SegmentPlacement {
-            segment_index: idx,
+        placements.push(ModelPlacement {
+            model_index: idx,
             compute_device: compute_device.clone(),
             parameter_storage,
         });
@@ -117,15 +117,15 @@ pub fn assign_initial(
     }
 
     // Оптимизация: коннекторы и операции размерности оставляем на том же устройстве,
-    // что и соседние сегменты, чтобы избежать лишних копирований.
-    optimize_connectors(segments, &mut placements);
+    // что и соседние модели, чтобы избежать лишних копирований.
+    optimize_connectors(models, &mut placements);
 
     placements
 }
 
-/// Простейшая эвристика выбора устройства для сегмента.
+/// Простейшая эвристика выбора устройства для модели.
 fn pick_initial_device(
-    segment: &Segment,
+    model: &Model,
     devices: &[ComputeDevice],
     last_device: &ComputeDevice,
 ) -> ComputeDevice {
@@ -144,14 +144,14 @@ fn pick_initial_device(
             .unwrap_or_else(|| last_device.clone());
     }
 
-    // Оцениваем «тяжесть» сегмента.
-    let heavy = match segment {
-        Segment::UniversalProcessor(layers, _slices, _) => {
+    // Оцениваем «тяжесть» модели.
+    let heavy = match model {
+        Model::UniversalProcessor(layers, _slices, _) => {
             let total_params: usize = layers.iter().map(|l| l.param_len()).sum();
             // Порог: если параметров больше 1000, то GPU предпочтительнее.
             total_params > 1000
         }
-        Segment::Splitter { .. } | Segment::Combiner { .. } => true,
+        Model::Splitter { .. } | Model::Combiner { .. } => true,
         _ => false,
     };
 
@@ -182,22 +182,22 @@ fn pick_initial_device(
     }
 }
 
-/// Проверяет, есть ли у сегмента обучаемые параметры.
-fn segment_has_params(segment: &Segment) -> bool {
-    match segment {
-        Segment::UniversalProcessor(layers, _slices, _) => layers.iter().any(|l| l.param_len() > 0),
-        Segment::Splitter { .. } | Segment::Combiner { .. } => true,
+/// Проверяет, есть ли у модели обучаемые параметры.
+fn model_has_params(model: &Model) -> bool {
+    match model {
+        Model::UniversalProcessor(layers, _slices, _) => layers.iter().any(|l| l.param_len() > 0),
+        Model::Splitter { .. } | Model::Combiner { .. } => true,
         _ => false,
     }
 }
 
 /// Подстраивает размещение коннекторов и операций размерности так,
-/// чтобы они использовали то же устройство, что и соседний вычислительный сегмент.
+/// чтобы они использовали то же устройство, что и соседняя вычислительная модель.
 pub(crate) fn optimize_connectors(
-    segments: &[Segment],
-    placements: &mut Vec<SegmentPlacement>,
+    models: &[Model],
+    placements: &mut Vec<ModelPlacement>,
 ) {
-    let n = segments.len();
+    let n = models.len();
     if n == 0 {
         return;
     }
@@ -207,14 +207,14 @@ pub(crate) fn optimize_connectors(
 
     // Проход слева направо: коннекторы и dim‑операции привязываются к левому соседу.
     for i in 1..n {
-        if is_connector_or_dimop(&segments[i]) {
+        if is_connector_or_dimop(&models[i]) {
             devices[i] = devices[i - 1].clone();
         }
     }
 
     // Проход справа налево: подстраиваем те, что не были охвачены левым проходом.
     for i in (0..n - 1).rev() {
-        if is_connector_or_dimop(&segments[i]) {
+        if is_connector_or_dimop(&models[i]) {
             devices[i] = devices[i + 1].clone();
         }
     }
@@ -225,13 +225,13 @@ pub(crate) fn optimize_connectors(
     }
 }
 
-/// Является ли сегмент коннектором или операцией изменения размерности.
-fn is_connector_or_dimop(segment: &Segment) -> bool {
+/// Является ли модель коннектором или операцией изменения размерности.
+fn is_connector_or_dimop(model: &Model) -> bool {
     matches!(
-        segment,
-        Segment::SplitterConnector { .. }
-            | Segment::CombinerConnector { .. }
-            | Segment::Unsqueeze(_)
-            | Segment::ReduceMean(_)
+        model,
+        Model::SplitterConnector { .. }
+            | Model::CombinerConnector { .. }
+            | Model::Unsqueeze(_)
+            | Model::ReduceMean(_)
     )
 }

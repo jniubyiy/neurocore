@@ -13,9 +13,13 @@ pub enum DynamicContext {
     Buffered(BufferedContext),
 }
 
-/// Типы сегментов вычислительного графа.
+/// Типы моделей вычислительного графа.
+///
+/// Модель представляет собой логическую группу слоёв или операцию,
+/// которая может быть размещена на вычислительном устройстве независимо.
+/// Ранее называлась "сегментом".
 #[derive(Clone)]
-pub enum Segment {
+pub enum Model {
     UniversalProcessor(
         Arc<Vec<Box<dyn UniversalLayer>>>,
         Vec<ParamSlice>,

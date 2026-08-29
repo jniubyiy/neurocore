@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::memory_executor::MatrixBufferId;
-use crate::compute_manager::graph::types::Segment;
+use crate::compute_manager::graph::types::Model;
 
 /// Статистика по параметрам модели или градиентам
 #[derive(Debug, Clone)]
@@ -30,8 +30,8 @@ pub struct TensorDiagInfo {
 pub struct DiagContext {
     /// Список зарегистрированных устройств (их строковые описания)
     pub device_info: Vec<String>,
-    /// Краткое описание сегментов модели
-    pub segment_summary: Vec<String>,
+    /// Краткое описание моделей
+    pub model_summary: Vec<String>,
     /// Снимок состояния тензоров (MatrixBufferId -> информация)
     pub tensor_snapshot: HashMap<MatrixBufferId, TensorDiagInfo>,
     /// Статистика параметров модели
@@ -47,7 +47,7 @@ impl DiagContext {
     pub fn new(error_message: impl Into<String>) -> Self {
         Self {
             device_info: Vec::new(),
-            segment_summary: Vec::new(),
+            model_summary: Vec::new(),
             tensor_snapshot: HashMap::new(),
             params_stats: None,
             last_step_description: String::new(),
@@ -60,8 +60,8 @@ impl DiagContext {
 ///
 /// # Аргументы
 /// * `device_info` – список строк с описанием устройств
-/// * `segment_summary` – список строк с описанием сегментов
-/// * `_segments` – ссылка на сегменты (задел на будущее)
+/// * `model_summary` – список строк с описанием моделей
+/// * `_models` – ссылка на модели (задел на будущее)
 /// * `tensor_loc` – карта расположения тензоров (MatrixBufferId -> DeviceId)
 /// * `tensor_sizes` – карта размеров тензоров (MatrixBufferId -> количество элементов)
 /// * `params` – плоский срез всех параметров модели
@@ -70,8 +70,8 @@ impl DiagContext {
 /// * `error_message` – текст ошибки
 pub fn capture_diagnostics(
     device_info: Vec<String>,
-    segment_summary: Vec<String>,
-    _segments: &[Segment],               // задел на будущее
+    model_summary: Vec<String>,
+    _models: &[Model],               // задел на будущее
     tensor_loc: &HashMap<MatrixBufferId, DeviceId>,
     tensor_sizes: &HashMap<MatrixBufferId, usize>,
     params: &[f32],
@@ -100,7 +100,7 @@ pub fn capture_diagnostics(
 
     DiagContext {
         device_info,
-        segment_summary,
+        model_summary,
         tensor_snapshot,
         params_stats,
         last_step_description,
@@ -171,9 +171,9 @@ pub fn format_diagnostics_report(ctx: &DiagContext) -> String {
         writeln!(s, "  [{}] {}", i, dev).ok();
     }
 
-    writeln!(s, "\n--- Segments ---").ok();
-    for (i, seg) in ctx.segment_summary.iter().enumerate() {
-        writeln!(s, "  [{}] {}", i, seg).ok();
+    writeln!(s, "\n--- Models ---").ok();
+    for (i, model) in ctx.model_summary.iter().enumerate() {
+        writeln!(s, "  [{}] {}", i, model).ok();
     }
 
     writeln!(s, "\n--- Tensor Snapshot ---").ok();

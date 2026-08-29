@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::compute_manager::dim_change;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
-use crate::compute_manager::graph::types::{DynamicContext, Segment};
+use crate::compute_manager::graph::types::{DynamicContext, Model};
 use crate::compute_manager::gpu::processor::process_backward_gpu_buffered;
 use crate::device_plan::ComputeDevice;
 use crate::layers::{
@@ -26,44 +26,41 @@ impl MixedModel {
             "backward_mat_multi_buffered: expected {} deltas, got {}",
             self.output_stream_count, deltas.len());
 
-        // Убираем старый код получения params_handle из buffered_param_store.
-        // Теперь параметры получаются посегментно внутри цикла.
-
         let mut stream_gradients = deltas;
         let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
         let mut ctx_pos = total_context_len;
 
-        let segments = self.segments.clone();
+        let models = self.models.clone();
 
-        for (seg_index, seg) in segments.iter().enumerate().rev() {
+        for (model_index, model) in models.iter().enumerate().rev() {
             let start = Instant::now();
-            let device = self.compute_executor.device_for_segment(seg_index);
+            let device = self.compute_executor.device_for_model(model_index);
 
-            // Получаем дескрипторы параметров и градиентов для этого сегмента.
+            // Получаем дескрипторы параметров и градиентов для этой модели.
             // Если параметров нет, создаём пустые CPU-буферы.
             let params_handle = self
-                .get_params_handle_for_segment(seg_index)
+                .get_params_handle_for_model(model_index)
                 .unwrap_or_else(|| pool.acquire(0, 0));
             let grad_params_handle = self
-                .get_grads_handle_for_segment(seg_index)
+                .get_grads_handle_for_model(model_index)
                 .unwrap_or_else(|| pool.acquire(0, 0));
 
-            match seg {
-                Segment::Unsqueeze(target_dims) => {
+            match model {
+                Model::Unsqueeze(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
                         new_stream.push(dim_change::reduce_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_gradients = new_stream;
                 }
-                Segment::ReduceMean(target_dims) => {
+                Model::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
                         new_stream.push(dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_gradients = new_stream;
                 }
-                Segment::UniversalProcessor(proc, slices, stream_indices) => {
+                Model::UniversalProcessor(proc, slices, stream_indices) => {
                     let num_layers = proc.len();
                     let active_indices: Vec<usize> = match stream_indices {
                         Some(indices) => indices.clone(),
@@ -111,9 +108,9 @@ impl MixedModel {
                                 &grad_params_handle,
                             );
 
-                            // Копируем результат из GPU в CPU, так как дальнейшие сегменты
+                            // Копируем результат из GPU в CPU, так как дальнейшие модели
                             // могут выполняться на CPU (или мы можем оставить на GPU,
-                            // если следующий сегмент тоже GPU, но для простоты всегда
+                            // если следующая модель тоже GPU, но для простоты всегда
                             // возвращаем CPU, чтобы не усложнять).
                             let cpu_handle = pool.acquire(out_gpu.rows(), out_gpu.cols());
                             gpu.copy_gpu_to_cpu_handle(&out_gpu, &cpu_handle);
@@ -145,7 +142,7 @@ impl MixedModel {
 
                     ctx_pos -= num_layers * active_indices.len();
                 }
-                Segment::SplitterConnector { .. } => {
+                Model::SplitterConnector { .. } => {
                     assert_eq!(stream_gradients.len(), 2);
                     let delta_a = stream_gradients[0].clone();
                     let delta_b = stream_gradients[1].clone();
@@ -164,10 +161,10 @@ impl MixedModel {
                     stream_gradients = vec![in_a, in_b];
                     ctx_pos -= 1;
                 }
-                Segment::CombinerConnector { .. } => {
+                Model::CombinerConnector { .. } => {
                     ctx_pos -= 1;
                 }
-                Segment::Splitter {
+                Model::Splitter {
                     input_dim,
                     output_dims,
                     slice,
@@ -212,9 +209,9 @@ impl MixedModel {
                         let pre_b: &[f32] = &*fifth[0];
                         let (sixth, rest) = rest.split_at_mut(1);
                         let params_ref: &[f32] = &*sixth[0];
-                        let (seventh, eighth) = rest.split_at_mut(1);
+                        let (seventh, rest) = rest.split_at_mut(1);
                         let gp: &mut [f32] = &mut *seventh[0];
-                        let dx_out: &mut [f32] = &mut *eighth[0];
+                        let dx_out: &mut [f32] = &mut *rest[0];
 
                         let wa_start = slice.start;
                         let wa_len = p * n;
@@ -289,7 +286,7 @@ impl MixedModel {
                     stream_gradients = vec![dx_handle];
                     ctx_pos -= 1;
                 }
-                Segment::Combiner {
+                Model::Combiner {
                     input_dim,
                     output_dim,
                     slice,
@@ -332,9 +329,9 @@ impl MixedModel {
                         let params_ref: &[f32] = &*fifth[0];
                         let (sixth, rest) = rest.split_at_mut(1);
                         let gp: &mut [f32] = &mut *sixth[0];
-                        let (seventh, eighth) = rest.split_at_mut(1);
+                        let (seventh, rest) = rest.split_at_mut(1);
                         let da_out: &mut [f32] = &mut *seventh[0];
-                        let db_out: &mut [f32] = &mut *eighth[0];
+                        let db_out: &mut [f32] = &mut *rest[0];
 
                         let wa_start = slice.start;
                         let wa_len = m * n;
@@ -401,7 +398,7 @@ impl MixedModel {
             }
 
             let duration = start.elapsed().as_nanos() as f64;
-            self.compute_executor.record_segment_time(seg_index, &device, duration);
+            self.compute_executor.record_model_time(model_index, &device, duration);
         }
 
         assert_eq!(stream_gradients.len(), self.input_stream_count);

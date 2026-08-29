@@ -1,67 +1,67 @@
 // src/compute_manager/compute_executor/strategy.rs
 
-use crate::compute_manager::graph::types::Segment;
+use crate::compute_manager::graph::types::Model;
 use crate::device_plan::plan::{ComputeDevice, DevicePlan, StorageDevice};
 
-use super::placement::{SegmentPlacement, optimize_connectors};
+use super::placement::{ModelPlacement, optimize_connectors};
 use super::profiling::ProfilingState;
 
-/// Вычисляет адаптивное размещение сегментов на основе накопленной профилировочной статистики.
+/// Вычисляет адаптивное размещение моделей на основе накопленной профилировочной статистики.
 ///
-/// Для каждого сегмента выбирается устройство с минимальной ожидаемой стоимостью выполнения.
+/// Для каждой модели выбирается устройство с минимальной ожидаемой стоимостью выполнения.
 /// Стоимость складывается из среднего времени (если есть измерения) и штрафа за текущую загрузку
-/// устройства. При отсутствии данных используется эвристика на основе «тяжести» сегмента.
+/// устройства. При отсутствии данных используется эвристика на основе «тяжести» модели.
 ///
 /// # Аргументы
-/// * `segments` – список сегментов модели.
+/// * `models` – список моделей вычислительного графа.
 /// * `device_plan` – план устройств.
 /// * `batch_size` – размер батча (не используется в текущей версии).
 /// * `profiling` – накопленная профилировочная статистика.
 /// * `current_placement` – текущее размещение (может использоваться для стабильности, пока игнорируется).
 pub fn compute_adaptive_placement(
-    segments: &[Segment],
+    models: &[Model],
     device_plan: &DevicePlan,
     _batch_size: usize,
     profiling: &ProfilingState,
-    _current_placement: &[SegmentPlacement],
-) -> Vec<SegmentPlacement> {
+    _current_placement: &[ModelPlacement],
+) -> Vec<ModelPlacement> {
     let devices = &device_plan.compute_devices;
     if devices.is_empty() {
         return Vec::new();
     }
 
-    let mut placements = Vec::with_capacity(segments.len());
-    // Счётчики назначенных сегментов на каждое устройство (для оценки загрузки).
+    let mut placements = Vec::with_capacity(models.len());
+    // Счётчики назначенных моделей на каждое устройство (для оценки загрузки).
     let mut assigned_counts: std::collections::HashMap<ComputeDevice, usize> =
         devices.iter().map(|d| (d.clone(), 0)).collect();
 
-    for (idx, segment) in segments.iter().enumerate() {
-        let best_device = choose_best_device(segment, devices, profiling, &assigned_counts);
+    for (idx, model) in models.iter().enumerate() {
+        let best_device = choose_best_device(model, devices, profiling, &assigned_counts);
         // Обновляем счётчик загрузки выбранного устройства.
         *assigned_counts.get_mut(&best_device).unwrap() += 1;
 
-        let parameter_storage = if segment_has_params(segment) {
+        let parameter_storage = if model_has_params(model) {
             storage_for_compute_device(&best_device, device_plan)
         } else {
             None
         };
 
-        placements.push(SegmentPlacement {
-            segment_index: idx,
+        placements.push(ModelPlacement {
+            model_index: idx,
             compute_device: best_device,
             parameter_storage,
         });
     }
 
-    // Выравниваем коннекторы и операции размерности к соседним вычислительным сегментам.
-    optimize_connectors(segments, &mut placements);
+    // Выравниваем коннекторы и операции размерности к соседним вычислительным моделям.
+    optimize_connectors(models, &mut placements);
 
     placements
 }
 
-/// Выбирает наилучшее устройство для сегмента с учётом профилирования и текущей загрузки.
+/// Выбирает наилучшее устройство для модели с учётом профилирования и текущей загрузки.
 fn choose_best_device(
-    segment: &Segment,
+    model: &Model,
     devices: &[ComputeDevice],
     profiling: &ProfilingState,
     assigned_counts: &std::collections::HashMap<ComputeDevice, usize>,
@@ -70,7 +70,7 @@ fn choose_best_device(
     let mut best_cost = f64::MAX;
 
     for device in devices {
-        let cost = estimate_cost(segment, device, profiling, assigned_counts);
+        let cost = estimate_cost(model, device, profiling, assigned_counts);
         if cost < best_cost {
             best_cost = cost;
             best_device = device.clone();
@@ -79,25 +79,25 @@ fn choose_best_device(
     best_device
 }
 
-/// Оценивает стоимость выполнения сегмента на данном устройстве.
+/// Оценивает стоимость выполнения модели на данном устройстве.
 ///
 /// Возвращает значение в условных единицах: чем меньше, тем предпочтительнее.
 /// Использует среднее время из профилировщика, если оно есть, иначе —
 /// эвристическую оценку. К итоговой стоимости добавляется штраф за загрузку устройства.
 fn estimate_cost(
-    segment: &Segment,
+    model: &Model,
     device: &ComputeDevice,
     profiling: &ProfilingState,
     assigned_counts: &std::collections::HashMap<ComputeDevice, usize>,
 ) -> f64 {
     // Базовое время (наносекунды)
-    let base_time = if let Some(avg) = profiling.average_time(segment_index(segment, 0), device) {
+    let base_time = if let Some(avg) = profiling.average_time(model_index(model, 0), device) {
         avg
     } else {
-        fallback_time_estimate(segment, device)
+        fallback_time_estimate(model, device)
     };
 
-    // Штраф за загрузку: чем больше сегментов уже назначено на устройство,
+    // Штраф за загрузку: чем больше моделей уже назначено на устройство,
     // тем больше стоимость. Коэффициент 0.2 (подбирается эмпирически).
     let load_count = assigned_counts.get(device).copied().unwrap_or(0) as f64;
     let load_penalty = load_count * base_time * 0.2;
@@ -106,35 +106,35 @@ fn estimate_cost(
 }
 
 /// Эвристическая оценка времени выполнения для случая отсутствия профилировочных данных.
-fn fallback_time_estimate(segment: &Segment, device: &ComputeDevice) -> f64 {
-    // Определяем "тяжесть" сегмента в количестве операций (приблизительно).
-    let heavy = match segment {
-        Segment::UniversalProcessor(layers, _slices, _) => {
+fn fallback_time_estimate(model: &Model, device: &ComputeDevice) -> f64 {
+    // Определяем "тяжесть" модели в количестве операций (приблизительно).
+    let heavy = match model {
+        Model::UniversalProcessor(layers, _slices, _) => {
             let total_params: usize = layers.iter().map(|l| l.param_len()).sum();
             // Предполагаем, что каждый параметр добавляет ~10 наносекунд.
             total_params as f64 * 10.0 + 1000.0
         }
-        Segment::Splitter { .. } | Segment::Combiner { .. } => 5000.0,
+        Model::Splitter { .. } | Model::Combiner { .. } => 5000.0,
         _ => 200.0,
     };
 
     match device {
-        ComputeDevice::Gpu { .. } => heavy * 0.3,   // GPU быстрее для тяжёлых сегментов
+        ComputeDevice::Gpu { .. } => heavy * 0.3,   // GPU быстрее для тяжёлых моделей
         ComputeDevice::Cpu { threads, .. } => heavy / (*threads as f64).max(1.0),
     }
 }
 
-/// Возвращает индекс сегмента. Вспомогательная функция, пока используется заглушка.
-/// В реальной интеграции segment_index будет передаваться явно.
-fn segment_index(_segment: &Segment, fallback: usize) -> usize {
+/// Возвращает индекс модели. Вспомогательная функция, пока используется заглушка.
+/// В реальной интеграции model_index будет передаваться явно.
+fn model_index(_model: &Model, fallback: usize) -> usize {
     fallback
 }
 
-/// Проверяет, есть ли у сегмента обучаемые параметры.
-fn segment_has_params(segment: &Segment) -> bool {
-    match segment {
-        Segment::UniversalProcessor(layers, _slices, _) => layers.iter().any(|l| l.param_len() > 0),
-        Segment::Splitter { .. } | Segment::Combiner { .. } => true,
+/// Проверяет, есть ли у модели обучаемые параметры.
+fn model_has_params(model: &Model) -> bool {
+    match model {
+        Model::UniversalProcessor(layers, _slices, _) => layers.iter().any(|l| l.param_len() > 0),
+        Model::Splitter { .. } | Model::Combiner { .. } => true,
         _ => false,
     }
 }

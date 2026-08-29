@@ -17,7 +17,7 @@ use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
-use super::types::Segment;
+use super::types::Model;
 
 // ---------- CpuExecutor ----------
 #[derive(Clone)]
@@ -115,20 +115,20 @@ impl MixedModel {
         );
 
         // -----------------------------------------------------------
-        // 6. Строим сегменты модели
+        // 6. Строим модели вычислительного графа
         // -----------------------------------------------------------
-        let mut segments: Vec<Segment> = Vec::new();
+        let mut models: Vec<Model> = Vec::new();
         let mut current_layers: Vec<Box<dyn UniversalLayer>> = Vec::new();
         let mut current_layer_sizes: Vec<usize> = Vec::new();
         let mut active_ports: Option<Vec<usize>> = None;
         let mut current_branch: Option<usize> = None;
         let mut current_stream_indices: Option<Vec<usize>> = None;
 
-        // Макрос для финализации текущего UniversalProcessor сегмента.
+        // Макрос для финализации текущего UniversalProcessor.
         macro_rules! finalize_universal {
             () => {
                 if !current_layers.is_empty() {
-                    // Выделяем параметры для всего сегмента одним блоком.
+                    // Выделяем параметры для всего блока одним буфером.
                     let slices = {
                         let mut ps = param_store.lock().unwrap();
                         ps.allocate_segment(
@@ -138,7 +138,7 @@ impl MixedModel {
                     };
                     debug_assert_eq!(slices.len(), current_layers.len(),
                         "Number of slices must match number of layers");
-                    segments.push(Segment::UniversalProcessor(
+                    models.push(Model::UniversalProcessor(
                         Arc::new(std::mem::take(&mut current_layers)),
                         slices,
                         current_stream_indices.take(),
@@ -184,7 +184,7 @@ impl MixedModel {
                     let output_dims = desc.output_shape.streams.clone();
                     active_ports = Some(output_dims.clone());
 
-                    // Выделяем параметры для сегмента Splitter.
+                    // Выделяем параметры для модели Splitter.
                     let slice = {
                         let mut ps = param_store.lock().unwrap();
                         let slices = ps.allocate_segment(
@@ -193,7 +193,7 @@ impl MixedModel {
                         );
                         slices[0]
                     };
-                    segments.push(Segment::Splitter {
+                    models.push(Model::Splitter {
                         input_dim,
                         output_dims,
                         slice,
@@ -205,7 +205,7 @@ impl MixedModel {
                     let input_dim = desc.input_shape.streams[0];
                     let output_dim = desc.output_shape.streams[0];
 
-                    // Выделяем параметры для сегмента Combiner.
+                    // Выделяем параметры для модели Combiner.
                     let slice = {
                         let mut ps = param_store.lock().unwrap();
                         let slices = ps.allocate_segment(
@@ -214,7 +214,7 @@ impl MixedModel {
                         );
                         slices[0]
                     };
-                    segments.push(Segment::Combiner {
+                    models.push(Model::Combiner {
                         input_dim,
                         output_dim,
                         slice,
@@ -225,12 +225,12 @@ impl MixedModel {
                 LayerKind::Unsqueeze => {
                     finalize_universal!();
                     let target_dims = desc.output_shape.streams.clone();
-                    segments.push(Segment::Unsqueeze(target_dims));
+                    models.push(Model::Unsqueeze(target_dims));
                 }
                 LayerKind::ReduceMean => {
                     finalize_universal!();
                     let target_dims = desc.output_shape.streams.clone();
-                    segments.push(Segment::ReduceMean(target_dims));
+                    models.push(Model::ReduceMean(target_dims));
                 }
                 _ => {
                     if current_stream_indices.is_none() {
@@ -261,12 +261,12 @@ impl MixedModel {
         }
         finalize_universal!();
 
-        let input_stream_count = match segments.first() {
-            Some(Segment::CombinerConnector { input_dims, .. }) => input_dims.len(),
+        let input_stream_count = match models.first() {
+            Some(Model::CombinerConnector { input_dims, .. }) => input_dims.len(),
             _ => 1,
         };
-        let output_stream_count = match segments.last() {
-            Some(Segment::SplitterConnector { .. }) | Some(Segment::Splitter { .. }) => 2,
+        let output_stream_count = match models.last() {
+            Some(Model::SplitterConnector { .. }) | Some(Model::Splitter { .. }) => 2,
             _ => 1,
         };
 
@@ -277,12 +277,12 @@ impl MixedModel {
         let output_shapes: Vec<Vec<usize>> = if output_stream_count == 1 {
             vec![layers.last().unwrap().output_shape.streams.clone()]
         } else {
-            let last_segment = segments.last().unwrap();
-            match last_segment {
-                Segment::Splitter { output_dims, .. } => {
+            let last_model = models.last().unwrap();
+            match last_model {
+                Model::Splitter { output_dims, .. } => {
                     output_dims.iter().map(|&d| vec![d]).collect()
                 }
-                Segment::SplitterConnector { dim_a, dim_b } => {
+                Model::SplitterConnector { dim_a, dim_b } => {
                     vec![vec![*dim_a], vec![*dim_b]]
                 }
                 _ => vec![],
@@ -295,15 +295,15 @@ impl MixedModel {
         let temp_matrix_pool = Arc::new(Mutex::new(TempMatrixPool::new(memory_executor.clone())));
 
         // -----------------------------------------------------------
-        // 9. Выполняем начальное размещение сегментов
+        // 9. Выполняем начальное размещение моделей
         // -----------------------------------------------------------
-        compute_executor.redistribute(&segments, batch_size, true);
+        compute_executor.redistribute(&models, batch_size, true);
 
         // -----------------------------------------------------------
         // 10. Собираем MixedModel
         // -----------------------------------------------------------
         let model = MixedModel {
-            segments,
+            models,
             param_store,
             executor: cpu_executor,
             compute_executor,

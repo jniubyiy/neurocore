@@ -16,7 +16,7 @@ impl MixedModel {
         pool: &mut TempMatrixPool,
         proc: &Arc<Vec<Box<dyn UniversalLayer>>>,
         slices: &[ParamSlice],
-        _seg_index: usize,
+        _model_index: usize,
         params: &MatrixBufferHandle,
         stream_buffers: &mut Vec<MatrixBufferHandle>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,

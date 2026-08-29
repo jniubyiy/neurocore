@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
-use crate::compute_manager::graph::types::{DynamicContext, Segment};
+use crate::compute_manager::graph::types::{DynamicContext, Model};
 use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::device_plan::{ComputeDevice, DevicePlan, StorageDevice};
@@ -16,7 +16,7 @@ use crate::optimizer_plan::{OptimizerExpr, OptimizerDesc};
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
 pub struct MixedModel {
-    pub(crate) segments: Vec<Segment>,
+    pub(crate) models: Vec<Model>,
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) compute_executor: Arc<ComputeExecutor>,
@@ -65,9 +65,9 @@ impl MixedModel {
         &self.compute_executor
     }
 
-    /// Возвращает сегменты модели.
-    pub fn segments(&self) -> &[Segment] {
-        &self.segments
+    /// Возвращает список моделей вычислительного графа.
+    pub fn models(&self) -> &[Model] {
+        &self.models
     }
 
     // ===================================================================
@@ -226,29 +226,29 @@ impl MixedModel {
     }
 
     // ===================================================================
-    // Миграция параметров сегментов
+    // Миграция параметров моделей
     // ===================================================================
 
-    /// Перемещает параметры, градиенты и состояния оптимизаторов для всех сегментов
+    /// Перемещает параметры, градиенты и состояния оптимизаторов для всех моделей
     /// в соответствии с переданным размещением.
     pub fn migrate_parameters(
         &mut self,
-        placement: &[crate::compute_manager::compute_executor::SegmentPlacement],
+        placement: &[crate::compute_manager::compute_executor::ModelPlacement],
     ) -> Result<(), String> {
         let mut param_store = self.param_store.lock().unwrap();
         let memory_executor = self.memory_executor.clone();
 
-        for (seg_idx, seg_placement) in placement.iter().enumerate() {
-            let target_kind = match &seg_placement.compute_device {
+        for (model_idx, model_placement) in placement.iter().enumerate() {
+            let target_kind = match &model_placement.compute_device {
                 ComputeDevice::Gpu { id } => MemoryDeviceKind::DeviceVram(crate::compute_manager::device_spec::DeviceId(*id)),
                 ComputeDevice::Cpu { .. } => MemoryDeviceKind::HostRam,
             };
 
-            // Получаем слайс(ы) параметров для сегмента.
-            let slices: Vec<ParamSlice> = match &self.segments[seg_idx] {
-                Segment::UniversalProcessor(_, param_slices, _) => param_slices.clone(),
-                Segment::Splitter { slice, .. } => vec![slice.clone()],
-                Segment::Combiner { slice, .. } => vec![slice.clone()],
+            // Получаем слайс(ы) параметров для модели.
+            let slices: Vec<ParamSlice> = match &self.models[model_idx] {
+                Model::UniversalProcessor(_, param_slices, _) => param_slices.clone(),
+                Model::Splitter { slice, .. } => vec![slice.clone()],
+                Model::Combiner { slice, .. } => vec![slice.clone()],
                 _ => Vec::new(),
             };
 
@@ -260,14 +260,14 @@ impl MixedModel {
                     let mut mem = memory_executor.lock().unwrap();
                     // Перемещаем params
                     mem.move_matrix_handle(buffer.params.id(), target_kind)
-                        .map_err(|e| format!("Failed to move params for segment {}: {:?}", seg_idx, e))?;
+                        .map_err(|e| format!("Failed to move params for model {}: {:?}", model_idx, e))?;
                     // Перемещаем grads
                     mem.move_matrix_handle(buffer.grads.id(), target_kind)
-                        .map_err(|e| format!("Failed to move grads for segment {}: {:?}", seg_idx, e))?;
+                        .map_err(|e| format!("Failed to move grads for model {}: {:?}", model_idx, e))?;
                     // Перемещаем opt_state, если есть
                     if let Some(ref opt_state) = buffer.opt_state {
                         mem.move_matrix_handle(opt_state.id(), target_kind)
-                            .map_err(|e| format!("Failed to move opt_state for segment {}: {:?}", seg_idx, e))?;
+                            .map_err(|e| format!("Failed to move opt_state for model {}: {:?}", model_idx, e))?;
                     }
                     buffer.location = target_kind;
                 }
@@ -422,29 +422,29 @@ impl MixedModel {
     }
 
     // ===================================================================
-    // Вспомогательные методы для доступа к параметрам сегмента
+    // Вспомогательные методы для доступа к параметрам модели
     // ===================================================================
 
-    pub(crate) fn get_params_handle_for_segment(&self, seg_idx: usize) -> Option<MatrixBufferHandle> {
+    pub(crate) fn get_params_handle_for_model(&self, model_idx: usize) -> Option<MatrixBufferHandle> {
         let ps = self.param_store.lock().unwrap();
-        match &self.segments[seg_idx] {
-            Segment::UniversalProcessor(_, slices, _) => {
+        match &self.models[model_idx] {
+            Model::UniversalProcessor(_, slices, _) => {
                 slices.first().map(|s| ps.params_handle(s).clone())
             }
-            Segment::Splitter { slice, .. } | Segment::Combiner { slice, .. } => {
+            Model::Splitter { slice, .. } | Model::Combiner { slice, .. } => {
                 Some(ps.params_handle(slice).clone())
             }
             _ => None,
         }
     }
 
-    pub(crate) fn get_grads_handle_for_segment(&self, seg_idx: usize) -> Option<MatrixBufferHandle> {
+    pub(crate) fn get_grads_handle_for_model(&self, model_idx: usize) -> Option<MatrixBufferHandle> {
         let ps = self.param_store.lock().unwrap();
-        match &self.segments[seg_idx] {
-            Segment::UniversalProcessor(_, slices, _) => {
+        match &self.models[model_idx] {
+            Model::UniversalProcessor(_, slices, _) => {
                 slices.first().map(|s| ps.grads_handle(s).clone())
             }
-            Segment::Splitter { slice, .. } | Segment::Combiner { slice, .. } => {
+            Model::Splitter { slice, .. } | Model::Combiner { slice, .. } => {
                 Some(ps.grads_handle(slice).clone())
             }
             _ => None,

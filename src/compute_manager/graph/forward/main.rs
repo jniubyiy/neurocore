@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::compute_manager::dim_change;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
-use crate::compute_manager::graph::types::{DynamicContext, Segment};
+use crate::compute_manager::graph::types::{DynamicContext, Model};
 use crate::compute_manager::gpu::processor::process_forward_gpu_buffered;
 use crate::device_plan::ComputeDevice;
 
@@ -43,38 +43,38 @@ impl MixedModel {
         let mut stream_buffers: Vec<MatrixBufferHandle> = inputs;
         let mut all_ctxs: Vec<Vec<DynamicContext>> = vec![Vec::new(); batch_size];
 
-        let segments = self.segments.clone();
+        let models = self.models.clone();
 
-        for (seg_index, seg) in segments.iter().enumerate() {
+        for (model_index, model) in models.iter().enumerate() {
             let start = Instant::now();
-            let device = self.compute_executor.device_for_segment(seg_index);
+            let device = self.compute_executor.device_for_model(model_index);
 
-            match seg {
-                Segment::Unsqueeze(target_dims) => {
+            match model {
+                Model::Unsqueeze(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
                         new_stream.push(dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_buffers = new_stream;
                 }
-                Segment::ReduceMean(target_dims) => {
+                Model::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
                         new_stream.push(dim_change::reduce_mat_buffered_handle(pool, buf, target_dims));
                     }
                     stream_buffers = new_stream;
                 }
-                Segment::UniversalProcessor(proc, slices, stream_indices) => {
+                Model::UniversalProcessor(proc, slices, stream_indices) => {
                     let active_indices: Vec<usize> = match stream_indices {
                         Some(indices) => indices.clone(),
                         None => (0..stream_buffers.len()).collect(),
                     };
 
-                    // Получаем дескриптор параметров для этого сегмента.
+                    // Получаем дескриптор параметров для этой модели.
                     // Если параметров нет (например, только активационные слои),
                     // создаём пустой CPU-буфер.
                     let params_handle = self
-                        .get_params_handle_for_segment(seg_index)
+                        .get_params_handle_for_model(model_index)
                         .unwrap_or_else(|| pool.acquire(0, 0));
 
                     if let ComputeDevice::Gpu { .. } = device {
@@ -118,7 +118,7 @@ impl MixedModel {
                             pool,
                             proc,
                             slices,
-                            seg_index,
+                            model_index,
                             &params_handle,
                             &mut stream_buffers,
                             &mut all_ctxs,
@@ -126,7 +126,7 @@ impl MixedModel {
                         );
                     }
                 }
-                Segment::SplitterConnector { dim_a, dim_b } => {
+                Model::SplitterConnector { dim_a, dim_b } => {
                     self.process_splitter_connector_forward_buffered(
                         pool,
                         *dim_a,
@@ -134,20 +134,20 @@ impl MixedModel {
                         batch_size,
                         &mut stream_buffers,
                         &mut all_ctxs,
-                        seg_index,
+                        model_index,
                     );
                 }
-                Segment::CombinerConnector { input_dims, .. } => {
+                Model::CombinerConnector { input_dims, .. } => {
                     self.process_combiner_connector_forward_buffered(
                         pool,
                         input_dims.clone(),
                         batch_size,
                         &mut stream_buffers,
                         &mut all_ctxs,
-                        seg_index,
+                        model_index,
                     );
                 }
-                Segment::Splitter {
+                Model::Splitter {
                     input_dim,
                     output_dims,
                     slice,
@@ -160,10 +160,10 @@ impl MixedModel {
                         batch_size,
                         &mut stream_buffers,
                         &mut all_ctxs,
-                        seg_index,
+                        model_index,
                     );
                 }
-                Segment::Combiner {
+                Model::Combiner {
                     input_dim,
                     output_dim,
                     slice,
@@ -176,13 +176,13 @@ impl MixedModel {
                         batch_size,
                         &mut stream_buffers,
                         &mut all_ctxs,
-                        seg_index,
+                        model_index,
                     );
                 }
             }
 
             let duration = start.elapsed().as_nanos() as f64;
-            self.compute_executor.record_segment_time(seg_index, &device, duration);
+            self.compute_executor.record_model_time(model_index, &device, duration);
         }
 
         assert_eq!(

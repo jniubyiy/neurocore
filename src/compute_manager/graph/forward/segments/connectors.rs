@@ -5,7 +5,6 @@ use std::time::Instant;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::device_plan::plan::ComputeDevice;
 use crate::layers::buffered_context::BufferedContext;
 use crate::model_plan::param_store::ParamSlice;
 
@@ -18,10 +17,10 @@ impl MixedModel {
         _batch_size: usize,
         stream_buffers: &mut Vec<MatrixBufferHandle>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
-        seg_index: usize,
+        model_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.compute_executor.device_for_segment(seg_index);
+        let device = self.compute_executor.device_for_model(model_index);
 
         assert_eq!(stream_buffers.len(), 2, "SplitterConnector buffered: expected 2 input streams");
 
@@ -55,7 +54,7 @@ impl MixedModel {
         *stream_buffers = vec![out_a, out_b];
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.compute_executor.record_segment_time(seg_index, &device, duration);
+        self.compute_executor.record_model_time(model_index, &device, duration);
     }
 
     pub(crate) fn process_combiner_connector_forward_buffered(
@@ -65,10 +64,10 @@ impl MixedModel {
         _batch_size: usize,
         stream_buffers: &mut Vec<MatrixBufferHandle>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
-        seg_index: usize,
+        model_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.compute_executor.device_for_segment(seg_index);
+        let device = self.compute_executor.device_for_model(model_index);
 
         let n = input_dims.len();
         assert_eq!(stream_buffers.len(), n,
@@ -84,7 +83,7 @@ impl MixedModel {
         }
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.compute_executor.record_segment_time(seg_index, &device, duration);
+        self.compute_executor.record_model_time(model_index, &device, duration);
     }
 
     pub(crate) fn process_splitter_forward_buffered(
@@ -96,17 +95,17 @@ impl MixedModel {
         _batch_size: usize,
         stream_buffers: &mut Vec<MatrixBufferHandle>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
-        seg_index: usize,
+        model_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.compute_executor.device_for_segment(seg_index);
+        let device = self.compute_executor.device_for_model(model_index);
 
         assert_eq!(stream_buffers.len(), 1, "Splitter buffered: expected 1 input stream");
 
         let input_handle = stream_buffers[0].clone();
         let batch = input_handle.rows();
 
-        // Получаем параметры сегмента через ParamStore, используя слайс.
+        // Получаем параметры модели через ParamStore, используя слайс.
         let params_handle = {
             let ps = self.param_store.lock().unwrap();
             ps.params_handle(&slice).clone()
@@ -184,7 +183,7 @@ impl MixedModel {
         *stream_buffers = vec![out_a, out_b];
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.compute_executor.record_segment_time(seg_index, &device, duration);
+        self.compute_executor.record_model_time(model_index, &device, duration);
     }
 
     pub(crate) fn process_combiner_forward_buffered(
@@ -196,10 +195,10 @@ impl MixedModel {
         _batch_size: usize,
         stream_buffers: &mut Vec<MatrixBufferHandle>,
         all_ctxs: &mut Vec<Vec<DynamicContext>>,
-        seg_index: usize,
+        model_index: usize,
     ) {
         let start = Instant::now();
-        let device = self.compute_executor.device_for_segment(seg_index);
+        let device = self.compute_executor.device_for_model(model_index);
 
         assert_eq!(stream_buffers.len(), 2, "Combiner buffered: expected 2 input streams");
 
@@ -207,7 +206,7 @@ impl MixedModel {
         let b_handle = stream_buffers[1].clone();
         let batch = a_handle.rows();
 
-        // Получаем параметры сегмента через ParamStore, используя слайс.
+        // Получаем параметры модели через ParamStore, используя слайс.
         let params_handle = {
             let ps = self.param_store.lock().unwrap();
             ps.params_handle(&slice).clone()
@@ -270,6 +269,6 @@ impl MixedModel {
         *stream_buffers = vec![out_handle];
 
         let duration = start.elapsed().as_nanos() as f64;
-        self.compute_executor.record_segment_time(seg_index, &device, duration);
+        self.compute_executor.record_model_time(model_index, &device, duration);
     }
 }

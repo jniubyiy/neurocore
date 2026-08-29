@@ -18,4 +18,4 @@ pub use graph::types::DynamicContext;
 pub use dim_change::DynamicTensor;
 pub use gpu::GpuExecutor;
 pub use matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-pub use compute_executor::{ComputeExecutor, SegmentPlacement};
+pub use compute_executor::{ComputeExecutor, ModelPlacement};

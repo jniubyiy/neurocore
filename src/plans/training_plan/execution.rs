@@ -74,7 +74,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     let _ = Plan::from_layer_descs(model_desc.clone())?;
     let mut model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
 
-    // --- первоначальное размещение сегментов уже выполнено в конструкторе ---
+    // --- первоначальное размещение моделей уже выполнено в конструкторе ---
     // Теперь при каждой эпохе будем вызывать redistribute с force=true,
     // чтобы перераспределять на основе накопленной статистики.
 
@@ -157,9 +157,9 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
     let mut zero_loss_epoch: Option<usize> = None;
 
     for epoch in 0..plan.epochs {
-        // Перед каждой эпохой перераспределяем сегменты по устройствам
+        // Перед каждой эпохой перераспределяем модели по устройствам
         // на основе накопленной профилировочной статистики.
-        model.compute_executor().redistribute(model.segments(), plan.batch_size, true);
+        model.compute_executor().redistribute(model.models(), plan.batch_size, true);
         let placement = model.compute_executor().get_placement();
         model.migrate_parameters(&placement)?;
 

@@ -105,7 +105,12 @@ impl MixedModel {
 
         let input_handle = stream_buffers[0].clone();
         let batch = input_handle.rows();
-        let params_handle = self.buffered_param_store.lock().unwrap().params_handle().clone();
+
+        // Получаем параметры сегмента через ParamStore, используя слайс.
+        let params_handle = {
+            let ps = self.param_store.lock().unwrap();
+            ps.params_handle(&slice).clone()
+        };
 
         let p = output_dims[0];
         let q = output_dims[1];
@@ -133,9 +138,9 @@ impl MixedModel {
                 let a_pre: &mut [f32] = &mut *third[0];
                 let (fourth, rest) = rest.split_at_mut(1);
                 let b_out: &mut [f32] = &mut *fourth[0];
-                let (fifth, sixth) = rest.split_at_mut(1);
+                let (fifth, rest) = rest.split_at_mut(1);
                 let b_pre: &mut [f32] = &mut *fifth[0];
-                let params: &[f32] = &*sixth[0];
+                let params: &[f32] = &*rest[0];
 
                 let wa_start = slice.start;
                 let wa_len = p * input_dim;
@@ -201,7 +206,12 @@ impl MixedModel {
         let a_handle = stream_buffers[0].clone();
         let b_handle = stream_buffers[1].clone();
         let batch = a_handle.rows();
-        let params_handle = self.buffered_param_store.lock().unwrap().params_handle().clone();
+
+        // Получаем параметры сегмента через ParamStore, используя слайс.
+        let params_handle = {
+            let ps = self.param_store.lock().unwrap();
+            ps.params_handle(&slice).clone()
+        };
 
         let out_handle = pool.acquire(batch, output_dim);
         let pre_handle = pool.acquire(batch, output_dim);
@@ -221,9 +231,9 @@ impl MixedModel {
                 let b: &[f32] = &*second[0];
                 let (third, rest) = rest.split_at_mut(1);
                 let out_val: &mut [f32] = &mut *third[0];
-                let (fourth, fifth) = rest.split_at_mut(1);
+                let (fourth, rest) = rest.split_at_mut(1);
                 let pre_val: &mut [f32] = &mut *fourth[0];
-                let params: &[f32] = &*fifth[0];
+                let params: &[f32] = &*rest[0];
 
                 let wa_start = slice.start;
                 let wa_len = output_dim * input_dim;

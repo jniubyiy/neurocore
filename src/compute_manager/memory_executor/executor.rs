@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter};
@@ -79,7 +79,6 @@ impl MemoryExecutor {
         kind: MemoryDeviceKind,
         elements: usize,
     ) -> (Subbuffer<[f32]>, RawBufferId) {
-        // Проверка доступной памяти перед запросом временного буфера.
         if kind != MemoryDeviceKind::SsdCache {
             if let Some(pool) = self.pools.get(&kind) {
                 if !pool.can_allocate(elements) {
@@ -313,7 +312,6 @@ impl MemoryExecutor {
     // БЕСКОПИЙНЫЙ ДОСТУП К CPU-БУФЕРАМ
     // ===================================================================
 
-    /// Предоставляет одновременный доступ на чтение к нескольким CPU-буферам.
     pub fn with_cpu_slices<T>(
         &self,
         ids: &[MatrixBufferId],
@@ -331,7 +329,6 @@ impl MemoryExecutor {
         f(&slices)
     }
 
-    /// Предоставляет одновременный доступ на чтение/запись к нескольким уникальным CPU-буферам.
     pub fn with_cpu_slices_mut<T>(
         &mut self,
         ids: &[MatrixBufferId],
@@ -364,7 +361,6 @@ impl MemoryExecutor {
         f(&mut slices)
     }
 
-    /// Копирует данные из одного CPU-буфера в другой без промежуточного Vec.
     pub fn copy_cpu_buffer(&mut self, src_id: MatrixBufferId, dst_id: MatrixBufferId) {
         assert_ne!(src_id, dst_id, "copy_cpu_buffer: source and destination must be different");
 
@@ -424,9 +420,12 @@ impl MemoryExecutor {
             let entry = self.matrix_entries.get(&id).unwrap();
             entry.rows * entry.cols
         };
+
+        // Проверяем, достаточно ли памяти в целевом пуле.
         if let Some(pool) = self.pools.get(&target) {
             if !pool.can_allocate(elements) {
-                return Err(MemoryError::OutOfMemory(target));
+                // Попытка вытеснения
+                self.evict_to_make_room(target, elements)?;
             }
         } else {
             return Err(MemoryError::DeviceNotFound(target));
@@ -461,7 +460,9 @@ impl MemoryExecutor {
                         self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf.clone(), staging_raw);
                         MemoryError::SsdError(format!("write staging: {}", e))
                     })?;
-                    write_guard.copy_from_slice(&data);
+                    // Важно: staging_buf может быть больше запрошенного размера из-за пула,
+                    // поэтому копируем только первые `elements` элементов.
+                    write_guard[..elements].copy_from_slice(&data);
                 }
                 data_mover::copy_buffer_sync(ctx.clone(), staging_buf.clone(), buffer.clone());
                 self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
@@ -490,6 +491,66 @@ impl MemoryExecutor {
         Ok(())
     }
 
+    /// Освобождает память на целевом устройстве, перемещая наименее используемые
+    /// буферы на другие устройства (обычно на HostRam или SsdCache).
+    /// Используется при нехватке памяти при миграции.
+    pub fn evict_to_make_room(
+        &mut self,
+        target_kind: MemoryDeviceKind,
+        required_elements: usize,
+    ) -> Result<(), MemoryError> {
+        // Собираем буферы, находящиеся на целевом устройстве.
+        let mut candidates: Vec<(MatrixBufferId, Instant, BufferPriority, usize)> = Vec::new();
+
+        for (&id, entry) in &self.matrix_entries {
+            if entry.device_kind() == target_kind && !entry.pinned {
+                candidates.push((id, entry.last_access, entry.priority, entry.size()));
+            }
+        }
+
+        // Сортируем: сначала самые старые, затем низкий приоритет.
+        candidates.sort_by(|a, b| {
+            a.1.cmp(&b.1).then_with(|| priority_rank(a.2).cmp(&priority_rank(b.2)))
+        });
+
+        // Пытаемся освободить, перемещая на менее быстрое устройство.
+        let mut freed = 0usize;
+        for (id, _, priority, size) in candidates {
+            if freed >= required_elements {
+                break;
+            }
+
+            // Определяем, куда переместить: предпочитаем HostRam, затем SsdCache.
+            let destination = if self.pools.contains_key(&MemoryDeviceKind::HostRam) {
+                MemoryDeviceKind::HostRam
+            } else if self.pools.contains_key(&MemoryDeviceKind::SsdCache) {
+                MemoryDeviceKind::SsdCache
+            } else {
+                // Нет доступных устройств для выгрузки.
+                break;
+            };
+
+            // Не выгружаем высокоприоритетные буферы, если только это не крайняя необходимость.
+            if priority == BufferPriority::High && freed < required_elements / 2 {
+                continue;
+            }
+
+            // Перемещаем буфер.
+            if let Err(e) = self.move_matrix_handle(id, destination) {
+                // Если переместить не удалось, пропускаем.
+                eprintln!("Warning: failed to evict buffer {}: {:?}", id.0, e);
+                continue;
+            }
+
+            freed += size;
+        }
+
+        if freed < required_elements {
+            return Err(MemoryError::OutOfMemory(target_kind));
+        }
+        Ok(())
+    }
+
     fn read_matrix_storage_to_vec(
         &mut self,
         storage: &MatrixStorage,
@@ -513,7 +574,7 @@ impl MemoryExecutor {
                         self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf.clone(), staging_raw);
                         MemoryError::SsdError(format!("read staging: {}", e))
                     })?;
-                    guard.to_vec()
+                    guard[..elements].to_vec()
                 };
                 self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf, staging_raw);
                 Ok(data)
@@ -576,5 +637,13 @@ impl MemoryExecutor {
         );
 
         Ok((buffer, raw_id))
+    }
+}
+
+fn priority_rank(p: BufferPriority) -> u8 {
+    match p {
+        BufferPriority::Low => 0,
+        BufferPriority::Medium => 1,
+        BufferPriority::High => 2,
     }
 }

@@ -1,5 +1,6 @@
 // src/compute_manager/graph/builder.rs
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::compute_executor::ComputeExecutor;
@@ -13,7 +14,8 @@ use crate::device_plan::{ComputeDevice, DevicePlan};
 use crate::layers::UniversalLayer;
 use crate::model_plan::blueprint::LayerKind;
 use crate::model_plan::layer_desc::LayerDesc;
-use crate::model_plan::param_store::{ParamSlice, BufferedParamStore};
+use crate::model_plan::param_store::{ParamSlice, ParamStore};
+use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
 use super::types::Segment;
 
@@ -97,11 +99,9 @@ impl MixedModel {
             .max(1);
 
         // -----------------------------------------------------------
-        // 4. Буферизованное хранилище параметров
+        // 4. Создаём хранилище параметров (ParamStore)
         // -----------------------------------------------------------
-        let buffered_param_store = Arc::new(Mutex::new(
-            BufferedParamStore::new(memory_executor.clone(), 0, 0)
-        ));
+        let param_store = Arc::new(Mutex::new(ParamStore::new(memory_executor.clone())));
 
         // -----------------------------------------------------------
         // 5. Создаём CPU-исполнитель (WorkerPool + Scheduler)
@@ -119,19 +119,31 @@ impl MixedModel {
         // -----------------------------------------------------------
         let mut segments: Vec<Segment> = Vec::new();
         let mut current_layers: Vec<Box<dyn UniversalLayer>> = Vec::new();
-        let mut current_slices: Vec<ParamSlice> = Vec::new();
+        let mut current_layer_sizes: Vec<usize> = Vec::new();
         let mut active_ports: Option<Vec<usize>> = None;
         let mut current_branch: Option<usize> = None;
         let mut current_stream_indices: Option<Vec<usize>> = None;
 
+        // Макрос для финализации текущего UniversalProcessor сегмента.
         macro_rules! finalize_universal {
             () => {
                 if !current_layers.is_empty() {
+                    // Выделяем параметры для всего сегмента одним блоком.
+                    let slices = {
+                        let mut ps = param_store.lock().unwrap();
+                        ps.allocate_segment(
+                            &current_layer_sizes,
+                            MemoryDeviceKind::HostRam, // начальное размещение
+                        )
+                    };
+                    debug_assert_eq!(slices.len(), current_layers.len(),
+                        "Number of slices must match number of layers");
                     segments.push(Segment::UniversalProcessor(
                         Arc::new(std::mem::take(&mut current_layers)),
-                        std::mem::take(&mut current_slices),
+                        slices,
                         current_stream_indices.take(),
                     ));
+                    current_layer_sizes.clear();
                 }
             };
         }
@@ -171,9 +183,15 @@ impl MixedModel {
                     let input_dim = desc.input_shape.streams[0];
                     let output_dims = desc.output_shape.streams.clone();
                     active_ports = Some(output_dims.clone());
+
+                    // Выделяем параметры для сегмента Splitter.
                     let slice = {
-                        let mut bp = buffered_param_store.lock().unwrap();
-                        bp.allocate(desc.param_len())
+                        let mut ps = param_store.lock().unwrap();
+                        let slices = ps.allocate_segment(
+                            &[desc.param_len()],
+                            MemoryDeviceKind::HostRam,
+                        );
+                        slices[0]
                     };
                     segments.push(Segment::Splitter {
                         input_dim,
@@ -186,9 +204,15 @@ impl MixedModel {
                     finalize_universal!();
                     let input_dim = desc.input_shape.streams[0];
                     let output_dim = desc.output_shape.streams[0];
+
+                    // Выделяем параметры для сегмента Combiner.
                     let slice = {
-                        let mut bp = buffered_param_store.lock().unwrap();
-                        bp.allocate(desc.param_len())
+                        let mut ps = param_store.lock().unwrap();
+                        let slices = ps.allocate_segment(
+                            &[desc.param_len()],
+                            MemoryDeviceKind::HostRam,
+                        );
+                        slices[0]
                     };
                     segments.push(Segment::Combiner {
                         input_dim,
@@ -230,12 +254,8 @@ impl MixedModel {
                     }
 
                     let layer = desc.create_universal_layer();
-                    let slice = {
-                        let mut bp = buffered_param_store.lock().unwrap();
-                        bp.allocate(desc.param_len())
-                    };
+                    current_layer_sizes.push(desc.param_len());
                     current_layers.push(layer);
-                    current_slices.push(slice);
                 }
             }
         }
@@ -284,7 +304,7 @@ impl MixedModel {
         // -----------------------------------------------------------
         let model = MixedModel {
             segments,
-            buffered_param_store,
+            param_store,
             executor: cpu_executor,
             compute_executor,
             input_stream_count,
@@ -293,7 +313,7 @@ impl MixedModel {
             input_shapes,
             output_shapes,
             temp_matrix_pool,
-            optimizer_expr: None,
+            optimizer_exprs: HashMap::new(),
         };
 
         Ok(model)

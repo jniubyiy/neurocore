@@ -70,8 +70,12 @@ impl MixedModel {
                         None => (0..stream_buffers.len()).collect(),
                     };
 
-                    // Единый дескриптор параметров для CPU и GPU.
-                    let params_handle = self.buffered_param_store.lock().unwrap().params_handle().clone();
+                    // Получаем дескриптор параметров для этого сегмента.
+                    // Если параметров нет (например, только активационные слои),
+                    // создаём пустой CPU-буфер.
+                    let params_handle = self
+                        .get_params_handle_for_segment(seg_index)
+                        .unwrap_or_else(|| pool.acquire(0, 0));
 
                     if let ComputeDevice::Gpu { .. } = device {
                         // GPU-путь

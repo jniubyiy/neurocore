@@ -1,5 +1,6 @@
 // src/compute_manager/graph/model.rs
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::compute_executor::ComputeExecutor;
@@ -8,14 +9,15 @@ use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{DynamicContext, Segment};
 use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::device_plan::ComputeDevice;
+use crate::device_plan::{ComputeDevice, DevicePlan, StorageDevice};
 use crate::loss_plan::{LossDesc, LossExpr};
-use crate::model_plan::param_store::BufferedParamStore;
+use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::optimizer_plan::{OptimizerExpr, OptimizerDesc};
+use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
 pub struct MixedModel {
     pub(crate) segments: Vec<Segment>,
-    pub(crate) buffered_param_store: Arc<Mutex<BufferedParamStore>>,
+    pub(crate) param_store: Arc<Mutex<ParamStore>>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) compute_executor: Arc<ComputeExecutor>,
     pub(crate) input_stream_count: usize,
@@ -28,8 +30,8 @@ pub struct MixedModel {
     /// Пул временных матриц для управляемого выделения памяти на CPU.
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
 
-    /// Буферизованный интерпретатор оптимизатора с состояниями.
-    pub(crate) optimizer_expr: Option<OptimizerExpr>,
+    /// Оптимизаторы для каждого буфера параметров (ключ — buffer_idx).
+    pub(crate) optimizer_exprs: HashMap<usize, OptimizerExpr>,
 }
 
 impl MixedModel {
@@ -45,9 +47,9 @@ impl MixedModel {
         self.output_stream_count
     }
 
-    /// Возвращает доступ к буферизованному хранилищу параметров.
-    pub fn buffered_param_store(&self) -> &Arc<Mutex<BufferedParamStore>> {
-        &self.buffered_param_store
+    /// Возвращает доступ к хранилищу параметров (ParamStore).
+    pub fn param_store(&self) -> &Arc<Mutex<ParamStore>> {
+        &self.param_store
     }
 
     pub fn executor(&self) -> &Box<dyn Executor> {
@@ -63,7 +65,7 @@ impl MixedModel {
         &self.compute_executor
     }
 
-    /// Возвращает сегменты модели (например, для перераспределения).
+    /// Возвращает сегменты модели.
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }
@@ -101,11 +103,20 @@ impl MixedModel {
 
         let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, vec![delta_buf]);
 
-        // Получаем градиенты параметров из BufferedParamStore
-        let bp = self.buffered_param_store.lock().unwrap();
-        let mut grads_vec = vec![0.0f32; bp.len()];
-        bp.copy_grads_to_slice(&mut grads_vec);
-        drop(bp);
+        // Получаем градиенты параметров из ParamStore (собираем все буферы)
+        let ps = self.param_store.lock().unwrap();
+        let total_params = ps.total_params();
+        let mut grads_vec = vec![0.0f32; total_params];
+        let mut offset = 0usize;
+        for buffer_idx in 0..ps.num_buffers() {
+            let buffer = ps.get_param_buffer_by_idx(buffer_idx);
+            let grads_handle = &buffer.grads;
+            let grads_data = self.read_buffer_to_vec(grads_handle);
+            let len = grads_data.len();
+            grads_vec[offset..offset + len].copy_from_slice(&grads_data);
+            offset += len;
+        }
+        drop(ps);
 
         let in_buf = in_bufs.into_iter().next().expect("No input buffer");
         let in_tensor = self.buffer_to_dynamic_tensor(in_buf, &self.input_shapes[0]);
@@ -151,10 +162,19 @@ impl MixedModel {
 
         let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, delta_bufs);
 
-        let bp = self.buffered_param_store.lock().unwrap();
-        let mut grads_vec = vec![0.0f32; bp.len()];
-        bp.copy_grads_to_slice(&mut grads_vec);
-        drop(bp);
+        let ps = self.param_store.lock().unwrap();
+        let total_params = ps.total_params();
+        let mut grads_vec = vec![0.0f32; total_params];
+        let mut offset = 0usize;
+        for buffer_idx in 0..ps.num_buffers() {
+            let buffer = ps.get_param_buffer_by_idx(buffer_idx);
+            let grads_handle = &buffer.grads;
+            let grads_data = self.read_buffer_to_vec(grads_handle);
+            let len = grads_data.len();
+            grads_vec[offset..offset + len].copy_from_slice(&grads_data);
+            offset += len;
+        }
+        drop(ps);
 
         let in_tensors = in_bufs
             .into_iter()
@@ -206,6 +226,57 @@ impl MixedModel {
     }
 
     // ===================================================================
+    // Миграция параметров сегментов
+    // ===================================================================
+
+    /// Перемещает параметры, градиенты и состояния оптимизаторов для всех сегментов
+    /// в соответствии с переданным размещением.
+    pub fn migrate_parameters(
+        &mut self,
+        placement: &[crate::compute_manager::compute_executor::SegmentPlacement],
+    ) -> Result<(), String> {
+        let mut param_store = self.param_store.lock().unwrap();
+        let memory_executor = self.memory_executor.clone();
+
+        for (seg_idx, seg_placement) in placement.iter().enumerate() {
+            let target_kind = match &seg_placement.compute_device {
+                ComputeDevice::Gpu { id } => MemoryDeviceKind::DeviceVram(crate::compute_manager::device_spec::DeviceId(*id)),
+                ComputeDevice::Cpu { .. } => MemoryDeviceKind::HostRam,
+            };
+
+            // Получаем слайс(ы) параметров для сегмента.
+            let slices: Vec<ParamSlice> = match &self.segments[seg_idx] {
+                Segment::UniversalProcessor(_, param_slices, _) => param_slices.clone(),
+                Segment::Splitter { slice, .. } => vec![slice.clone()],
+                Segment::Combiner { slice, .. } => vec![slice.clone()],
+                _ => Vec::new(),
+            };
+
+            // Для каждого уникального buffer_idx из слайсов перемещаем буферы.
+            if let Some(first_slice) = slices.first() {
+                let buffer_idx = first_slice.buffer_idx;
+                let buffer = param_store.get_param_buffer_mut(&first_slice);
+                if buffer.location != target_kind {
+                    let mut mem = memory_executor.lock().unwrap();
+                    // Перемещаем params
+                    mem.move_matrix_handle(buffer.params.id(), target_kind)
+                        .map_err(|e| format!("Failed to move params for segment {}: {:?}", seg_idx, e))?;
+                    // Перемещаем grads
+                    mem.move_matrix_handle(buffer.grads.id(), target_kind)
+                        .map_err(|e| format!("Failed to move grads for segment {}: {:?}", seg_idx, e))?;
+                    // Перемещаем opt_state, если есть
+                    if let Some(ref opt_state) = buffer.opt_state {
+                        mem.move_matrix_handle(opt_state.id(), target_kind)
+                            .map_err(|e| format!("Failed to move opt_state for segment {}: {:?}", seg_idx, e))?;
+                    }
+                    buffer.location = target_kind;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ===================================================================
     // Конвертация DynamicTensor <-> MatrixBufferHandle
     // ===================================================================
 
@@ -240,13 +311,11 @@ impl MixedModel {
                 .compute_executor
                 .gpu_compute()
                 .expect("GPU compute not available");
-            // Скачиваем в управляемый CPU-буфер и извлекаем данные.
             let cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(&buf);
             let vec = {
                 let guard = cpu_handle.read();
                 guard.as_slice().unwrap().to_vec()
             };
-            // cpu_handle выйдет из области видимости и будет освобождён.
             let batch = buf.rows();
             let features = buf.cols();
             let mut flat = vec![0.0f32; batch * features];
@@ -292,32 +361,93 @@ impl MixedModel {
     }
 
     // ===================================================================
-    // Шаг оптимизации через буферизованное хранилище
+    // Вспомогательный метод для чтения буфера с возможным GPU
     // ===================================================================
 
-    pub fn update_params_buffered(&mut self, desc: OptimizerDesc, grads: &[f32]) {
-        let chain = desc.build_chain();
-        let state_size = chain.total_state_size_per_param();
-
-        let mut bp = self.buffered_param_store.lock().unwrap();
-
-        bp.ensure_opt_state(state_size);
-        bp.copy_grads_from_slice(grads);
-
-        if self.optimizer_expr.is_none() {
-            let num_params = bp.len();
-            let pool_arc = self.temp_matrix_pool.clone();
-            let mut pool = pool_arc.lock().unwrap();
-            let opt_expr = OptimizerExpr::new_buffered_handle(
-                self.memory_executor.clone(),
-                num_params,
-                chain,
-                &mut pool,
-            );
-            self.optimizer_expr = Some(opt_expr);
+    fn read_buffer_to_vec(&self, handle: &MatrixBufferHandle) -> Vec<f32> {
+        if handle.is_gpu() {
+            let gpu_compute = self
+                .compute_executor
+                .gpu_compute()
+                .expect("GPU compute not available");
+            let cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(handle);
+            let guard = cpu_handle.read();
+            guard.as_slice().unwrap().to_vec()
+        } else {
+            let guard = handle.read();
+            guard.as_slice().expect("CPU buffer").to_vec()
         }
+    }
 
-        let opt = self.optimizer_expr.as_mut().unwrap();
-        opt.step_buffered_handle(&bp.params, &bp.grads);
+    // ===================================================================
+    // Шаг оптимизации (обновление параметров)
+    // ===================================================================
+
+    /// Выполняет шаг оптимизатора для каждого буфера параметров.
+    pub fn update_params_buffered(&mut self, desc: OptimizerDesc, _grads: &[f32]) {
+        let mut ps = self.param_store.lock().unwrap();
+        let gpu_compute_guard = self.compute_executor.gpu_compute();
+        let gpu_compute_ref = gpu_compute_guard.as_deref();
+
+        for buffer_idx in 0..ps.num_buffers() {
+            let (num_params, slice) = {
+                let buffer = ps.get_param_buffer_by_idx(buffer_idx);
+                (buffer.params.rows(), ParamSlice::new(buffer_idx, 0, buffer.params.rows()))
+            };
+
+            let chain = desc.build_chain(); // создаём новую цепочку для каждого буфера
+            let state_size = chain.total_state_size_per_param();
+            ps.ensure_opt_state(&slice, state_size);
+
+            if !self.optimizer_exprs.contains_key(&buffer_idx) {
+                let pool_arc = self.temp_matrix_pool.clone();
+                let mut pool = pool_arc.lock().unwrap();
+                let opt_expr = OptimizerExpr::new_buffered_handle(
+                    self.memory_executor.clone(),
+                    num_params,
+                    chain,
+                    &mut pool,
+                );
+                self.optimizer_exprs.insert(buffer_idx, opt_expr);
+            }
+
+            let opt = self.optimizer_exprs.get_mut(&buffer_idx).unwrap();
+            let buffer = ps.get_param_buffer_by_idx(buffer_idx);
+            let params_handle = buffer.params.clone();
+            let grads_handle = buffer.grads.clone();
+
+            // Используем гибридный метод, который сам скачивает/загружает при необходимости.
+            opt.step_buffered_handle_hybrid(&params_handle, &grads_handle, gpu_compute_ref);
+        }
+    }
+
+    // ===================================================================
+    // Вспомогательные методы для доступа к параметрам сегмента
+    // ===================================================================
+
+    pub(crate) fn get_params_handle_for_segment(&self, seg_idx: usize) -> Option<MatrixBufferHandle> {
+        let ps = self.param_store.lock().unwrap();
+        match &self.segments[seg_idx] {
+            Segment::UniversalProcessor(_, slices, _) => {
+                slices.first().map(|s| ps.params_handle(s).clone())
+            }
+            Segment::Splitter { slice, .. } | Segment::Combiner { slice, .. } => {
+                Some(ps.params_handle(slice).clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn get_grads_handle_for_segment(&self, seg_idx: usize) -> Option<MatrixBufferHandle> {
+        let ps = self.param_store.lock().unwrap();
+        match &self.segments[seg_idx] {
+            Segment::UniversalProcessor(_, slices, _) => {
+                slices.first().map(|s| ps.grads_handle(s).clone())
+            }
+            Segment::Splitter { slice, .. } | Segment::Combiner { slice, .. } => {
+                Some(ps.grads_handle(slice).clone())
+            }
+            _ => None,
+        }
     }
 }

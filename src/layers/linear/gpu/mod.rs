@@ -1,19 +1,38 @@
-pub mod pipeline;   // <-- новый модуль
+// src/layers/linear/gpu/mod.rs
+
+pub mod pipeline;
 
 use crate::compute_manager::gpu::compute::GpuCompute;
+use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use vulkano::buffer::Subbuffer;
+
+/// Вспомогательная функция: получает `Subbuffer<[f32]>` из `MatrixBufferView`,
+/// используя смещение и длину. Родительский буфер должен быть GPU.
+fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[f32]> {
+    let parent_sub = gpu.get_gpu_subbuffer_from_handle(view.parent_handle());
+    let start = view.offset_elements() as u64;
+    let end = (view.offset_elements() + view.len()) as u64;
+    parent_sub.slice(start..end)
+}
 
 impl GpuCompute {
+    /// Прямой проход линейного слоя на GPU.
+    ///
+    /// Веса и смещения передаются как `MatrixBufferView`, которые ссылаются
+    /// на части одного большого GPU-буфера параметров сегмента.
+    /// Вход и выход — GPU-дескрипторы.
     pub fn run_linear_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
-        weight: &MatrixBufferHandle,
-        bias: &[f32],
+        weight: &MatrixBufferView,
+        bias: &MatrixBufferView,
         output: &MatrixBufferHandle,
     ) {
         assert!(input.is_gpu(), "Input handle must be GPU");
-        assert!(weight.is_gpu(), "Weight handle must be GPU");
         assert!(output.is_gpu(), "Output handle must be GPU");
+        assert!(weight.is_gpu(), "Weight view must point to GPU buffer");
+        assert!(bias.is_gpu(), "Bias view must point to GPU buffer");
 
         let batch = input.rows();
         let in_features = input.cols();
@@ -24,46 +43,42 @@ impl GpuCompute {
         assert_eq!(bias.len(), out_features, "Bias length mismatch");
 
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
-        let w_buf = self.get_gpu_subbuffer_from_handle(weight);
+        let w_buf = subbuffer_from_view(self, weight);
+        let b_buf = subbuffer_from_view(self, bias);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let (bias_buf, bias_raw) = self.upload_to_temp_buffer(bias);
-
-        // Используем новый пайплайн из собственной структуры Linear
+        // Используем пайплайн линейного слоя (веса и смещения уже на GPU)
         let pipeline = self.linear_pipelines().forward.clone();
         let push = [batch as u32, in_features as u32, out_features as u32];
 
         self.run_compute_shader_with_dispatch(
             pipeline,
-            &[
-                (0, in_buf),
-                (1, w_buf),
-                (2, bias_buf.clone()),
-                (3, out_buf),
-            ],
+            &[(0, in_buf), (1, w_buf), (2, b_buf), (3, out_buf)],
             &push,
             [((batch * out_features + 255) / 256) as u32, 1, 1],
         );
-
-        self.release_temp_buffer(bias_buf, bias_raw);
     }
 
+    /// Обратный проход линейного слоя на GPU.
+    ///
+    /// Градиенты весов и смещений записываются непосредственно в
+    /// предоставленные `MatrixBufferView` (части общего буфера градиентов).
+    /// Входной градиент (`grad_output`) и выходной (`grad_input`) — GPU-дескрипторы.
     pub fn run_linear_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
-        weight: &MatrixBufferHandle,
+        weight: &MatrixBufferView,
         grad_output: &MatrixBufferHandle,
         grad_input: &MatrixBufferHandle,
-        grad_weight: &MatrixBufferHandle,
-        grad_bias_handle: &MatrixBufferHandle,
-        grad_bias_cpu: &MatrixBufferHandle,
+        grad_weight: &MatrixBufferView,
+        grad_bias: &MatrixBufferView,
     ) {
         assert!(input.is_gpu(), "Input handle must be GPU");
-        assert!(weight.is_gpu(), "Weight handle must be GPU");
+        assert!(weight.is_gpu(), "Weight view must point to GPU buffer");
         assert!(grad_output.is_gpu(), "grad_output handle must be GPU");
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
-        assert!(grad_weight.is_gpu(), "grad_weight handle must be GPU");
-        assert!(grad_bias_handle.is_gpu(), "grad_bias_handle must be GPU");
+        assert!(grad_weight.is_gpu(), "grad_weight view must point to GPU buffer");
+        assert!(grad_bias.is_gpu(), "grad_bias view must point to GPU buffer");
 
         let batch = input.rows();
         let in_features = input.cols();
@@ -75,23 +90,16 @@ impl GpuCompute {
         assert_eq!(grad_weight.cols(), in_features, "grad_weight cols mismatch");
         assert_eq!(grad_output.rows(), batch, "grad_output rows mismatch");
         assert_eq!(grad_output.cols(), out_features, "grad_output cols mismatch");
-        assert_eq!(grad_bias_handle.rows(), 1, "grad_bias_handle rows must be 1");
-        assert_eq!(grad_bias_handle.cols(), out_features, "grad_bias_handle cols mismatch");
-        assert!(!grad_bias_cpu.is_gpu(), "grad_bias_cpu must be CPU");
-        assert_eq!(grad_bias_cpu.rows(), 1, "grad_bias_cpu rows must be 1");
-        assert_eq!(grad_bias_cpu.cols(), out_features, "grad_bias_cpu cols mismatch");
+        assert_eq!(grad_bias.len(), out_features, "grad_bias length mismatch");
 
         let x_buf = self.get_gpu_subbuffer_from_handle(input);
-        let w_buf = self.get_gpu_subbuffer_from_handle(weight);
+        let w_buf = subbuffer_from_view(self, weight);
         let dout_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let dx_buf = self.get_gpu_subbuffer_from_handle(grad_input);
-        let dw_buf = self.get_gpu_subbuffer_from_handle(grad_weight);
-        let db_buf = self.get_gpu_subbuffer_from_handle(grad_bias_handle);
+        let dw_buf = subbuffer_from_view(self, grad_weight);
+        let db_buf = subbuffer_from_view(self, grad_bias);
 
-        self.fill_gpu_handle(grad_weight, 0.0);
-        self.fill_gpu_handle(grad_bias_handle, 0.0);
-
-        // Используем новый пайплайн из собственной структуры Linear
+        // Используем пайплайн обратного прохода линейного слоя.
         let pipeline = self.linear_pipelines().backward.clone();
         let push = [batch as u32, in_features as u32, out_features as u32];
 
@@ -108,7 +116,5 @@ impl GpuCompute {
             &push,
             [((batch + 255) / 256) as u32, 1, 1],
         );
-
-        self.copy_gpu_to_cpu_handle(grad_bias_handle, grad_bias_cpu);
     }
 }

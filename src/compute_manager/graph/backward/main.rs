@@ -26,10 +26,8 @@ impl MixedModel {
             "backward_mat_multi_buffered: expected {} deltas, got {}",
             self.output_stream_count, deltas.len());
 
-        let bp = self.buffered_param_store.lock().unwrap();
-        let params_handle = bp.params_handle().clone();
-        let grad_params_handle = bp.grads_handle().clone();
-        drop(bp);
+        // Убираем старый код получения params_handle из buffered_param_store.
+        // Теперь параметры получаются посегментно внутри цикла.
 
         let mut stream_gradients = deltas;
         let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
@@ -40,6 +38,15 @@ impl MixedModel {
         for (seg_index, seg) in segments.iter().enumerate().rev() {
             let start = Instant::now();
             let device = self.compute_executor.device_for_segment(seg_index);
+
+            // Получаем дескрипторы параметров и градиентов для этого сегмента.
+            // Если параметров нет, создаём пустые CPU-буферы.
+            let params_handle = self
+                .get_params_handle_for_segment(seg_index)
+                .unwrap_or_else(|| pool.acquire(0, 0));
+            let grad_params_handle = self
+                .get_grads_handle_for_segment(seg_index)
+                .unwrap_or_else(|| pool.acquire(0, 0));
 
             match seg {
                 Segment::Unsqueeze(target_dims) => {
@@ -401,6 +408,9 @@ impl MixedModel {
         stream_gradients
     }
 
+    // Вспомогательный метод `backward_universal_batch_buffered_handle` остаётся без изменений,
+    // но теперь он получает `params` и `grad_params` как `MatrixBufferHandle`, которые могут
+    // быть уже на нужном устройстве. Внутри он использует эти дескрипторы напрямую.
     fn backward_universal_batch_buffered_handle(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -455,6 +465,7 @@ impl MixedModel {
     }
 }
 
+// Функция `call_backward_buffered` остаётся без изменений.
 fn call_backward_buffered(
     layer: &Box<dyn UniversalLayer>,
     ctx: &DynamicContext,

@@ -80,11 +80,11 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
 
     // --- инициализация весов ---
     {
-        let mut bp = model.buffered_param_store().lock().unwrap();
-        let len = bp.len();
+        let mut ps = model.param_store().lock().unwrap();
+        let len = ps.total_params();
         match &plan.initializer {
-            Initializer::Zeros => bp.set_all_params(&vec![0.0f32; len]),
-            Initializer::Ones => bp.set_all_params(&vec![1.0f32; len]),
+            Initializer::Zeros => ps.set_all_params(&vec![0.0f32; len]),
+            Initializer::Ones => ps.set_all_params(&vec![1.0f32; len]),
             Initializer::RandomUniform { min, max } => {
                 let mut rng: Box<dyn rand::RngCore> = if let Some(seed) = plan.seed {
                     Box::new(rand::rngs::StdRng::seed_from_u64(seed))
@@ -95,7 +95,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
                 for p in &mut params {
                     *p = rng.gen_range(*min..*max);
                 }
-                bp.set_all_params(&params);
+                ps.set_all_params(&params);
             }
         }
     }
@@ -160,6 +160,8 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         // Перед каждой эпохой перераспределяем сегменты по устройствам
         // на основе накопленной профилировочной статистики.
         model.compute_executor().redistribute(model.segments(), plan.batch_size, true);
+        let placement = model.compute_executor().get_placement();
+        model.migrate_parameters(&placement)?;
 
         let mut epoch_loss = 0.0f32;
 

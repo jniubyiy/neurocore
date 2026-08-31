@@ -36,6 +36,10 @@ pub struct Scheduler {
     cost: CostModel,
     training_data: Vec<Vec<(usize, f64)>>,
     training_threshold: usize,
+    /// Наличие GPU в плане устройств. Может использоваться для
+    /// корректировки стратегии планирования (например, уменьшения
+    /// числа CPU-чанков, если часть работы перекладывается на GPU).
+    has_gpu: bool,
 }
 
 impl Clone for Scheduler {
@@ -55,6 +59,7 @@ impl Clone for Scheduler {
             cost: self.cost.clone(),
             training_data: vec![Vec::new(); num_cpus],
             training_threshold: self.training_threshold,
+            has_gpu: self.has_gpu,
         }
     }
 }
@@ -83,7 +88,13 @@ fn get_data_dir() -> PathBuf {
 }
 
 impl Scheduler {
-    pub fn new_with_cpus(cost: CostModel, cpu_info: CpuInfo, num_cpus: usize) -> Self {
+    /// Создаёт планировщик с указанием наличия GPU.
+    pub fn new_with_cpus(
+        cost: CostModel,
+        cpu_info: CpuInfo,
+        num_cpus: usize,
+        has_gpu: bool,
+    ) -> Self {
         let num_workers = cost.num_cores;
         let data_dir = get_data_dir();
         let profile_path = data_dir.join("hardware_profile.json");
@@ -115,11 +126,13 @@ impl Scheduler {
             cost,
             training_data: vec![Vec::new(); num_cpus],
             training_threshold: TRAINING_THRESHOLD,
+            has_gpu,
         }
     }
 
+    /// Создаёт планировщик без GPU (обратная совместимость).
     pub fn new(cost: CostModel, cpu_info: CpuInfo) -> Self {
-        Self::new_with_cpus(cost, cpu_info, 1)
+        Self::new_with_cpus(cost, cpu_info, 1, false)
     }
 
     pub fn set_num_workers(&mut self, n: usize) {
@@ -183,8 +196,19 @@ impl Scheduler {
             return vec![Vec::new(); self.num_workers];
         }
 
+        // Если есть GPU, можно уменьшить максимальное количество чанков,
+        // так как часть работы уже выполняется на GPU, и CPU‑потоки не должны
+        // создавать излишнюю конкуренцию. Для простоты ограничим максимальное
+        // число чанков половиной от обычного.
+        let max_chunks_per_worker = if self.has_gpu {
+            MAX_CHUNKS_PER_WORKER / 2
+        } else {
+            MAX_CHUNKS_PER_WORKER
+        };
+
+        let max_chunks = total_tasks.min(self.num_workers * max_chunks_per_worker);
+
         let speeds = self.profile.core_relative_speeds.clone();
-        let max_chunks = total_tasks.min(self.num_workers * MAX_CHUNKS_PER_WORKER);
 
         let has_trained_model = self.predictors.iter().enumerate().any(|(idx, _)| {
             !self.training_data[idx].is_empty()

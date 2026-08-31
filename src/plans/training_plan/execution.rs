@@ -10,7 +10,7 @@ use rand::SeedableRng;
 
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::graph::model::MixedModel;
-use crate::device_plan::{ComputeDevice, DevicePlan};
+use crate::device_plan::DevicePlan;
 use crate::logging::training_monitor::TrainingMonitor;
 use crate::model_plan::Plan;
 use crate::tensor::Tensor2D;
@@ -32,30 +32,39 @@ pub struct TrainingResult {
     pub monitor_summary: Option<crate::logging::TrainingSummary>,
 }
 
-/// Выполняет план обучения. Для GPU запускает весь цикл в отдельном потоке
-/// с увеличенным стеком, чтобы избежать переполнения в Vulkan-драйверах.
+/// Выполняет план обучения.
+///
+/// Запускает весь процесс (построение модели и обучение) в отдельном потоке
+/// с увеличенным стеком (32 МБ), чтобы избежать переполнения стека при
+/// инициализации Vulkan и работе с GPU.
 pub fn execute(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<TrainingResult, String> {
-    let has_gpu = device_plan
-        .compute_devices
-        .iter()
-        .any(|d| matches!(d, ComputeDevice::Gpu { .. }));
+    let plan = plan.clone();
+    let device_plan = device_plan.clone();
 
-    if has_gpu {
-        let plan = plan.clone();
-        let device_plan = device_plan.clone();
-        let handle = thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn(move || execute_inner(&plan, &device_plan))
-            .map_err(|e| format!("Failed to spawn GPU training thread: {}", e))?;
-        handle
-            .join()
-            .map_err(|_| "GPU training thread panicked".to_string())?
-    } else {
-        execute_inner(plan, device_plan)
-    }
+    let handle = thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let model_desc = (plan.model_fn)();
+            let _ = Plan::from_layer_descs(model_desc.clone())?;
+            let mut model = MixedModel::from_plan_with_device_plan(
+                model_desc,
+                device_plan.clone(),
+            )?;
+            execute_inner(&plan, &device_plan, &mut model)
+        })
+        .map_err(|e| format!("Failed to spawn training thread: {}", e))?;
+
+    handle
+        .join()
+        .map_err(|_| "Training thread panicked".to_string())?
 }
 
-fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<TrainingResult, String> {
+/// Внутренняя реализация обучения. Принимает уже созданную модель.
+fn execute_inner(
+    plan: &TrainingPlan,
+    _device_plan: &DevicePlan,
+    model: &mut MixedModel,
+) -> Result<TrainingResult, String> {
     let start_time = Instant::now();
 
     // --- проверка использования многопотоковых данных ---
@@ -68,15 +77,6 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
                 .to_string(),
         );
     }
-
-    // --- построение модели ---
-    let model_desc = (plan.model_fn)();
-    let _ = Plan::from_layer_descs(model_desc.clone())?;
-    let mut model = MixedModel::from_plan_with_device_plan(model_desc, device_plan.clone())?;
-
-    // --- первоначальное размещение моделей уже выполнено в конструкторе ---
-    // Теперь при каждой эпохе будем вызывать redistribute с force=true,
-    // чтобы перераспределять на основе накопленной статистики.
 
     // --- инициализация весов ---
     {
@@ -158,7 +158,6 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
 
     for epoch in 0..plan.epochs {
         // Перед каждой эпохой перераспределяем модели по устройствам
-        // на основе накопленной профилировочной статистики.
         model.compute_executor().redistribute(model.models(), plan.batch_size, true);
         let placement = model.compute_executor().get_placement();
         model.migrate_parameters(&placement)?;
@@ -188,12 +187,12 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
             );
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
-            // backward (теперь требует &mut self)
+            // backward
             let t2 = Instant::now();
             let (_, grads) = model.backward(&ctxs, delta);
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
-            // обновление параметров через буферизованный оптимизатор
+            // обновление параметров
             let t3 = Instant::now();
             model.update_params_buffered(plan.optimizer_desc.clone(), &grads[0]);
             let update_dt = t3.elapsed().as_nanos() as u64;
@@ -303,12 +302,10 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
         let test_input_dynamic = test_input.to_dynamic_tensor();
         let (pred, _) = model.forward(test_input_dynamic.clone());
 
-        // Сохраняем предсказание в результат, если запрошено пользователем
         if plan.output_tensors.contains(&"prediction".to_string()) {
             result.tensors.insert("prediction".into(), pred.clone());
         }
 
-        // Определяем цель для теста
         let target_for_test = match &plan.test_target_data {
             Some(t) => {
                 assert_eq!(
@@ -318,7 +315,7 @@ fn execute_inner(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Traini
                 );
                 t.to_dynamic_tensor()
             }
-            None => test_input_dynamic.clone(), // обратная совместимость: цель = вход
+            None => test_input_dynamic.clone(),
         };
 
         let (loss, _) = model.compute_loss(

@@ -20,8 +20,20 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    /// Создаёт пул с заданным числом потоков.
+    /// Создаёт пул с заданным числом потоков и стандартным размером стека (2 МБ).
     pub fn new(num_threads: usize) -> Self {
+        Self::new_with_stack_size(num_threads, 2 * 1024 * 1024)
+    }
+
+    /// Создаёт пул с заданным числом потоков и указанным размером стека.
+    ///
+    /// # Аргументы
+    /// * `num_threads` – количество потоков.
+    /// * `stack_size` – размер стека каждого потока в байтах.
+    ///
+    /// # Паника
+    /// Паникует, если не удалось создать хотя бы один поток.
+    pub fn new_with_stack_size(num_threads: usize, stack_size: usize) -> Self {
         let (sender, receiver) = mpsc::channel::<Option<Task>>();
         let receiver = Arc::new(Mutex::new(receiver));
         let active_tasks = Arc::new(AtomicUsize::new(0));
@@ -30,24 +42,27 @@ impl WorkerPool {
         for worker_id in 0..num_threads {
             let receiver = Arc::clone(&receiver);
             let active_tasks = Arc::clone(&active_tasks);
-            let handle = thread::spawn(move || {
-                // Устанавливаем индекс текущего потока
-                WORKER_INDEX.set(worker_id);
+            let handle = thread::Builder::new()
+                .stack_size(stack_size)
+                .spawn(move || {
+                    // Устанавливаем индекс текущего потока
+                    WORKER_INDEX.set(worker_id);
 
-                loop {
-                    let task = {
-                        let rx = receiver.lock().unwrap();
-                        rx.recv().unwrap()
-                    };
-                    match task {
-                        Some(task) => {
-                            task();
-                            active_tasks.fetch_sub(1, Ordering::Release);
+                    loop {
+                        let task = {
+                            let rx = receiver.lock().unwrap();
+                            rx.recv().unwrap()
+                        };
+                        match task {
+                            Some(task) => {
+                                task();
+                                active_tasks.fetch_sub(1, Ordering::Release);
+                            }
+                            None => break,
                         }
-                        None => break,
                     }
-                }
-            });
+                })
+                .expect("Failed to spawn worker thread");
             workers.push(handle);
         }
 

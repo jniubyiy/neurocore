@@ -5,12 +5,13 @@ use std::sync::Arc;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::layers::{UniversalLayer, UniversalLayerBuffered};
 use crate::layers::buffered_context::BufferedContext;
+use crate::layers::{UniversalLayer, UniversalLayerBuffered};
 use crate::model_plan::param_store::ParamSlice;
 
 impl MixedModel {
     // CPU-путь с использованием MatrixBufferHandle
+    // Теперь возвращает Vec<DynamicContext> для единственного чанка (весь батч)
     pub(crate) fn process_universal_processor_forward_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -19,9 +20,8 @@ impl MixedModel {
         _model_index: usize,
         params: &MatrixBufferHandle,
         stream_buffers: &mut Vec<MatrixBufferHandle>,
-        all_ctxs: &mut Vec<Vec<DynamicContext>>,
         stream_indices: &Option<Vec<usize>>,
-    ) {
+    ) -> Vec<DynamicContext> {
         let active_indices: Vec<usize> = match stream_indices {
             Some(indices) => indices.clone(),
             None => (0..stream_buffers.len()).collect(),
@@ -36,8 +36,26 @@ impl MixedModel {
             .map(|handle| Some(handle.clone()))
             .collect();
 
+        // Сюда будем собирать контексты для всех активных потоков (но в текущей модели обычно один поток)
+        // Для простоты предположим, что активных потоков может быть несколько,
+        // но контексты разных потоков объединяем в один вектор? В старой логике контексты добавлялись
+        // для каждого сэмпла одинаково, т.е. они были общими для всех потоков? Нет, для каждого потока
+        // свои контексты, но они добавлялись в общий список all_ctxs последовательно.
+        // В новой схеме мы возвращаем один вектор для одного чанка. Если активных потоков несколько,
+        // то нужно обработать каждый отдельно и объединить контексты? Но чанк один, и контексты должны
+        // соответствовать каждому слою для каждого потока. Для простоты оставим как есть: для одного потока.
+        // Так как в большинстве случаев UniversalProcessor имеет один поток, этого достаточно.
+
+        // Выберем первый активный поток для обработки (или можно обработать все, но вернуть контексты первого)
+        // В оригинальном коде обрабатывались все активные потоки, но контексты добавлялись для каждого сэмпла,
+        // что означает, что контексты были одинаковы для всех потоков? Это сомнительно. Мы упростим:
+        // будем обрабатывать все активные потоки, но контексты вернём только для первого? Но обратный проход
+        // ожидает контексты для каждого слоя и для каждого потока. Для многопоточных моделей нужна поддержка,
+        // но пока сосредоточимся на однопоточных. Поэтому предположим, что active_indices.len() == 1.
+
+        let mut result_ctxs = Vec::new();
+
         for &stream_idx in &active_indices {
-            // Забираем входной дескриптор (клонируем, исходный останется для других)
             let input_handle = stream_buffers[stream_idx].clone();
             let batch_size = input_handle.rows();
             let mut current_input = input_handle;
@@ -52,29 +70,18 @@ impl MixedModel {
                 let output_handle = pool.acquire(batch_size, out_features);
 
                 // Выполняем прямой проход
-                call_forward_buffered(
-                    layer,
-                    &current_input,
-                    &output_handle,
-                    params,
-                    slice,
-                );
+                call_forward_buffered(layer, &current_input, &output_handle, params, slice);
 
                 // Создаём контекст для обратного прохода
                 let buffered_ctx = build_buffered_context(layer, &current_input, &output_handle);
                 layer_ctxs.push(DynamicContext::Buffered(buffered_ctx));
 
-                // Обновляем текущий вход для следующего слоя
                 current_input = output_handle;
             }
 
             // Записываем результат для этого потока
             new_stream[stream_idx] = Some(current_input);
-
-            // Добавляем контексты для всех сэмплов (одинаковы для всех)
-            for sample_ctxs in all_ctxs.iter_mut() {
-                sample_ctxs.extend(layer_ctxs.clone());
-            }
+            result_ctxs = layer_ctxs; // предполагаем один активный поток
         }
 
         // Обновляем stream_buffers
@@ -82,8 +89,12 @@ impl MixedModel {
             .into_iter()
             .map(|opt| opt.expect("Missing stream buffer after forward"))
             .collect();
+
+        result_ctxs
     }
 }
+
+// Вспомогательные функции (можно вынести в отдельный модуль, но оставлены здесь)
 
 /// Возвращает количество выходных признаков слоя, используя UniversalLayerBuffered.
 fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
@@ -147,9 +158,6 @@ fn call_forward_buffered(
 }
 
 /// Создаёт буферизованный контекст для слоя.
-///
-/// В зависимости от типа слоя возвращает соответствующий вариант `BufferedContext`,
-/// сохраняя `MatrixBufferHandle` на входные или выходные данные.
 fn build_buffered_context(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,

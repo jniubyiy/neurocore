@@ -76,7 +76,16 @@ impl DevicePlan {
     // ---------- Builder методы ----------
 
     /// Добавляет CPU.
+    ///
+    /// # Паника
+    /// Паникует, если количество потоков меньше 2, так как системе требуется
+    /// минимум один управляющий и один вычислительный поток.
     pub fn cpu(mut self, id: usize, threads: usize) -> Self {
+        assert!(
+            threads >= 2,
+            "DevicePlan: CPU threads must be at least 2 (got {})",
+            threads
+        );
         self.compute_devices.push(ComputeDevice::Cpu { id, threads });
         if self.compute_devices.len() == 1 {
             self.default_compute_id = id;
@@ -116,8 +125,6 @@ impl DevicePlan {
     }
 
     /// Устанавливает политику управления VRAM.
-    /// - `high_watermark`: порог заполнения VRAM (0.0..1.0), после которого начинается выгрузка.
-    /// - `low_watermark`: порог, при котором можно загружать новые данные в VRAM.
     pub fn with_vram_policy(mut self, high_watermark: f32, low_watermark: f32) -> Self {
         self.vram_high_watermark = high_watermark.clamp(0.0, 1.0);
         self.vram_low_watermark = low_watermark.clamp(0.0, 1.0);
@@ -137,7 +144,6 @@ impl DevicePlan {
     }
 
     /// Устанавливает максимальный размер буфера (в элементах f32), который может быть размещён в VRAM.
-    /// Буферы больше этого размера будут реже продвигаться в VRAM.
     pub fn with_max_vram_buffer_elements(mut self, max_elements: usize) -> Self {
         self.max_vram_buffer_elements = max_elements;
         self
@@ -149,12 +155,7 @@ impl DevicePlan {
         self.default_compute_id
     }
 
-    /// Интерпретатор конфигурационной строки (для удобства).
-    ///
-    /// Формат: `"cpu:<id>:<threads>; gpu:<id>; ram:<id>:<mb>; vram:<id>:<gpu_id>:<mb>; ssd:<id>:<path>:<mb>"`
-    /// Элементы разделяются `;`, пробелы игнорируются.
-    /// Дополнительно можно указать параметры политики:
-    /// `vram_high=<float>; vram_low=<float>; ssd_age=<u64>; promotion=<usize>; max_vram_elems=<usize>`
+    /// Интерпретатор конфигурационной строки.
     pub fn from_config_string(config: &str) -> Result<Self, String> {
         let mut plan = DevicePlan::empty();
         let cleaned = config.replace(' ', "").replace('\t', "");

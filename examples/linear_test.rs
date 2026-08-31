@@ -58,7 +58,7 @@ mod training_plan_v1 {
 }
 mod device_plan_v1 {
     use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 1).ram(0, 8192) }
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192) }
 }
 mod training_plan_v2 {
     use neurocore::training_plan::TrainingPlan;
@@ -82,7 +82,7 @@ mod training_plan_v4 {
 }
 mod device_plan_v4_cpu {
     use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 1).ram(0, 8192) }
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192) }
 }
 mod device_plan_v4_gpu {
     use neurocore::device_plan::DevicePlan;
@@ -98,7 +98,7 @@ mod device_plan_v5_gpu {
 }
 mod device_plan_v5_cpu {
     use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 1).ram(0, 8192) }
+    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192) }
 }
 mod training_plan_v6 {
     use neurocore::training_plan::TrainingPlan;
@@ -134,19 +134,19 @@ fn print_result(label: &str, r: &neurocore::training_plan::execution::TrainingRe
 
 fn main() {
     let r1 = neurocore::run_training!(training_plan_v1::plan, device = device_plan_v1::plan);
-    print_result("V1 CPU 1t", &r1);
+    print_result("V1 CPU 2t", &r1);
     let r2 = neurocore::run_training!(training_plan_v2::plan, device = device_plan_v2::plan);
     print_result("V2 CPU 4t", &r2);
     let r3 = neurocore::run_training!(training_plan_v3::plan, device = device_plan_v3::plan);
     print_result("V3 GPU   ", &r3);
     let r4_cpu = neurocore::run_training!(training_plan_v4::plan, device = device_plan_v4_cpu::plan);
-    print_result("V4a CPU ", &r4_cpu);
+    print_result("V4a CPU 2t", &r4_cpu);
     let r4_gpu = neurocore::run_training!(training_plan_v4::plan, device = device_plan_v4_gpu::plan);
     print_result("V4b GPU ", &r4_gpu);
     let r5_gpu = neurocore::run_training!(training_plan_v5::plan, device = device_plan_v5_gpu::plan);
     print_result("V5a GPU ", &r5_gpu);
     let r5_cpu = neurocore::run_training!(training_plan_v5::plan, device = device_plan_v5_cpu::plan);
-    print_result("V5b CPU ", &r5_cpu);
+    print_result("V5b CPU 2t", &r5_cpu);
     let r6 = neurocore::run_training!(training_plan_v6::plan, device = device_plan_v6::plan);
     print_result("V6 SSD  ", &r6);
     let r7 = neurocore::run_training!(training_plan_v7::plan, device = device_plan_v7::plan);

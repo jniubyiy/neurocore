@@ -75,9 +75,7 @@ macro_rules! device_plan_v {
         mod $name {
             use neurocore::device_plan::DevicePlan;
             pub fn plan() -> DevicePlan {
-                let p = DevicePlan::empty()
-                    .cpu(0, $cpu)
-                    .ram(0, $ram);
+                let p = DevicePlan::empty().cpu(0, $cpu).ram(0, $ram);
                 let p = if $gpu { p.gpu(0).vram(0, 0, $vram) } else { p };
                 if $ssd {
                     p.ssd(0, "neurocore_ssd_cache", 5000)
@@ -89,13 +87,13 @@ macro_rules! device_plan_v {
     };
 }
 
-device_plan_v!(device_plan_v1, 1, 8192, false, 0, false);
+device_plan_v!(device_plan_v1, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v2, 4, 8192, false, 0, false);
 device_plan_v!(device_plan_v3, 2, 8192, true, 4096, false);
-device_plan_v!(device_plan_v4_cpu, 1, 8192, false, 0, false);
+device_plan_v!(device_plan_v4_cpu, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v4_gpu, 2, 8192, true, 4096, false);
 device_plan_v!(device_plan_v5_gpu, 2, 8192, true, 4096, false);
-device_plan_v!(device_plan_v5_cpu, 1, 8192, false, 0, false);
+device_plan_v!(device_plan_v5_cpu, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v6, 4, 8192, false, 0, true);
 device_plan_v!(device_plan_v7, 4, 8192, true, 4096, false);
 
@@ -114,7 +112,7 @@ fn main() {
         base_training,
         device = device_plan_v1::plan
     );
-    print_result("V1 CPU1", &r1);
+    print_result("V1 CPU2", &r1);
 
     let r2 = neurocore::run_training!(
         base_training,
@@ -132,7 +130,7 @@ fn main() {
         base_training,
         device = device_plan_v4_cpu::plan
     );
-    print_result("V4a CPU", &r4a);
+    print_result("V4a CPU2", &r4a);
     let r4b = neurocore::run_training!(
         base_training,
         device = device_plan_v4_gpu::plan
@@ -148,7 +146,7 @@ fn main() {
         base_training,
         device = device_plan_v5_cpu::plan
     );
-    print_result("V5b CPU", &r5b);
+    print_result("V5b CPU2", &r5b);
 
     let r6 = neurocore::run_training!(
         base_training,

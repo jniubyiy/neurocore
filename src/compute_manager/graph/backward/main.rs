@@ -19,7 +19,7 @@ impl MixedModel {
     pub fn backward_mat_multi_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
-        contexts: &[Vec<DynamicContext>],
+        contexts: &[Vec<DynamicContext>], // TODO: в будущем заменить на ChunkedContexts
         deltas: Vec<MatrixBufferHandle>,
     ) -> Vec<MatrixBufferHandle> {
         assert_eq!(deltas.len(), self.output_stream_count,
@@ -36,8 +36,6 @@ impl MixedModel {
             let start = Instant::now();
             let device = self.compute_executor.device_for_model(model_index);
 
-            // Получаем дескрипторы параметров и градиентов для этой модели.
-            // Если параметров нет, создаём пустые CPU-буферы.
             let params_handle = self
                 .get_params_handle_for_model(model_index)
                 .unwrap_or_else(|| pool.acquire(0, 0));
@@ -108,15 +106,11 @@ impl MixedModel {
                                 &grad_params_handle,
                             );
 
-                            // Копируем результат из GPU в CPU, так как дальнейшие модели
-                            // могут выполняться на CPU (или мы можем оставить на GPU,
-                            // если следующая модель тоже GPU, но для простоты всегда
-                            // возвращаем CPU, чтобы не усложнять).
                             let cpu_handle = pool.acquire(out_gpu.rows(), out_gpu.cols());
                             gpu.copy_gpu_to_cpu_handle(&out_gpu, &cpu_handle);
                             new_gradients[stream_idx] = Some(cpu_handle);
                         } else {
-                            // CPU-путь
+                            // CPU-путь (последовательный)
                             let in_delta_handle = self.backward_universal_batch_buffered_handle(
                                 pool,
                                 proc,
@@ -405,9 +399,7 @@ impl MixedModel {
         stream_gradients
     }
 
-    // Вспомогательный метод `backward_universal_batch_buffered_handle` остаётся без изменений,
-    // но теперь он получает `params` и `grad_params` как `MatrixBufferHandle`, которые могут
-    // быть уже на нужном устройстве. Внутри он использует эти дескрипторы напрямую.
+    // Вспомогательный метод для последовательного обратного прохода
     fn backward_universal_batch_buffered_handle(
         &mut self,
         pool: &mut TempMatrixPool,

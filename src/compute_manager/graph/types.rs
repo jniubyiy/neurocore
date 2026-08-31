@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use crate::layers::buffered_context::BufferedContext;
-use crate::model_plan::param_store::ParamSlice;
 use crate::layers::UniversalLayer;
+use crate::model_plan::param_store::ParamSlice;
 
 /// Контекст, сохраняемый слоями для обратного прохода.
 #[derive(Clone)]
@@ -13,11 +13,12 @@ pub enum DynamicContext {
     Buffered(BufferedContext),
 }
 
+/// Контексты обратного прохода, сгруппированные по чанкам.
+/// Внешний вектор содержит по одному элементу на каждый чанк батча.
+/// Каждый элемент — вектор контекстов слоёв для соответствующего чанка.
+pub type ChunkedContexts = Vec<Vec<DynamicContext>>;
+
 /// Типы моделей вычислительного графа.
-///
-/// Модель представляет собой логическую группу слоёв или операцию,
-/// которая может быть размещена на вычислительном устройстве независимо.
-/// Ранее называлась "сегментом".
 #[derive(Clone)]
 pub enum Model {
     UniversalProcessor(

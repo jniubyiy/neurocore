@@ -4,50 +4,58 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::compute_executor::ComputeExecutor;
-use crate::compute_manager::cpu::{CostModel, Scheduler, WorkerPool};
 use crate::compute_manager::cpu::hardware::CPU_INFO;
+use crate::compute_manager::cpu::{ComputeThreadPool, ControlThreadPool, CostModel, Scheduler};
 use crate::compute_manager::device::Device;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::matrix_buffer::TempMatrixPool;
+use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 use crate::device_plan::{ComputeDevice, DevicePlan};
 use crate::layers::UniversalLayer;
 use crate::model_plan::blueprint::LayerKind;
 use crate::model_plan::layer_desc::LayerDesc;
-use crate::model_plan::param_store::{ParamSlice, ParamStore};
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::model_plan::param_store::ParamStore;
 
 use super::types::Model;
 
-// ---------- CpuExecutor ----------
-#[derive(Clone)]
-struct CpuExecutor {
-    pool: Arc<WorkerPool>,
-    scheduler: Arc<Mutex<Scheduler>>,
-}
+/// Автоматически разделяет доступные CPU-потоки на управляющие и вычислительные.
+///
+/// # Аргументы
+/// * `total_threads` – общее количество CPU-потоков, указанное в `DevicePlan`.
+/// * `has_gpu` – наличие GPU в плане устройств.
+///
+/// # Возвращает
+/// Кортеж `(control_threads, compute_threads)`, где оба значения больше либо равны 1.
+///
+/// # Паника
+/// Паникует, если `total_threads` меньше 2.
+fn split_cpu_threads(total_threads: usize, has_gpu: bool) -> (usize, usize) {
+    assert!(total_threads >= 2, "total_threads must be at least 2");
+    let physical_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(total_threads);
 
-impl CpuExecutor {
-    fn new(pool: Arc<WorkerPool>, scheduler: Arc<Mutex<Scheduler>>) -> Self {
-        Self { pool, scheduler }
-    }
-}
+    // Базовое количество управляющих потоков: 1 на каждые 8 ядер, минимум 1, максимум 4.
+    let mut control = ((physical_cores / 8).max(1)).min(4);
 
-impl Executor for CpuExecutor {
-    fn execute_dyn(&self, f: Box<dyn FnOnce() + Send>) {
-        self.pool.execute(f);
+    // Не забираем все потоки под управление, оставляем минимум один вычислительный.
+    control = control.min(total_threads - 1);
+
+    let mut compute = total_threads - control;
+
+    // Если есть GPU, можно сократить CPU-вычислительные потоки, но не до нуля.
+    if has_gpu {
+        compute = compute.min(physical_cores / 2);
     }
-    fn wait_all(&self) {
-        self.pool.wait_all();
-    }
-    fn num_workers(&self) -> usize {
-        self.scheduler.lock().unwrap().num_workers()
-    }
-    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
-        self.scheduler.lock().unwrap().plan_chunks_assignment(total_tasks)
-    }
-    fn clone_executor(&self) -> Box<dyn Executor> {
-        Box::new(self.clone())
-    }
+
+    // Гарантируем минимум один вычислительный поток.
+    compute = compute.max(1);
+
+    // На случай, если после предыдущих корректировок compute превысил доступное количество.
+    compute = compute.min(total_threads - control);
+
+    (control, compute)
 }
 
 impl MixedModel {
@@ -65,7 +73,11 @@ impl MixedModel {
     ) -> Result<Self, String> {
         let plan = match device {
             Device::Cpu { threads } => DevicePlan::empty().cpu(0, threads).ram(0, 8192),
-            Device::Gpu { id } => DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(id).vram(0, id, 4096),
+            Device::Gpu { id } => DevicePlan::empty()
+                .cpu(0, 2)
+                .ram(0, 8192)
+                .gpu(id)
+                .vram(0, id, 4096),
         };
         Self::from_plan_with_device_plan_and_batch(layers, plan, 1)
     }
@@ -86,36 +98,47 @@ impl MixedModel {
         // -----------------------------------------------------------
         let compute_executor = Arc::new(
             ComputeExecutor::new(device_plan.clone(), memory_executor.clone())
-                .map_err(|e| format!("Failed to create ComputeExecutor: {}", e))?
+                .map_err(|e| format!("Failed to create ComputeExecutor: {}", e))?,
         );
 
         // -----------------------------------------------------------
-        // 3. Суммарное количество потоков CPU
+        // 3. Определяем общее количество потоков CPU и наличие GPU
         // -----------------------------------------------------------
         let cpu_threads = compute_executor.cpu_threads();
-        let num_cpus = device_plan.compute_devices.iter()
-            .filter(|d| matches!(d, ComputeDevice::Cpu { .. }))
-            .count()
-            .max(1);
+        let has_gpu = device_plan
+            .compute_devices
+            .iter()
+            .any(|d| matches!(d, ComputeDevice::Gpu { .. }));
 
         // -----------------------------------------------------------
-        // 4. Создаём хранилище параметров (ParamStore)
+        // 4. Разделяем потоки на управляющие и вычислительные
+        // -----------------------------------------------------------
+        let (control_threads, compute_threads) = split_cpu_threads(cpu_threads, has_gpu);
+
+        // -----------------------------------------------------------
+        // 5. Создаём пулы потоков
+        // -----------------------------------------------------------
+        let cost = CostModel::calibrate();
+        let scheduler = Arc::new(Mutex::new(Scheduler::new_with_cpus(
+            cost,
+            CPU_INFO.clone(),
+            compute_threads,
+            has_gpu,
+        )));
+        scheduler.lock().unwrap().set_num_workers(compute_threads);
+
+        let compute_executor_pool: Box<dyn Executor> =
+            Box::new(ComputeThreadPool::new(compute_threads, scheduler.clone()));
+        let control_executor_pool: Box<dyn Executor> =
+            Box::new(ControlThreadPool::new(control_threads));
+
+        // -----------------------------------------------------------
+        // 6. Создаём хранилище параметров (ParamStore)
         // -----------------------------------------------------------
         let param_store = Arc::new(Mutex::new(ParamStore::new(memory_executor.clone())));
 
         // -----------------------------------------------------------
-        // 5. Создаём CPU-исполнитель (WorkerPool + Scheduler)
-        // -----------------------------------------------------------
-        let cost = CostModel::calibrate();
-        let mut scheduler = Scheduler::new_with_cpus(cost, CPU_INFO.clone(), num_cpus);
-        scheduler.set_num_workers(cpu_threads);
-        let pool = Arc::new(WorkerPool::new(cpu_threads));
-        let cpu_executor: Box<dyn Executor> = Box::new(
-            CpuExecutor::new(pool.clone(), Arc::new(Mutex::new(scheduler.clone())))
-        );
-
-        // -----------------------------------------------------------
-        // 6. Строим модели вычислительного графа
+        // 7. Строим модели вычислительного графа
         // -----------------------------------------------------------
         let mut models: Vec<Model> = Vec::new();
         let mut current_layers: Vec<Box<dyn UniversalLayer>> = Vec::new();
@@ -124,20 +147,18 @@ impl MixedModel {
         let mut current_branch: Option<usize> = None;
         let mut current_stream_indices: Option<Vec<usize>> = None;
 
-        // Макрос для финализации текущего UniversalProcessor.
         macro_rules! finalize_universal {
             () => {
                 if !current_layers.is_empty() {
-                    // Выделяем параметры для всего блока одним буфером.
                     let slices = {
                         let mut ps = param_store.lock().unwrap();
-                        ps.allocate_segment(
-                            &current_layer_sizes,
-                            MemoryDeviceKind::HostRam, // начальное размещение
-                        )
+                        ps.allocate_segment(&current_layer_sizes, MemoryDeviceKind::HostRam)
                     };
-                    debug_assert_eq!(slices.len(), current_layers.len(),
-                        "Number of slices must match number of layers");
+                    debug_assert_eq!(
+                        slices.len(),
+                        current_layers.len(),
+                        "Number of slices must match number of layers"
+                    );
                     models.push(Model::UniversalProcessor(
                         Arc::new(std::mem::take(&mut current_layers)),
                         slices,
@@ -184,13 +205,9 @@ impl MixedModel {
                     let output_dims = desc.output_shape.streams.clone();
                     active_ports = Some(output_dims.clone());
 
-                    // Выделяем параметры для модели Splitter.
                     let slice = {
                         let mut ps = param_store.lock().unwrap();
-                        let slices = ps.allocate_segment(
-                            &[desc.param_len()],
-                            MemoryDeviceKind::HostRam,
-                        );
+                        let slices = ps.allocate_segment(&[desc.param_len()], MemoryDeviceKind::HostRam);
                         slices[0]
                     };
                     models.push(Model::Splitter {
@@ -205,13 +222,9 @@ impl MixedModel {
                     let input_dim = desc.input_shape.streams[0];
                     let output_dim = desc.output_shape.streams[0];
 
-                    // Выделяем параметры для модели Combiner.
                     let slice = {
                         let mut ps = param_store.lock().unwrap();
-                        let slices = ps.allocate_segment(
-                            &[desc.param_len()],
-                            MemoryDeviceKind::HostRam,
-                        );
+                        let slices = ps.allocate_segment(&[desc.param_len()], MemoryDeviceKind::HostRam);
                         slices[0]
                     };
                     models.push(Model::Combiner {
@@ -236,15 +249,19 @@ impl MixedModel {
                     if current_stream_indices.is_none() {
                         let indices = if let Some(ref ports) = active_ports {
                             if let Some(ref mut branch) = current_branch {
-                                if let Some(pos) = ports.iter().position(|&p| p == desc.input_shape.streams[0]) {
+                                if let Some(pos) = ports
+                                    .iter()
+                                    .position(|&p| p == desc.input_shape.streams[0])
+                                {
                                     *branch = pos;
                                 }
+                            } else if let Some(pos) = ports
+                                .iter()
+                                .position(|&p| p == desc.input_shape.streams[0])
+                            {
+                                current_branch = Some(pos);
                             } else {
-                                if let Some(pos) = ports.iter().position(|&p| p == desc.input_shape.streams[0]) {
-                                    current_branch = Some(pos);
-                                } else {
-                                    current_branch = Some(0);
-                                }
+                                current_branch = Some(0);
                             }
                             Some(vec![current_branch.unwrap()])
                         } else {
@@ -271,9 +288,10 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
-        // 7. Вычисляем ожидаемые формы входных и выходных тензоров
+        // 8. Вычисляем ожидаемые формы входных и выходных тензоров
         // -----------------------------------------------------------
-        let input_shapes: Vec<Vec<usize>> = vec![layers.first().unwrap().input_shape.streams.clone()];
+        let input_shapes: Vec<Vec<usize>> =
+            vec![layers.first().unwrap().input_shape.streams.clone()];
         let output_shapes: Vec<Vec<usize>> = if output_stream_count == 1 {
             vec![layers.last().unwrap().output_shape.streams.clone()]
         } else {
@@ -290,22 +308,23 @@ impl MixedModel {
         };
 
         // -----------------------------------------------------------
-        // 8. Создаём пул временных матриц
+        // 9. Создаём пул временных матриц
         // -----------------------------------------------------------
         let temp_matrix_pool = Arc::new(Mutex::new(TempMatrixPool::new(memory_executor.clone())));
 
         // -----------------------------------------------------------
-        // 9. Выполняем начальное размещение моделей
+        // 10. Выполняем начальное размещение моделей
         // -----------------------------------------------------------
         compute_executor.redistribute(&models, batch_size, true);
 
         // -----------------------------------------------------------
-        // 10. Собираем MixedModel
+        // 11. Собираем MixedModel
         // -----------------------------------------------------------
         let model = MixedModel {
             models,
             param_store,
-            executor: cpu_executor,
+            executor: compute_executor_pool,
+            control_executor: control_executor_pool,
             compute_executor,
             input_stream_count,
             output_stream_count,
@@ -345,4 +364,4 @@ impl MixedModel {
     ) -> Result<Self, String> {
         Self::from_plan_with_device_plan_and_batch(plan.layers, device_plan, batch_size)
     }
-}
+} 

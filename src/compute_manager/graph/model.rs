@@ -7,18 +7,23 @@ use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{DynamicContext, Model};
-use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::device_plan::{ComputeDevice, DevicePlan, StorageDevice};
+use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::device_plan::ComputeDevice;
 use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
-use crate::optimizer_plan::{OptimizerExpr, OptimizerDesc};
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::optimizer_plan::{OptimizerDesc, OptimizerExpr};
 
 pub struct MixedModel {
     pub(crate) models: Vec<Model>,
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
+    /// Вычислительный пул потоков. Используется для выполнения CPU-интенсивных
+    /// операций (прямой и обратный проходы, функции потерь, оптимизаторы).
     pub(crate) executor: Box<dyn Executor>,
+    /// Управляющий пул потоков. Используется для координации, планирования,
+    /// подготовки данных и запуска GPU-операций.
+    pub(crate) control_executor: Box<dyn Executor>,
     pub(crate) compute_executor: Arc<ComputeExecutor>,
     pub(crate) input_stream_count: usize,
     pub(crate) output_stream_count: usize,
@@ -52,15 +57,21 @@ impl MixedModel {
         &self.param_store
     }
 
+    /// Возвращает вычислительный пул потоков.
     pub fn executor(&self) -> &Box<dyn Executor> {
         &self.executor
+    }
+
+    /// Возвращает управляющий пул потоков.
+    pub fn control_executor(&self) -> &Box<dyn Executor> {
+        &self.control_executor
     }
 
     pub fn memory_executor(&self) -> &Arc<Mutex<MemoryExecutor>> {
         &self.memory_executor
     }
 
-    /// Возвращает ссылку на вычислительный исполнитель.
+    /// Возвращает ссылку на менеджер размещения (ComputeExecutor).
     pub fn compute_executor(&self) -> &Arc<ComputeExecutor> {
         &self.compute_executor
     }
@@ -240,11 +251,12 @@ impl MixedModel {
 
         for (model_idx, model_placement) in placement.iter().enumerate() {
             let target_kind = match &model_placement.compute_device {
-                ComputeDevice::Gpu { id } => MemoryDeviceKind::DeviceVram(crate::compute_manager::device_spec::DeviceId(*id)),
+                ComputeDevice::Gpu { id } => {
+                    MemoryDeviceKind::DeviceVram(crate::compute_manager::device_spec::DeviceId(*id))
+                }
                 ComputeDevice::Cpu { .. } => MemoryDeviceKind::HostRam,
             };
 
-            // Получаем слайс(ы) параметров для модели.
             let slices: Vec<ParamSlice> = match &self.models[model_idx] {
                 Model::UniversalProcessor(_, param_slices, _) => param_slices.clone(),
                 Model::Splitter { slice, .. } => vec![slice.clone()],
@@ -252,22 +264,20 @@ impl MixedModel {
                 _ => Vec::new(),
             };
 
-            // Для каждого уникального buffer_idx из слайсов перемещаем буферы.
             if let Some(first_slice) = slices.first() {
-                let buffer_idx = first_slice.buffer_idx;
-                let buffer = param_store.get_param_buffer_mut(&first_slice);
+                let buffer = param_store.get_param_buffer_mut(first_slice);
                 if buffer.location != target_kind {
                     let mut mem = memory_executor.lock().unwrap();
-                    // Перемещаем params
-                    mem.move_matrix_handle(buffer.params.id(), target_kind)
-                        .map_err(|e| format!("Failed to move params for model {}: {:?}", model_idx, e))?;
-                    // Перемещаем grads
-                    mem.move_matrix_handle(buffer.grads.id(), target_kind)
-                        .map_err(|e| format!("Failed to move grads for model {}: {:?}", model_idx, e))?;
-                    // Перемещаем opt_state, если есть
+                    mem.move_matrix_handle(buffer.params.id(), target_kind).map_err(|e| {
+                        format!("Failed to move params for model {}: {:?}", model_idx, e)
+                    })?;
+                    mem.move_matrix_handle(buffer.grads.id(), target_kind).map_err(|e| {
+                        format!("Failed to move grads for model {}: {:?}", model_idx, e)
+                    })?;
                     if let Some(ref opt_state) = buffer.opt_state {
-                        mem.move_matrix_handle(opt_state.id(), target_kind)
-                            .map_err(|e| format!("Failed to move opt_state for model {}: {:?}", model_idx, e))?;
+                        mem.move_matrix_handle(opt_state.id(), target_kind).map_err(|e| {
+                            format!("Failed to move opt_state for model {}: {:?}", model_idx, e)
+                        })?;
                     }
                     buffer.location = target_kind;
                 }
@@ -345,15 +355,33 @@ impl MixedModel {
 
     fn flat_to_dynamic_tensor(&self, shape: &[usize], flat: Vec<f32>) -> DynamicTensor {
         let feature_count: usize = shape.iter().product();
-        assert_eq!(flat.len() % feature_count, 0, "Flat size must be multiple of feature count");
+        assert_eq!(
+            flat.len() % feature_count,
+            0,
+            "Flat size must be multiple of feature count"
+        );
         let batch = flat.len() / feature_count;
 
         let mut dest = match shape.len() {
             1 => DynamicTensor::Dim1(crate::tensor::Tensor2D::zeros(batch, shape[0])),
             2 => DynamicTensor::Dim2(crate::tensor::Tensor3D::zeros(batch, shape[0], shape[1])),
-            3 => DynamicTensor::Dim3(crate::tensor::Tensor4D::zeros(batch, shape[0], shape[1], shape[2])),
-            4 => DynamicTensor::Dim4(crate::tensor::Tensor5D::zeros(batch, shape[0], shape[1], shape[2], shape[3])),
-            _ => panic!("Unsupported tensor dimensionality: {} spatial dims", shape.len()),
+            3 => DynamicTensor::Dim3(crate::tensor::Tensor4D::zeros(
+                batch,
+                shape[0],
+                shape[1],
+                shape[2],
+            )),
+            4 => DynamicTensor::Dim4(crate::tensor::Tensor5D::zeros(
+                batch,
+                shape[0],
+                shape[1],
+                shape[2],
+                shape[3],
+            )),
+            _ => panic!(
+                "Unsupported tensor dimensionality: {} spatial dims",
+                shape.len()
+            ),
         };
         let shape_ref = dest.clone();
         DynamicTensor::from_flat_into(&shape_ref, &flat, &mut dest);
@@ -392,7 +420,10 @@ impl MixedModel {
         for buffer_idx in 0..ps.num_buffers() {
             let (num_params, slice) = {
                 let buffer = ps.get_param_buffer_by_idx(buffer_idx);
-                (buffer.params.rows(), ParamSlice::new(buffer_idx, 0, buffer.params.rows()))
+                (
+                    buffer.params.rows(),
+                    ParamSlice::new(buffer_idx, 0, buffer.params.rows()),
+                )
             };
 
             let chain = desc.build_chain(); // создаём новую цепочку для каждого буфера
@@ -416,7 +447,6 @@ impl MixedModel {
             let params_handle = buffer.params.clone();
             let grads_handle = buffer.grads.clone();
 
-            // Используем гибридный метод, который сам скачивает/загружает при необходимости.
             opt.step_buffered_handle_hybrid(&params_handle, &grads_handle, gpu_compute_ref);
         }
     }
@@ -425,12 +455,15 @@ impl MixedModel {
     // Вспомогательные методы для доступа к параметрам модели
     // ===================================================================
 
-    pub(crate) fn get_params_handle_for_model(&self, model_idx: usize) -> Option<MatrixBufferHandle> {
+    pub(crate) fn get_params_handle_for_model(
+        &self,
+        model_idx: usize,
+    ) -> Option<MatrixBufferHandle> {
         let ps = self.param_store.lock().unwrap();
         match &self.models[model_idx] {
-            Model::UniversalProcessor(_, slices, _) => {
-                slices.first().map(|s| ps.params_handle(s).clone())
-            }
+            Model::UniversalProcessor(_, slices, _) => slices
+                .first()
+                .map(|s| ps.params_handle(s).clone()),
             Model::Splitter { slice, .. } | Model::Combiner { slice, .. } => {
                 Some(ps.params_handle(slice).clone())
             }
@@ -438,12 +471,15 @@ impl MixedModel {
         }
     }
 
-    pub(crate) fn get_grads_handle_for_model(&self, model_idx: usize) -> Option<MatrixBufferHandle> {
+    pub(crate) fn get_grads_handle_for_model(
+        &self,
+        model_idx: usize,
+    ) -> Option<MatrixBufferHandle> {
         let ps = self.param_store.lock().unwrap();
         match &self.models[model_idx] {
-            Model::UniversalProcessor(_, slices, _) => {
-                slices.first().map(|s| ps.grads_handle(s).clone())
-            }
+            Model::UniversalProcessor(_, slices, _) => slices
+                .first()
+                .map(|s| ps.grads_handle(s).clone()),
             Model::Splitter { slice, .. } | Model::Combiner { slice, .. } => {
                 Some(ps.grads_handle(slice).clone())
             }

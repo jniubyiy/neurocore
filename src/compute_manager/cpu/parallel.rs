@@ -13,6 +13,26 @@ use crate::layers::{
 };
 use crate::model_plan::param_store::ParamSlice;
 
+struct ForwardTaskShared {
+    input: MatrixBufferHandle,
+    output: MatrixBufferHandle,
+    params: MatrixBufferHandle,
+    layers: Arc<Vec<Box<dyn UniversalLayer>>>,
+    slices: Arc<Vec<ParamSlice>>,
+    pool: Arc<Mutex<TempMatrixPool>>,
+}
+
+struct BackwardTaskShared {
+    grad_output: MatrixBufferHandle,
+    grad_input: MatrixBufferHandle,
+    params: MatrixBufferHandle,
+    grad_params: MatrixBufferHandle,
+    layers: Arc<Vec<Box<dyn UniversalLayer>>>,
+    slices: Arc<Vec<ParamSlice>>,
+    contexts: ChunkedContexts,
+    pool: Arc<Mutex<TempMatrixPool>>,
+}
+
 pub(crate) fn extract_chunk(
     input: &MatrixBufferHandle,
     start: usize,
@@ -225,36 +245,41 @@ pub(crate) fn forward_universal_parallel(
         return Vec::new();
     }
 
+    let slices_arc = Arc::new(slices);
+    let shared = Arc::new(ForwardTaskShared {
+        input,
+        output,
+        params,
+        layers,
+        slices: slices_arc,
+        pool,
+    });
+
     let ctx_storage = Arc::new(Mutex::new(vec![Vec::new(); num_chunks]));
     let barrier = Arc::new(Barrier::new(num_chunks + 1));
 
     for (chunk_id, (start, _size, end)) in all_chunks.into_iter().enumerate() {
-        let input = input.clone();
-        let output = output.clone();
-        let params = params.clone();
-        let layers = layers.clone();
-        let slices = slices.clone();
-        let pool = pool.clone();
+        let shared = shared.clone();
         let barrier = barrier.clone();
         let ctx_storage = ctx_storage.clone();
 
         executor.execute_dyn(Box::new(move || {
             {
-                let mut pool_guard = pool.lock().unwrap();
-                let input_chunk = extract_chunk(&input, start, end, &mut pool_guard);
+                let mut pool_guard = shared.pool.lock().unwrap();
+                let input_chunk = extract_chunk(&shared.input, start, end, &mut *pool_guard);
                 let mut current = input_chunk;
-                let mut chunk_ctxs = Vec::with_capacity(layers.len());
+                let mut chunk_ctxs = Vec::with_capacity(shared.layers.len());
 
-                for (layer, slice) in layers.iter().zip(slices.iter()) {
+                for (layer, slice) in shared.layers.iter().zip(shared.slices.iter()) {
                     let out_cols = get_output_features(layer, &current);
                     let out = pool_guard.acquire(current.rows(), out_cols);
                     let buffered_ctx = build_buffered_context(layer, &current, &out);
-                    call_forward_buffered(layer, &current, &out, &params, slice);
+                    call_forward_buffered(layer, &current, &out, &shared.params, slice);
                     chunk_ctxs.push(DynamicContext::Buffered(buffered_ctx));
                     current = out;
                 }
 
-                write_chunk(&output, &current, start);
+                write_chunk(&shared.output, &current, start);
 
                 {
                     let mut storage = ctx_storage.lock().unwrap();
@@ -266,7 +291,6 @@ pub(crate) fn forward_universal_parallel(
     }
 
     barrier.wait();
-
     let storage = ctx_storage.lock().unwrap();
     storage.clone()
 }
@@ -290,34 +314,47 @@ pub(crate) fn backward_universal_parallel(
         panic!("backward_universal_parallel: number of chunks does not match contexts");
     }
 
-    let param_len = grad_params.rows();
+    let slices_arc = Arc::new(slices);
+    let shared = Arc::new(BackwardTaskShared {
+        grad_output,
+        grad_input,
+        params,
+        grad_params,
+        layers,
+        slices: slices_arc,
+        contexts,
+        pool,
+    });
+
+    let param_len = shared.grad_params.rows();
     let mut temp_grads = Vec::with_capacity(num_chunks);
     for _ in 0..num_chunks {
-        temp_grads.push(pool.lock().unwrap().acquire(param_len, 1));
+        temp_grads.push(
+            shared
+                .pool
+                .lock()
+                .unwrap()
+                .acquire(param_len, 1),
+        );
     }
 
     let barrier = Arc::new(Barrier::new(num_chunks + 1));
 
     for (chunk_id, (start, _size, end)) in all_chunks.into_iter().enumerate() {
-        let grad_output = grad_output.clone();
-        let grad_input = grad_input.clone();
-        let params = params.clone();
-        let grad_params_temp = temp_grads[chunk_id].clone();
-        let layers = layers.clone();
-        let slices = slices.clone();
-        let contexts_chunk = contexts[chunk_id].clone();
-        let pool = pool.clone();
+        let shared = shared.clone();
         let barrier = barrier.clone();
+        let temp_grad = temp_grads[chunk_id].clone();
 
         executor.execute_dyn(Box::new(move || {
             {
-                let mut pool_guard = pool.lock().unwrap();
-                let grad_output_chunk = extract_chunk(&grad_output, start, end, &mut pool_guard);
+                let mut pool_guard = shared.pool.lock().unwrap();
+                let grad_output_chunk = extract_chunk(&shared.grad_output, start, end, &mut *pool_guard);
                 let mut current_grad = grad_output_chunk;
 
-                for i in (0..layers.len()).rev() {
-                    let layer = &layers[i];
-                    let slice = &slices[i];
+                let contexts_chunk = &shared.contexts[chunk_id];
+                for i in (0..shared.layers.len()).rev() {
+                    let layer = &shared.layers[i];
+                    let slice = &shared.slices[i];
                     let ctx = &contexts_chunk[i];
 
                     let in_features = get_input_features(layer, &current_grad);
@@ -328,16 +365,16 @@ pub(crate) fn backward_universal_parallel(
                         ctx,
                         &current_grad,
                         &grad_input_chunk,
-                        &params,
+                        &shared.params,
                         slice,
-                        &grad_params_temp,
+                        &temp_grad,
                     );
 
                     pool_guard.release(current_grad);
                     current_grad = grad_input_chunk;
                 }
 
-                write_chunk(&grad_input, &current_grad, start);
+                write_chunk(&shared.grad_input, &current_grad, start);
                 pool_guard.release(current_grad);
             }
             barrier.wait();
@@ -346,9 +383,9 @@ pub(crate) fn backward_universal_parallel(
 
     barrier.wait();
 
-    let mut pool_guard = pool.lock().unwrap();
+    let mut pool_guard = shared.pool.lock().unwrap();
     {
-        let mut grad_guard = grad_params.write();
+        let mut grad_guard = shared.grad_params.write();
         let grad_slice = grad_guard.as_slice_mut().expect("CPU buffer");
         for v in grad_slice.iter_mut() {
             *v = 0.0;
@@ -357,7 +394,7 @@ pub(crate) fn backward_universal_parallel(
     for temp in temp_grads {
         let temp_guard = temp.read();
         let temp_slice = temp_guard.as_slice().expect("CPU buffer");
-        let mut grad_guard = grad_params.write();
+        let mut grad_guard = shared.grad_params.write();
         let grad_slice = grad_guard.as_slice_mut().expect("CPU buffer");
         for i in 0..grad_slice.len() {
             grad_slice[i] += temp_slice[i];

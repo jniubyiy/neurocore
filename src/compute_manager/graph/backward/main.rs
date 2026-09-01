@@ -101,6 +101,9 @@ impl MixedModel {
                                 pool_guard.acquire(batch, input_features)
                             };
 
+                            // Клонируем нужные данные, так как в цикле они потребуются для других итераций
+                            // или веток. Клонирование MatrixBufferHandle дёшево (увеличивает счётчик ссылок).
+                            // Клонирование ChunkedContexts также необходимо, так как иначе будет перемещено.
                             backward_universal_parallel(
                                 self.executor.as_ref(),
                                 pool.clone(),

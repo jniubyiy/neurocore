@@ -21,7 +21,7 @@ impl UniversalLayerBuffered for Linear {
         let out_cols = self.out_features;
 
         let ids = [input.id(), output.id(), params.id()];
-        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let (second, rest) = rest.split_at_mut(1);
@@ -70,7 +70,7 @@ impl UniversalLayerBuffered for Linear {
             params.id(),
             grad_params.id(),
         ];
-        input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input_handle.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let (second, rest) = rest.split_at_mut(1);

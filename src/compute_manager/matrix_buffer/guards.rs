@@ -1,7 +1,6 @@
 // src/compute_manager/matrix_buffer/guards.rs
 
-use std::sync::{Arc, Mutex};
-use vulkano::buffer::Subbuffer;
+use std::sync::{Arc, RwLock};
 
 use crate::compute_manager::memory_executor::executor::MemoryExecutor;
 use crate::compute_manager::memory_executor::matrix_entry::MatrixStorage;
@@ -10,7 +9,7 @@ use crate::compute_manager::memory_executor::matrix_id::MatrixBufferId;
 /// RAII-гард для чтения данных, хранящий локальную копию.
 ///
 /// При создании гарда данные из CPU-хранилища копируются в локальный вектор.
-/// Это позволяет избежать удержания блокировки `Mutex<MemoryExecutor>` на время
+/// Это позволяет избежать удержания блокировки `RwLock<MemoryExecutor>` на время
 /// использования, что исключает взаимные блокировки при одновременном чтении
 /// и записи одного и того же `MemoryExecutor` в одном потоке.
 pub struct MatrixReadGuard {
@@ -23,8 +22,8 @@ impl MatrixReadGuard {
     /// Создаёт гард, копируя данные из CPU-хранилища.
     ///
     /// Если запись отсутствует или хранилище не является CPU, паникует.
-    pub(crate) fn new(memory: &Arc<Mutex<MemoryExecutor>>, id: MatrixBufferId) -> Self {
-        let mem = memory.lock().unwrap();
+    pub(crate) fn new(memory: &Arc<RwLock<MemoryExecutor>>, id: MatrixBufferId) -> Self {
+        let mem = memory.read().unwrap();
         let entry = mem
             .get_matrix_entry(id)
             .expect("MatrixReadGuard: entry not found in MemoryExecutor");
@@ -54,7 +53,7 @@ impl MatrixReadGuard {
     }
 
     /// Для GPU-буферов не поддерживается, всегда `None`.
-    pub fn as_gpu_buffer(&self) -> Option<&Subbuffer<[f32]>> {
+    pub fn as_gpu_buffer(&self) -> Option<&vulkano::buffer::Subbuffer<[f32]>> {
         None
     }
 }
@@ -63,7 +62,7 @@ impl MatrixReadGuard {
 /// её обратно в `MemoryExecutor` при удалении.
 pub struct MatrixWriteGuard {
     id: MatrixBufferId,
-    memory: Arc<Mutex<MemoryExecutor>>,
+    memory: Arc<RwLock<MemoryExecutor>>,
     data: Vec<f32>,
     rows: usize,
     cols: usize,
@@ -74,8 +73,8 @@ impl MatrixWriteGuard {
     /// Создаёт гард, копируя текущие данные из CPU-хранилища.
     ///
     /// Если запись отсутствует или хранилище не является CPU, паникует.
-    pub(crate) fn new(memory: &Arc<Mutex<MemoryExecutor>>, id: MatrixBufferId) -> Self {
-        let mem = memory.lock().unwrap();
+    pub(crate) fn new(memory: &Arc<RwLock<MemoryExecutor>>, id: MatrixBufferId) -> Self {
+        let mem = memory.read().unwrap();
         let entry = mem
             .get_matrix_entry(id)
             .expect("MatrixWriteGuard: entry not found in MemoryExecutor");
@@ -108,7 +107,7 @@ impl MatrixWriteGuard {
     }
 
     /// Для GPU-буферов не поддерживается, всегда `None`.
-    pub fn as_gpu_buffer(&self) -> Option<&Subbuffer<[f32]>> {
+    pub fn as_gpu_buffer(&self) -> Option<&vulkano::buffer::Subbuffer<[f32]>> {
         None
     }
 }
@@ -119,7 +118,7 @@ impl Drop for MatrixWriteGuard {
         if self.written {
             return;
         }
-        let mut mem = self.memory.lock().unwrap();
+        let mut mem = self.memory.write().unwrap();
         if let Some(entry) = mem.get_matrix_entry_mut(self.id) {
             if let MatrixStorage::Cpu(data) = &mut entry.storage {
                 *data = std::mem::take(&mut self.data);

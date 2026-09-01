@@ -3,12 +3,6 @@
 use crate::compute_manager::matrix_buffer::handle::MatrixBufferHandle;
 
 /// Представление непрерывного диапазона строк CPU-буфера.
-///
-/// `MatrixBufferSlice` не владеет данными и не создаёт отдельного буфера.
-/// Все операции чтения/записи делегируются родительскому `MatrixBufferHandle`
-/// с учётом смещения `start_row`.
-///
-/// Работает только с CPU-хранилищем, для GPU/SSD использовать нельзя.
 #[derive(Clone)]
 pub struct MatrixBufferSlice {
     parent: MatrixBufferHandle,
@@ -17,15 +11,6 @@ pub struct MatrixBufferSlice {
 }
 
 impl MatrixBufferSlice {
-    /// Создаёт новый слайс над частью родительского буфера.
-    ///
-    /// # Аргументы
-    /// * `parent` – дескриптор родительского буфера (CPU).
-    /// * `start_row` – индекс первой строки слайса.
-    /// * `num_rows` – количество строк слайса.
-    ///
-    /// # Паника
-    /// Паникует, если диапазон выходит за пределы родительского буфера.
     pub fn new(parent: MatrixBufferHandle, start_row: usize, num_rows: usize) -> Self {
         assert!(
             start_row + num_rows <= parent.rows(),
@@ -45,45 +30,36 @@ impl MatrixBufferSlice {
         }
     }
 
-    /// Возвращает количество строк слайса.
     #[inline]
     pub fn rows(&self) -> usize {
         self.num_rows
     }
 
-    /// Возвращает количество столбцов слайса (равно колонкам родителя).
     #[inline]
     pub fn cols(&self) -> usize {
         self.parent.cols()
     }
 
-    /// Возвращает общее количество элементов в слайсе.
     #[inline]
     pub fn len(&self) -> usize {
         self.num_rows * self.cols()
     }
 
-    /// Возвращает `true`, если слайс не содержит элементов.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.num_rows == 0
     }
 
-    /// Возвращает ссылку на родительский дескриптор.
     #[inline]
     pub fn parent(&self) -> &MatrixBufferHandle {
         &self.parent
     }
 
-    /// Возвращает индекс первой строки слайса в родительском буфере.
     #[inline]
     pub fn start_row(&self) -> usize {
         self.start_row
     }
 
-    /// Читает все данные слайса в плоский вектор (column-major).
-    ///
-    /// Порядок элементов: сначала все строки первого столбца, затем второго и т.д.
     pub fn read(&self) -> Vec<f32> {
         let rows_total = self.parent.rows();
         let cols = self.cols();
@@ -101,14 +77,6 @@ impl MatrixBufferSlice {
         })
     }
 
-    /// Записывает данные в слайс.
-    ///
-    /// # Аргументы
-    /// * `data` – плоский вектор в column-major порядке, длина должна быть
-    ///   равна `rows() * cols()`.
-    ///
-    /// # Паника
-    /// Паникует, если длина данных не соответствует размеру слайса.
     pub fn write(&self, data: &[f32]) {
         assert_eq!(
             data.len(),
@@ -132,14 +100,9 @@ impl MatrixBufferSlice {
         });
     }
 
-    /// Копирует содержимое слайса в новый `MatrixBufferHandle` (CPU).
-    ///
-    /// Эта функция полезна, если нужно передать слайс в другой поток,
-    /// так как `MatrixBufferSlice` не является `Send` из-за `MatrixBufferHandle`.
-    /// Для параллельной обработки чаще используется выделение отдельного буфера.
     pub fn to_handle(&self) -> MatrixBufferHandle {
-        let pool = self.parent.memory();
-        let mut mem = pool.lock().unwrap();
+        let memory = self.parent.memory();
+        let mut mem = memory.write().unwrap();
         let handle = mem
             .acquire_matrix_handle(
                 self.num_rows,
@@ -150,9 +113,8 @@ impl MatrixBufferSlice {
             .expect("Failed to allocate buffer for slice");
         drop(mem);
 
-        self.write(
-            &self.read(), // inefficient, but simple
-        );
+        let data = self.read();
+        handle.write_range(0, &data);
         handle
     }
 }

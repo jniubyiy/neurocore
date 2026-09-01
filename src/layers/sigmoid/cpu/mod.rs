@@ -17,7 +17,7 @@ impl UniversalLayerBuffered for Sigmoid {
         _slice: &ParamSlice,
     ) {
         let ids = [input.id(), output.id()];
-        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let y: &mut [f32] = &mut *rest[0];
@@ -43,7 +43,7 @@ impl UniversalLayerBuffered for Sigmoid {
         };
 
         let ids = [output_handle.id(), grad_output.id(), grad_input.id()];
-        output_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        output_handle.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let y: &[f32] = &*first[0];
             let (second, rest) = rest.split_at_mut(1);

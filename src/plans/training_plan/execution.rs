@@ -191,7 +191,7 @@ fn execute_inner(
                 }
                 if prof.mode == ProfileMode::Memory || prof.mode == ProfileMode::Full {
                     let mem = model.memory_executor();
-                    let me = mem.lock().unwrap();
+                    let me = mem.read().unwrap();  // изменено с .lock() на .read()
                     let kinds = [
                         MemoryDeviceKind::HostRam,
                         MemoryDeviceKind::SsdCache,

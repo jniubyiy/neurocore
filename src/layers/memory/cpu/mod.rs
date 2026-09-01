@@ -24,7 +24,7 @@ impl UniversalLayerBuffered for Memory {
         let mut cells_guard = self.cells.lock().unwrap();
         let cells = &mut *cells_guard;
 
-        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let y: &mut [f32] = &mut *rest[0];
@@ -81,7 +81,7 @@ impl UniversalLayerBuffered for Memory {
 
         let factor = 1.0 - self.alpha;
         let ids = [grad_output.id(), grad_input.id()];
-        grad_output.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        grad_output.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let go: &[f32] = &*first[0];
             let gi: &mut [f32] = &mut *rest[0];

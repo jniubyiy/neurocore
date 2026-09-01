@@ -1,6 +1,6 @@
 // src/plans/model_plan/param_store/param_store.rs
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::compute_manager::memory_executor::executor::MemoryExecutor;
@@ -26,12 +26,12 @@ pub struct ParamStore {
     buffers: Vec<ParamBuffer>,
 
     /// Глобальный менеджер памяти, используемый для выделения новых буферов.
-    memory: Arc<Mutex<MemoryExecutor>>,
+    memory: Arc<RwLock<MemoryExecutor>>,
 }
 
 impl ParamStore {
     /// Создаёт пустое хранилище параметров.
-    pub fn new(memory: Arc<Mutex<MemoryExecutor>>) -> Self {
+    pub fn new(memory: Arc<RwLock<MemoryExecutor>>) -> Self {
         Self {
             buffers: Vec::new(),
             memory,
@@ -271,7 +271,7 @@ impl ParamStore {
         location: MemoryDeviceKind,
         priority: BufferPriority,
     ) -> Result<MatrixBufferHandle, String> {
-        let mut mem = self.memory.lock().unwrap();
+        let mut mem = self.memory.write().unwrap();
         mem.acquire_matrix_handle(rows, cols, location, priority)
             .map_err(|e| format!("{:?}", e))
     }

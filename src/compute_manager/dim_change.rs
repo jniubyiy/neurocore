@@ -153,7 +153,7 @@ pub fn unsqueeze_mat_buffered_handle(
 
     {
         let ids = [input.id(), output.id()];
-        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let src: &[f32] = &*first[0];
             let dst: &mut [f32] = &mut *rest[0];
@@ -197,7 +197,7 @@ pub fn reduce_mat_buffered_handle(
 
     {
         let ids = [input.id(), output.id()];
-        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let src: &[f32] = &*first[0];
             let dst: &mut [f32] = &mut *rest[0];

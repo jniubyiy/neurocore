@@ -1,7 +1,7 @@
 // src/compute_manager/matrix_buffer/pool.rs
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::compute_manager::device_spec::DeviceId;
@@ -32,8 +32,8 @@ pub struct PoolStats {
 pub struct TempMatrixPool {
     /// Свободные дескрипторы, ключ – (тип памяти, rows, cols).
     free: HashMap<(MemoryDeviceKind, usize, usize), VecDeque<MatrixBufferHandle>>,
-    /// Глобальный менеджер памяти.
-    memory: Arc<Mutex<MemoryExecutor>>,
+    /// Глобальный менеджер памяти (теперь с RwLock для параллельных чтений).
+    memory: Arc<RwLock<MemoryExecutor>>,
     /// Максимальное время простоя буфера, после которого он удаляется из пула.
     max_idle_age: Option<Duration>,
     /// Максимальное количество свободных буферов в пуле.
@@ -44,7 +44,7 @@ pub struct TempMatrixPool {
 
 impl TempMatrixPool {
     /// Создаёт пустой пул, связанный с указанным менеджером памяти.
-    pub fn new(memory: Arc<Mutex<MemoryExecutor>>) -> Self {
+    pub fn new(memory: Arc<RwLock<MemoryExecutor>>) -> Self {
         Self {
             free: HashMap::new(),
             memory,
@@ -113,7 +113,7 @@ impl TempMatrixPool {
             if let Some(handle) = queue.pop_front() {
                 // Снимаем пометку pooled без изменения счётчика ссылок.
                 {
-                    let mut mem = self.memory.lock().unwrap();
+                    let mut mem = self.memory.write().unwrap();
                     if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
                         entry.pooled = false;
                     }
@@ -125,7 +125,7 @@ impl TempMatrixPool {
 
         // Создаём новый буфер через MemoryExecutor.
         let handle = {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = self.memory.write().unwrap();
             mem.acquire_matrix_handle(rows, cols, kind, BufferPriority::Medium)
                 .expect("TempMatrixPool: failed to acquire MatrixBufferHandle")
         };
@@ -144,7 +144,7 @@ impl TempMatrixPool {
 
         // Проверяем, что на запись ссылается только этот handle.
         let should_pool = {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = self.memory.write().unwrap();
             if let Some(entry) = mem.get_matrix_entry_mut(id) {
                 if entry.ref_count > 1 {
                     // Есть другие владельцы — не кладём в пул, просто дропаем.
@@ -183,7 +183,7 @@ impl TempMatrixPool {
         for list in self.free.values_mut() {
             while let Some(handle) = list.pop_front() {
                 {
-                    let mut mem = self.memory.lock().unwrap();
+                    let mut mem = self.memory.write().unwrap();
                     if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
                         entry.pooled = false;
                     }
@@ -216,7 +216,7 @@ impl TempMatrixPool {
                 let mut new_queue = VecDeque::new();
                 while let Some(handle) = queue.pop_front() {
                     let last_access = {
-                        let mem = self.memory.lock().unwrap();
+                        let mem = self.memory.read().unwrap();
                         mem.get_matrix_entry(handle.id())
                             .map(|e| e.last_access)
                             .unwrap_or(Instant::now() - max_age)
@@ -225,7 +225,7 @@ impl TempMatrixPool {
                         new_queue.push_back(handle);
                     } else {
                         {
-                            let mut mem = self.memory.lock().unwrap();
+                            let mut mem = self.memory.write().unwrap();
                             if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
                                 entry.pooled = false;
                             }
@@ -256,7 +256,7 @@ impl TempMatrixPool {
                 for queue in self.free.values_mut() {
                     if let Some(handle) = queue.pop_back() {
                         {
-                            let mut mem = self.memory.lock().unwrap();
+                            let mut mem = self.memory.write().unwrap();
                             if let Some(entry) = mem.get_matrix_entry_mut(handle.id()) {
                                 entry.pooled = false;
                             }

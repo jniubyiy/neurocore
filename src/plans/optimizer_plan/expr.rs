@@ -1,6 +1,6 @@
 // src/plans/optimizer_plan/expr.rs
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
@@ -33,7 +33,7 @@ impl OptimizerExpr {
     /// * `chain` – цепочка кубиков.
     /// * `pool` – пул временных матриц для выделения состояний.
     pub fn new_buffered_handle(
-        _memory_executor: Arc<Mutex<MemoryExecutor>>,
+        _memory_executor: Arc<RwLock<MemoryExecutor>>,
         num_params: usize,
         chain: OptimizerChain,
         pool: &mut TempMatrixPool,

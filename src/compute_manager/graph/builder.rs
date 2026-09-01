@@ -1,7 +1,7 @@
 // src/compute_manager/graph/builder.rs
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::cpu::hardware::CPU_INFO;
@@ -92,6 +92,7 @@ impl MixedModel {
         // 1. Создаём MemoryExecutor
         // -----------------------------------------------------------
         let (memory_executor, _gpu_context) = device_plan.build_memory_executor();
+        // Тип memory_executor: Arc<RwLock<MemoryExecutor>>
 
         // -----------------------------------------------------------
         // 2. Создаём вычислительный исполнитель (ComputeExecutor)

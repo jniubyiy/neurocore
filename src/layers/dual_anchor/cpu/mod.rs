@@ -19,7 +19,7 @@ impl UniversalLayerBuffered for DualAnchor {
         let rows = input.rows();
         let cols = input.cols();
         let ids = [input.id(), output.id(), params.id()];
-        input.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let (second, third) = rest.split_at_mut(1);
@@ -70,7 +70,7 @@ impl UniversalLayerBuffered for DualAnchor {
             params.id(),
             grad_params.id(),
         ];
-        input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+        input_handle.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let (second, rest) = rest.split_at_mut(1);

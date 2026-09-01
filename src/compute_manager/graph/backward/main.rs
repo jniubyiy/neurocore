@@ -199,14 +199,14 @@ impl MixedModel {
                     let in_a = {
                         let mut pool_guard = pool.lock().unwrap();
                         let handle = pool_guard.acquire(delta_a.rows(), delta_a.cols());
-                        let mut mem = self.memory_executor.lock().unwrap();
+                        let mut mem = self.memory_executor.write().unwrap();
                         mem.copy_cpu_buffer(delta_a.id(), handle.id());
                         handle
                     };
                     let in_b = {
                         let mut pool_guard = pool.lock().unwrap();
                         let handle = pool_guard.acquire(delta_b.rows(), delta_b.cols());
-                        let mut mem = self.memory_executor.lock().unwrap();
+                        let mut mem = self.memory_executor.write().unwrap();
                         mem.copy_cpu_buffer(delta_b.id(), handle.id());
                         handle
                     };
@@ -250,7 +250,7 @@ impl MixedModel {
                         params_handle.id(), grad_params_handle.id(), dx_handle.id(),
                     ];
 
-                    x_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+                    x_handle.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
                         let (first, rest) = slices.split_at_mut(1);
                         let x: &[f32] = &*first[0];
                         let (second, rest) = rest.split_at_mut(1);
@@ -372,7 +372,7 @@ impl MixedModel {
                         params_handle.id(), grad_params_handle.id(), da_handle.id(), db_handle.id(),
                     ];
 
-                    a_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+                    a_handle.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
                         let (first, rest) = slices.split_at_mut(1);
                         let a: &[f32] = &*first[0];
                         let (second, rest) = rest.split_at_mut(1);

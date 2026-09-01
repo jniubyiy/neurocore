@@ -13,6 +13,7 @@ use crate::layers::{
 };
 use crate::model_plan::param_store::ParamSlice;
 
+/// Общая структура данных для одной задачи прямого прохода.
 struct ForwardTaskShared {
     input: MatrixBufferHandle,
     output: MatrixBufferHandle,
@@ -22,6 +23,7 @@ struct ForwardTaskShared {
     pool: Arc<Mutex<TempMatrixPool>>,
 }
 
+/// Общая структура данных для одной задачи обратного прохода.
 struct BackwardTaskShared {
     grad_output: MatrixBufferHandle,
     grad_input: MatrixBufferHandle,

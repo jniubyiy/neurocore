@@ -1,7 +1,7 @@
 // src/plans/device_plan/plan.rs
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use crate::compute_manager::device_spec::DeviceSpec;
 use crate::compute_manager::gpu::init::GpuContext;
@@ -235,24 +235,24 @@ impl DevicePlan {
     }
 
     /// Создаёт `MemoryExecutor` и возвращает GPU-контекст, если есть.
-    pub fn build_memory_executor(&self) -> (Arc<Mutex<MemoryExecutor>>, Option<Arc<GpuContext>>) {
-        let mem_exec = Arc::new(Mutex::new(MemoryExecutor::new()));
+    pub fn build_memory_executor(&self) -> (Arc<RwLock<MemoryExecutor>>, Option<Arc<GpuContext>>) {
+        let mem_exec = Arc::new(RwLock::new(MemoryExecutor::new()));
 
         // ВАЖНО: устанавливаем ссылку на самого себя, чтобы `acquire_matrix_handle`
         // мог создавать `MatrixBufferHandle`.
-        mem_exec.lock().unwrap().set_self_arc(mem_exec.clone());
+        mem_exec.write().unwrap().set_self_arc(mem_exec.clone());
 
         // Регистрация хранилищ RAM и SSD
         for storage in &self.storage_devices {
             match storage {
                 StorageDevice::Ram { id, max_mb } => {
                     let spec = DeviceSpec::cpu(*id, *max_mb, 1);
-                    mem_exec.lock().unwrap().register_compute_device(spec, None);
+                    mem_exec.write().unwrap().register_compute_device(spec, None);
                 }
                 StorageDevice::Ssd { path, max_mb, .. } => {
                     let max_bytes = *max_mb * 1024 * 1024;
                     mem_exec
-                        .lock()
+                        .write()
                         .unwrap()
                         .register_ssd_cache(path.clone(), max_bytes)
                         .expect("SSD registration failed");
@@ -273,7 +273,7 @@ impl DevicePlan {
                     if let StorageDevice::Vram { gpu_id, max_mb, .. } = storage {
                         if *gpu_id == *id {
                             let spec = DeviceSpec::gpu(*id, *max_mb, false);
-                            mem_exec.lock().unwrap().register_compute_device(spec, Some(ctx.clone()));
+                            mem_exec.write().unwrap().register_compute_device(spec, Some(ctx.clone()));
                         }
                     }
                 }

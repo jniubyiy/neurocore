@@ -1,7 +1,7 @@
 // src/compute_manager/gpu/compute/base.rs
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use vulkano::buffer::Subbuffer;
 use vulkano::command_buffer::{
@@ -67,7 +67,7 @@ pub struct GpuCompute {
     pub pipeline_cache: Arc<PipelineCache>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    pub memory_executor: Arc<Mutex<MemoryExecutor>>,
+    pub memory_executor: Arc<RwLock<MemoryExecutor>>,
     pub gpu_device_id: DeviceId,
     /// Хранилище состояний для каждого слоя Memory по индексу (memory_idx).
     pub memory_states: Mutex<HashMap<usize, (Subbuffer<[f32]>, RawBufferId)>>,
@@ -113,7 +113,7 @@ impl GpuCompute {
     pub fn new(
         context: Arc<GpuContext>,
         pipeline_cache: Arc<PipelineCache>,
-        memory_executor: Arc<Mutex<MemoryExecutor>>,
+        memory_executor: Arc<RwLock<MemoryExecutor>>,
         gpu_device_id: DeviceId,
     ) -> Self {
         let descriptor_set_allocator = Arc::new(
@@ -326,14 +326,14 @@ impl GpuCompute {
         elements: usize,
     ) -> (Subbuffer<[f32]>, RawBufferId) {
         let kind = MemoryDeviceKind::DeviceVram(self.gpu_device_id);
-        self.memory_executor.lock().unwrap().acquire_temp_buffer(kind, elements)
+        self.memory_executor.write().unwrap().acquire_temp_buffer(kind, elements)
     }
 
     pub fn acquire_staging_buffer(
         &self,
         elements: usize,
     ) -> (Subbuffer<[f32]>, RawBufferId) {
-        self.memory_executor.lock().unwrap().acquire_temp_buffer(MemoryDeviceKind::HostRam, elements)
+        self.memory_executor.write().unwrap().acquire_temp_buffer(MemoryDeviceKind::HostRam, elements)
     }
 
     pub fn release_temp_buffer(
@@ -342,7 +342,7 @@ impl GpuCompute {
         raw_id: RawBufferId,
     ) {
         let kind = MemoryDeviceKind::DeviceVram(self.gpu_device_id);
-        self.memory_executor.lock().unwrap().release_temp_buffer(kind, buffer, raw_id);
+        self.memory_executor.write().unwrap().release_temp_buffer(kind, buffer, raw_id);
     }
 
     pub fn release_staging_buffer(
@@ -350,7 +350,7 @@ impl GpuCompute {
         buffer: Subbuffer<[f32]>,
         raw_id: RawBufferId,
     ) {
-        self.memory_executor.lock().unwrap().release_temp_buffer(MemoryDeviceKind::HostRam, buffer, raw_id);
+        self.memory_executor.write().unwrap().release_temp_buffer(MemoryDeviceKind::HostRam, buffer, raw_id);
     }
 
     // --- Загрузка данных ---
@@ -476,7 +476,7 @@ impl GpuCompute {
     // ===================================================================
 
     pub fn allocate_gpu_matrix_handle(&self, rows: usize, cols: usize) -> MatrixBufferHandle {
-        let mut mem = self.memory_executor.lock().unwrap();
+        let mut mem = self.memory_executor.write().unwrap();
         mem.acquire_matrix_handle(
             rows,
             cols,
@@ -487,7 +487,7 @@ impl GpuCompute {
     }
 
     pub fn allocate_cpu_matrix_handle(&self, rows: usize, cols: usize) -> MatrixBufferHandle {
-        let mut mem = self.memory_executor.lock().unwrap();
+        let mut mem = self.memory_executor.write().unwrap();
         mem.acquire_matrix_handle(
             rows,
             cols,
@@ -658,7 +658,7 @@ impl GpuCompute {
     }
 
     pub(crate) fn get_gpu_subbuffer_from_handle(&self, handle: &MatrixBufferHandle) -> Subbuffer<[f32]> {
-        let mem = self.memory_executor.lock().unwrap();
+        let mem = self.memory_executor.read().unwrap();
         let entry = mem.get_matrix_entry(handle.id())
             .expect("MatrixBufferHandle: entry not found");
         match &entry.storage {

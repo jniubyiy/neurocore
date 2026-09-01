@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -43,7 +43,7 @@ pub struct MemoryExecutor {
     temp_pool: TempBufferPool,
     matrix_entries: HashMap<MatrixBufferId, MatrixEntry>,
     next_matrix_id: AtomicUsize,
-    memory_arc: Option<Arc<std::sync::Mutex<MemoryExecutor>>>,
+    memory_arc: Option<Arc<RwLock<MemoryExecutor>>>,
 }
 
 impl MemoryExecutor {
@@ -61,7 +61,7 @@ impl MemoryExecutor {
         }
     }
 
-    pub fn set_self_arc(&mut self, arc: Arc<std::sync::Mutex<MemoryExecutor>>) {
+    pub fn set_self_arc(&mut self, arc: Arc<RwLock<MemoryExecutor>>) {
         self.memory_arc = Some(arc);
     }
 
@@ -421,10 +421,8 @@ impl MemoryExecutor {
             entry.rows * entry.cols
         };
 
-        // Проверяем, достаточно ли памяти в целевом пуле.
         if let Some(pool) = self.pools.get(&target) {
             if !pool.can_allocate(elements) {
-                // Попытка вытеснения
                 self.evict_to_make_room(target, elements)?;
             }
         } else {
@@ -460,8 +458,6 @@ impl MemoryExecutor {
                         self.temp_pool.release(MemoryDeviceKind::HostRam, staging_buf.clone(), staging_raw);
                         MemoryError::SsdError(format!("write staging: {}", e))
                     })?;
-                    // Важно: staging_buf может быть больше запрошенного размера из-за пула,
-                    // поэтому копируем только первые `elements` элементов.
                     write_guard[..elements].copy_from_slice(&data);
                 }
                 data_mover::copy_buffer_sync(ctx.clone(), staging_buf.clone(), buffer.clone());
@@ -493,13 +489,11 @@ impl MemoryExecutor {
 
     /// Освобождает память на целевом устройстве, перемещая наименее используемые
     /// буферы на другие устройства (обычно на HostRam или SsdCache).
-    /// Используется при нехватке памяти при миграции.
     pub fn evict_to_make_room(
         &mut self,
         target_kind: MemoryDeviceKind,
         required_elements: usize,
     ) -> Result<(), MemoryError> {
-        // Собираем буферы, находящиеся на целевом устройстве.
         let mut candidates: Vec<(MatrixBufferId, Instant, BufferPriority, usize)> = Vec::new();
 
         for (&id, entry) in &self.matrix_entries {
@@ -508,36 +502,29 @@ impl MemoryExecutor {
             }
         }
 
-        // Сортируем: сначала самые старые, затем низкий приоритет.
         candidates.sort_by(|a, b| {
             a.1.cmp(&b.1).then_with(|| priority_rank(a.2).cmp(&priority_rank(b.2)))
         });
 
-        // Пытаемся освободить, перемещая на менее быстрое устройство.
         let mut freed = 0usize;
         for (id, _, priority, size) in candidates {
             if freed >= required_elements {
                 break;
             }
 
-            // Определяем, куда переместить: предпочитаем HostRam, затем SsdCache.
             let destination = if self.pools.contains_key(&MemoryDeviceKind::HostRam) {
                 MemoryDeviceKind::HostRam
             } else if self.pools.contains_key(&MemoryDeviceKind::SsdCache) {
                 MemoryDeviceKind::SsdCache
             } else {
-                // Нет доступных устройств для выгрузки.
                 break;
             };
 
-            // Не выгружаем высокоприоритетные буферы, если только это не крайняя необходимость.
             if priority == BufferPriority::High && freed < required_elements / 2 {
                 continue;
             }
 
-            // Перемещаем буфер.
             if let Err(e) = self.move_matrix_handle(id, destination) {
-                // Если переместить не удалось, пропускаем.
                 eprintln!("Warning: failed to evict buffer {}: {:?}", id.0, e);
                 continue;
             }

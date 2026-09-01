@@ -1,6 +1,6 @@
 // src/compute_manager/compute_executor/mod.rs
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::gpu::compute::GpuCompute;
@@ -26,7 +26,7 @@ pub use profiling::ProfilingState;
 pub struct ComputeExecutor {
     device_plan: DevicePlan,
     gpu_compute: Option<Mutex<GpuCompute>>,
-    memory_executor: Arc<Mutex<MemoryExecutor>>,
+    memory_executor: Arc<RwLock<MemoryExecutor>>,
     profiling: Mutex<ProfilingState>,
     current_placement: Mutex<Vec<ModelPlacement>>,
     epoch_counter: Mutex<usize>,
@@ -41,7 +41,7 @@ impl ComputeExecutor {
     /// через `DevicePlan::build_memory_executor`.
     pub fn new(
         device_plan: DevicePlan,
-        memory_executor: Arc<Mutex<MemoryExecutor>>,
+        memory_executor: Arc<RwLock<MemoryExecutor>>,
     ) -> Result<Self, String> {
         // Инициализация GPU, если он указан в плане
         let gpu_compute = if let Some(gpu_device) = device_plan
@@ -51,8 +51,9 @@ impl ComputeExecutor {
         {
             if let ComputeDevice::Gpu { id } = gpu_device {
                 // Получаем уже существующий контекст GPU из MemoryExecutor.
+                // Используем read(), так как контекст не изменяется.
                 let ctx = {
-                    let mem = memory_executor.lock().unwrap();
+                    let mem = memory_executor.read().unwrap();
                     mem.gpu_context(DeviceId(*id))
                         .cloned()
                         .ok_or_else(|| {
@@ -208,7 +209,7 @@ impl ComputeExecutor {
     }
 
     /// Возвращает ссылку на менеджер памяти.
-    pub fn memory_executor(&self) -> &Arc<Mutex<MemoryExecutor>> {
+    pub fn memory_executor(&self) -> &Arc<RwLock<MemoryExecutor>> {
         &self.memory_executor
     }
 

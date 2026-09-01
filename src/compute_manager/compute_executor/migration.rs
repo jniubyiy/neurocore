@@ -1,5 +1,7 @@
 // src/compute_manager/compute_executor/migration.rs
 
+use std::sync::{Arc, RwLock};
+
 use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
@@ -46,7 +48,7 @@ pub fn migrate_buffers_to_device(
 pub fn migrate_models(
     _models: &[Model],
     _new_placement: &[ModelPlacement],
-    _memory_executor: &std::sync::Arc<std::sync::Mutex<MemoryExecutor>>,
+    _memory_executor: &Arc<RwLock<MemoryExecutor>>,
 ) {
     // В данной версии не выполняется: параметры общие, миграция не нужна.
 }

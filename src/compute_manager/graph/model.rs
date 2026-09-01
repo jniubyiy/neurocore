@@ -1,7 +1,7 @@
 // src/compute_manager/graph/model.rs
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::dim_change::DynamicTensor;
@@ -23,7 +23,7 @@ pub struct MixedModel {
     pub(crate) compute_executor: Arc<ComputeExecutor>,
     pub(crate) input_stream_count: usize,
     pub(crate) output_stream_count: usize,
-    pub(crate) memory_executor: Arc<Mutex<MemoryExecutor>>,
+    pub(crate) memory_executor: Arc<RwLock<MemoryExecutor>>,
 
     pub(crate) input_shapes: Vec<Vec<usize>>,
     pub(crate) output_shapes: Vec<Vec<usize>>,
@@ -57,7 +57,7 @@ impl MixedModel {
         &self.control_executor
     }
 
-    pub fn memory_executor(&self) -> &Arc<Mutex<MemoryExecutor>> {
+    pub fn memory_executor(&self) -> &Arc<RwLock<MemoryExecutor>> {
         &self.memory_executor
     }
 
@@ -253,7 +253,7 @@ impl MixedModel {
             if let Some(first_slice) = slices.first() {
                 let buffer = param_store.get_param_buffer_mut(first_slice);
                 if buffer.location != target_kind {
-                    let mut mem = memory_executor.lock().unwrap();
+                    let mut mem = memory_executor.write().unwrap();
                     mem.move_matrix_handle(buffer.params.id(), target_kind).map_err(|e| {
                         format!("Failed to move params for model {}: {:?}", model_idx, e)
                     })?;

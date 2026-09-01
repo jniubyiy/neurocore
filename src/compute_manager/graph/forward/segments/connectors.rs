@@ -36,7 +36,7 @@ impl MixedModel {
         let out_b = pool.acquire(rows_b, cols_b);
 
         {
-            let mut mem = self.memory_executor.lock().unwrap();
+            let mut mem = self.memory_executor.write().unwrap();
             mem.copy_cpu_buffer(input_a.id(), out_a.id());
             mem.copy_cpu_buffer(input_b.id(), out_b.id());
         }
@@ -128,7 +128,7 @@ impl MixedModel {
                 pre_b.id(),
                 params_handle.id(),
             ];
-            input_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            input_handle.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
                 let (first, rest) = slices.split_at_mut(1);
                 let x: &[f32] = &*first[0];
                 let (second, rest) = rest.split_at_mut(1);
@@ -223,7 +223,7 @@ impl MixedModel {
                 pre_handle.id(),
                 params_handle.id(),
             ];
-            a_handle.memory().lock().unwrap().with_cpu_slices_mut(&ids, |slices| {
+            a_handle.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
                 let (first, rest) = slices.split_at_mut(1);
                 let a: &[f32] = &*first[0];
                 let (second, rest) = rest.split_at_mut(1);

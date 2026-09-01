@@ -19,7 +19,6 @@ use super::plan::{Initializer, TrainingPlan};
 use super::profiling::{Profiler, ProfileMode, ProfileResult};
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 
-/// Результат обучения с метриками и опциональным профилем.
 pub struct TrainingResult {
     pub tensors: HashMap<String, DynamicTensor>,
     pub final_loss: f32,
@@ -28,15 +27,9 @@ pub struct TrainingResult {
     pub best_loss: f32,
     pub zero_loss_epoch: Option<usize>,
     pub profile: Option<ProfileResult>,
-    /// Сводка мониторинга обучения, если был включён.
     pub monitor_summary: Option<crate::logging::TrainingSummary>,
 }
 
-/// Выполняет план обучения.
-///
-/// Запускает весь процесс (построение модели и обучение) в отдельном потоке
-/// с увеличенным стеком (32 МБ), чтобы избежать переполнения стека при
-/// инициализации Vulkan и работе с GPU.
 pub fn execute(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<TrainingResult, String> {
     let plan = plan.clone();
     let device_plan = device_plan.clone();
@@ -54,12 +47,12 @@ pub fn execute(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<Training
         })
         .map_err(|e| format!("Failed to spawn training thread: {}", e))?;
 
-    handle
-        .join()
-        .map_err(|_| "Training thread panicked".to_string())?
+    match handle.join() {
+        Ok(inner_result) => inner_result,
+        Err(_) => Err("Training thread panicked".to_string()),
+    }
 }
 
-/// Внутренняя реализация обучения. Принимает уже созданную модель.
 fn execute_inner(
     plan: &TrainingPlan,
     _device_plan: &DevicePlan,
@@ -67,7 +60,6 @@ fn execute_inner(
 ) -> Result<TrainingResult, String> {
     let start_time = Instant::now();
 
-    // --- проверка использования многопотоковых данных ---
     if plan.train_data_streams.is_some() || plan.target_data_streams.is_some() ||
        plan.test_input_streams.is_some() || plan.test_target_streams.is_some() {
         return Err(
@@ -78,7 +70,6 @@ fn execute_inner(
         );
     }
 
-    // --- инициализация весов ---
     {
         let mut ps = model.param_store().lock().unwrap();
         let len = ps.total_params();
@@ -100,10 +91,8 @@ fn execute_inner(
         }
     }
 
-    // --- оптимизатор: строим цепочку только для извлечения learning rate ---
     let opt_chain = plan.optimizer_desc.build_chain();
 
-    // --- learning rate для монитора (ищем первый ScaleGradient в цепочке) ---
     let learning_rate = opt_chain
         .cubes()
         .iter()
@@ -114,7 +103,6 @@ fn execute_inner(
         })
         .unwrap_or(0.01);
 
-    // --- монитор обучения ---
     let mut monitor = if plan.monitoring {
         let dump_dir = PathBuf::from("nan_dumps");
         let _ = std::fs::create_dir_all(&dump_dir);
@@ -127,14 +115,13 @@ fn execute_inner(
         None
     };
 
-    // --- извлечение данных ---
     let train_data = match &plan.train_data {
         Some(data) => data.clone(),
         None => return Err("Training data not provided".into()),
     };
     let target_data = match &plan.target_data {
         Some(data) => data.clone(),
-        None => train_data.clone(), // цель совпадает с входными данными (автоэнкодер)
+        None => train_data.clone(),
     };
     assert_eq!(
         train_data.num_samples(),
@@ -145,7 +132,6 @@ fn execute_inner(
     let num_samples = train_data.num_samples();
     let batch_size = plan.batch_size.max(1);
 
-    // --- профилировщик ---
     let mut profiler = if plan.profile != ProfileMode::None {
         Some(Profiler::new(plan.profile))
     } else {
@@ -157,7 +143,6 @@ fn execute_inner(
     let mut zero_loss_epoch: Option<usize> = None;
 
     for epoch in 0..plan.epochs {
-        // Перед каждой эпохой перераспределяем модели по устройствам
         model.compute_executor().redistribute(model.models(), plan.batch_size, true);
         let placement = model.compute_executor().get_placement();
         model.migrate_parameters(&placement)?;
@@ -168,17 +153,13 @@ fn execute_inner(
             let end = (start + batch_size).min(num_samples);
             let batch_size_actual = end - start;
 
-            // входной батч
             let batch_tensor = train_data.batch(start, end);
-            // целевой батч
             let target_batch = target_data.batch(start, end);
 
-            // forward
             let t0 = Instant::now();
-            let (pred, ctxs) = model.forward(batch_tensor.clone());
+            let (pred, _ctxs) = model.forward(batch_tensor.clone());
             let forward_dt = t0.elapsed().as_nanos() as u64;
 
-            // loss
             let t1 = Instant::now();
             let (loss, delta) = model.compute_loss(
                 plan.loss_desc.clone(),
@@ -187,24 +168,20 @@ fn execute_inner(
             );
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
-            // backward
             let t2 = Instant::now();
-            let (_, grads) = model.backward(&ctxs, delta);
+            let (_, grads) = model.backward(delta);
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
-            // обновление параметров
             let t3 = Instant::now();
             model.update_params_buffered(plan.optimizer_desc.clone(), &grads[0]);
             let update_dt = t3.elapsed().as_nanos() as u64;
 
             epoch_loss += loss * batch_size_actual as f32;
 
-            // --- мониторинг шага ---
             if let Some(ref mut mon) = monitor {
                 mon.record_step(loss, Some(&grads[0]), None);
             }
 
-            // профилирование одного шага
             if let Some(ref mut prof) = profiler {
                 if prof.mode == ProfileMode::Time || prof.mode == ProfileMode::Full {
                     prof.record_timing(0, "batch", "CPU", "forward", forward_dt);
@@ -245,7 +222,6 @@ fn execute_inner(
             println!("Epoch {}: avg loss = {:.6}", epoch, avg_loss);
         }
 
-        // --- завершение эпохи для монитора ---
         if let Some(ref mut mon) = monitor {
             let summary = mon.end_epoch();
             if !summary.warnings.is_empty() {
@@ -256,7 +232,6 @@ fn execute_inner(
             }
         }
 
-        // --- валидация ---
         if let Some(ref val_cfg) = plan.validation {
             if (epoch + 1) % val_cfg.frequency == 0 {
                 let val_data = &val_cfg.data;
@@ -297,7 +272,6 @@ fn execute_inner(
         monitor_summary: None,
     };
 
-    // --- финальный тест ---
     if let Some(test_input) = &plan.test_data {
         let test_input_dynamic = test_input.to_dynamic_tensor();
         let (pred, _) = model.forward(test_input_dynamic.clone());
@@ -333,12 +307,10 @@ fn execute_inner(
         );
     }
 
-    // --- финализация профиля ---
     if let Some(prof) = profiler {
         result.profile = Some(prof.finish());
     }
 
-    // --- итог мониторинга ---
     if let Some(mon) = monitor {
         let summary = mon.summary();
         println!("=== Training Monitor Summary ===");

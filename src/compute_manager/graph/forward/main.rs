@@ -1,18 +1,17 @@
 // src/compute_manager/graph/forward/main.rs
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::compute_manager::cpu::parallel::{can_parallelize, forward_universal_parallel};
 use crate::compute_manager::dim_change;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
-use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext, Model};
+use crate::compute_manager::graph::types::{ChunkedContexts, Model};
 use crate::compute_manager::gpu::processor::process_forward_gpu_buffered;
 use crate::device_plan::ComputeDevice;
 use crate::layers::{UniversalLayer, UniversalLayerBuffered};
 
-/// Вспомогательная функция: определяет количество выходных признаков
-/// для последовательности слоёв (UniversalProcessor).
 fn get_proc_output_features(
     layers: &[Box<dyn UniversalLayer>],
     input: &MatrixBufferHandle,
@@ -39,13 +38,9 @@ fn get_proc_output_features(
 }
 
 impl MixedModel {
-    // -----------------------------------------------------------------------
-    // Прямой проход с управляемыми буферами через TempMatrixPool
-    // -----------------------------------------------------------------------
-
     pub fn forward_mat_multi_buffered(
         &mut self,
-        pool: &mut TempMatrixPool,
+        pool: Arc<Mutex<TempMatrixPool>>,
         inputs: Vec<MatrixBufferHandle>,
     ) -> (Vec<MatrixBufferHandle>, ChunkedContexts) {
         assert_eq!(
@@ -70,7 +65,7 @@ impl MixedModel {
         }
 
         let mut stream_buffers: Vec<MatrixBufferHandle> = inputs;
-        let mut all_ctxs: ChunkedContexts = Vec::new(); // контексты по чанкам
+        let mut all_ctxs: ChunkedContexts = Vec::new();
 
         let models = self.models.clone();
 
@@ -82,16 +77,20 @@ impl MixedModel {
                 Model::Unsqueeze(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
-                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims));
+                        let mut pool_guard = pool.lock().unwrap();
+                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(&mut pool_guard, buf, target_dims));
                     }
                     stream_buffers = new_stream;
+                    self.last_forward_contexts.insert(model_index, Vec::new());
                 }
                 Model::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
-                        new_stream.push(dim_change::reduce_mat_buffered_handle(pool, buf, target_dims));
+                        let mut pool_guard = pool.lock().unwrap();
+                        new_stream.push(dim_change::reduce_mat_buffered_handle(&mut pool_guard, buf, target_dims));
                     }
                     stream_buffers = new_stream;
+                    self.last_forward_contexts.insert(model_index, Vec::new());
                 }
                 Model::UniversalProcessor(proc, slices, stream_indices) => {
                     let active_indices: Vec<usize> = match stream_indices {
@@ -99,16 +98,17 @@ impl MixedModel {
                         None => (0..stream_buffers.len()).collect(),
                     };
 
-                    // Получаем дескриптор параметров для этой модели.
                     let params_handle = self
                         .get_params_handle_for_model(model_index)
-                        .unwrap_or_else(|| pool.acquire(0, 0));
+                        .unwrap_or_else(|| {
+                            let mut pool_guard = pool.lock().unwrap();
+                            pool_guard.acquire(0, 0)
+                        });
 
                     for &stream_idx in &active_indices {
                         let input_buf = stream_buffers[stream_idx].clone();
 
                         if let ComputeDevice::Gpu { .. } = device {
-                            // GPU-путь
                             let gpu = self.compute_executor.gpu_compute()
                                 .expect("GPU requested but not available");
 
@@ -132,23 +132,24 @@ impl MixedModel {
                             );
 
                             stream_buffers[stream_idx] = out_gpu;
-
-                            // Добавляем контексты как один чанк (весь батч)
+                            self.last_forward_contexts
+                                .insert(model_index, vec![layer_ctxs.clone()]);
                             all_ctxs.push(layer_ctxs);
                         } else {
-                            // CPU-путь
                             let can_parallel = can_parallelize(proc)
                                 && input_buf.rows() > 1
                                 && self.executor.num_workers() > 1;
 
                             if can_parallel {
-                                // Определяем выходные признаки
                                 let out_features = get_proc_output_features(proc, &input_buf);
-                                let out_handle = pool.acquire(input_buf.rows(), out_features);
+                                let out_handle = {
+                                    let mut pool_guard = pool.lock().unwrap();
+                                    pool_guard.acquire(input_buf.rows(), out_features)
+                                };
 
                                 let chunk_ctxs = forward_universal_parallel(
                                     self.executor.as_ref(),
-                                    self.temp_matrix_pool.clone(),
+                                    pool.clone(),
                                     proc.clone(),
                                     slices.clone(),
                                     params_handle.clone(),
@@ -157,55 +158,58 @@ impl MixedModel {
                                 );
 
                                 stream_buffers[stream_idx] = out_handle;
-
-                                // Добавляем контексты всех чанков
+                                self.last_forward_contexts
+                                    .insert(model_index, chunk_ctxs.clone());
                                 all_ctxs.extend(chunk_ctxs);
                             } else {
-                                // Последовательный CPU-путь
-                                let ctxs = self.process_universal_processor_forward_buffered(
-                                    pool,
-                                    proc,
-                                    slices,
-                                    model_index,
-                                    &params_handle,
-                                    &mut stream_buffers,
-                                    stream_indices,
-                                );
-
-                                // Один чанк (весь батч)
+                                let ctxs = {
+                                    let mut pool_guard = pool.lock().unwrap();
+                                    self.process_universal_processor_forward_buffered(
+                                        &mut pool_guard,
+                                        proc,
+                                        slices,
+                                        model_index,
+                                        &params_handle,
+                                        &mut stream_buffers,
+                                        stream_indices,
+                                    )
+                                };
+                                self.last_forward_contexts
+                                    .insert(model_index, vec![ctxs.clone()]);
                                 all_ctxs.push(ctxs);
                             }
                         }
                     }
                 }
                 Model::SplitterConnector { dim_a, dim_b } => {
+                    let mut pool_guard = pool.lock().unwrap();
                     self.process_splitter_connector_forward_buffered(
-                        pool,
+                        &mut pool_guard,
                         *dim_a,
                         *dim_b,
                         batch_size,
                         &mut stream_buffers,
-                        &mut all_ctxs, // изменится в processors.rs, пока оставим
+                        &mut all_ctxs,
                         model_index,
                     );
+                    self.last_forward_contexts.insert(model_index, Vec::new());
                 }
                 Model::CombinerConnector { input_dims, .. } => {
+                    let mut pool_guard = pool.lock().unwrap();
                     self.process_combiner_connector_forward_buffered(
-                        pool,
+                        &mut pool_guard,
                         input_dims.clone(),
                         batch_size,
                         &mut stream_buffers,
                         &mut all_ctxs,
                         model_index,
                     );
+                    self.last_forward_contexts.insert(model_index, Vec::new());
                 }
-                Model::Splitter {
-                    input_dim,
-                    output_dims,
-                    slice,
-                } => {
+                Model::Splitter { input_dim, output_dims, slice } => {
+                    let mut pool_guard = pool.lock().unwrap();
                     self.process_splitter_forward_buffered(
-                        pool,
+                        &mut pool_guard,
                         *input_dim,
                         output_dims.clone(),
                         *slice,
@@ -214,14 +218,17 @@ impl MixedModel {
                         &mut all_ctxs,
                         model_index,
                     );
+                    if let Some(ctx) = all_ctxs.last().and_then(|chunk| chunk.last()) {
+                        self.last_forward_contexts
+                            .insert(model_index, vec![vec![ctx.clone()]]);
+                    } else {
+                        self.last_forward_contexts.insert(model_index, Vec::new());
+                    }
                 }
-                Model::Combiner {
-                    input_dim,
-                    output_dim,
-                    slice,
-                } => {
+                Model::Combiner { input_dim, output_dim, slice } => {
+                    let mut pool_guard = pool.lock().unwrap();
                     self.process_combiner_forward_buffered(
-                        pool,
+                        &mut pool_guard,
                         *input_dim,
                         *output_dim,
                         *slice,
@@ -230,11 +237,18 @@ impl MixedModel {
                         &mut all_ctxs,
                         model_index,
                     );
+                    if let Some(ctx) = all_ctxs.last().and_then(|chunk| chunk.last()) {
+                        self.last_forward_contexts
+                            .insert(model_index, vec![vec![ctx.clone()]]);
+                    } else {
+                        self.last_forward_contexts.insert(model_index, Vec::new());
+                    }
                 }
             }
 
             let duration = start.elapsed().as_nanos() as f64;
-            self.compute_executor.record_model_time(model_index, &device, duration);
+            self.compute_executor
+                .record_model_time(model_index, &device, duration);
         }
 
         assert_eq!(
@@ -243,6 +257,6 @@ impl MixedModel {
             "forward_mat_multi_buffered: output stream count mismatch"
         );
 
-        (stream_buffers, all_ctxs)
+        (stream_buffers, Vec::new())
     }
 }

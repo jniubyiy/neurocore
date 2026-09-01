@@ -1,6 +1,6 @@
 // src/compute_manager/executor.rs
 
-pub type ChunkAssignment = Vec<Vec<(usize, usize)>>;
+pub type ChunkAssignment = Vec<Vec<(usize, usize, usize)>>; // (start, size, end)
 
 pub trait Executor: Send + Sync + 'static {
     fn execute_dyn(&self, f: Box<dyn FnOnce() + Send>);

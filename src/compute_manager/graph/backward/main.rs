@@ -1,7 +1,9 @@
 // src/compute_manager/graph/backward/main.rs
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::compute_manager::cpu::parallel::{can_parallelize, backward_universal_parallel};
 use crate::compute_manager::dim_change;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
@@ -18,8 +20,7 @@ use crate::model_plan::param_store::ParamSlice;
 impl MixedModel {
     pub fn backward_mat_multi_buffered(
         &mut self,
-        pool: &mut TempMatrixPool,
-        contexts: &[Vec<DynamicContext>], // TODO: в будущем заменить на ChunkedContexts
+        pool: Arc<Mutex<TempMatrixPool>>,
         deltas: Vec<MatrixBufferHandle>,
     ) -> Vec<MatrixBufferHandle> {
         assert_eq!(deltas.len(), self.output_stream_count,
@@ -27,9 +28,6 @@ impl MixedModel {
             self.output_stream_count, deltas.len());
 
         let mut stream_gradients = deltas;
-        let total_context_len = contexts.first().map(|c| c.len()).unwrap_or(0);
-        let mut ctx_pos = total_context_len;
-
         let models = self.models.clone();
 
         for (model_index, model) in models.iter().enumerate().rev() {
@@ -38,28 +36,41 @@ impl MixedModel {
 
             let params_handle = self
                 .get_params_handle_for_model(model_index)
-                .unwrap_or_else(|| pool.acquire(0, 0));
+                .unwrap_or_else(|| {
+                    let mut pool_guard = pool.lock().unwrap();
+                    pool_guard.acquire(0, 0)
+                });
             let grad_params_handle = self
                 .get_grads_handle_for_model(model_index)
-                .unwrap_or_else(|| pool.acquire(0, 0));
+                .unwrap_or_else(|| {
+                    let mut pool_guard = pool.lock().unwrap();
+                    pool_guard.acquire(0, 0)
+                });
+
+            let chunked_ctxs = self
+                .last_forward_contexts
+                .get(&model_index)
+                .cloned()
+                .unwrap_or_default();
 
             match model {
                 Model::Unsqueeze(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
-                        new_stream.push(dim_change::reduce_mat_buffered_handle(pool, buf, target_dims));
+                        let mut pool_guard = pool.lock().unwrap();
+                        new_stream.push(dim_change::reduce_mat_buffered_handle(&mut pool_guard, buf, target_dims));
                     }
                     stream_gradients = new_stream;
                 }
                 Model::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
-                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(pool, buf, target_dims));
+                        let mut pool_guard = pool.lock().unwrap();
+                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(&mut pool_guard, buf, target_dims));
                     }
                     stream_gradients = new_stream;
                 }
                 Model::UniversalProcessor(proc, slices, stream_indices) => {
-                    let num_layers = proc.len();
                     let active_indices: Vec<usize> = match stream_indices {
                         Some(indices) => indices.clone(),
                         None => (0..stream_gradients.len()).collect(),
@@ -70,23 +81,45 @@ impl MixedModel {
 
                     for &stream_idx in &active_indices {
                         let delta_handle = stream_gradients[stream_idx].clone();
-                        let pos_in_sorted = active_indices.iter().position(|&x| x == stream_idx).unwrap();
-                        let stream_ctx_start = ctx_pos - (active_indices.len() - pos_in_sorted) * num_layers;
-                        let layer_ctxs: Vec<&DynamicContext> = contexts[0]
-                            [stream_ctx_start..stream_ctx_start + num_layers]
-                            .iter()
-                            .collect();
 
-                        let ctxs_owned: Vec<DynamicContext> = layer_ctxs.iter().map(|&c| c.clone()).collect();
-                        let ctxs_slice: &[DynamicContext] = &ctxs_owned;
+                        let can_parallel = matches!(device, ComputeDevice::Cpu { .. })
+                            && can_parallelize(proc)
+                            && delta_handle.rows() > 1
+                            && self.executor.num_workers() > 1
+                            && chunked_ctxs.len() > 1;
 
-                        if let ComputeDevice::Gpu { .. } = device {
-                            // GPU-путь
+                        if can_parallel {
+                            let batch = delta_handle.rows();
+                            let input_features = if let Some(linear) = proc.first().and_then(|l| l.as_linear()) {
+                                <dyn UniversalLayerBuffered>::input_features(linear)
+                            } else {
+                                delta_handle.cols()
+                            };
+
+                            let grad_input_handle = {
+                                let mut pool_guard = pool.lock().unwrap();
+                                pool_guard.acquire(batch, input_features)
+                            };
+
+                            backward_universal_parallel(
+                                self.executor.as_ref(),
+                                pool.clone(),
+                                proc.clone(),
+                                slices.clone(),
+                                chunked_ctxs.clone(),
+                                delta_handle,
+                                grad_input_handle.clone(),
+                                params_handle.clone(),
+                                grad_params_handle.clone(),
+                            );
+
+                            new_gradients[stream_idx] = Some(grad_input_handle);
+                        } else if let ComputeDevice::Gpu { .. } = device {
                             let gpu = self.compute_executor.gpu_compute()
                                 .expect("GPU requested but not available");
 
                             let delta_gpu_handle = if delta_handle.is_gpu() {
-                                delta_handle.clone()
+                                delta_handle
                             } else {
                                 let gpu_handle = gpu.allocate_gpu_matrix_handle(
                                     delta_handle.rows(),
@@ -95,6 +128,14 @@ impl MixedModel {
                                 gpu.copy_cpu_to_gpu_handle(&delta_handle, &gpu_handle);
                                 gpu_handle
                             };
+
+                            let layer_ctxs = if chunked_ctxs.is_empty() {
+                                Vec::new()
+                            } else {
+                                chunked_ctxs[0].clone()
+                            };
+                            let ctxs_owned: Vec<DynamicContext> = layer_ctxs;
+                            let ctxs_slice: &[DynamicContext] = &ctxs_owned;
 
                             let out_gpu = process_backward_gpu_buffered(
                                 &gpu,
@@ -106,20 +147,33 @@ impl MixedModel {
                                 &grad_params_handle,
                             );
 
-                            let cpu_handle = pool.acquire(out_gpu.rows(), out_gpu.cols());
-                            gpu.copy_gpu_to_cpu_handle(&out_gpu, &cpu_handle);
+                            let cpu_handle = {
+                                let mut pool_guard = pool.lock().unwrap();
+                                let handle = pool_guard.acquire(out_gpu.rows(), out_gpu.cols());
+                                gpu.copy_gpu_to_cpu_handle(&out_gpu, &handle);
+                                handle
+                            };
                             new_gradients[stream_idx] = Some(cpu_handle);
                         } else {
-                            // CPU-путь (последовательный)
-                            let in_delta_handle = self.backward_universal_batch_buffered_handle(
-                                pool,
-                                proc,
-                                slices,
-                                &layer_ctxs,
-                                delta_handle,
-                                &params_handle,
-                                &grad_params_handle,
-                            );
+                            let layer_ctxs = if chunked_ctxs.is_empty() {
+                                Vec::new()
+                            } else {
+                                chunked_ctxs[0].clone()
+                            };
+                            let ctxs_refs: Vec<&DynamicContext> = layer_ctxs.iter().collect();
+
+                            let in_delta_handle = {
+                                let mut pool_guard = pool.lock().unwrap();
+                                self.backward_universal_batch_buffered_handle(
+                                    &mut pool_guard,
+                                    proc,
+                                    slices,
+                                    &ctxs_refs,
+                                    delta_handle,
+                                    &params_handle,
+                                    &grad_params_handle,
+                                )
+                            };
                             new_gradients[stream_idx] = Some(in_delta_handle);
                         }
                     }
@@ -133,44 +187,44 @@ impl MixedModel {
                         }
                     }
                     stream_gradients = final_grads;
-
-                    ctx_pos -= num_layers * active_indices.len();
                 }
                 Model::SplitterConnector { .. } => {
                     assert_eq!(stream_gradients.len(), 2);
                     let delta_a = stream_gradients[0].clone();
                     let delta_b = stream_gradients[1].clone();
 
-                    let in_a = pool.acquire(delta_a.rows(), delta_a.cols());
-                    let in_b = pool.acquire(delta_b.rows(), delta_b.cols());
-                    {
+                    let in_a = {
+                        let mut pool_guard = pool.lock().unwrap();
+                        let handle = pool_guard.acquire(delta_a.rows(), delta_a.cols());
                         let mut mem = self.memory_executor.lock().unwrap();
-                        mem.copy_cpu_buffer(delta_a.id(), in_a.id());
-                        mem.copy_cpu_buffer(delta_b.id(), in_b.id());
+                        mem.copy_cpu_buffer(delta_a.id(), handle.id());
+                        handle
+                    };
+                    let in_b = {
+                        let mut pool_guard = pool.lock().unwrap();
+                        let handle = pool_guard.acquire(delta_b.rows(), delta_b.cols());
+                        let mut mem = self.memory_executor.lock().unwrap();
+                        mem.copy_cpu_buffer(delta_b.id(), handle.id());
+                        handle
+                    };
+                    {
+                        let mut pool_guard = pool.lock().unwrap();
+                        pool_guard.release(delta_a);
+                        pool_guard.release(delta_b);
                     }
-
-                    pool.release(delta_a);
-                    pool.release(delta_b);
-
                     stream_gradients = vec![in_a, in_b];
-                    ctx_pos -= 1;
                 }
-                Model::CombinerConnector { .. } => {
-                    ctx_pos -= 1;
-                }
-                Model::Splitter {
-                    input_dim,
-                    output_dims,
-                    slice,
-                } => {
-                    assert!(ctx_pos > 0);
-                    let ctx = &contexts[0][ctx_pos - 1];
+                Model::CombinerConnector { .. } => {}
+                Model::Splitter { input_dim, output_dims, slice } => {
+                    let ctx = chunked_ctxs
+                        .first()
+                        .and_then(|chunk| chunk.first())
+                        .cloned()
+                        .expect("Missing Splitter context");
                     let (x_handle, pre_a_handle, pre_b_handle) = match ctx {
                         DynamicContext::Buffered(crate::layers::buffered_context::BufferedContext::Splitter {
-                            input,
-                            pre_a,
-                            pre_b,
-                        }) => (input.clone(), pre_a.clone(), pre_b.clone()),
+                            input, pre_a, pre_b,
+                        }) => (input, pre_a, pre_b),
                         _ => panic!("Expected Splitter Buffered context"),
                     };
 
@@ -182,7 +236,10 @@ impl MixedModel {
                     let p = output_dims[0];
                     let q = output_dims[1];
 
-                    let dx_handle = pool.acquire(batch, n);
+                    let dx_handle = {
+                        let mut pool_guard = pool.lock().unwrap();
+                        pool_guard.acquire(batch, n)
+                    };
 
                     let ids = [
                         x_handle.id(), da_handle.id(), db_handle.id(),
@@ -214,7 +271,6 @@ impl MixedModel {
                         let bias_a_start = wb_start + wb_len;
                         let bias_b_start = bias_a_start + p;
 
-                        // Вычисляем dx
                         for r in 0..batch {
                             for c in 0..n {
                                 let mut sum = 0.0;
@@ -230,7 +286,6 @@ impl MixedModel {
                             }
                         }
 
-                        // Градиенты весов
                         for out_idx in 0..p {
                             for in_idx in 0..n {
                                 let mut sum = 0.0;
@@ -252,7 +307,6 @@ impl MixedModel {
                             }
                         }
 
-                        // Градиенты смещений
                         for c in 0..p {
                             let mut sum = 0.0;
                             for r in 0..batch {
@@ -271,28 +325,27 @@ impl MixedModel {
                         }
                     });
 
-                    pool.release(da_handle);
-                    pool.release(db_handle);
-                    pool.release(x_handle);
-                    pool.release(pre_a_handle);
-                    pool.release(pre_b_handle);
+                    {
+                        let mut pool_guard = pool.lock().unwrap();
+                        pool_guard.release(da_handle);
+                        pool_guard.release(db_handle);
+                        pool_guard.release(x_handle);
+                        pool_guard.release(pre_a_handle);
+                        pool_guard.release(pre_b_handle);
+                    }
 
                     stream_gradients = vec![dx_handle];
-                    ctx_pos -= 1;
                 }
-                Model::Combiner {
-                    input_dim,
-                    output_dim,
-                    slice,
-                } => {
-                    assert!(ctx_pos > 0);
-                    let ctx = &contexts[0][ctx_pos - 1];
+                Model::Combiner { input_dim, output_dim, slice } => {
+                    let ctx = chunked_ctxs
+                        .first()
+                        .and_then(|chunk| chunk.first())
+                        .cloned()
+                        .expect("Missing Combiner context");
                     let (a_handle, b_handle, pre_handle) = match ctx {
                         DynamicContext::Buffered(crate::layers::buffered_context::BufferedContext::Combiner {
-                            input_a,
-                            input_b,
-                            pre_act,
-                        }) => (input_a.clone(), input_b.clone(), pre_act.clone()),
+                            input_a, input_b, pre_act,
+                        }) => (input_a, input_b, pre_act),
                         _ => panic!("Expected Combiner Buffered context"),
                     };
 
@@ -302,8 +355,14 @@ impl MixedModel {
                     let n = *input_dim;
                     let m = *output_dim;
 
-                    let da_handle = pool.acquire(batch, n);
-                    let db_handle = pool.acquire(batch, n);
+                    let da_handle = {
+                        let mut pool_guard = pool.lock().unwrap();
+                        pool_guard.acquire(batch, n)
+                    };
+                    let db_handle = {
+                        let mut pool_guard = pool.lock().unwrap();
+                        pool_guard.acquire(batch, n)
+                    };
 
                     let ids = [
                         a_handle.id(), b_handle.id(), pre_handle.id(), dout_handle.id(),
@@ -333,7 +392,6 @@ impl MixedModel {
                         let wb_len = m * n;
                         let bias_start = wb_start + wb_len;
 
-                        // Вычисляем da и db
                         for r in 0..batch {
                             for c in 0..n {
                                 let mut sum_a = 0.0;
@@ -348,7 +406,6 @@ impl MixedModel {
                             }
                         }
 
-                        // Градиенты весов
                         for out_idx in 0..m {
                             for in_idx in 0..n {
                                 let mut sum = 0.0;
@@ -370,7 +427,6 @@ impl MixedModel {
                             }
                         }
 
-                        // Градиент смещения
                         for c in 0..m {
                             let mut sum = 0.0;
                             for r in 0..batch {
@@ -381,13 +437,15 @@ impl MixedModel {
                         }
                     });
 
-                    pool.release(dout_handle);
-                    pool.release(a_handle);
-                    pool.release(b_handle);
-                    pool.release(pre_handle);
+                    {
+                        let mut pool_guard = pool.lock().unwrap();
+                        pool_guard.release(dout_handle);
+                        pool_guard.release(a_handle);
+                        pool_guard.release(b_handle);
+                        pool_guard.release(pre_handle);
+                    }
 
                     stream_gradients = vec![da_handle, db_handle];
-                    ctx_pos -= 1;
                 }
             }
 
@@ -399,7 +457,6 @@ impl MixedModel {
         stream_gradients
     }
 
-    // Вспомогательный метод для последовательного обратного прохода
     fn backward_universal_batch_buffered_handle(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -454,7 +511,6 @@ impl MixedModel {
     }
 }
 
-// Функция `call_backward_buffered` остаётся без изменений.
 fn call_backward_buffered(
     layer: &Box<dyn UniversalLayer>,
     ctx: &DynamicContext,

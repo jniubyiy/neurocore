@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::executor::Executor;
-use crate::compute_manager::graph::types::{DynamicContext, Model};
+use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext, Model};
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::memory_executor::MemoryExecutor;
 use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
@@ -18,11 +18,7 @@ use crate::optimizer_plan::{OptimizerDesc, OptimizerExpr};
 pub struct MixedModel {
     pub(crate) models: Vec<Model>,
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
-    /// Вычислительный пул потоков. Используется для выполнения CPU-интенсивных
-    /// операций (прямой и обратный проходы, функции потерь, оптимизаторы).
     pub(crate) executor: Box<dyn Executor>,
-    /// Управляющий пул потоков. Используется для координации, планирования,
-    /// подготовки данных и запуска GPU-операций.
     pub(crate) control_executor: Box<dyn Executor>,
     pub(crate) compute_executor: Arc<ComputeExecutor>,
     pub(crate) input_stream_count: usize,
@@ -31,12 +27,9 @@ pub struct MixedModel {
 
     pub(crate) input_shapes: Vec<Vec<usize>>,
     pub(crate) output_shapes: Vec<Vec<usize>>,
-
-    /// Пул временных матриц для управляемого выделения памяти на CPU.
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
-
-    /// Оптимизаторы для каждого буфера параметров (ключ — buffer_idx).
     pub(crate) optimizer_exprs: HashMap<usize, OptimizerExpr>,
+    pub(crate) last_forward_contexts: HashMap<usize, ChunkedContexts>,
 }
 
 impl MixedModel {
@@ -52,17 +45,14 @@ impl MixedModel {
         self.output_stream_count
     }
 
-    /// Возвращает доступ к хранилищу параметров (ParamStore).
     pub fn param_store(&self) -> &Arc<Mutex<ParamStore>> {
         &self.param_store
     }
 
-    /// Возвращает вычислительный пул потоков.
     pub fn executor(&self) -> &Box<dyn Executor> {
         &self.executor
     }
 
-    /// Возвращает управляющий пул потоков.
     pub fn control_executor(&self) -> &Box<dyn Executor> {
         &self.control_executor
     }
@@ -71,50 +61,47 @@ impl MixedModel {
         &self.memory_executor
     }
 
-    /// Возвращает ссылку на менеджер размещения (ComputeExecutor).
     pub fn compute_executor(&self) -> &Arc<ComputeExecutor> {
         &self.compute_executor
     }
 
-    /// Возвращает список моделей вычислительного графа.
     pub fn models(&self) -> &[Model] {
         &self.models
     }
-
-    // ===================================================================
-    // Публичные методы с DynamicTensor (конвертация на границе)
-    // ===================================================================
 
     pub fn forward(
         &mut self,
         input: DynamicTensor,
     ) -> (DynamicTensor, Vec<Vec<DynamicContext>>) {
         let pool_arc = self.temp_matrix_pool.clone();
-        let mut pool = pool_arc.lock().unwrap();
+        self.last_forward_contexts.clear();
 
-        let buf = self.dynamic_tensor_to_buffer(&mut pool, input);
+        let buf = {
+            let mut pool_guard = pool_arc.lock().unwrap();
+            self.dynamic_tensor_to_buffer(&mut pool_guard, input)
+        };
 
-        let (out_bufs, ctxs) = self.forward_mat_multi_buffered(&mut pool, vec![buf]);
+        let (out_bufs, _ctxs) = self.forward_mat_multi_buffered(pool_arc, vec![buf]);
 
         let out_buf = out_bufs.into_iter().next().expect("No output buffer");
         let out_tensor = self.buffer_to_dynamic_tensor(out_buf, &self.output_shapes[0]);
 
-        (out_tensor, ctxs)
+        (out_tensor, Vec::new())
     }
 
     pub fn backward(
         &mut self,
-        contexts: &[Vec<DynamicContext>],
         delta: DynamicTensor,
     ) -> (DynamicTensor, Vec<Vec<f32>>) {
         let pool_arc = self.temp_matrix_pool.clone();
-        let mut pool = pool_arc.lock().unwrap();
 
-        let delta_buf = self.dynamic_tensor_to_buffer(&mut pool, delta);
+        let delta_buf = {
+            let mut pool_guard = pool_arc.lock().unwrap();
+            self.dynamic_tensor_to_buffer(&mut pool_guard, delta)
+        };
 
-        let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, vec![delta_buf]);
+        let in_bufs = self.backward_mat_multi_buffered(pool_arc, vec![delta_buf]);
 
-        // Получаем градиенты параметров из ParamStore (собираем все буферы)
         let ps = self.param_store.lock().unwrap();
         let total_params = ps.total_params();
         let mut grads_vec = vec![0.0f32; total_params];
@@ -140,14 +127,18 @@ impl MixedModel {
         inputs: Vec<DynamicTensor>,
     ) -> (Vec<DynamicTensor>, Vec<Vec<DynamicContext>>) {
         let pool_arc = self.temp_matrix_pool.clone();
-        let mut pool = pool_arc.lock().unwrap();
+        self.last_forward_contexts.clear();
 
-        let bufs: Vec<MatrixBufferHandle> = inputs
-            .into_iter()
-            .map(|tensor| self.dynamic_tensor_to_buffer(&mut pool, tensor))
-            .collect();
+        let bufs = {
+            let mut pool_guard = pool_arc.lock().unwrap();
+            let mut bufs = Vec::with_capacity(inputs.len());
+            for tensor in inputs {
+                bufs.push(self.dynamic_tensor_to_buffer(&mut pool_guard, tensor));
+            }
+            bufs
+        };
 
-        let (out_bufs, ctxs) = self.forward_mat_multi_buffered(&mut pool, bufs);
+        let (out_bufs, _ctxs) = self.forward_mat_multi_buffered(pool_arc, bufs);
 
         let out_tensors = out_bufs
             .into_iter()
@@ -155,23 +146,25 @@ impl MixedModel {
             .map(|(buf, shape)| self.buffer_to_dynamic_tensor(buf, shape))
             .collect();
 
-        (out_tensors, ctxs)
+        (out_tensors, Vec::new())
     }
 
     pub fn backward_multi(
         &mut self,
-        contexts: &[Vec<DynamicContext>],
         deltas: Vec<DynamicTensor>,
     ) -> (Vec<DynamicTensor>, Vec<Vec<f32>>) {
         let pool_arc = self.temp_matrix_pool.clone();
-        let mut pool = pool_arc.lock().unwrap();
 
-        let delta_bufs: Vec<MatrixBufferHandle> = deltas
-            .into_iter()
-            .map(|tensor| self.dynamic_tensor_to_buffer(&mut pool, tensor))
-            .collect();
+        let delta_bufs = {
+            let mut pool_guard = pool_arc.lock().unwrap();
+            let mut bufs = Vec::with_capacity(deltas.len());
+            for tensor in deltas {
+                bufs.push(self.dynamic_tensor_to_buffer(&mut pool_guard, tensor));
+            }
+            bufs
+        };
 
-        let in_bufs = self.backward_mat_multi_buffered(&mut pool, contexts, delta_bufs);
+        let in_bufs = self.backward_mat_multi_buffered(pool_arc, delta_bufs);
 
         let ps = self.param_store.lock().unwrap();
         let total_params = ps.total_params();
@@ -214,7 +207,6 @@ impl MixedModel {
         (loss, grad_tensor)
     }
 
-    // Приватный метод: вычисление потерь полностью на MatrixBufferHandle
     fn compute_loss_handle(
         &self,
         expr: Arc<LossExpr>,
@@ -236,12 +228,6 @@ impl MixedModel {
         )
     }
 
-    // ===================================================================
-    // Миграция параметров моделей
-    // ===================================================================
-
-    /// Перемещает параметры, градиенты и состояния оптимизаторов для всех моделей
-    /// в соответствии с переданным размещением.
     pub fn migrate_parameters(
         &mut self,
         placement: &[crate::compute_manager::compute_executor::ModelPlacement],
@@ -285,10 +271,6 @@ impl MixedModel {
         }
         Ok(())
     }
-
-    // ===================================================================
-    // Конвертация DynamicTensor <-> MatrixBufferHandle
-    // ===================================================================
 
     fn dynamic_tensor_to_buffer(
         &self,
@@ -388,10 +370,6 @@ impl MixedModel {
         dest
     }
 
-    // ===================================================================
-    // Вспомогательный метод для чтения буфера с возможным GPU
-    // ===================================================================
-
     fn read_buffer_to_vec(&self, handle: &MatrixBufferHandle) -> Vec<f32> {
         if handle.is_gpu() {
             let gpu_compute = self
@@ -407,11 +385,6 @@ impl MixedModel {
         }
     }
 
-    // ===================================================================
-    // Шаг оптимизации (обновление параметров)
-    // ===================================================================
-
-    /// Выполняет шаг оптимизатора для каждого буфера параметров.
     pub fn update_params_buffered(&mut self, desc: OptimizerDesc, _grads: &[f32]) {
         let mut ps = self.param_store.lock().unwrap();
         let gpu_compute_guard = self.compute_executor.gpu_compute();
@@ -426,7 +399,7 @@ impl MixedModel {
                 )
             };
 
-            let chain = desc.build_chain(); // создаём новую цепочку для каждого буфера
+            let chain = desc.build_chain();
             let state_size = chain.total_state_size_per_param();
             ps.ensure_opt_state(&slice, state_size);
 
@@ -450,10 +423,6 @@ impl MixedModel {
             opt.step_buffered_handle_hybrid(&params_handle, &grads_handle, gpu_compute_ref);
         }
     }
-
-    // ===================================================================
-    // Вспомогательные методы для доступа к параметрам модели
-    // ===================================================================
 
     pub(crate) fn get_params_handle_for_model(
         &self,

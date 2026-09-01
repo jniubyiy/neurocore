@@ -191,7 +191,7 @@ impl Scheduler {
         }
     }
 
-    pub fn plan_chunks_assignment(&mut self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
+    pub fn plan_chunks_assignment(&mut self, total_tasks: usize) -> Vec<Vec<(usize, usize, usize)>> {
         if total_tasks == 0 {
             return vec![Vec::new(); self.num_workers];
         }
@@ -226,7 +226,7 @@ impl Scheduler {
         total_tasks: usize,
         max_chunks: usize,
         speeds: &[f64],
-    ) -> Vec<Vec<(usize, usize)>> {
+    ) -> Vec<Vec<(usize, usize, usize)>> {
         let num_workers = self.num_workers;
         let mut best_assignment = vec![Vec::new(); num_workers];
         let mut best_max_time = f64::MAX;
@@ -238,7 +238,7 @@ impl Scheduler {
             let mut max_time = 0.0;
             for cpu_idx in 0..num_workers {
                 let mut total_time = 0.0;
-                for &(_start, size) in &assignment[cpu_idx] {
+                for &(_start, size, _end) in &assignment[cpu_idx] {
                     if let Some(time) = self.predict_time(cpu_idx, size) {
                         total_time += time;
                     } else {
@@ -259,15 +259,15 @@ impl Scheduler {
         best_assignment
     }
 
-    fn assign_chunks_with_predictions(&self, chunks: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    fn assign_chunks_with_predictions(&self, chunks: &[(usize, usize, usize)]) -> Vec<Vec<(usize, usize, usize)>> {
         let num_workers = self.num_workers;
-        let mut assignment: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_workers];
+        let mut assignment: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); num_workers];
         let mut load_times = vec![0.0; num_workers];
 
-        let mut sorted_chunks: Vec<(usize, usize)> = chunks.to_vec();
-        sorted_chunks.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut sorted_chunks: Vec<(usize, usize, usize)> = chunks.to_vec();
+        sorted_chunks.sort_by(|a, b| b.1.cmp(&a.1)); // сортируем по size
 
-        for &(start, size) in &sorted_chunks {
+        for &(start, size, end) in &sorted_chunks {
             let mut best_cpu = 0;
             let mut best_time = f64::MAX;
             for cpu_idx in 0..num_workers {
@@ -286,7 +286,7 @@ impl Scheduler {
                     best_cpu = cpu_idx;
                 }
             }
-            assignment[best_cpu].push((start, size));
+            assignment[best_cpu].push((start, size, end));
             if let Some(pred) = self.predict_time(best_cpu, size) {
                 load_times[best_cpu] += pred;
             } else {
@@ -307,7 +307,7 @@ impl Scheduler {
         total_tasks: usize,
         max_chunks: usize,
         speeds: &[f64],
-    ) -> Vec<Vec<(usize, usize)>> {
+    ) -> Vec<Vec<(usize, usize, usize)>> {
         let mut best_penalty = f32::MAX;
         let mut best_assignment = vec![Vec::new(); self.num_workers];
 
@@ -316,7 +316,7 @@ impl Scheduler {
             let assignment = greedy_assign(&chunks, speeds);
             let loads: Vec<f64> = assignment
                 .iter()
-                .map(|assigned| assigned.iter().map(|(_, size)| *size as f64).sum())
+                .map(|assigned| assigned.iter().map(|(_, size, _)| *size as f64).sum())
                 .collect();
             let penalty = calculate_imbalance(&loads, speeds);
             if penalty < best_penalty {
@@ -348,29 +348,30 @@ impl Scheduler {
     }
 }
 
-fn split_into_chunks(total: usize, num_chunks: usize) -> Vec<(usize, usize)> {
+fn split_into_chunks(total: usize, num_chunks: usize) -> Vec<(usize, usize, usize)> {
     let base = total / num_chunks;
     let rem = total % num_chunks;
     let mut chunks = Vec::with_capacity(num_chunks);
     let mut start = 0;
     for i in 0..num_chunks {
         let size = if i < rem { base + 1 } else { base };
-        chunks.push((start, size));
-        start += size;
+        let end = start + size;
+        chunks.push((start, size, end));
+        start = end;
     }
     chunks
 }
 
 fn greedy_assign(
-    chunks: &[(usize, usize)],
+    chunks: &[(usize, usize, usize)],
     speeds: &[f64],
-) -> Vec<Vec<(usize, usize)>> {
+) -> Vec<Vec<(usize, usize, usize)>> {
     let num_workers = speeds.len();
-    let mut assignment: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_workers];
+    let mut assignment: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); num_workers];
     let mut loads = vec![0.0; num_workers];
 
-    let mut sorted_chunks: Vec<(usize, usize)> = chunks.to_vec();
-    sorted_chunks.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut sorted_chunks: Vec<(usize, usize, usize)> = chunks.to_vec();
+    sorted_chunks.sort_by(|a, b| b.1.cmp(&a.1)); // по size
 
     for chunk in &sorted_chunks {
         let mut best_worker = 0;

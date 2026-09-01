@@ -67,7 +67,7 @@ impl Executor for ControlThreadPool {
         self.pool.num_workers()
     }
 
-    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
+    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize, usize)>> {
         // Управляющий пул не выполняет параллельных вычислений,
         // поэтому возвращаем одно "назначение" на каждый поток,
         // где все задачи приписаны первому потоку (или всем, если потоков несколько,
@@ -75,7 +75,7 @@ impl Executor for ControlThreadPool {
         let workers = self.num_workers();
         let mut assignment = vec![Vec::new(); workers];
         if total_tasks > 0 && workers > 0 {
-            assignment[0].push((0, total_tasks));
+            assignment[0].push((0, total_tasks, total_tasks));
         }
         assignment
     }

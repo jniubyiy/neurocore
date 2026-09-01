@@ -333,6 +333,7 @@ impl MixedModel {
             output_shapes,
             temp_matrix_pool,
             optimizer_exprs: HashMap::new(),
+            last_forward_contexts: HashMap::new(),
         };
 
         Ok(model)
@@ -364,4 +365,4 @@ impl MixedModel {
     ) -> Result<Self, String> {
         Self::from_plan_with_device_plan_and_batch(plan.layers, device_plan, batch_size)
     }
-} 
+}

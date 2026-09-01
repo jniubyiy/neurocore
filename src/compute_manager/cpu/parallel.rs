@@ -13,11 +13,6 @@ use crate::layers::{
 };
 use crate::model_plan::param_store::ParamSlice;
 
-// ---------------------------------------------------------------------------
-// Вспомогательные функции для работы с чанками
-// ---------------------------------------------------------------------------
-
-/// Извлекает подмножество строк (start..end) из входного буфера в новый буфер.
 pub(crate) fn extract_chunk(
     input: &MatrixBufferHandle,
     start: usize,
@@ -44,7 +39,6 @@ pub(crate) fn extract_chunk(
     chunk
 }
 
-/// Копирует данные из чанка в соответствующие строки выходного буфера.
 pub(crate) fn write_chunk(
     output: &MatrixBufferHandle,
     chunk: &MatrixBufferHandle,
@@ -68,11 +62,6 @@ pub(crate) fn write_chunk(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Определение размеров и вызовы слоёв
-// ---------------------------------------------------------------------------
-
-/// Возвращает количество выходных признаков слоя.
 fn get_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
     if let Some(linear) = layer.as_linear() {
         <Linear as UniversalLayerBuffered>::output_features(linear)
@@ -93,7 +82,6 @@ fn get_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHand
     }
 }
 
-/// Возвращает количество входных признаков слоя (для обратного прохода).
 fn get_input_features(layer: &Box<dyn UniversalLayer>, grad_output: &MatrixBufferHandle) -> usize {
     if let Some(linear) = layer.as_linear() {
         <Linear as UniversalLayerBuffered>::input_features(linear)
@@ -114,7 +102,6 @@ fn get_input_features(layer: &Box<dyn UniversalLayer>, grad_output: &MatrixBuffe
     }
 }
 
-/// Вызывает прямой проход конкретного слоя.
 fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,
@@ -149,7 +136,6 @@ fn call_forward_buffered(
     }
 }
 
-/// Вызывает обратный проход конкретного слоя.
 fn call_backward_buffered(
     layer: &Box<dyn UniversalLayer>,
     ctx: &DynamicContext,
@@ -186,7 +172,6 @@ fn call_backward_buffered(
     }
 }
 
-/// Строит буферизованный контекст для слоя.
 fn build_buffered_context(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,
@@ -219,17 +204,10 @@ fn build_buffered_context(
     }
 }
 
-/// Проверяет, можно ли параллельно обрабатывать данные слои (нет слоёв с состоянием).
 pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
     !layers.iter().any(|l| l.as_memory().is_some())
 }
 
-// ---------------------------------------------------------------------------
-// Параллельный прямой проход
-// ---------------------------------------------------------------------------
-
-/// Параллельный прямой проход для UniversalProcessor (CPU).
-/// Возвращает контексты обратного прохода, сгруппированные по чанкам.
 pub(crate) fn forward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -241,18 +219,16 @@ pub(crate) fn forward_universal_parallel(
 ) -> ChunkedContexts {
     let batch_size = input.rows();
     let chunks = executor.plan_chunks_assignment(batch_size);
-    // Разворачиваем в плоский список (start, end)
-    let all_chunks: Vec<(usize, usize)> = chunks.into_iter().flatten().collect();
+    let all_chunks: Vec<(usize, usize, usize)> = chunks.into_iter().flatten().collect();
     let num_chunks = all_chunks.len();
     if num_chunks == 0 {
         return Vec::new();
     }
 
-    // Общее хранилище контекстов: индекс чанка -> Vec<DynamicContext>
     let ctx_storage = Arc::new(Mutex::new(vec![Vec::new(); num_chunks]));
     let barrier = Arc::new(Barrier::new(num_chunks + 1));
 
-    for (chunk_id, (start, end)) in all_chunks.into_iter().enumerate() {
+    for (chunk_id, (start, _size, end)) in all_chunks.into_iter().enumerate() {
         let input = input.clone();
         let output = output.clone();
         let params = params.clone();
@@ -263,48 +239,38 @@ pub(crate) fn forward_universal_parallel(
         let ctx_storage = ctx_storage.clone();
 
         executor.execute_dyn(Box::new(move || {
-            let mut pool_guard = pool.lock().unwrap();
-            let input_chunk = extract_chunk(&input, start, end, &mut pool_guard);
-            let mut current = input_chunk;
-            let mut chunk_ctxs = Vec::with_capacity(layers.len());
-
-            for (layer, slice) in layers.iter().zip(slices.iter()) {
-                let out_cols = get_output_features(layer, &current);
-                let out = pool_guard.acquire(current.rows(), out_cols);
-                let buffered_ctx = build_buffered_context(layer, &current, &out);
-                call_forward_buffered(layer, &current, &out, &params, slice);
-                chunk_ctxs.push(DynamicContext::Buffered(buffered_ctx));
-                current = out;
-            }
-
-            // Записываем результат в выходной буфер
-            write_chunk(&output, &current, start);
-
-            // Сохраняем контексты
             {
-                let mut storage = ctx_storage.lock().unwrap();
-                storage[chunk_id] = chunk_ctxs;
-            }
+                let mut pool_guard = pool.lock().unwrap();
+                let input_chunk = extract_chunk(&input, start, end, &mut pool_guard);
+                let mut current = input_chunk;
+                let mut chunk_ctxs = Vec::with_capacity(layers.len());
 
+                for (layer, slice) in layers.iter().zip(slices.iter()) {
+                    let out_cols = get_output_features(layer, &current);
+                    let out = pool_guard.acquire(current.rows(), out_cols);
+                    let buffered_ctx = build_buffered_context(layer, &current, &out);
+                    call_forward_buffered(layer, &current, &out, &params, slice);
+                    chunk_ctxs.push(DynamicContext::Buffered(buffered_ctx));
+                    current = out;
+                }
+
+                write_chunk(&output, &current, start);
+
+                {
+                    let mut storage = ctx_storage.lock().unwrap();
+                    storage[chunk_id] = chunk_ctxs;
+                }
+            }
             barrier.wait();
         }));
     }
 
-    // Ждём завершения всех задач
     barrier.wait();
 
-    // Извлекаем контексты
     let storage = ctx_storage.lock().unwrap();
     storage.clone()
 }
 
-// ---------------------------------------------------------------------------
-// Параллельный обратный проход
-// ---------------------------------------------------------------------------
-
-/// Параллельный обратный проход для UniversalProcessor (CPU).
-/// Принимает контексты, сгруппированные по чанкам.
-/// Градиенты параметров суммируются в grad_params.
 pub(crate) fn backward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -318,16 +284,12 @@ pub(crate) fn backward_universal_parallel(
 ) {
     let batch_size = grad_output.rows();
     let chunks = executor.plan_chunks_assignment(batch_size);
-    let all_chunks: Vec<(usize, usize)> = chunks.into_iter().flatten().collect();
+    let all_chunks: Vec<(usize, usize, usize)> = chunks.into_iter().flatten().collect();
     let num_chunks = all_chunks.len();
     if num_chunks == 0 || num_chunks != contexts.len() {
-        // Если число чанков не совпадает с контекстами, используем последовательный путь
-        // (это не должно происходить, но оставим защиту)
-        // Можно просто вернуться к последовательному выполнению, но здесь мы паникуем.
         panic!("backward_universal_parallel: number of chunks does not match contexts");
     }
 
-    // Временные буферы градиентов параметров для каждого чанка
     let param_len = grad_params.rows();
     let mut temp_grads = Vec::with_capacity(num_chunks);
     for _ in 0..num_chunks {
@@ -336,7 +298,7 @@ pub(crate) fn backward_universal_parallel(
 
     let barrier = Arc::new(Barrier::new(num_chunks + 1));
 
-    for (chunk_id, (start, end)) in all_chunks.into_iter().enumerate() {
+    for (chunk_id, (start, _size, end)) in all_chunks.into_iter().enumerate() {
         let grad_output = grad_output.clone();
         let grad_input = grad_input.clone();
         let params = params.clone();
@@ -348,46 +310,42 @@ pub(crate) fn backward_universal_parallel(
         let barrier = barrier.clone();
 
         executor.execute_dyn(Box::new(move || {
-            let mut pool_guard = pool.lock().unwrap();
+            {
+                let mut pool_guard = pool.lock().unwrap();
+                let grad_output_chunk = extract_chunk(&grad_output, start, end, &mut pool_guard);
+                let mut current_grad = grad_output_chunk;
 
-            // Извлекаем чанк из градиента выхода
-            let grad_output_chunk = extract_chunk(&grad_output, start, end, &mut pool_guard);
+                for i in (0..layers.len()).rev() {
+                    let layer = &layers[i];
+                    let slice = &slices[i];
+                    let ctx = &contexts_chunk[i];
 
-            // Выполняем обратный проход для этого чанка
-            let mut current_grad = grad_output_chunk;
-            for i in (0..layers.len()).rev() {
-                let layer = &layers[i];
-                let slice = &slices[i];
-                let ctx = &contexts_chunk[i];
+                    let in_features = get_input_features(layer, &current_grad);
+                    let grad_input_chunk = pool_guard.acquire(current_grad.rows(), in_features);
 
-                let in_features = get_input_features(layer, &current_grad);
-                let grad_input_chunk = pool_guard.acquire(current_grad.rows(), in_features);
+                    call_backward_buffered(
+                        layer,
+                        ctx,
+                        &current_grad,
+                        &grad_input_chunk,
+                        &params,
+                        slice,
+                        &grad_params_temp,
+                    );
 
-                call_backward_buffered(
-                    layer,
-                    ctx,
-                    &current_grad,
-                    &grad_input_chunk,
-                    &params,
-                    slice,
-                    &grad_params_temp,
-                );
+                    pool_guard.release(current_grad);
+                    current_grad = grad_input_chunk;
+                }
 
+                write_chunk(&grad_input, &current_grad, start);
                 pool_guard.release(current_grad);
-                current_grad = grad_input_chunk;
             }
-
-            // Записываем градиент входа в соответствующий участок grad_input
-            write_chunk(&grad_input, &current_grad, start);
-            pool_guard.release(current_grad);
-
             barrier.wait();
         }));
     }
 
     barrier.wait();
 
-    // Суммируем временные градиенты параметров в основной grad_params
     let mut pool_guard = pool.lock().unwrap();
     {
         let mut grad_guard = grad_params.write();

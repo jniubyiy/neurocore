@@ -37,11 +37,11 @@ impl Executor for GpuExecutor {
         1
     }
 
-    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
+    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize, usize)>> {
         if total_tasks == 0 {
             return vec![Vec::new(); 1];
         }
-        vec![vec![(0, total_tasks)]]
+        vec![vec![(0, total_tasks, total_tasks)]]
     }
 
     fn clone_executor(&self) -> Box<dyn Executor> {

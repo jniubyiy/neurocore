@@ -87,7 +87,7 @@ impl Executor for ComputeThreadPool {
         self.pool.num_workers()
     }
 
-    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize)>> {
+    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize, usize)>> {
         self.scheduler.lock().unwrap().plan_chunks_assignment(total_tasks)
     }
 

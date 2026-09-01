@@ -14,7 +14,8 @@ impl GpuCompute {
         total: usize,
     ) {
         let push = [total as u32];
-        let pipeline = self.apply_update_pipelines().forward.clone();
+        // Используем ссылку на Arc, чтобы избежать клонирования.
+        let pipeline = &self.apply_update_pipelines().forward;
         self.run_compute_shader(
             pipeline,
             &[(0, params.clone()), (1, grads.clone())],

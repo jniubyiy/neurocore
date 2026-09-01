@@ -21,7 +21,7 @@ impl GpuCompute {
         let b_buf = self.get_gpu_subbuffer_from_handle(b);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
-        let pipeline = self.mul_pipelines().forward.clone();
+        let pipeline = &self.mul_pipelines().forward;
         self.run_compute_shader(
             pipeline,
             &[(0, a_buf), (1, b_buf), (2, out_buf)],
@@ -51,7 +51,7 @@ impl GpuCompute {
         let ga_buf = self.get_gpu_subbuffer_from_handle(ga);
         let gb_buf = self.get_gpu_subbuffer_from_handle(gb);
 
-        let pipeline = self.mul_pipelines().backward.clone();
+        let pipeline = &self.mul_pipelines().backward;
         self.run_compute_shader(
             pipeline,
             &[

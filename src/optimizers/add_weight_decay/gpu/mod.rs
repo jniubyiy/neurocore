@@ -15,7 +15,8 @@ impl GpuCompute {
         total: usize,
     ) {
         let push = [decay.to_bits(), total as u32];
-        let pipeline = self.add_weight_decay_pipelines().forward.clone();
+        // Используем ссылку на Arc, чтобы избежать клонирования.
+        let pipeline = &self.add_weight_decay_pipelines().forward;
         self.run_compute_shader(
             pipeline,
             &[(0, params.clone()), (1, grads.clone())],

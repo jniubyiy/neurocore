@@ -27,6 +27,7 @@ impl GpuCompute {
         let b_buf = self.get_gpu_subbuffer_from_handle(b);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
+        // Получаем Arc<ComputePipeline> и передаём ссылку для избежания клонирования.
         let pipeline = self.pipeline_cache.mat_mul_pipeline();
         let push: [u32; 3] = [m as u32, n as u32, k as u32];
         let dispatch_dim = [
@@ -36,7 +37,7 @@ impl GpuCompute {
         ];
 
         self.run_compute_shader_with_dispatch(
-            pipeline,
+            &pipeline,
             &[(0, a_buf), (1, b_buf), (2, out_buf)],
             &push,
             dispatch_dim,
@@ -64,7 +65,7 @@ impl GpuCompute {
         let push: [u32; 1] = [rows as u32];
 
         self.run_compute_shader_with_dispatch(
-            pipeline,
+            &pipeline,
             &[(0, in_buf), (1, out_buf)],
             &push,
             [cols as u32, 1, 1], // одна workgroup на столбец

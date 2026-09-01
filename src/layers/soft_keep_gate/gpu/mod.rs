@@ -43,7 +43,7 @@ impl GpuCompute {
         let thresh_buf = subbuffer_from_view(self, thresholds);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let pipeline = self.soft_keep_gate_pipelines().forward.clone();
+        let pipeline = &self.soft_keep_gate_pipelines().forward;
         let push = [total as u32, temperature.to_bits(), features as u32];
         self.run_compute_shader(
             pipeline,
@@ -88,7 +88,7 @@ impl GpuCompute {
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
         let gthresh_buf = subbuffer_from_view(self, grad_thresh);
 
-        let pipeline = self.soft_keep_gate_pipelines().backward.clone();
+        let pipeline = &self.soft_keep_gate_pipelines().backward;
         let push = [total as u32, temperature.to_bits(), features as u32];
         self.run_compute_shader(
             pipeline,

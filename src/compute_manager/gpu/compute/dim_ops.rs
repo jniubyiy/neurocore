@@ -87,8 +87,9 @@ impl GpuCompute {
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
         let push = [in_rows, in_cols, out_rows, out_cols];
+        // Передаём ссылку на Arc, чтобы избежать лишнего клонирования.
         self.run_compute_shader(
-            self.pipeline_cache.unsqueeze.clone(),
+            &self.pipeline_cache.unsqueeze,
             &[(0, in_buf), (1, out_buf)],
             &push,
             total_elements,

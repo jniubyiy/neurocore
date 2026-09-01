@@ -39,7 +39,7 @@ impl GpuCompute {
         let (bias_buf, bias_raw) = self.upload_to_temp_buffer(bias);
 
         // Используем новый пайплайн из собственной структуры Combiner
-        let pipeline = self.combiner_pipelines().forward.clone();
+        let pipeline = &self.combiner_pipelines().forward;
         let push = [batch as u32, n as u32, m as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,
@@ -115,7 +115,7 @@ impl GpuCompute {
         self.fill_gpu_handle(d_bias, 0.0);
 
         // Используем новый пайплайн из собственной структуры Combiner
-        let pipeline = self.combiner_pipelines().backward.clone();
+        let pipeline = &self.combiner_pipelines().backward;
         let push = [batch as u32, n as u32, m as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,

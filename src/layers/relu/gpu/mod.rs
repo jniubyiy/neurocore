@@ -1,3 +1,5 @@
+// src/layers/relu/gpu/mod.rs
+
 pub mod pipeline;   // <-- новый модуль
 
 use crate::compute_manager::gpu::compute::GpuCompute;
@@ -17,7 +19,7 @@ impl GpuCompute {
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
         // Используем новый пайплайн из собственной структуры ReLU
-        let pipeline = self.relu_pipelines().forward.clone();
+        let pipeline = &self.relu_pipelines().forward;
         let push = [total as u32];
         self.run_compute_shader(
             pipeline,
@@ -42,7 +44,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.relu_pipelines().backward.clone();
+        let pipeline = &self.relu_pipelines().backward;
         let push = [total as u32];
         self.run_compute_shader(
             pipeline,

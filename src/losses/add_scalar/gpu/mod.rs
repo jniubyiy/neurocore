@@ -19,7 +19,7 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
-        let pipeline = self.add_scalar_pipelines().forward.clone();
+        let pipeline = &self.add_scalar_pipelines().forward;
         self.run_compute_shader(
             pipeline,
             &[(0, in_buf), (1, out_buf)],
@@ -40,7 +40,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let gi_buf = self.get_gpu_subbuffer_from_handle(gi);
 
-        let pipeline = self.add_scalar_pipelines().backward.clone();
+        let pipeline = &self.add_scalar_pipelines().backward;
         self.run_compute_shader(
             pipeline,
             &[(0, go_buf), (1, gi_buf)],

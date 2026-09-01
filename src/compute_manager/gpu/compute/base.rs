@@ -396,9 +396,11 @@ impl GpuCompute {
 
     // --- Диспатч ---
 
+    /// Запускает compute shader с автоматическим вычислением dispatch.
+    /// `pipeline` – ссылка на Arc<ComputePipeline>, чтобы избежать лишних клонирований.
     pub fn run_compute_shader<const N: usize>(
         &self,
-        pipeline: Arc<vulkano::pipeline::ComputePipeline>,
+        pipeline: &Arc<vulkano::pipeline::ComputePipeline>,
         buffers: &[(u32, Subbuffer<[f32]>)],
         push_constants: &[u32; N],
         total_elements: usize,
@@ -407,9 +409,10 @@ impl GpuCompute {
         self.run_compute_shader_with_dispatch(pipeline, buffers, push_constants, dispatch_dim);
     }
 
+    /// Запускает compute shader с явно заданным dispatch.
     pub fn run_compute_shader_with_dispatch<const N: usize>(
         &self,
-        pipeline: Arc<vulkano::pipeline::ComputePipeline>,
+        pipeline: &Arc<vulkano::pipeline::ComputePipeline>,
         buffers: &[(u32, Subbuffer<[f32]>)],
         push_constants: &[u32; N],
         dispatch_dim: [u32; 3],
@@ -437,7 +440,7 @@ impl GpuCompute {
 
         unsafe {
             builder
-                .bind_pipeline_compute(pipeline.clone())
+                .bind_pipeline_compute(pipeline.clone()) // единственное неизбежное клонирование Arc для Vulkan
                 .unwrap()
                 .bind_descriptor_sets(
                     PipelineBindPoint::Compute,
@@ -461,9 +464,10 @@ impl GpuCompute {
         future.wait(None).unwrap();
     }
 
+    /// Запускает compute shader с явным dispatch (2D-вариант).
     pub fn run_compute_shader_2d<const N: usize>(
         &self,
-        pipeline: Arc<vulkano::pipeline::ComputePipeline>,
+        pipeline: &Arc<vulkano::pipeline::ComputePipeline>,
         buffers: &[(u32, Subbuffer<[f32]>)],
         push_constants: &[u32; N],
         dispatch_dim: [u32; 3],

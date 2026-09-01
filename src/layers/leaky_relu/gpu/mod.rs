@@ -18,7 +18,7 @@ impl GpuCompute {
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
         // Используем новый пайплайн из собственной структуры LeakyReLU
-        let pipeline = self.leaky_relu_pipelines().forward.clone();
+        let pipeline = &self.leaky_relu_pipelines().forward;
         let push = [total as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,
@@ -44,7 +44,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.leaky_relu_pipelines().backward.clone();
+        let pipeline = &self.leaky_relu_pipelines().backward;
         let push = [total as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,

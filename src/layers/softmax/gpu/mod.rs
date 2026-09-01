@@ -1,9 +1,13 @@
-pub mod pipeline;   // <-- новый модуль
+// src/layers/softmax/gpu/mod.rs
+
+pub mod pipeline;
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 impl GpuCompute {
+    /// Прямой проход softmax на GPU с использованием MatrixBufferHandle.
+    /// Вход и выход должны быть GPU-буферами.
     pub fn run_softmax_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -20,8 +24,8 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        // Используем новый пайплайн из собственной структуры Softmax
-        let pipeline = self.softmax_pipelines().forward.clone();
+        // Используем пайплайн из собственной структуры Softmax
+        let pipeline = &self.softmax_pipelines().forward;
         let push: [u32; 2] = [batch as u32, cols as u32];
 
         self.run_compute_shader_with_dispatch(
@@ -32,6 +36,9 @@ impl GpuCompute {
         );
     }
 
+    /// Обратный проход softmax на GPU с использованием MatrixBufferHandle.
+    /// `output` — выход softmax (GPU), `grad_output` — градиент по выходу (GPU),
+    /// `grad_input` — буфер для записи градиента по входу (GPU).
     pub fn run_softmax_backward_buffered_handle(
         &self,
         output: &MatrixBufferHandle,
@@ -53,7 +60,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.softmax_pipelines().backward.clone();
+        let pipeline = &self.softmax_pipelines().backward;
         let push: [u32; 2] = [batch as u32, cols as u32];
 
         self.run_compute_shader_with_dispatch(

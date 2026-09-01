@@ -27,7 +27,8 @@ impl GpuCompute {
             bias_correction2.to_bits(),
             total as u32,
         ];
-        let pipeline = self.adam_pipelines().forward.clone();
+        // Используем ссылку на Arc, чтобы избежать клонирования.
+        let pipeline = &self.adam_pipelines().forward;
         self.run_compute_shader(
             pipeline,
             &[(0, grads.clone()), (1, state.clone())],

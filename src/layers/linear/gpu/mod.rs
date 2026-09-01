@@ -48,7 +48,7 @@ impl GpuCompute {
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
         // Используем пайплайн линейного слоя (веса и смещения уже на GPU)
-        let pipeline = self.linear_pipelines().forward.clone();
+        let pipeline = &self.linear_pipelines().forward;
         let push = [batch as u32, in_features as u32, out_features as u32];
 
         self.run_compute_shader_with_dispatch(
@@ -100,7 +100,7 @@ impl GpuCompute {
         let db_buf = subbuffer_from_view(self, grad_bias);
 
         // Используем пайплайн обратного прохода линейного слоя.
-        let pipeline = self.linear_pipelines().backward.clone();
+        let pipeline = &self.linear_pipelines().backward;
         let push = [batch as u32, in_features as u32, out_features as u32];
 
         self.run_compute_shader_with_dispatch(

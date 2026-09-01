@@ -52,7 +52,7 @@ impl GpuCompute {
         };
 
         // Используем новый пайплайн из собственной структуры Memory
-        let pipeline = self.memory_pipelines().forward.clone();
+        let pipeline = &self.memory_pipelines().forward;
         let push = [batch as u32, features as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,
@@ -79,7 +79,7 @@ impl GpuCompute {
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
         // Используем новый пайплайн из собственной структуры Memory
-        let pipeline = self.memory_pipelines().backward.clone();
+        let pipeline = &self.memory_pipelines().backward;
         let push = [total as u32, alpha.to_bits()];
         self.run_compute_shader(
             pipeline,

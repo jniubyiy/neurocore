@@ -15,7 +15,8 @@ impl GpuCompute {
         total: usize,
     ) {
         let push = [min_val.to_bits(), max_val.to_bits(), total as u32];
-        let pipeline = self.gradient_clip_pipelines().forward.clone();
+        // Используем ссылку на Arc, чтобы избежать клонирования.
+        let pipeline = &self.gradient_clip_pipelines().forward;
         self.run_compute_shader(
             pipeline,
             &[(0, grads.clone())],

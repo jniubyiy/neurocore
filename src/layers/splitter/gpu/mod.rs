@@ -46,7 +46,7 @@ impl GpuCompute {
         let (bias_b_buf, bias_b_raw) = self.upload_to_temp_buffer(bias_b);
 
         // Используем новый пайплайн из собственной структуры Splitter
-        let pipeline = self.splitter_pipelines().forward.clone();
+        let pipeline = &self.splitter_pipelines().forward;
         let push = [batch as u32, n as u32, p as u32, q as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,
@@ -124,7 +124,7 @@ impl GpuCompute {
         self.fill_gpu_handle(d_bias_b, 0.0);
 
         // Используем новый пайплайн из собственной структуры Splitter
-        let pipeline = self.splitter_pipelines().backward.clone();
+        let pipeline = &self.splitter_pipelines().backward;
         let push = [batch as u32, n as u32, p as u32, q as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,

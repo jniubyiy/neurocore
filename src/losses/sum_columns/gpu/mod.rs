@@ -20,7 +20,7 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
-        let pipeline = self.sum_columns_pipelines().forward.clone();
+        let pipeline = &self.sum_columns_pipelines().forward;
         let push = [rows as u32, cols as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,
@@ -44,7 +44,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let gi_buf = self.get_gpu_subbuffer_from_handle(gi);
 
-        let pipeline = self.sum_columns_pipelines().backward.clone();
+        let pipeline = &self.sum_columns_pipelines().backward;
         let push = [rows as u32, original_cols as u32];
         self.run_compute_shader_with_dispatch(
             pipeline,

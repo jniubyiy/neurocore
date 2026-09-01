@@ -17,7 +17,7 @@ impl GpuCompute {
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
         // Используем новый пайплайн из собственной структуры Tanh
-        let pipeline = self.tanh_pipelines().forward.clone();
+        let pipeline = &self.tanh_pipelines().forward;
         let push = [total as u32];
         self.run_compute_shader(
             pipeline,
@@ -42,7 +42,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_output);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let pipeline = self.tanh_pipelines().backward.clone();
+        let pipeline = &self.tanh_pipelines().backward;
         let push = [total as u32];
         self.run_compute_shader(
             pipeline,

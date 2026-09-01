@@ -18,11 +18,6 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 
 impl GpuCompute {
     /// Прямой проход DualAnchor на GPU.
-    ///
-    /// Минимальные и максимальные значения передаются как `MatrixBufferView`,
-    /// ссылающиеся на части общего GPU-буфера параметров сегмента.
-    /// Коэффициент `alpha` передаётся как отдельный `MatrixBufferView` длины 1.
-    /// Вход и выход — GPU-дескрипторы.
     pub fn run_dualanchor_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -49,19 +44,17 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let min_buf = subbuffer_from_view(self, min_vals);
         let max_buf = subbuffer_from_view(self, max_vals);
-        let alpha_buf = subbuffer_from_view(self, alpha);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        let pipeline = self.dual_anchor_pipelines().forward.clone();
-        let push = [total as u32, features as u32, 0.0f32.to_bits()];
-        // ВНИМАНИЕ: alpha извлекается на CPU, так как шейдер ожидает float push constant.
-        // Для простоты читаем alpha из view (CPU-side), так как длина 1.
+        // Читаем alpha на CPU, так как шейдер ожидает float push constant.
         let alpha_val = {
             let cpu_handle = self.download_gpu_handle_to_cpu_handle(alpha.parent_handle());
             let guard = cpu_handle.read();
             let slice = guard.as_slice().unwrap();
             slice[alpha.offset_elements()]
         };
+
+        let pipeline = &self.dual_anchor_pipelines().forward;
         let push = [total as u32, features as u32, alpha_val.to_bits()];
 
         self.run_compute_shader_with_dispatch(
@@ -78,10 +71,6 @@ impl GpuCompute {
     }
 
     /// Обратный проход DualAnchor на GPU.
-    ///
-    /// Градиенты минимальных/максимальных значений и alpha записываются
-    /// непосредственно в `grad_min`, `grad_max`, `grad_alpha` — части общего
-    /// GPU-буфера градиентов. Вход/выходные градиенты — GPU-дескрипторы.
     pub fn run_dualanchor_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -119,13 +108,12 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let min_buf = subbuffer_from_view(self, min_vals);
         let max_buf = subbuffer_from_view(self, max_vals);
-        let alpha_buf = subbuffer_from_view(self, alpha);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
         let gmin_buf = subbuffer_from_view(self, grad_min);
         let gmax_buf = subbuffer_from_view(self, grad_max);
         let galpha_buf = subbuffer_from_view(self, grad_alpha);
 
-        // Читаем alpha из view (CPU-side)
+        // Читаем alpha на CPU.
         let alpha_val = {
             let cpu_handle = self.download_gpu_handle_to_cpu_handle(alpha.parent_handle());
             let guard = cpu_handle.read();
@@ -133,7 +121,7 @@ impl GpuCompute {
             slice[alpha.offset_elements()]
         };
 
-        let pipeline = self.dual_anchor_pipelines().backward.clone();
+        let pipeline = &self.dual_anchor_pipelines().backward;
         let push = [total as u32, features as u32, alpha_val.to_bits()];
 
         self.run_compute_shader_with_dispatch(

@@ -22,7 +22,7 @@ impl GpuCompute {
         let in_buf = self.get_gpu_subbuffer_from_handle(logits_and_target);
         let out_buf = self.get_gpu_subbuffer_from_handle(out);
 
-        let pipeline = self.cross_entropy_pipelines().forward.clone();
+        let pipeline = &self.cross_entropy_pipelines().forward;
         self.run_compute_shader_with_dispatch(
             pipeline,
             &[(0, in_buf), (1, out_buf)],
@@ -51,7 +51,7 @@ impl GpuCompute {
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let gi_buf = self.get_gpu_subbuffer_from_handle(gi);
 
-        let pipeline = self.cross_entropy_pipelines().backward.clone();
+        let pipeline = &self.cross_entropy_pipelines().backward;
         self.run_compute_shader_with_dispatch(
             pipeline,
             &[(0, in_buf), (1, go_buf), (2, gi_buf)],

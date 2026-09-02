@@ -16,7 +16,7 @@ use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::optimizer_plan::{OptimizerDesc, OptimizerExpr};
 
 pub struct MixedModel {
-    pub(crate) models: Arc<Vec<Model>>,          // <-- изменено на Arc<Vec<Model>>
+    pub(crate) models: Arc<Vec<Model>>,
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) control_executor: Box<dyn Executor>,
@@ -81,7 +81,8 @@ impl MixedModel {
             self.dynamic_tensor_to_buffer(&mut pool_guard, input)
         };
 
-        let (out_bufs, _ctxs) = self.forward_mat_multi_buffered(pool_arc, vec![buf]);
+        // Вызываем без передачи пула
+        let (out_bufs, _ctxs) = self.forward_mat_multi_buffered(vec![buf]);
 
         let out_buf = out_bufs.into_iter().next().expect("No output buffer");
         let out_tensor = self.buffer_to_dynamic_tensor(out_buf, &self.output_shapes[0]);
@@ -100,7 +101,7 @@ impl MixedModel {
             self.dynamic_tensor_to_buffer(&mut pool_guard, delta)
         };
 
-        let in_bufs = self.backward_mat_multi_buffered(pool_arc, vec![delta_buf]);
+        let in_bufs = self.backward_mat_multi_buffered(vec![delta_buf]);
 
         let ps = self.param_store.lock().unwrap();
         let total_params = ps.total_params();
@@ -138,7 +139,7 @@ impl MixedModel {
             bufs
         };
 
-        let (out_bufs, _ctxs) = self.forward_mat_multi_buffered(pool_arc, bufs);
+        let (out_bufs, _ctxs) = self.forward_mat_multi_buffered(bufs);
 
         let out_tensors = out_bufs
             .into_iter()
@@ -164,7 +165,7 @@ impl MixedModel {
             bufs
         };
 
-        let in_bufs = self.backward_mat_multi_buffered(pool_arc, delta_bufs);
+        let in_bufs = self.backward_mat_multi_buffered(delta_bufs);
 
         let ps = self.param_store.lock().unwrap();
         let total_params = ps.total_params();

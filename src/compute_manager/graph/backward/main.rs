@@ -1,6 +1,6 @@
 // src/compute_manager/graph/backward/main.rs
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::compute_manager::cpu::parallel::{can_parallelize, backward_universal_parallel};
@@ -20,7 +20,6 @@ use crate::model_plan::param_store::ParamSlice;
 impl MixedModel {
     pub fn backward_mat_multi_buffered(
         &mut self,
-        pool: Arc<Mutex<TempMatrixPool>>,
         deltas: Vec<MatrixBufferHandle>,
     ) -> Vec<MatrixBufferHandle> {
         assert_eq!(deltas.len(), self.output_stream_count,
@@ -28,7 +27,10 @@ impl MixedModel {
             self.output_stream_count, deltas.len());
 
         let mut stream_gradients = deltas;
-        let models = Arc::clone(&self.models); // <-- клонируем только Arc
+        let models = Arc::clone(&self.models);
+
+        // Получаем пул из self
+        let pool = self.temp_matrix_pool.clone();
 
         for (model_index, model) in models.iter().enumerate().rev() {
             let start = Instant::now();

@@ -1,6 +1,6 @@
 // src/compute_manager/graph/forward/main.rs
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::compute_manager::cpu::parallel::{can_parallelize, forward_universal_parallel};
@@ -40,7 +40,6 @@ fn get_proc_output_features(
 impl MixedModel {
     pub fn forward_mat_multi_buffered(
         &mut self,
-        pool: Arc<Mutex<TempMatrixPool>>,
         inputs: Vec<MatrixBufferHandle>,
     ) -> (Vec<MatrixBufferHandle>, ChunkedContexts) {
         assert_eq!(
@@ -66,6 +65,9 @@ impl MixedModel {
 
         let mut stream_buffers: Vec<MatrixBufferHandle> = inputs;
         let mut all_ctxs: ChunkedContexts = Vec::new();
+
+        // Получаем пул из self, а не из параметра
+        let pool = self.temp_matrix_pool.clone();
 
         // Клонируем Arc, а не весь вектор моделей
         let models = Arc::clone(&self.models);

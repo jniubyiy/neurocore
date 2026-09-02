@@ -67,7 +67,8 @@ impl MixedModel {
         let mut stream_buffers: Vec<MatrixBufferHandle> = inputs;
         let mut all_ctxs: ChunkedContexts = Vec::new();
 
-        let models = self.models.clone();
+        // Клонируем Arc, а не весь вектор моделей
+        let models = Arc::clone(&self.models);
 
         for (model_index, model) in models.iter().enumerate() {
             let start = Instant::now();
@@ -123,10 +124,11 @@ impl MixedModel {
                                 gpu_buf
                             };
 
+                            // Передаём срезы
                             let (out_gpu, layer_ctxs) = process_forward_gpu_buffered(
                                 &gpu,
-                                proc,
-                                slices,
+                                proc.as_ref().as_slice(),
+                                slices.as_slice(),
                                 &params_handle,
                                 input_gpu,
                             );
@@ -136,22 +138,26 @@ impl MixedModel {
                                 .insert(model_index, vec![layer_ctxs.clone()]);
                             all_ctxs.push(layer_ctxs);
                         } else {
-                            let can_parallel = can_parallelize(proc)
+                            let can_parallel = can_parallelize(proc.as_ref().as_slice())
                                 && input_buf.rows() > 1
                                 && self.executor.num_workers() > 1;
 
                             if can_parallel {
-                                let out_features = get_proc_output_features(proc, &input_buf);
+                                let out_features = get_proc_output_features(proc.as_ref().as_slice(), &input_buf);
                                 let out_handle = {
                                     let mut pool_guard = pool.lock().unwrap();
                                     pool_guard.acquire(input_buf.rows(), out_features)
                                 };
 
+                                // Для параллельной ветки нужны владеющие копии
+                                let proc_arc = Arc::clone(proc);
+                                let slices_vec = slices.clone();
+
                                 let chunk_ctxs = forward_universal_parallel(
                                     self.executor.as_ref(),
                                     pool.clone(),
-                                    proc.clone(),
-                                    slices.clone(),
+                                    proc_arc,
+                                    slices_vec,
                                     params_handle.clone(),
                                     input_buf,
                                     out_handle.clone(),
@@ -166,8 +172,8 @@ impl MixedModel {
                                     let mut pool_guard = pool.lock().unwrap();
                                     self.process_universal_processor_forward_buffered(
                                         &mut pool_guard,
-                                        proc,
-                                        slices,
+                                        proc,  // передаём &Arc<Vec<...>> как ожидает метод
+                                        slices.as_slice(),
                                         model_index,
                                         &params_handle,
                                         &mut stream_buffers,

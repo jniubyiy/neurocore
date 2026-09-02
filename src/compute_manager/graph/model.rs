@@ -16,7 +16,7 @@ use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::optimizer_plan::{OptimizerDesc, OptimizerExpr};
 
 pub struct MixedModel {
-    pub(crate) models: Vec<Model>,
+    pub(crate) models: Arc<Vec<Model>>,          // <-- изменено на Arc<Vec<Model>>
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
     pub(crate) executor: Box<dyn Executor>,
     pub(crate) control_executor: Box<dyn Executor>,

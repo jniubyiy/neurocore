@@ -1,7 +1,7 @@
 // src/compute_manager/graph/builder.rs
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::cpu::hardware::CPU_INFO;
@@ -319,7 +319,12 @@ impl MixedModel {
         compute_executor.redistribute(&models, batch_size, true);
 
         // -----------------------------------------------------------
-        // 11. Собираем MixedModel
+        // 11. Оборачиваем модели в Arc для совместного использования
+        // -----------------------------------------------------------
+        let models = Arc::new(models);
+
+        // -----------------------------------------------------------
+        // 12. Собираем MixedModel
         // -----------------------------------------------------------
         let model = MixedModel {
             models,

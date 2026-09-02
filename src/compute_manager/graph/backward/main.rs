@@ -28,7 +28,7 @@ impl MixedModel {
             self.output_stream_count, deltas.len());
 
         let mut stream_gradients = deltas;
-        let models = self.models.clone();
+        let models = Arc::clone(&self.models); // <-- клонируем только Arc
 
         for (model_index, model) in models.iter().enumerate().rev() {
             let start = Instant::now();
@@ -83,7 +83,7 @@ impl MixedModel {
                         let delta_handle = stream_gradients[stream_idx].clone();
 
                         let can_parallel = matches!(device, ComputeDevice::Cpu { .. })
-                            && can_parallelize(proc)
+                            && can_parallelize(proc.as_ref().as_slice())
                             && delta_handle.rows() > 1
                             && self.executor.num_workers() > 1
                             && chunked_ctxs.len() > 1;
@@ -101,15 +101,17 @@ impl MixedModel {
                                 pool_guard.acquire(batch, input_features)
                             };
 
-                            // Клонируем нужные данные, так как в цикле они потребуются для других итераций
-                            // или веток. Клонирование MatrixBufferHandle дёшево (увеличивает счётчик ссылок).
-                            // Клонирование ChunkedContexts также необходимо, так как иначе будет перемещено.
+                            // Клонируем владеющие части для параллельной задачи
+                            let proc_arc = Arc::clone(proc);
+                            let slices_vec = slices.clone();
+                            let ctx_chunk = chunked_ctxs.clone();
+
                             backward_universal_parallel(
                                 self.executor.as_ref(),
                                 pool.clone(),
-                                proc.clone(),
-                                slices.clone(),
-                                chunked_ctxs.clone(),
+                                proc_arc,
+                                slices_vec,
+                                ctx_chunk,
                                 delta_handle,
                                 grad_input_handle.clone(),
                                 params_handle.clone(),
@@ -142,8 +144,8 @@ impl MixedModel {
 
                             let out_gpu = process_backward_gpu_buffered(
                                 &gpu,
-                                proc,
-                                slices,
+                                proc.as_ref().as_slice(),
+                                slices.as_slice(),
                                 ctxs_slice,
                                 &params_handle,
                                 delta_gpu_handle,
@@ -169,8 +171,8 @@ impl MixedModel {
                                 let mut pool_guard = pool.lock().unwrap();
                                 self.backward_universal_batch_buffered_handle(
                                     &mut pool_guard,
-                                    proc,
-                                    slices,
+                                    proc.as_ref().as_slice(),
+                                    slices.as_slice(),
                                     &ctxs_refs,
                                     delta_handle,
                                     &params_handle,

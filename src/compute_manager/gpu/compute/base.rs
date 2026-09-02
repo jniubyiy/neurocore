@@ -72,6 +72,10 @@ pub struct GpuCompute {
     /// Хранилище состояний для каждого слоя Memory по индексу (memory_idx).
     pub memory_states: Mutex<HashMap<usize, (Subbuffer<[f32]>, RawBufferId)>>,
 
+    // Внутренний мьютекс для сериализации доступа к очереди Vulkan.
+    // Позволяет использовать GpuCompute из нескольких потоков без внешнего Mutex.
+    queue_lock: Mutex<()>,
+
     // Пайплайны слоёв (ленивая инициализация)
     relu_pipelines: OnceLock<ReLUPipelines>,
     sigmoid_pipelines: OnceLock<SigmoidPipelines>,
@@ -130,6 +134,7 @@ impl GpuCompute {
             memory_executor,
             gpu_device_id,
             memory_states: Mutex::new(HashMap::new()),
+            queue_lock: Mutex::new(()),
             relu_pipelines: OnceLock::new(),
             sigmoid_pipelines: OnceLock::new(),
             tanh_pipelines: OnceLock::new(),
@@ -375,7 +380,11 @@ impl GpuCompute {
 
     // --- Копирование между Subbuffer'ами ---
 
+    /// Синхронно копирует данные между двумя Vulkan-буферами.
+    /// Захватывает внутренний мьютекс очереди.
     pub fn copy_buffer_sync(&self, src: Subbuffer<[f32]>, dst: Subbuffer<[f32]>) {
+        let _lock = self.queue_lock.lock().unwrap();
+
         let mut builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
             self.context.queue.queue_family_index(),
@@ -417,6 +426,8 @@ impl GpuCompute {
         push_constants: &[u32; N],
         dispatch_dim: [u32; 3],
     ) {
+        let _lock = self.queue_lock.lock().unwrap();
+
         let set_layout = pipeline.layout().set_layouts().get(0).unwrap().clone();
         let writes: Vec<WriteDescriptorSet> = buffers
             .iter()
@@ -619,6 +630,8 @@ impl GpuCompute {
     ) {
         assert!(src.is_gpu(), "Source must be GPU");
         assert!(dst.is_gpu(), "Destination must be GPU");
+
+        let _lock = self.queue_lock.lock().unwrap();
 
         let elem_size = std::mem::size_of::<f32>() as u64;
         let src_start_byte = src_offset as u64 * elem_size;

@@ -81,7 +81,6 @@ impl MixedModel {
             self.dynamic_tensor_to_buffer(&mut pool_guard, input)
         };
 
-        // Вызываем без передачи пула
         let (out_bufs, _ctxs) = self.forward_mat_multi_buffered(vec![buf]);
 
         let out_buf = out_bufs.into_iter().next().expect("No output buffer");
@@ -219,7 +218,7 @@ impl MixedModel {
             let gpu = self.compute_executor.gpu_compute().unwrap();
             if pred.is_gpu() && target.is_gpu() {
                 return crate::plans::loss_plan::gpu_exec::compute_loss_gpu_buffered_handle(
-                    &gpu, &expr, &pred, &target,
+                    gpu.as_ref(), &expr, &pred, &target,
                 );
             }
         }

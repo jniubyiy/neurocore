@@ -1,6 +1,6 @@
 // src/compute_manager/compute_executor/mod.rs
 
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::compute_manager::device_spec::DeviceId;
 use crate::compute_manager::gpu::compute::GpuCompute;
@@ -25,7 +25,7 @@ pub use profiling::ProfilingState;
 /// эпохой обучения, используя накопленную профилировочную статистику.
 pub struct ComputeExecutor {
     device_plan: DevicePlan,
-    gpu_compute: Option<Mutex<GpuCompute>>,
+    gpu_compute: Option<Arc<GpuCompute>>,
     memory_executor: Arc<RwLock<MemoryExecutor>>,
     profiling: Mutex<ProfilingState>,
     current_placement: Mutex<Vec<ModelPlacement>>,
@@ -71,7 +71,7 @@ impl ComputeExecutor {
                     memory_executor.clone(),
                     DeviceId(*id),
                 );
-                Some(Mutex::new(compute))
+                Some(Arc::new(compute))
             } else {
                 None
             }
@@ -108,10 +108,9 @@ impl ComputeExecutor {
     }
 
     /// Возвращает ссылку на `GpuCompute`, если он инициализирован.
-    /// Блокирует внутренний мьютекс, поэтому вызывающий код должен быть осторожен,
-    /// чтобы не удерживать блокировку длительное время.
-    pub fn gpu_compute(&self) -> Option<MutexGuard<'_, GpuCompute>> {
-        self.gpu_compute.as_ref().map(|m| m.lock().unwrap())
+    /// Теперь возвращает клон `Arc`, который можно использовать в любом потоке.
+    pub fn gpu_compute(&self) -> Option<Arc<GpuCompute>> {
+        self.gpu_compute.as_ref().map(|arc| Arc::clone(arc))
     }
 
     /// Вычисляет начальное размещение моделей (статическая эвристика).

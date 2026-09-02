@@ -66,7 +66,7 @@ impl MixedModel {
         let mut stream_buffers: Vec<MatrixBufferHandle> = inputs;
         let mut all_ctxs: ChunkedContexts = Vec::new();
 
-        // Получаем пул из self, а не из параметра
+        // Получаем пул из self
         let pool = self.temp_matrix_pool.clone();
 
         // Клонируем Arc, а не весь вектор моделей
@@ -128,7 +128,7 @@ impl MixedModel {
 
                             // Передаём срезы
                             let (out_gpu, layer_ctxs) = process_forward_gpu_buffered(
-                                &gpu,
+                                gpu.as_ref(),
                                 proc.as_ref().as_slice(),
                                 slices.as_slice(),
                                 &params_handle,

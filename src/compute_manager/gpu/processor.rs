@@ -124,7 +124,6 @@ pub fn process_forward_gpu_buffered(
             current = out_handle;
         } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
             let features = soft_sparse.in_features;
-            // Пороги лежат в params_handle, начиная с slice.start
             let thresholds_view = MatrixBufferView::new(
                 params_handle.clone(),
                 slice.start,
@@ -163,9 +162,6 @@ pub fn process_forward_gpu_buffered(
             current = out_handle;
         } else if let Some(dual) = layer.as_dual_anchor() {
             let features = dual.features;
-            // Параметры: min_vals [slice.start .. slice.start+features],
-            // max_vals [slice.start+features .. slice.start+2*features],
-            // alpha [slice.start+2*features]
             let min_view = MatrixBufferView::new(params_handle.clone(), slice.start, features);
             let max_view = MatrixBufferView::new(
                 params_handle.clone(),
@@ -242,7 +238,6 @@ pub fn process_backward_gpu_buffered(
                 _ => panic!("Expected Linear Buffered context"),
             };
 
-            // View для весов
             let weight_view = MatrixBufferView::with_shape(
                 params_handle.clone(),
                 w_start,
@@ -251,7 +246,6 @@ pub fn process_backward_gpu_buffered(
                 in_feat,
             );
 
-            // View для градиентов весов и смещений в общем буфере градиентов
             let grad_weight_view = MatrixBufferView::with_shape(
                 grad_params_handle.clone(),
                 w_start,

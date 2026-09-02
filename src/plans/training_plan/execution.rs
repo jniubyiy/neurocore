@@ -173,13 +173,16 @@ fn execute_inner(
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
             let t3 = Instant::now();
-            model.update_params_buffered(plan.optimizer_desc.clone(), &grads[0]);
+            // Градиенты уже находятся внутри ParamStore, поэтому передаём пустой срез
+            model.update_params_buffered(plan.optimizer_desc.clone(), &[]);
             let update_dt = t3.elapsed().as_nanos() as u64;
 
             epoch_loss += loss * batch_size_actual as f32;
 
             if let Some(ref mut mon) = monitor {
-                mon.record_step(loss, Some(&grads[0]), None);
+                // Для мониторинга вычисляем плоский вектор градиентов
+                let grads_flat = grads.to_flat_vec();
+                mon.record_step(loss, Some(&grads_flat), None);
             }
 
             if let Some(ref mut prof) = profiler {
@@ -191,7 +194,7 @@ fn execute_inner(
                 }
                 if prof.mode == ProfileMode::Memory || prof.mode == ProfileMode::Full {
                     let mem = model.memory_executor();
-                    let me = mem.read().unwrap();  // изменено с .lock() на .read()
+                    let me = mem.read().unwrap();
                     let kinds = [
                         MemoryDeviceKind::HostRam,
                         MemoryDeviceKind::SsdCache,

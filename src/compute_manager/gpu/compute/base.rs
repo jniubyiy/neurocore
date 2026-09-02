@@ -562,6 +562,25 @@ impl GpuCompute {
         cpu_handle
     }
 
+    /// Скачивает данные из GPU напрямую в `Vec<f32>` без создания CPU‑буфера.
+    /// Предназначен для случаев, когда нужен числовой доступ к данным.
+    pub fn download_gpu_handle_to_vec(&self, handle: &MatrixBufferHandle) -> Vec<f32> {
+        assert!(handle.is_gpu(), "Handle must be GPU");
+        let elements = handle.rows() * handle.cols();
+
+        let gpu_buf = self.get_gpu_subbuffer_from_handle(handle);
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(elements);
+        self.copy_buffer_sync(gpu_buf, staging_buf.clone());
+
+        let data = {
+            let staging_guard = staging_buf.read().expect("read staging buffer");
+            staging_guard[..elements].to_vec()
+        };
+
+        self.release_staging_buffer(staging_buf, staging_raw);
+        data
+    }
+
     pub fn fill_gpu_handle(&self, handle: &MatrixBufferHandle, value: f32) {
         let elements = handle.rows() * handle.cols();
         let data = vec![value; elements];

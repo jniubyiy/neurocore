@@ -15,6 +15,48 @@ use crate::loss_plan::{LossDesc, LossExpr};
 use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::optimizer_plan::{OptimizerDesc, OptimizerExpr};
 
+/// Коллекция градиентов параметров модели, представленная управляемыми буферами.
+///
+/// В отличие от обычных `Vec<f32>`, этот тип не копирует данные и сохраняет
+/// прямую связь с буферами градиентов внутри `ParamStore`. Это позволяет
+/// избежать накладных расходов на сериализацию и оставаться в рамках
+/// управляемой памяти.
+pub struct ParamGradients {
+    /// Клоны дескрипторов буферов градиентов (по одному на сегмент модели).
+    buffers: Vec<MatrixBufferHandle>,
+    compute_executor: Arc<ComputeExecutor>,
+}
+
+impl ParamGradients {
+    /// Возвращает срез дескрипторов буферов градиентов.
+    pub fn buffers(&self) -> &[MatrixBufferHandle] {
+        &self.buffers
+    }
+
+    /// Возвращает плоский вектор всех градиентов (с копированием данных).
+    ///
+    /// Этот метод следует использовать только для диагностики, логирования
+    /// или интеграции с внешним кодом, которому нужен числовой доступ.
+    /// В горячем пути обучения его вызывать не рекомендуется.
+    pub fn to_flat_vec(&self) -> Vec<f32> {
+        let mut result = Vec::new();
+        for buf in &self.buffers {
+            let data = if buf.is_gpu() {
+                let gpu = self
+                    .compute_executor
+                    .gpu_compute()
+                    .expect("GPU compute not available");
+                gpu.download_gpu_handle_to_vec(buf)
+            } else {
+                let guard = buf.read();
+                guard.as_slice().expect("CPU buffer").to_vec()
+            };
+            result.extend_from_slice(&data);
+        }
+        result
+    }
+}
+
 pub struct MixedModel {
     pub(crate) models: Arc<Vec<Model>>,
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
@@ -92,7 +134,7 @@ impl MixedModel {
     pub fn backward(
         &mut self,
         delta: DynamicTensor,
-    ) -> (DynamicTensor, Vec<Vec<f32>>) {
+    ) -> (DynamicTensor, ParamGradients) {
         let pool_arc = self.temp_matrix_pool.clone();
 
         let delta_buf = {
@@ -102,24 +144,12 @@ impl MixedModel {
 
         let in_bufs = self.backward_mat_multi_buffered(vec![delta_buf]);
 
-        let ps = self.param_store.lock().unwrap();
-        let total_params = ps.total_params();
-        let mut grads_vec = vec![0.0f32; total_params];
-        let mut offset = 0usize;
-        for buffer_idx in 0..ps.num_buffers() {
-            let buffer = ps.get_param_buffer_by_idx(buffer_idx);
-            let grads_handle = &buffer.grads;
-            let grads_data = self.read_buffer_to_vec(grads_handle);
-            let len = grads_data.len();
-            grads_vec[offset..offset + len].copy_from_slice(&grads_data);
-            offset += len;
-        }
-        drop(ps);
+        let param_grads = self.collect_param_gradients();
 
         let in_buf = in_bufs.into_iter().next().expect("No input buffer");
         let in_tensor = self.buffer_to_dynamic_tensor(in_buf, &self.input_shapes[0]);
 
-        (in_tensor, vec![grads_vec])
+        (in_tensor, param_grads)
     }
 
     pub fn forward_multi(
@@ -152,7 +182,7 @@ impl MixedModel {
     pub fn backward_multi(
         &mut self,
         deltas: Vec<DynamicTensor>,
-    ) -> (Vec<DynamicTensor>, Vec<Vec<f32>>) {
+    ) -> (Vec<DynamicTensor>, ParamGradients) {
         let pool_arc = self.temp_matrix_pool.clone();
 
         let delta_bufs = {
@@ -166,19 +196,7 @@ impl MixedModel {
 
         let in_bufs = self.backward_mat_multi_buffered(delta_bufs);
 
-        let ps = self.param_store.lock().unwrap();
-        let total_params = ps.total_params();
-        let mut grads_vec = vec![0.0f32; total_params];
-        let mut offset = 0usize;
-        for buffer_idx in 0..ps.num_buffers() {
-            let buffer = ps.get_param_buffer_by_idx(buffer_idx);
-            let grads_handle = &buffer.grads;
-            let grads_data = self.read_buffer_to_vec(grads_handle);
-            let len = grads_data.len();
-            grads_vec[offset..offset + len].copy_from_slice(&grads_data);
-            offset += len;
-        }
-        drop(ps);
+        let param_grads = self.collect_param_gradients();
 
         let in_tensors = in_bufs
             .into_iter()
@@ -186,7 +204,22 @@ impl MixedModel {
             .map(|(buf, shape)| self.buffer_to_dynamic_tensor(buf, shape))
             .collect();
 
-        (in_tensors, vec![grads_vec])
+        (in_tensors, param_grads)
+    }
+
+    /// Собирает клоны дескрипторов градиентных буферов из ParamStore.
+    /// Не копирует данные — только дескрипторы.
+    fn collect_param_gradients(&self) -> ParamGradients {
+        let ps = self.param_store.lock().unwrap();
+        let mut buffers = Vec::with_capacity(ps.num_buffers());
+        for buffer_idx in 0..ps.num_buffers() {
+            let buffer = ps.get_param_buffer_by_idx(buffer_idx);
+            buffers.push(buffer.grads.clone());
+        }
+        ParamGradients {
+            buffers,
+            compute_executor: Arc::clone(&self.compute_executor),
+        }
     }
 
     pub fn compute_loss(
@@ -298,16 +331,12 @@ impl MixedModel {
         buf: MatrixBufferHandle,
         shape: &[usize],
     ) -> DynamicTensor {
-        if buf.is_gpu() {
+        let (batch, features, flat) = if buf.is_gpu() {
             let gpu_compute = self
                 .compute_executor
                 .gpu_compute()
                 .expect("GPU compute not available");
-            let cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(&buf);
-            let vec = {
-                let guard = cpu_handle.read();
-                guard.as_slice().unwrap().to_vec()
-            };
+            let vec = gpu_compute.download_gpu_handle_to_vec(&buf);
             let batch = buf.rows();
             let features = buf.cols();
             let mut flat = vec![0.0f32; batch * features];
@@ -316,21 +345,21 @@ impl MixedModel {
                     flat[r * features + c] = vec[c * batch + r];
                 }
             }
-            drop(buf);
-            return self.flat_to_dynamic_tensor(shape, flat);
-        }
-
-        let batch = buf.rows();
-        let features = buf.cols();
-        let guard = buf.read();
-        let slice = guard.as_slice().expect("CPU buffer");
-        let mut flat = vec![0.0f32; batch * features];
-        for r in 0..batch {
-            for c in 0..features {
-                flat[r * features + c] = slice[c * batch + r];
+            (batch, features, flat)
+        } else {
+            let batch = buf.rows();
+            let features = buf.cols();
+            let guard = buf.read();
+            let slice = guard.as_slice().expect("CPU buffer");
+            let mut flat = vec![0.0f32; batch * features];
+            for r in 0..batch {
+                for c in 0..features {
+                    flat[r * features + c] = slice[c * batch + r];
+                }
             }
-        }
-        drop(guard);
+            drop(guard);
+            (batch, features, flat)
+        };
         drop(buf);
         self.flat_to_dynamic_tensor(shape, flat)
     }
@@ -368,21 +397,6 @@ impl MixedModel {
         let shape_ref = dest.clone();
         DynamicTensor::from_flat_into(&shape_ref, &flat, &mut dest);
         dest
-    }
-
-    fn read_buffer_to_vec(&self, handle: &MatrixBufferHandle) -> Vec<f32> {
-        if handle.is_gpu() {
-            let gpu_compute = self
-                .compute_executor
-                .gpu_compute()
-                .expect("GPU compute not available");
-            let cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(handle);
-            let guard = cpu_handle.read();
-            guard.as_slice().unwrap().to_vec()
-        } else {
-            let guard = handle.read();
-            guard.as_slice().expect("CPU buffer").to_vec()
-        }
     }
 
     pub fn update_params_buffered(&mut self, desc: OptimizerDesc, _grads: &[f32]) {

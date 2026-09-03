@@ -15,6 +15,7 @@ pub mod identity;
 pub mod soft_sparse_gate;
 pub mod soft_keep_gate;
 pub mod dual_anchor;
+pub mod adaptive_activation;   // <-- добавлен новый модуль
 
 pub mod layers_special;
 pub mod buffered_context;
@@ -39,6 +40,7 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_soft_sparse_gate(&self) -> Option<&SoftSparseGate> { None }
     fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> { None }
     fn as_dual_anchor(&self) -> Option<&DualAnchor> { None }
+    fn as_adaptive_activation(&self) -> Option<&AdaptivePerFeatureActivation> { None }   // <-- добавлен метод
     fn as_reduce_mean(&self) -> Option<&ReduceMean> { None }
     fn as_unsqueeze(&self) -> Option<&Unsqueeze> { None }
 
@@ -98,6 +100,7 @@ pub use identity::Identity;
 pub use soft_sparse_gate::SoftSparseGate;
 pub use soft_keep_gate::SoftKeepGate;
 pub use dual_anchor::DualAnchor;
+pub use adaptive_activation::AdaptivePerFeatureActivation;   // <-- реэкспорт нового слоя
 
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 pub use buffered_context::BufferedContext;

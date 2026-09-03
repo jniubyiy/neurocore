@@ -186,6 +186,30 @@ pub fn process_forward_gpu_buffered(
                 input: current.clone(),
             }));
             current = out_handle;
+        } else if let Some(adaptive) = layer.as_adaptive_activation() {
+            // Новый слой AdaptivePerFeatureActivation
+            let in_features = adaptive.in_features;
+            let num_activations = adaptive.num_activations;
+            let params_len = in_features * num_activations;
+
+            let params_view = MatrixBufferView::new(
+                params_handle.clone(),
+                slice.start,
+                params_len,
+            );
+
+            let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), in_features);
+            gpu_compute.run_adaptive_activation_forward_buffered_handle(
+                &current,
+                &params_view,
+                num_activations,
+                &out_handle,
+            );
+
+            ctxs.push(DynamicContext::Buffered(BufferedContext::AdaptiveActivation {
+                input: current.clone(),
+            }));
+            current = out_handle;
         } else {
             panic!(
                 "Unsupported layer in GPU buffered forward: {:?}",
@@ -440,6 +464,33 @@ pub fn process_backward_gpu_buffered(
                 &grad_max_view,
                 &grad_alpha_view,
             );
+            current_grad = grad_input_handle;
+        } else if let Some(adaptive) = layer.as_adaptive_activation() {
+            // Обработка обратного прохода для AdaptivePerFeatureActivation
+            let in_features = adaptive.in_features;
+            let num_activations = adaptive.num_activations;
+            let params_len = in_features * num_activations;
+
+            let DynamicContext::Buffered(bc) = ctx;
+            let input_handle = match bc {
+                BufferedContext::AdaptiveActivation { input } => input.clone(),
+                _ => panic!("Expected AdaptiveActivation Buffered context"),
+            };
+
+            let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, params_len);
+            let grad_params_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start, params_len);
+
+            let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), in_features);
+
+            gpu_compute.run_adaptive_activation_backward_buffered_handle(
+                &input_handle,
+                &current_grad,
+                &params_view,
+                num_activations,
+                &grad_input_handle,
+                &grad_params_view,
+            );
+
             current_grad = grad_input_handle;
         } else {
             panic!(

@@ -19,4 +19,5 @@ pub enum LayerKind {
     SoftSparseGate,
     SoftKeepGate,
     DualAnchor,
+    AdaptivePerFeatureActivation,
 }

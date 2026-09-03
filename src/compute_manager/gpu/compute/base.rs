@@ -39,6 +39,7 @@ use crate::layers::softmax::gpu::pipeline::SoftmaxPipelines;
 use crate::layers::memory::gpu::pipeline::MemoryPipelines;
 use crate::layers::splitter::gpu::pipeline::SplitterPipelines;
 use crate::layers::combiner::gpu::pipeline::CombinerPipelines;
+use crate::layers::adaptive_activation::gpu::pipeline::AdaptivePerFeatureActivationPipelines; // <-- добавлен импорт
 
 // Новые пайплайны оптимизаторов
 use crate::optimizers::scale_gradient::gpu::pipeline::ScaleGradientPipelines;
@@ -85,6 +86,7 @@ pub struct GpuCompute {
     soft_sparse_gate_pipelines: OnceLock<SoftSparseGatePipelines>,
     soft_keep_gate_pipelines: OnceLock<SoftKeepGatePipelines>,
     dual_anchor_pipelines: OnceLock<DualAnchorPipelines>,
+    adaptive_activation_pipelines: OnceLock<AdaptivePerFeatureActivationPipelines>, // <-- добавлено поле
     softmax_pipelines: OnceLock<SoftmaxPipelines>,
     memory_pipelines: OnceLock<MemoryPipelines>,
     splitter_pipelines: OnceLock<SplitterPipelines>,
@@ -143,6 +145,7 @@ impl GpuCompute {
             soft_sparse_gate_pipelines: OnceLock::new(),
             soft_keep_gate_pipelines: OnceLock::new(),
             dual_anchor_pipelines: OnceLock::new(),
+            adaptive_activation_pipelines: OnceLock::new(), // <-- добавлено
             softmax_pipelines: OnceLock::new(),
             memory_pipelines: OnceLock::new(),
             splitter_pipelines: OnceLock::new(),
@@ -208,6 +211,11 @@ impl GpuCompute {
     pub fn dual_anchor_pipelines(&self) -> &DualAnchorPipelines {
         self.dual_anchor_pipelines
             .get_or_init(|| DualAnchorPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn adaptive_activation_pipelines(&self) -> &AdaptivePerFeatureActivationPipelines {
+        self.adaptive_activation_pipelines
+            .get_or_init(|| AdaptivePerFeatureActivationPipelines::new(self.context.device.clone()))
     }
 
     pub fn softmax_pipelines(&self) -> &SoftmaxPipelines {

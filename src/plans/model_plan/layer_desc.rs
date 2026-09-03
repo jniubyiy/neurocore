@@ -110,6 +110,15 @@ impl LayerDesc {
                 2 * self.input_shape.streams[0] + 1
             }
             LayerKind::LeakyReLU | LayerKind::Identity => 0,
+            LayerKind::AdaptivePerFeatureActivation => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "AdaptivePerFeatureActivation expects one input stream");
+                let in_features = self.input_shape.streams[0];
+                let num_activations = self.extra.get(0)
+                    .map(|v| *v as usize)
+                    .unwrap_or(4); // по умолчанию 4 базовые активации
+                in_features * num_activations
+            }
             LayerKind::SplitterConnector | LayerKind::CombinerConnector => 0,
             LayerKind::Unsqueeze | LayerKind::ReduceMean => 0,
             _ => 0,
@@ -149,6 +158,16 @@ impl LayerDesc {
             LayerKind::DualAnchor => {
                 let features = self.input_shape.streams[0];
                 Box::new(crate::layers::DualAnchor::new(features, features))
+            }
+            LayerKind::AdaptivePerFeatureActivation => {
+                let in_features = self.input_shape.streams[0];
+                let num_activations = self.extra.get(0)
+                    .map(|v| *v as usize)
+                    .unwrap_or(4); // по умолчанию 4 базовые активации
+                Box::new(crate::layers::AdaptivePerFeatureActivation::new(
+                    in_features,
+                    num_activations,
+                ))
             }
             _ => panic!("Unsupported layer kind for UniversalLayer: {:?}", self.kind),
         }

@@ -5,7 +5,7 @@ use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::{
     UniversalLayer, UniversalLayerBuffered,
     Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
-    Memory, SoftSparseGate, SoftKeepGate, DualAnchor,
+    Memory, SoftSparseGate, SoftKeepGate, DualAnchor, AdaptivePerFeatureActivation,
 };
 use crate::model_plan::param_store::ParamSlice;
 
@@ -40,6 +40,7 @@ impl crate::compute_manager::graph::model::MixedModel {
                 || layer.as_soft_sparse_gate().is_some()
                 || layer.as_soft_keep_gate().is_some()
                 || layer.as_dual_anchor().is_some()
+                || layer.as_adaptive_activation().is_some()   // <-- добавлено
             {
                 current_grad.cols()
             } else {
@@ -119,6 +120,10 @@ fn call_backward_buffered(
     } else if let Some(dual_anchor) = layer.as_dual_anchor() {
         <DualAnchor as UniversalLayerBuffered>::backward_buffered(
             dual_anchor, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(adaptive) = layer.as_adaptive_activation() {
+        <AdaptivePerFeatureActivation as UniversalLayerBuffered>::backward_buffered(
+            adaptive, ctx, grad_output, grad_input, params, slice, grad_params_handle,
         );
     } else {
         unreachable!(

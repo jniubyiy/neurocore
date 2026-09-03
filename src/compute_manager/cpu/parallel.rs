@@ -9,7 +9,7 @@ use crate::layers::buffered_context::BufferedContext;
 use crate::layers::{
     UniversalLayer, UniversalLayerBuffered,
     Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
-    Memory, SoftSparseGate, SoftKeepGate, DualAnchor,
+    Memory, SoftSparseGate, SoftKeepGate, DualAnchor, AdaptivePerFeatureActivation,
 };
 use crate::model_plan::param_store::ParamSlice;
 
@@ -97,6 +97,7 @@ fn get_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHand
         || layer.as_soft_sparse_gate().is_some()
         || layer.as_soft_keep_gate().is_some()
         || layer.as_dual_anchor().is_some()
+        || layer.as_adaptive_activation().is_some()
     {
         input.cols()
     } else {
@@ -117,6 +118,7 @@ fn get_input_features(layer: &Box<dyn UniversalLayer>, grad_output: &MatrixBuffe
         || layer.as_soft_sparse_gate().is_some()
         || layer.as_soft_keep_gate().is_some()
         || layer.as_dual_anchor().is_some()
+        || layer.as_adaptive_activation().is_some()
     {
         grad_output.cols()
     } else {
@@ -153,6 +155,8 @@ fn call_forward_buffered(
         <SoftKeepGate as UniversalLayerBuffered>::forward_buffered(soft_keep, input, output, params, slice);
     } else if let Some(dual_anchor) = layer.as_dual_anchor() {
         <DualAnchor as UniversalLayerBuffered>::forward_buffered(dual_anchor, input, output, params, slice);
+    } else if let Some(adaptive) = layer.as_adaptive_activation() {
+        <AdaptivePerFeatureActivation as UniversalLayerBuffered>::forward_buffered(adaptive, input, output, params, slice);
     } else {
         unreachable!("Unsupported layer in parallel forward");
     }
@@ -189,6 +193,8 @@ fn call_backward_buffered(
         <SoftKeepGate as UniversalLayerBuffered>::backward_buffered(soft_keep, ctx, grad_output, grad_input, params, slice, grad_params);
     } else if let Some(dual_anchor) = layer.as_dual_anchor() {
         <DualAnchor as UniversalLayerBuffered>::backward_buffered(dual_anchor, ctx, grad_output, grad_input, params, slice, grad_params);
+    } else if let Some(adaptive) = layer.as_adaptive_activation() {
+        <AdaptivePerFeatureActivation as UniversalLayerBuffered>::backward_buffered(adaptive, ctx, grad_output, grad_input, params, slice, grad_params);
     } else {
         unreachable!("Unsupported layer in parallel backward");
     }
@@ -221,6 +227,8 @@ fn build_buffered_context(
         BufferedContext::SoftKeepGate { input: input.clone() }
     } else if layer.as_dual_anchor().is_some() {
         BufferedContext::DualAnchor1D { input: input.clone() }
+    } else if layer.as_adaptive_activation().is_some() {
+        BufferedContext::AdaptiveActivation { input: input.clone() }
     } else {
         BufferedContext::Identity { input: input.clone() }
     }

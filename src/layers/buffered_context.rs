@@ -62,6 +62,11 @@ pub enum BufferedContext {
         input: MatrixBufferHandle,
     },
 
+    /// Вход AdaptivePerFeatureActivation.
+    AdaptiveActivation {
+        input: MatrixBufferHandle,
+    },
+
     /// Вход Identity.
     Identity {
         input: MatrixBufferHandle,

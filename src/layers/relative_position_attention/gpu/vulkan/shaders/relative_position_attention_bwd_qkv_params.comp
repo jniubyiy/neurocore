@@ -1,0 +1,105 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint seq_len;
+    uint d_model;
+} pc;
+
+layout(binding = 0, std430) readonly buffer QBuf {
+    float q[];          // (batch * seq_len) x d_model, row-major
+};
+
+layout(binding = 1, std430) readonly buffer KBuf {
+    float k[];          // (batch * seq_len) x d_model, row-major
+};
+
+layout(binding = 2, std430) readonly buffer DScoresBuf {
+    float d_scores[];   // (batch * seq_len) x seq_len, row-major
+};
+
+layout(binding = 3, std430) writeonly buffer DQBuf {
+    float d_q[];        // (batch * seq_len) x d_model, row-major
+};
+
+layout(binding = 4, std430) writeonly buffer DKBuf {
+    float d_k[];        // (batch * seq_len) x d_model, row-major
+};
+
+layout(binding = 5, std430) buffer GradRelBiasBuf {
+    uint grad_rel_bias[]; // битовое представление float, длина 2*seq_len - 1
+};
+
+// Вспомогательная функция атомарного сложения float
+void atomicAddFloat(inout uint target, float value) {
+    uint expected = target;
+    uint desired;
+    do {
+        float cur = uintBitsToFloat(expected);
+        desired = floatBitsToUint(cur + value);
+        uint old = atomicCompSwap(target, expected, desired);
+        if (old == expected) return;
+        expected = old;
+    } while (true);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total_dq = pc.batch * pc.seq_len * pc.d_model;
+    uint total_dk = total_dq;
+
+    // Секция 1: вычисление d_q
+    if (idx < total_dq) {
+        uint token = idx / pc.d_model;    // глобальный индекс токена (batch*t)
+        uint i = idx % pc.d_model;        // признак
+
+        uint r = token / pc.seq_len;
+        uint t = token % pc.seq_len;
+        uint seq = pc.seq_len;
+        float scale = inversesqrt(float(pc.d_model));
+
+        float sum = 0.0;
+        for (uint s = 0u; s < seq; ++s) {
+            uint k_idx = (r * seq + s) * pc.d_model + i;
+            sum += d_scores[token * seq + s] * k[k_idx] * scale;
+        }
+        d_q[idx] = sum;
+    }
+    // Секция 2: вычисление d_k
+    else if (idx < total_dq + total_dk) {
+        uint local_idx = idx - total_dq;
+        uint token_s = local_idx / pc.d_model; // здесь token_s относится к индексу s (номер токена в последовательности)
+        uint i = local_idx % pc.d_model;
+
+        uint r = token_s / pc.seq_len;
+        uint s = token_s % pc.seq_len; // в d_k индексация по s (ключ)
+        uint seq = pc.seq_len;
+        float scale = inversesqrt(float(pc.d_model));
+
+        float sum = 0.0;
+        for (uint t = 0u; t < seq; ++t) {
+            uint q_idx = (r * seq + t) * pc.d_model + i;
+            uint d_score_idx = (r * seq + t) * seq + s;
+            sum += d_scores[d_score_idx] * q[q_idx] * scale;
+        }
+        d_k[local_idx] = sum;
+    }
+    // Секция 3: накопление градиента по rel_bias
+    else {
+        // Каждый поток обрабатывает один элемент d_scores, чтобы атомарно добавить вклад
+        uint total_scores = pc.batch * pc.seq_len * pc.seq_len;
+        uint score_idx = idx - total_dq - total_dk;
+        if (score_idx < total_scores) {
+            uint token = score_idx / pc.seq_len;
+            uint s_pos = score_idx % pc.seq_len;
+
+            uint r = token / pc.seq_len;
+            uint t = token % pc.seq_len;
+
+            int rel_idx = int(s_pos) - int(t) + int(pc.seq_len - 1u);
+            atomicAddFloat(grad_rel_bias[uint(rel_idx)], d_scores[score_idx]);
+        }
+    }
+}

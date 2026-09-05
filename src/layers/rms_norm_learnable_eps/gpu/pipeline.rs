@@ -23,14 +23,18 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
 pub struct RMSNormWithLearnableEpsilonPipelines {
     pub forward: Arc<ComputePipeline>,
     pub backward: Arc<ComputePipeline>,
+    pub row_stats: Arc<ComputePipeline>,
 }
 
 impl RMSNormWithLearnableEpsilonPipelines {
     pub fn new(device: Arc<Device>) -> Self {
         let fwd_bytes = include_bytes!("vulkan/shaders/rms_norm_learnable_eps_fwd.spv");
         let bwd_bytes = include_bytes!("vulkan/shaders/rms_norm_learnable_eps_bwd.spv");
+        let stats_bytes = include_bytes!("vulkan/shaders/rms_norm_learnable_eps_row_stats.spv");
+
         let fwd_spv = as_u32_slice(fwd_bytes);
         let bwd_spv = as_u32_slice(bwd_bytes);
+        let stats_spv = as_u32_slice(stats_bytes);
 
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
             let mut bindings = std::collections::BTreeMap::new();
@@ -57,8 +61,8 @@ impl RMSNormWithLearnableEpsilonPipelines {
             .expect("Failed to create descriptor set layout for RMSNormWithLearnableEpsilon")
         }
 
-        // Прямой пайплайн (3 буфера: input, params, output)
-        let fwd_layout = create_ds_layout(device.clone(), 3);
+        // ==================== Forward ====================
+        let fwd_layout = create_ds_layout(device.clone(), 4);
         let fwd_module = unsafe {
             ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(fwd_spv))
                 .expect("Failed to create RMSNormWithLearnableEpsilon forward shader module")
@@ -88,8 +92,8 @@ impl RMSNormWithLearnableEpsilonPipelines {
         )
         .expect("Failed to create RMSNormWithLearnableEpsilon forward pipeline");
 
-        // Обратный пайплайн (5 буферов: input, grad_out, params, grad_input, grad_params)
-        let bwd_layout = create_ds_layout(device.clone(), 5);
+        // ==================== Backward ====================
+        let bwd_layout = create_ds_layout(device.clone(), 6);
         let bwd_module = unsafe {
             ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_spv))
                 .expect("Failed to create RMSNormWithLearnableEpsilon backward shader module")
@@ -113,12 +117,43 @@ impl RMSNormWithLearnableEpsilonPipelines {
             .expect("RMSNormWithLearnableEpsilon backward entry point not found");
         let bwd_stage = PipelineShaderStageCreateInfo::new(bwd_entry);
         let backward = ComputePipeline::new(
-            device,
+            device.clone(),
             None,
             ComputePipelineCreateInfo::stage_layout(bwd_stage, bwd_pipeline_layout),
         )
         .expect("Failed to create RMSNormWithLearnableEpsilon backward pipeline");
 
-        Self { forward, backward }
+        // ==================== Row Statistics ====================
+        let stats_layout = create_ds_layout(device.clone(), 2);
+        let stats_module = unsafe {
+            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(stats_spv))
+                .expect("Failed to create RMSNormWithLearnableEpsilon row stats shader module")
+        };
+        let stats_push = PushConstantRange {
+            stages: ShaderStages::COMPUTE,
+            offset: 0,
+            size: 8, // batch, features
+        };
+        let stats_pipeline_layout = PipelineLayout::new(
+            device.clone(),
+            PipelineLayoutCreateInfo {
+                set_layouts: vec![stats_layout],
+                push_constant_ranges: vec![stats_push],
+                ..Default::default()
+            },
+        )
+        .expect("Failed to create RMSNormWithLearnableEpsilon row stats pipeline layout");
+        let stats_entry = stats_module
+            .entry_point_with_execution("main", ExecutionModel::GLCompute)
+            .expect("RMSNormWithLearnableEpsilon row stats entry point not found");
+        let stats_stage = PipelineShaderStageCreateInfo::new(stats_entry);
+        let row_stats = ComputePipeline::new(
+            device,
+            None,
+            ComputePipelineCreateInfo::stage_layout(stats_stage, stats_pipeline_layout),
+        )
+        .expect("Failed to create RMSNormWithLearnableEpsilon row stats pipeline");
+
+        Self { forward, backward, row_stats }
     }
 }

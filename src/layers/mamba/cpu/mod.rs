@@ -6,7 +6,7 @@ use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 
-use super::super::mamba::{Mamba, MambaForwardCache};
+use super::super::mamba::mamba::{Mamba, MambaForwardCache};
 
 // Вспомогательные функции линейной алгебры
 
@@ -45,9 +45,7 @@ fn expm_taylor(mat: &[f32], n: usize) -> Vec<f32> {
     for i in 0..n {
         term[i * n + i] = 1.0;
     }
-    let mut factorial = 1.0f32;
     for k in 1..=10 {
-        factorial *= k as f32;
         // term = term * mat / k
         let mut next = vec![0.0f32; n * n];
         for i in 0..n {
@@ -155,15 +153,13 @@ impl UniversalLayerBuffered for Mamba {
                         y_t[j] = ch[j] + D * x_t[j];
                     }
 
-                    // Сохраняем h_t и y_t
+                    // Сохраняем h_t
                     let h_offset = (r * seq + t) * n;
                     for i in 0..n {
                         h_all[h_offset + i] = h_t[i];
                     }
-                    let y_offset = (t * d + j) * batch + r; // j от 0..d, но мы записываем в цикле ниже
-                    // Правильнее: сохранить y_t в выходной буфер по column-major
-                    // Выходной буфер y имеет ту же структуру, что и вход: признак (t*d + j) для батча r.
-                    // Поэтому запишем каждый компонент j.
+
+                    // Сохраняем y_t в выходной буфер (column-major)
                     for j in 0..d {
                         let out_idx = (t * d + j) * batch + r;
                         y[out_idx] = y_t[j];
@@ -329,11 +325,6 @@ impl UniversalLayerBuffered for Mamba {
                         // dA_bar += dh_t ⊗ h_prev
                         for i in 0..n {
                             for j in 0..n {
-                                // Накопление во временные переменные не делаем здесь, а сразу в grad_A_bar (но у нас нет отдельного grad_A_bar, сразу пересчитываем в grad_A)
-                                // Для точности мы можем накапливать grad_A_bar и grad_B_bar, а потом преобразовать.
-                                // Но мы используем приближение: dA = delta * dA_bar, dB = delta * dB_bar, ddelta = sum(A*dA_bar + B*dB_bar)
-                                // Поэтому сразу накапливаем в grad_A, grad_B, grad_delta.
-                                // grad_A[i,j] += delta * dh_t[i] * h_prev[j]  (поскольку dA_bar = dh_t[i] * h_prev[j])
                                 grad_A[i * n + j] += delta * dh_t[i] * h_prev[j];
                                 grad_delta += A[i * n + j] * dh_t[i] * h_prev[j];
                             }

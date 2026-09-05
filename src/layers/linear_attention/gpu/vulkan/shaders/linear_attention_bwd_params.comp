@@ -8,75 +8,79 @@ layout(push_constant) uniform PushConsts {
     uint d_model;
 } pc;
 
-// Входные данные и промежуточные результаты
-layout(binding = 0, std430) readonly buffer XBuf {
-    float x[];           // row-major: (batch * seq_len) x d_model
+// Входной тензор (row-major: (batch * seq_len) x d_model)
+layout(binding = 0, std430) readonly buffer InputBuf {
+    float x[];
 };
 
+// Градиент по выходу (row-major, как и вход)
 layout(binding = 1, std430) readonly buffer GoBuf {
-    float go[];          // row-major: (batch * seq_len) x d_model
+    float go[];
 };
 
+// Параметры слоя: 4*(d*d + d) элементов
 layout(binding = 2, std430) readonly buffer ParamsBuf {
-    float params[];      // 4*(d*d + d): w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o
+    float params[];      // [Wq, bq, Wk, bk, Wv, bv, Wo, bo]
 };
 
+// Промежуточные результаты forward
 layout(binding = 3, std430) readonly buffer QPhiBuf {
-    float q_phi[];       // (batch*seq_len) x d_model
+    float q_phi[];
 };
-
 layout(binding = 4, std430) readonly buffer KPhiBuf {
-    float k_phi[];       // (batch*seq_len) x d_model
+    float k_phi[];
 };
-
 layout(binding = 5, std430) readonly buffer VBuf {
-    float v[];           // (batch*seq_len) x d_model
+    float v[];
 };
-
 layout(binding = 6, std430) readonly buffer QRawBuf {
-    float q_raw[];       // (batch*seq_len) x d_model (до phi)
+    float q_raw[];
 };
-
 layout(binding = 7, std430) readonly buffer KRawBuf {
-    float k_raw[];       // (batch*seq_len) x d_model (до phi)
+    float k_raw[];
 };
 
-layout(binding = 8, std430) readonly buffer AttnOutBuf {
-    float attn_out[];    // (batch*seq_len) x d_model
+// Градиенты, вычисленные в backward_main
+layout(binding = 8, std430) readonly buffer DQPhiBuf {
+    float d_q_phi[];
+};
+layout(binding = 9, std430) readonly buffer DKVBuf {
+    uint d_kv[];
+};
+layout(binding = 10, std430) readonly buffer DZBuf {
+    uint d_z[];
 };
 
-layout(binding = 9, std430) readonly buffer DQPhiBuf {
-    float d_q_phi[];     // (batch*seq_len) x d_model
+// Выходной градиент по входу
+layout(binding = 11, std430) writeonly buffer GradInBuf {
+    float gi[];
 };
 
-layout(binding = 10, std430) readonly buffer DKVBuf {
-    uint d_kv[];         // d_model x d_model (битовое представление float)
+// Градиенты параметров (атомарное накопление)
+layout(binding = 12, std430) buffer GradParamsBuf {
+    uint grad_params[];
 };
 
-layout(binding = 11, std430) readonly buffer DZBuf {
-    uint d_z[];          // d_model (битовое представление float)
+// KV и Z из forward (нужны для вычисления attn_out внутри)
+layout(binding = 13, std430) readonly buffer KVBuf {
+    float kv[];
+};
+layout(binding = 14, std430) readonly buffer ZBuf {
+    float z[];
 };
 
-// Выходные буферы
-layout(binding = 12, std430) writeonly buffer GradInBuf {
-    float gi[];          // row-major: (batch*seq_len) x d_model
-};
-
-layout(binding = 13, std430) buffer GradParamsBuf {
-    uint grad_params[];  // 4*(d*d + d) битовое представление float
-};
-
-// Вспомогательная функция атомарного сложения float
-void atomicAddFloat(inout uint target, float value) {
-    uint expected = target;
-    uint desired;
-    do {
-        float cur = uintBitsToFloat(expected);
-        desired = floatBitsToUint(cur + value);
-        uint old = atomicCompSwap(target, expected, desired);
-        if (old == expected) return;
-        expected = old;
-    } while (true);
+// Макрос атомарного сложения float
+#define ATOMIC_ADD_FLOAT(target, value) \
+{ \
+    uint expected = target; \
+    uint desired; \
+    do { \
+        float cur = uintBitsToFloat(expected); \
+        desired = floatBitsToUint(cur + (value)); \
+        uint old = atomicCompSwap(target, expected, desired); \
+        if (old == expected) break; \
+        expected = old; \
+    } while (true); \
 }
 
 // Производная phi (ELU+1)
@@ -89,15 +93,18 @@ float phi_derivative(float x) {
 }
 
 void main() {
-    uint token_idx = gl_GlobalInvocationID.x; // глобальный индекс токена
+    uint idx = gl_GlobalInvocationID.x;
     uint total_tokens = pc.batch * pc.seq_len;
-    if (token_idx >= total_tokens) return;
+    uint total_elements = total_tokens * pc.d_model;
+    if (idx >= total_elements) return;
+
+    uint token_idx = idx / pc.d_model;
+    uint j = idx % pc.d_model;
 
     uint d = pc.d_model;
-    uint base = token_idx * d;
 
     // Смещения параметров
-    uint wq_start = 0;
+    uint wq_start = 0u;
     uint bq_start = wq_start + d * d;
     uint wk_start = bq_start + d;
     uint bk_start = wk_start + d * d;
@@ -106,95 +113,103 @@ void main() {
     uint wo_start = bv_start + d;
     uint bo_start = wo_start + d * d;
 
-    // 1. Вычислить d_k_phi и d_v из d_kv и d_z (для этого токена)
-    float d_k_phi[256]; // предположим MAX_D=256
-    float d_v[256];
-    if (d > 256) return; // защита
+    // --- 1. Вычисляем attn_out для данного токена (все i) ---
+    float eps = 1e-6;
+    float denom = eps;
+    uint base = token_idx * d;
+    for (uint l = 0u; l < d; ++l) {
+        denom += q_phi[base + l] * z[l];
+    }
+    float inv_denom = 1.0 / denom;
 
-    for (uint l = 0; l < d; l++) {
+    const uint MAX_D = 256u;
+    if (d > MAX_D) return;
+
+    float attn_out[MAX_D];
+    float d_attn_out[MAX_D];
+
+    for (uint i = 0u; i < d; ++i) {
+        float sum_l = 0.0;
+        for (uint l = 0u; l < d; ++l) {
+            sum_l += q_phi[base + l] * kv[l * d + i];
+        }
+        attn_out[i] = sum_l * inv_denom;
+
+        float sum_j = 0.0;
+        for (uint jj = 0u; jj < d; ++jj) {
+            sum_j += go[base + jj] * params[wo_start + jj * d + i];
+        }
+        d_attn_out[i] = sum_j;
+    }
+
+    // --- 2. Вычисляем d_k_phi и d_v из d_kv и d_z ---
+    float d_k_phi[MAX_D];
+    float d_v[MAX_D];
+
+    for (uint l = 0u; l < d; ++l) {
         float sum = uintBitsToFloat(d_z[l]);
-        for (uint i = 0; i < d; i++) {
-            float d_kv_val = uintBitsToFloat(d_kv[l * d + i]);
-            sum += d_kv_val * v[base + i];
+        for (uint i = 0u; i < d; ++i) {
+            sum += uintBitsToFloat(d_kv[l * d + i]) * v[base + i];
         }
         d_k_phi[l] = sum;
     }
-    for (uint i = 0; i < d; i++) {
+    for (uint i = 0u; i < d; ++i) {
         float sum = 0.0;
-        for (uint l = 0; l < d; l++) {
-            float d_kv_val = uintBitsToFloat(d_kv[l * d + i]);
-            sum += d_kv_val * k_phi[base + l];
+        for (uint l = 0u; l < d; ++l) {
+            sum += uintBitsToFloat(d_kv[l * d + i]) * k_phi[base + l];
         }
         d_v[i] = sum;
     }
 
-    // 2. Вычислить d_q_raw, d_k_raw
-    float d_q_raw[256];
-    float d_k_raw[256];
-    for (uint i = 0; i < d; i++) {
-        float q_raw_val = q_raw[base + i];
-        float dq_phi = d_q_phi[base + i];
-        d_q_raw[i] = dq_phi * phi_derivative(q_raw_val);
+    // --- 3. Применяем производные phi к q_raw и k_raw ---
+    float d_q_raw[MAX_D];
+    float d_k_raw[MAX_D];
+    for (uint i = 0u; i < d; ++i) {
+        float dq_phi_val = d_q_phi[base + i];
+        d_q_raw[i] = dq_phi_val * phi_derivative(q_raw[base + i]);
 
-        float k_raw_val = k_raw[base + i];
-        float dk_phi = d_k_phi[i]; // d_k_phi уже для этого токена
-        d_k_raw[i] = dk_phi * phi_derivative(k_raw_val);
+        float dk_phi_val = d_k_phi[i];
+        d_k_raw[i] = dk_phi_val * phi_derivative(k_raw[base + i]);
     }
 
-    // 3. Вычислить gi (градиент по входу) и накопить градиенты по W_q, b_q, W_k, b_k, W_v, b_v
-    // Предварительно обнуляем gi для этого токена (запишем позже)
-    float gi_local[256];
-    for (uint j = 0; j < d; j++) {
-        gi_local[j] = 0.0;
+    // --- 4. Вычисляем градиент по входу для текущего j ---
+    float gi_val = 0.0;
+    for (uint i = 0u; i < d; ++i) {
+        gi_val += d_q_raw[i] * params[wq_start + i * d + j];
+        gi_val += d_k_raw[i] * params[wk_start + i * d + j];
+        gi_val += d_v[i] * params[wv_start + i * d + j];
+    }
+    gi[base + j] = gi_val;
+
+    // --- 5. Атомарное накопление градиентов параметров ---
+
+    // W_q, b_q
+    for (uint i = 0u; i < d; ++i) {
+        float dq = d_q_raw[i];
+        ATOMIC_ADD_FLOAT(grad_params[bq_start + i], dq);
+        ATOMIC_ADD_FLOAT(grad_params[wq_start + i * d + j], dq * x[base + j]);
     }
 
-    // Для каждого выходного признака i (размер d)
-    for (uint i = 0; i < d; i++) {
-        // W_q
-        {
-            float grad_i = d_q_raw[i];
-            // b_q
-            atomicAddFloat(grad_params[bq_start + i], grad_i);
-            for (uint j = 0; j < d; j++) {
-                float grad_w = grad_i * x[base + j];
-                atomicAddFloat(grad_params[wq_start + i * d + j], grad_w);
-                gi_local[j] += grad_i * params[wq_start + i * d + j];
-            }
-        }
-        // W_k
-        {
-            float grad_i = d_k_raw[i];
-            atomicAddFloat(grad_params[bk_start + i], grad_i);
-            for (uint j = 0; j < d; j++) {
-                float grad_w = grad_i * x[base + j];
-                atomicAddFloat(grad_params[wk_start + i * d + j], grad_w);
-                gi_local[j] += grad_i * params[wk_start + i * d + j];
-            }
-        }
-        // W_v
-        {
-            float grad_i = d_v[i];
-            atomicAddFloat(grad_params[bv_start + i], grad_i);
-            for (uint j = 0; j < d; j++) {
-                float grad_w = grad_i * x[base + j];
-                atomicAddFloat(grad_params[wv_start + i * d + j], grad_w);
-                gi_local[j] += grad_i * params[wv_start + i * d + j];
-            }
-        }
+    // W_k, b_k
+    for (uint i = 0u; i < d; ++i) {
+        float dk = d_k_raw[i];
+        ATOMIC_ADD_FLOAT(grad_params[bk_start + i], dk);
+        ATOMIC_ADD_FLOAT(grad_params[wk_start + i * d + j], dk * x[base + j]);
     }
 
-    // Записываем gi
-    for (uint j = 0; j < d; j++) {
-        gi[base + j] = gi_local[j];
+    // W_v, b_v
+    for (uint i = 0u; i < d; ++i) {
+        float dv = d_v[i];
+        ATOMIC_ADD_FLOAT(grad_params[bv_start + i], dv);
+        ATOMIC_ADD_FLOAT(grad_params[wv_start + i * d + j], dv * x[base + j]);
     }
 
-    // 4. Градиенты по W_o и b_o (используем go и attn_out)
-    for (uint j = 0; j < d; j++) {
-        float go_j = go[base + j];
-        atomicAddFloat(grad_params[bo_start + j], go_j);
-        for (uint i = 0; i < d; i++) {
-            float grad_wo = go_j * attn_out[base + i];
-            atomicAddFloat(grad_params[wo_start + j * d + i], grad_wo);
+    // W_o, b_o
+    {
+        float go_val = go[base + j];
+        ATOMIC_ADD_FLOAT(grad_params[bo_start + j], go_val);
+        for (uint i = 0u; i < d; ++i) {
+            ATOMIC_ADD_FLOAT(grad_params[wo_start + j * d + i], go_val * attn_out[i]);
         }
     }
 }

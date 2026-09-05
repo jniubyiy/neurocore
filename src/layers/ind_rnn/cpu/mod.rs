@@ -6,7 +6,7 @@ use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 
-use super::super::ind_rnn::{IndRNN, IndRNNForwardCache};
+use super::super::ind_rnn::ind_rnn::{IndRNN, IndRNNForwardCache};
 
 impl UniversalLayerBuffered for IndRNN {
     fn forward_buffered(
@@ -177,34 +177,15 @@ impl UniversalLayerBuffered for IndRNN {
                             for i in 0..d {
                                 let x_t_i = cache.input[(t * d + i) * batch + r];
                                 grad_W[j * d + i] += delta_t * x_t_i;
+                                // Вклад в градиент по входу: dx_t_i = sum_j delta_t * W[j,i]
+                                gi[(t * d + i) * batch + r] += delta_t * p[w_start + j * d + i];
                             }
 
                             // Обновляем delta_next для предыдущего шага
                             delta_next[r * d + j] = delta_t;
                         }
                     }
-
-                    // После обработки всех r,j для шага t, delta_next уже содержит delta_t,
-                    // которая будет использована на шаге t-1.
                 }
-
-                // Градиент по входу: dL/dx_t_i = sum_j delta_t * W[j,i]
-                // Мы можем вычислить это, пройдя ещё раз, но проще накопить в gi в том же цикле,
-                // используя уже вычисленные delta_t для каждого t,r,j.
-                // Однако в цикле выше мы не накапливали gi, потому что delta_t вычисляется внутри j,
-                // а gi для i зависит от всех j. Поэтому лучше выполнить отдельный проход после BPTT,
-                // используя сохранённые delta_t. Но у нас нет сохранённых delta_t по отдельности,
-                // только delta_next, которая перезаписывается. Можно накопить gi внутри цикла,
-                // добавляя вклад от каждого j к соответствующему i.
-                // Мы сделаем это внутри цикла по j, накапливая в gi[(t*d + i)*batch + r] += delta_t * W[j,i].
-                // Так как мы ещё не перезаписали delta_next (она будет перезаписана после завершения j),
-                // мы можем использовать delta_t.
-                // Добавим внутри цикла по j после вычисления delta_t:
-                // for i in 0..d { gi[(t*d + i)*batch + r] += delta_t * p[w_start + j*d + i]; }
-                // Это корректно, так как delta_t для каждого j добавляется ко входам i.
-                // В текущем коде выше мы этого не сделали. Вставим это.
-
-                // (Исправленный код будет включать эту строку)
 
                 // Записываем градиенты параметров
                 for j in 0..d {

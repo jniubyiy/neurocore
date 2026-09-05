@@ -51,10 +51,26 @@ impl GpuCompute {
         let in_feat = input.cols();
         let out_feat = output.cols();
         assert_eq!(output.rows(), batch, "Output rows mismatch");
-        assert_eq!(params.len(), out_feat * in_feat + out_feat + 1, "Params length mismatch");
-        assert_eq!(u_state.rows() * u_state.cols(), in_feat, "u_state size mismatch");
-        assert_eq!(v_state.rows() * v_state.cols(), out_feat, "v_state size mismatch");
-        assert_eq!(sigma_state.rows() * sigma_state.cols(), 1, "sigma_state size mismatch");
+        assert_eq!(
+            params.len(),
+            out_feat * in_feat + out_feat + 1,
+            "Params length mismatch"
+        );
+        assert_eq!(
+            u_state.rows() * u_state.cols(),
+            in_feat,
+            "u_state size mismatch"
+        );
+        assert_eq!(
+            v_state.rows() * v_state.cols(),
+            out_feat,
+            "v_state size mismatch"
+        );
+        assert_eq!(
+            sigma_state.rows() * sigma_state.cols(),
+            1,
+            "sigma_state size mismatch"
+        );
 
         // Создаём view для W и bias
         let w_view = MatrixBufferView::with_shape(
@@ -149,7 +165,10 @@ impl GpuCompute {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(grad_out.is_gpu(), "grad_out handle must be GPU");
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
-        assert!(grad_params.is_gpu(), "grad_params view must point to GPU buffer");
+        assert!(
+            grad_params.is_gpu(),
+            "grad_params view must point to GPU buffer"
+        );
         assert!(params.is_gpu(), "Params view must point to GPU buffer");
 
         let batch = input.rows();
@@ -158,8 +177,16 @@ impl GpuCompute {
         assert_eq!(grad_out.rows(), batch, "grad_out rows mismatch");
         assert_eq!(grad_input.rows(), batch, "grad_input rows mismatch");
         assert_eq!(grad_input.cols(), in_feat, "grad_input cols mismatch");
-        assert_eq!(params.len(), out_feat * in_feat + out_feat + 1, "Params length mismatch");
-        assert_eq!(grad_params.len(), out_feat * in_feat + out_feat + 1, "Grad params length mismatch");
+        assert_eq!(
+            params.len(),
+            out_feat * in_feat + out_feat + 1,
+            "Params length mismatch"
+        );
+        assert_eq!(
+            grad_params.len(),
+            out_feat * in_feat + out_feat + 1,
+            "Grad params length mismatch"
+        );
 
         // Обнуляем градиенты параметров
         let zero_handle = self.upload_vec_to_gpu_handle(

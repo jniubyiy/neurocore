@@ -25,6 +25,7 @@ pub struct LinearAttentionPipelines {
     pub forward: Arc<ComputePipeline>,
     pub backward_main: Arc<ComputePipeline>,
     pub backward_params: Arc<ComputePipeline>,
+    pub phi: Arc<ComputePipeline>,
 }
 
 impl LinearAttentionPipelines {
@@ -34,11 +35,13 @@ impl LinearAttentionPipelines {
         let fwd_bytes = include_bytes!("vulkan/shaders/linear_attention_fwd.spv");
         let bwd_main_bytes = include_bytes!("vulkan/shaders/linear_attention_bwd_main.spv");
         let bwd_params_bytes = include_bytes!("vulkan/shaders/linear_attention_bwd_params.spv");
+        let phi_bytes = include_bytes!("vulkan/shaders/linear_attention_phi.spv");
 
         let kvz_spv = as_u32_slice(kvz_bytes);
         let fwd_spv = as_u32_slice(fwd_bytes);
         let bwd_main_spv = as_u32_slice(bwd_main_bytes);
         let bwd_params_spv = as_u32_slice(bwd_params_bytes);
+        let phi_spv = as_u32_slice(phi_bytes);
 
         // Вспомогательная функция создания layout с N storage-буферами
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
@@ -184,17 +187,49 @@ impl LinearAttentionPipelines {
             .expect("LinearAttention backward params entry point not found");
         let bwd_params_stage = PipelineShaderStageCreateInfo::new(bwd_params_entry);
         let backward_params = ComputePipeline::new(
-            device,
+            device.clone(),
             None,
             ComputePipelineCreateInfo::stage_layout(bwd_params_stage, bwd_params_pipeline_layout),
         )
         .expect("Failed to create LinearAttention backward params pipeline");
+
+        // ==================== Phi ====================
+        let phi_layout = create_ds_layout(device.clone(), 2);
+        let phi_module = unsafe {
+            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(phi_spv))
+                .expect("Failed to create LinearAttention phi shader module")
+        };
+        let phi_push = PushConstantRange {
+            stages: ShaderStages::COMPUTE,
+            offset: 0,
+            size: 4, // total
+        };
+        let phi_pipeline_layout = PipelineLayout::new(
+            device.clone(),
+            PipelineLayoutCreateInfo {
+                set_layouts: vec![phi_layout],
+                push_constant_ranges: vec![phi_push],
+                ..Default::default()
+            },
+        )
+        .expect("Failed to create LinearAttention phi pipeline layout");
+        let phi_entry = phi_module
+            .entry_point_with_execution("main", ExecutionModel::GLCompute)
+            .expect("LinearAttention phi entry point not found");
+        let phi_stage = PipelineShaderStageCreateInfo::new(phi_entry);
+        let phi = ComputePipeline::new(
+            device,
+            None,
+            ComputePipelineCreateInfo::stage_layout(phi_stage, phi_pipeline_layout),
+        )
+        .expect("Failed to create LinearAttention phi pipeline");
 
         Self {
             compute_kvz,
             forward,
             backward_main,
             backward_params,
+            phi,
         }
     }
 }

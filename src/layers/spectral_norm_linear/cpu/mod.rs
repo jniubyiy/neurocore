@@ -77,21 +77,14 @@ impl UniversalLayerBuffered for SpectrallyNormalizedLinear {
             // sigma = u^T W v
             let mut sigma = 0.0;
             for i in 0..out_feat {
-                let mut wv = 0.0;
                 for j in 0..in_feat {
-                    wv += p[w_start + i * in_feat + j] * v[i] * u[j];
-                }
-                sigma += wv;
-            }
-            // Можно упростить: sigma = v^T W u? Используем v^T W u
-            // Пересчитаем точно:
-            let mut sigma = 0.0;
-            for i in 0..out_feat {
-                for j in 0..in_feat {
-                    sigma += v[i] * p[w_start + i * in_feat + j] * u[j];
+                    sigma += u[j] * p[w_start + i * in_feat + j] * v[i];
                 }
             }
-            sigma = sigma.abs() + 1e-12;
+            sigma = sigma.abs().max(1e-12);
+            // Сохраняем sigma для обратного прохода
+            state.last_sigma = sigma;
+            drop(state); // освобождаем блокировку перед прямым проходом
 
             let effective_scale = scale / sigma;
 
@@ -126,6 +119,12 @@ impl UniversalLayerBuffered for SpectrallyNormalizedLinear {
         let batch = grad_output.rows();
         let in_feat = self.in_features;
         let out_feat = self.out_features;
+        debug_assert_eq!(input_handle.cols(), in_feat);
+        debug_assert_eq!(grad_output.cols(), out_feat);
+        debug_assert_eq!(grad_input.cols(), in_feat);
+        debug_assert_eq!(grad_input.rows(), batch);
+        debug_assert!(slice.start + self.param_len() <= params.rows() * params.cols());
+        debug_assert!(slice.start + self.param_len() <= grad_params.rows() * grad_params.cols());
 
         let ids = [
             input_handle.id(),
@@ -155,30 +154,53 @@ impl UniversalLayerBuffered for SpectrallyNormalizedLinear {
                 let scale_idx = b_start + out_feat;
                 let scale = p[scale_idx];
 
-                // Получаем текущую sigma из состояния (мы не сохраняем sigma в состоянии,
-                // но можем пересчитать, как в forward, однако для простоты будем считать,
-                // что sigma = 1.0, игнорируя влияние спектральной нормализации на градиенты.
-                // Это приближение снижает качество, но допустимо для демонстрации.
-                let sigma = 1.0;
+                // Получаем сохранённую sigma
+                let sigma = self.get_last_sigma();
                 let effective_scale = scale / sigma;
 
-                // Градиенты как у обычного Linear, но с effective_scale
+                // Инициализируем градиенты параметров нулями
+                for i in 0..self.param_len() {
+                    gp[base + i] = 0.0;
+                }
+
+                // Временные накопители
                 let mut grad_w = vec![0.0f32; in_feat * out_feat];
                 let mut grad_b = vec![0.0f32; out_feat];
                 let mut grad_scale = 0.0f32;
 
+                // Вычисляем градиенты
                 for r in 0..batch {
                     for i in 0..out_feat {
                         let gout = go[i * batch + r];
                         grad_b[i] += gout;
+
+                        // Градиент по scale: dL/dscale = sum (gout * (W x)_i) / sigma
+                        // (W x)_i = sum_j W[i,j] * x[j,r]
+                        let mut wx = 0.0f32;
                         for j in 0..in_feat {
-                            grad_w[i * in_feat + j] += gout * x[j * batch + r] * effective_scale;
-                            grad_scale += gout * p[w_start + i * in_feat + j] * x[j * batch + r] / sigma;
+                            wx += p[w_start + i * in_feat + j] * x[j * batch + r];
+                        }
+                        grad_scale += gout * wx / sigma;
+
+                        // Градиенты по весам: dL/dW[i,j] = effective_scale * gout * x[j,r]
+                        for j in 0..in_feat {
+                            grad_w[i * in_feat + j] += effective_scale * gout * x[j * batch + r];
                         }
                     }
                 }
 
-                // Записываем градиенты
+                // Градиенты по входу: dL/dx[j,r] = sum_i effective_scale * W[i,j] * gout[i,r]
+                for j in 0..in_feat {
+                    for r in 0..batch {
+                        let mut sum = 0.0f32;
+                        for i in 0..out_feat {
+                            sum += effective_scale * p[w_start + i * in_feat + j] * go[i * batch + r];
+                        }
+                        gi[j * batch + r] = sum;
+                    }
+                }
+
+                // Записываем градиенты в общий буфер
                 for i in 0..out_feat {
                     gp[b_start + i] = grad_b[i];
                 }
@@ -186,17 +208,6 @@ impl UniversalLayerBuffered for SpectrallyNormalizedLinear {
                     gp[w_start + idx] = grad_w[idx];
                 }
                 gp[scale_idx] = grad_scale;
-
-                // Градиент по входу
-                for j in 0..in_feat {
-                    for r in 0..batch {
-                        let mut sum = 0.0;
-                        for i in 0..out_feat {
-                            sum += go[i * batch + r] * effective_scale * p[w_start + i * in_feat + j];
-                        }
-                        gi[j * batch + r] = sum;
-                    }
-                }
             });
     }
 

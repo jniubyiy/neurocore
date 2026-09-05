@@ -25,10 +25,16 @@ pub struct SpectrallyNormalizedLinear {
     pub(crate) state: Mutex<SpectralNormState>,
 }
 
-struct SpectralNormState {
-    u: Vec<f32>, // размер in_features
-    v: Vec<f32>, // размер out_features
-    initialized: bool,
+/// Внутреннее состояние спектральной нормализации.
+pub(crate) struct SpectralNormState {
+    /// Вектор u размером in_features.
+    pub(crate) u: Vec<f32>,
+    /// Вектор v размером out_features.
+    pub(crate) v: Vec<f32>,
+    /// Флаг инициализации векторов.
+    pub(crate) initialized: bool,
+    /// Последнее вычисленное значение sigma (для обратного прохода).
+    pub(crate) last_sigma: f32,
 }
 
 impl SpectrallyNormalizedLinear {
@@ -41,8 +47,19 @@ impl SpectrallyNormalizedLinear {
                 u: vec![0.0; in_features],
                 v: vec![0.0; out_features],
                 initialized: false,
+                last_sigma: 1.0,
             }),
         }
+    }
+
+    /// Возвращает сохранённое значение sigma, вычисленное при последнем прямом проходе.
+    pub(crate) fn get_last_sigma(&self) -> f32 {
+        self.state.lock().unwrap().last_sigma
+    }
+
+    /// Сохраняет новое значение sigma.
+    pub(crate) fn set_last_sigma(&self, sigma: f32) {
+        self.state.lock().unwrap().last_sigma = sigma;
     }
 }
 

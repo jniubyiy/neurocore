@@ -67,6 +67,49 @@ pub enum BufferedContext {
         input: MatrixBufferHandle,
     },
 
+    /// Вход AdaptiveNormalization.
+    AdaptiveNormalization {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход BatchRenorm1d, включая статистики, использованные при прямом проходе.
+    BatchRenorm {
+        input: MatrixBufferHandle,
+        mean: Vec<f32>,
+        var: Vec<f32>,
+        use_batch_stats: bool,
+    },
+
+    /// Вход ConcreteDropout.
+    ConcreteDropout {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход Mamba (состояния и промежуточные данные хранятся в самом слое).
+    Mamba {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход LinearAttention (промежуточные данные хранятся в самом слое).
+    LinearAttention {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход RelativePositionAttention (промежуточные данные хранятся в самом слое).
+    RelativePositionAttention {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход IndRNN (промежуточные данные хранятся в самом слое).
+    IndRNN {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход SpectrallyNormalizedLinear (сохранение sigma производится в самом слое).
+    SpectralNormLinear {
+        input: MatrixBufferHandle,
+    },
+
     /// Вход Identity.
     Identity {
         input: MatrixBufferHandle,

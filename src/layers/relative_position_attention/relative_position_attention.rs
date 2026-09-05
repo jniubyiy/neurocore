@@ -1,6 +1,29 @@
 // src/layers/relative_position_attention/relative_position_attention.rs
 
+use std::sync::Mutex;
 use crate::layers::UniversalLayer;
+
+/// Кэш промежуточных результатов прямого прохода для обратного распространения.
+pub(crate) struct RelativePositionAttentionCache {
+    /// Преобразованные запросы Q (batch * seq * d_model, row-major).
+    pub q: Vec<f32>,
+    /// Преобразованные ключи K (batch * seq * d_model, row-major).
+    pub k: Vec<f32>,
+    /// Преобразованные значения V (batch * seq * d_model, row-major).
+    pub v: Vec<f32>,
+    /// Скоры до softmax (batch * seq * seq, row-major).
+    pub scores: Vec<f32>,
+    /// Веса после softmax (batch * seq * seq, row-major).
+    pub attention_weights: Vec<f32>,
+    /// Результат внимания до выходного линейного слоя (batch * seq * d_model).
+    pub attn_out: Vec<f32>,
+    /// Размер батча.
+    pub batch: usize,
+    /// Длина последовательности.
+    pub seq: usize,
+    /// Размерность модели.
+    pub d_model: usize,
+}
 
 /// Слой RelativePositionAttention.
 ///
@@ -17,13 +40,31 @@ use crate::layers::UniversalLayer;
 pub struct RelativePositionAttention {
     pub seq_len: usize,
     pub d_model: usize,
+    /// Кэш прямого прохода.
+    pub(crate) cache: Mutex<Option<RelativePositionAttentionCache>>,
 }
 
 impl RelativePositionAttention {
     pub fn new(seq_len: usize, d_model: usize) -> Self {
         assert!(seq_len > 0, "RelativePositionAttention: seq_len must be positive");
         assert!(d_model > 0, "RelativePositionAttention: d_model must be positive");
-        Self { seq_len, d_model }
+        Self {
+            seq_len,
+            d_model,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// Сохраняет кэш прямого прохода.
+    pub(crate) fn store_cache(&self, cache: RelativePositionAttentionCache) {
+        let mut guard = self.cache.lock().unwrap();
+        *guard = Some(cache);
+    }
+
+    /// Извлекает кэш прямого прохода.
+    pub(crate) fn take_cache(&self) -> Option<RelativePositionAttentionCache> {
+        let mut guard = self.cache.lock().unwrap();
+        guard.take()
     }
 }
 

@@ -1,6 +1,5 @@
 // src/layers/batch_renorm/cpu/mod.rs
 
-use std::sync::Mutex;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
@@ -8,35 +7,6 @@ use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 
 use super::super::batch_renorm::BatchRenorm1d;
-
-pub struct BatchRenormState {
-    pub running_mean: Vec<f32>,
-    pub running_var: Vec<f32>,
-    pub momentum: f32,
-    pub eps: f32,
-}
-
-impl BatchRenorm1d {
-    fn state(&self) -> &Mutex<BatchRenormState> {
-        // В данном простом примере мы не храним состояние в структуре.
-        // Для корректной работы нужно добавить поле state: Mutex<Option<BatchRenormState>>.
-        // Так как UniversalLayer должен быть Send+Sync, Mutex подходит.
-        // Но в текущей реализации мы не можем добавить поле в существующую структуру без изменения её определения.
-        // Поэтому для простоты будем считать, что слой не имеет состояния,
-        // а running статистики не используются (режим обучения и инференса одинаков).
-        // Для полной реализации потребуется изменить структуру BatchRenorm1d,
-        // добавив в неё Mutex<Option<BatchRenormState>>.
-        // В рамках этого ответа мы предоставим упрощённую версию без running статистик.
-        // Администратор может позже доработать.
-        // Чтобы избежать паники, создадим фиктивный Mutex? Нельзя, так как это изменит код структуры.
-        // Поэтому в CPU-реализации мы будем игнорировать running статистики и всегда использовать батч-статистики.
-        // Это соответствует режиму обучения, но не инференса.
-        // Для примера приемлемо.
-        // В реальном коде нужно добавить поле state.
-        // Мы оставим комментарий об этом.
-        unreachable!("State not implemented in this simplified version")
-    }
-}
 
 impl UniversalLayerBuffered for BatchRenorm1d {
     fn forward_buffered(
@@ -63,37 +33,65 @@ impl UniversalLayerBuffered for BatchRenorm1d {
             let p: &[f32] = &*rest[0];
 
             let base = slice.start;
-            let features = self.features;
+            let f = self.features;
+            let eps = self.eps;
+
+            // Смещения параметров
             let gamma_start = base;
-            let beta_start  = gamma_start + features;
-            let r_start     = beta_start + features;
-            let d_start     = r_start + features;
+            let beta_start = gamma_start + f;
+            let r_start = beta_start + f;
+            let d_start = r_start + f;
 
-            // Вычисляем статистики по батчу для каждого признака
-            let eps = 1e-5;
-            for c in 0..cols {
-                let mut sum = 0.0;
-                let mut sum_sq = 0.0;
-                for r in 0..rows {
-                    let idx = c * rows + r;
-                    let v = x[idx];
-                    sum += v;
-                    sum_sq += v * v;
+            // Определяем статистики
+            let (mean, var) = if self.training {
+                // Вычисляем батч-статистики
+                let mut batch_mean = vec![0.0f32; f];
+                let mut batch_var = vec![0.0f32; f];
+                for c in 0..cols {
+                    let mut sum = 0.0f32;
+                    let mut sum_sq = 0.0f32;
+                    for r in 0..rows {
+                        let idx = c * rows + r;
+                        let v = x[idx];
+                        sum += v;
+                        sum_sq += v * v;
+                    }
+                    let mean = sum / rows as f32;
+                    let var = (sum_sq / rows as f32) - mean * mean;
+                    batch_mean[c] = mean;
+                    batch_var[c] = var.max(0.0f32);
                 }
-                let mean = sum / rows as f32;
-                let var = sum_sq / rows as f32 - mean * mean;
-                let std = (var + eps).sqrt();
 
+                // Обновляем скользящие статистики
+                if let Ok(mut state) = self.state.lock() {
+                    for c in 0..f {
+                        state.running_mean[c] = (1.0 - self.momentum) * state.running_mean[c]
+                            + self.momentum * batch_mean[c];
+                        state.running_var[c] = (1.0 - self.momentum) * state.running_var[c]
+                            + self.momentum * batch_var[c];
+                    }
+                }
+
+                (batch_mean, batch_var)
+            } else {
+                // Используем скользящие статистики
+                let state = self.state.lock().unwrap();
+                (state.running_mean.clone(), state.running_var.clone())
+            };
+
+            // Прямой проход
+            for c in 0..cols {
                 let gamma = p[gamma_start + c];
-                let beta  = p[beta_start + c];
-                let r     = p[r_start + c];
-                let d     = p[d_start + c];
-
-                for r in 0..rows {
-                    let idx = c * rows + r;
-                    let x_hat = (x[idx] - mean) / std;
-                    let renorm = x_hat * r + d;
-                    y[idx] = renorm * gamma + beta;
+                let beta = p[beta_start + c];
+                let r = p[r_start + c];
+                let d = p[d_start + c];
+                let mean_c = mean[c];
+                let var_c = var[c];
+                let inv_std = 1.0 / (var_c + eps).sqrt();
+                for row in 0..rows {
+                    let idx = c * rows + row;
+                    let x_hat = (x[idx] - mean_c) * inv_std;
+                    y[idx] = x_hat * r * gamma + d * gamma + beta;
                 }
             }
         });
@@ -109,8 +107,13 @@ impl UniversalLayerBuffered for BatchRenorm1d {
         grad_params: &MatrixBufferHandle,
     ) {
         let DynamicContext::Buffered(bc) = ctx;
-        let input_handle = match bc {
-            BufferedContext::BatchRenorm { input } => input,
+        let (input_handle, mean, var, use_batch_stats) = match bc {
+            BufferedContext::BatchRenorm {
+                input,
+                mean,
+                var,
+                use_batch_stats,
+            } => (input, mean, var, *use_batch_stats),
             _ => panic!("Expected BatchRenorm context"),
         };
 
@@ -118,6 +121,14 @@ impl UniversalLayerBuffered for BatchRenorm1d {
         let cols = grad_output.cols();
         debug_assert_eq!(cols, self.features);
         debug_assert_eq!(rows, input_handle.rows());
+        debug_assert!(
+            slice.start + self.param_len() <= params.rows() * params.cols(),
+            "BatchRenorm1d backward: parameter slice out of bounds"
+        );
+        debug_assert!(
+            slice.start + self.param_len() <= grad_params.rows() * grad_params.cols(),
+            "BatchRenorm1d backward: grad parameter slice out of bounds"
+        );
 
         let ids = [
             input_handle.id(),
@@ -142,79 +153,89 @@ impl UniversalLayerBuffered for BatchRenorm1d {
                 let gp: &mut [f32] = &mut *rest[0];
 
                 let base = slice.start;
-                let features = self.features;
+                let f = self.features;
+                let eps = self.eps;
+
+                // Смещения параметров
                 let gamma_start = base;
-                let beta_start  = gamma_start + features;
-                let r_start     = beta_start + features;
-                let d_start     = r_start + features;
+                let beta_start = gamma_start + f;
+                let r_start = beta_start + f;
+                let d_start = r_start + f;
 
-                let eps = 1e-5;
+                // Инициализируем градиенты параметров нулями
+                for i in 0..(4 * f) {
+                    gp[base + i] = 0.0f32;
+                }
 
-                // Градиенты по γ, β, r, d накапливаем во временные векторы
-                let mut grad_gamma = vec![0.0f32; features];
-                let mut grad_beta  = vec![0.0f32; features];
-                let mut grad_r     = vec![0.0f32; features];
-                let mut grad_d     = vec![0.0f32; features];
+                // Локальные накопители для градиентов параметров
+                let mut grad_gamma = vec![0.0f32; f];
+                let mut grad_beta = vec![0.0f32; f];
+                let mut grad_r = vec![0.0f32; f];
+                let mut grad_d = vec![0.0f32; f];
 
+                // Для каждого признака
                 for c in 0..cols {
-                    let mut sum = 0.0;
-                    let mut sum_sq = 0.0;
-                    for r in 0..rows {
-                        let idx = c * rows + r;
-                        let v = x[idx];
-                        sum += v;
-                        sum_sq += v * v;
-                    }
-                    let mean = sum / rows as f32;
-                    let var = sum_sq / rows as f32 - mean * mean;
-                    let std = (var + eps).sqrt();
-
                     let gamma = p[gamma_start + c];
-                    let beta  = p[beta_start + c];
-                    let r     = p[r_start + c];
-                    let d     = p[d_start + c];
+                    let beta = p[beta_start + c];
+                    let r = p[r_start + c];
+                    let d = p[d_start + c];
+                    let mean_c = mean[c];
+                    let var_c = var[c];
+                    let inv_std = 1.0 / (var_c + eps).sqrt();
 
-                    let mut d_gamma_acc = 0.0;
-                    let mut d_beta_acc  = 0.0;
-                    let mut d_r_acc     = 0.0;
-                    let mut d_d_acc     = 0.0;
+                    // Суммы для градиентов по статистикам (если используется batch)
+                    let mut sum_gamma_r = 0.0f32;
+                    let mut sum_gamma_r_xhat = 0.0f32;
+                    let mut sum_gamma_r_xhat_2 = 0.0f32; // для вариации
 
-                    // Временные суммы для градиентов по статистикам (не нужны, так как r,d обучаемы)
+                    // Проходим по строкам для данного признака
                     for row in 0..rows {
                         let idx = c * rows + row;
                         let x_val = x[idx];
                         let gout = go[idx];
-                        let x_hat = (x_val - mean) / std;
-                        let renorm = x_hat * r + d;
-                        // Градиент по выходу y = renorm * gamma + beta
-                        let d_gamma = gout * renorm;
-                        let d_beta  = gout;
-                        let d_renorm = gout * gamma;
-                        let d_r = d_renorm * x_hat;
-                        let d_d = d_renorm;
+                        let x_hat = (x_val - mean_c) * inv_std;
 
-                        // Градиент по входу
-                        // dL/dx = dL/dy * dy/dx = gout * gamma * r / std
-                        gi[idx] = gout * gamma * r / std;
+                        // Градиенты по параметрам
+                        grad_gamma[c] += gout * (x_hat * r + d);
+                        grad_beta[c] += gout;
+                        grad_r[c] += gout * gamma * x_hat;
+                        grad_d[c] += gout * gamma;
 
-                        d_gamma_acc += d_gamma;
-                        d_beta_acc  += d_beta;
-                        d_r_acc     += d_r;
-                        d_d_acc     += d_d;
+                        // Накопления для batch статистик
+                        if use_batch_stats {
+                            let gy = gout * gamma * r;
+                            sum_gamma_r += gy;
+                            sum_gamma_r_xhat += gy * x_hat;
+                            sum_gamma_r_xhat_2 += gy * x_hat * x_hat;
+                        }
                     }
 
-                    grad_gamma[c] = d_gamma_acc;
-                    grad_beta[c]  = d_beta_acc;
-                    grad_r[c]     = d_r_acc;
-                    grad_d[c]     = d_d_acc;
+                    // Градиенты по входу
+                    for row in 0..rows {
+                        let idx = c * rows + row;
+                        let gout = go[idx];
+                        let x_hat = (x[idx] - mean_c) * inv_std;
+
+                        if use_batch_stats {
+                            // Полная производная с учётом batch статистик
+                            let n = rows as f32;
+                            let term1 = gout * gamma * r * inv_std;
+                            let term2 = sum_gamma_r / n;
+                            let term3 = x_hat * sum_gamma_r_xhat / (n * (var_c + eps).sqrt());
+                            gi[idx] = term1 - term2 - term3;
+                        } else {
+                            // Running статистики считаются константами
+                            gi[idx] = gout * gamma * r * inv_std;
+                        }
+                    }
                 }
 
-                // Записываем градиенты в общий буфер
-                for c in 0..features {
+                // Записываем градиенты параметров в общий буфер
+                for c in 0..f {
                     gp[gamma_start + c] = grad_gamma[c];
-                    gp[beta_start + c]  = grad_beta[c];
-                    gp[r_start + c]     = grad_r[c];
-                    gp[d_start + c]     = grad_d[c];
+                    gp[beta_start + c] = grad_beta[c];
+                    gp[r_start + c] = grad_r[c];
+                    gp[d_start + c] = grad_d[c];
                 }
             });
     }

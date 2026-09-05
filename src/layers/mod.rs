@@ -15,7 +15,15 @@ pub mod identity;
 pub mod soft_sparse_gate;
 pub mod soft_keep_gate;
 pub mod dual_anchor;
-pub mod adaptive_activation;   // <-- добавлен новый модуль
+pub mod adaptive_activation;
+pub mod adaptive_normalization;
+pub mod batch_renorm;
+pub mod concrete_dropout;
+pub mod mamba;
+pub mod linear_attention;
+pub mod relative_position_attention;
+pub mod ind_rnn;
+pub mod spectral_norm_linear;
 
 pub mod layers_special;
 pub mod buffered_context;
@@ -40,7 +48,15 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_soft_sparse_gate(&self) -> Option<&SoftSparseGate> { None }
     fn as_soft_keep_gate(&self) -> Option<&SoftKeepGate> { None }
     fn as_dual_anchor(&self) -> Option<&DualAnchor> { None }
-    fn as_adaptive_activation(&self) -> Option<&AdaptivePerFeatureActivation> { None }   // <-- добавлен метод
+    fn as_adaptive_activation(&self) -> Option<&AdaptivePerFeatureActivation> { None }
+    fn as_adaptive_normalization(&self) -> Option<&AdaptiveNormalization> { None }
+    fn as_batch_renorm(&self) -> Option<&BatchRenorm1d> { None }
+    fn as_concrete_dropout(&self) -> Option<&ConcreteDropout> { None }
+    fn as_mamba(&self) -> Option<&Mamba> { None }
+    fn as_linear_attention(&self) -> Option<&LinearAttention> { None }
+    fn as_relative_position_attention(&self) -> Option<&RelativePositionAttention> { None }
+    fn as_ind_rnn(&self) -> Option<&IndRNN> { None }
+    fn as_spectral_norm_linear(&self) -> Option<&SpectrallyNormalizedLinear> { None }
     fn as_reduce_mean(&self) -> Option<&ReduceMean> { None }
     fn as_unsqueeze(&self) -> Option<&Unsqueeze> { None }
 
@@ -100,7 +116,15 @@ pub use identity::Identity;
 pub use soft_sparse_gate::SoftSparseGate;
 pub use soft_keep_gate::SoftKeepGate;
 pub use dual_anchor::DualAnchor;
-pub use adaptive_activation::AdaptivePerFeatureActivation;   // <-- реэкспорт нового слоя
+pub use adaptive_activation::AdaptivePerFeatureActivation;
+pub use adaptive_normalization::AdaptiveNormalization;
+pub use batch_renorm::BatchRenorm1d;
+pub use concrete_dropout::ConcreteDropout;
+pub use mamba::Mamba;
+pub use linear_attention::LinearAttention;
+pub use relative_position_attention::RelativePositionAttention;
+pub use ind_rnn::IndRNN;
+pub use spectral_norm_linear::SpectrallyNormalizedLinear;
 
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 pub use buffered_context::BufferedContext;

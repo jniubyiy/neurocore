@@ -3,6 +3,14 @@
 use std::sync::Mutex;
 use crate::layers::UniversalLayer;
 
+/// Кэш прямого прохода для обратного распространения.
+pub(crate) struct IndRNNForwardCache {
+    /// Входной тензор в column-major порядке (batch * seq_len * input_dim).
+    pub input: Vec<f32>,
+    /// Все скрытые состояния (batch * seq_len * input_dim).
+    pub hidden_states: Vec<f32>,
+}
+
 /// Слой IndRNN (Independent RNN).
 ///
 /// Каждый скрытый нейрон обновляется независимо:
@@ -19,8 +27,8 @@ pub struct IndRNN {
     pub input_dim: usize,
     /// Длина последовательности.
     pub seq_len: usize,
-    /// Состояние, хранящее скрытые состояния последнего прямого прохода для обратного.
-    pub(crate) state: Mutex<Option<Vec<f32>>>,
+    /// Состояние, хранящее вход и скрытые состояния последнего прямого прохода для обратного.
+    pub(crate) state: Mutex<Option<IndRNNForwardCache>>,
 }
 
 impl IndRNN {
@@ -36,6 +44,18 @@ impl IndRNN {
             seq_len,
             state: Mutex::new(None),
         }
+    }
+
+    /// Сохраняет кэш прямого прохода.
+    pub(crate) fn store_cache(&self, cache: IndRNNForwardCache) {
+        let mut guard = self.state.lock().unwrap();
+        *guard = Some(cache);
+    }
+
+    /// Извлекает кэш прямого прохода.
+    pub(crate) fn take_cache(&self) -> Option<IndRNNForwardCache> {
+        let mut guard = self.state.lock().unwrap();
+        guard.take()
     }
 }
 

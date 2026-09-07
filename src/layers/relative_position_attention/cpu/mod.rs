@@ -6,7 +6,7 @@ use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 
-use super::super::relative_position_attention::{RelativePositionAttention, RelativePositionAttentionCache};
+use super::super::relative_position_attention::relative_position_attention::{RelativePositionAttention, RelativePositionAttentionCache};
 
 impl UniversalLayerBuffered for RelativePositionAttention {
     fn forward_buffered(
@@ -35,8 +35,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
             let p: &[f32] = &*rest[0];
 
             let base = slice.start;
-
-            // Смещения параметров
             let wq_start = base;
             let bq_start = wq_start + d * d;
             let wk_start = bq_start + d;
@@ -45,9 +43,8 @@ impl UniversalLayerBuffered for RelativePositionAttention {
             let bv_start = wv_start + d * d;
             let wo_start = bv_start + d;
             let bo_start = wo_start + d * d;
-            let bias_start = bo_start + d; // relative_bias (2*seq-1)
+            let bias_start = bo_start + d;
 
-            // Преобразуем вход в row-major: (batch, seq*d)
             let mut x_rows = vec![0.0f32; batch * total_tokens];
             for r in 0..batch {
                 for t in 0..seq {
@@ -59,7 +56,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 }
             }
 
-            // Вычисляем Q, K, V
             let mut q = vec![0.0f32; batch * total_tokens];
             let mut k = vec![0.0f32; batch * total_tokens];
             let mut v = vec![0.0f32; batch * total_tokens];
@@ -83,7 +79,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 }
             }
 
-            // Вычисляем скоры и softmax
             let scale = 1.0f32 / (d as f32).sqrt();
             let mut scores = vec![0.0f32; batch * seq * seq];
             let mut attention_weights = vec![0.0f32; batch * seq * seq];
@@ -92,7 +87,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 for t in 0..seq {
                     let q_offset = r * total_tokens + t * d;
                     let score_offset = r * seq * seq + t * seq;
-                    // Сначала вычисляем все скоры
                     let mut max_score = f32::NEG_INFINITY;
                     for s in 0..seq {
                         let k_offset = r * total_tokens + s * d;
@@ -101,13 +95,11 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                             score += q[q_offset + j] * k[k_offset + j];
                         }
                         score *= scale;
-                        // добавляем относительное смещение
                         let rel_idx = (s as isize - t as isize + (seq as isize - 1)) as usize;
                         score += p[bias_start + rel_idx];
                         scores[score_offset + s] = score;
                         if score > max_score { max_score = score; }
                     }
-                    // softmax
                     let mut sum_exp = 0.0;
                     let mut exps = vec![0.0f32; seq];
                     for s in 0..seq {
@@ -121,7 +113,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 }
             }
 
-            // Вычисляем attn_out
             let mut attn_out = vec![0.0f32; batch * total_tokens];
             for r in 0..batch {
                 for t in 0..seq {
@@ -138,7 +129,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 }
             }
 
-            // Выходной линейный слой и запись в column-major
             for r in 0..batch {
                 for t in 0..seq {
                     for j in 0..d {
@@ -153,7 +143,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 }
             }
 
-            // Сохраняем кэш
             self.store_cache(RelativePositionAttentionCache {
                 q,
                 k,
@@ -241,12 +230,10 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 let bo_start = wo_start + d * d;
                 let bias_start = bo_start + d;
 
-                // Инициализируем градиенты параметров нулями
                 for i in 0..self.param_len() {
                     gp[base + i] = 0.0;
                 }
 
-                // Локальные накопители
                 let mut grad_wq = vec![0.0f32; d * d];
                 let mut grad_bq = vec![0.0f32; d];
                 let mut grad_wk = vec![0.0f32; d * d];
@@ -257,12 +244,10 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 let mut grad_bo = vec![0.0f32; d];
                 let mut grad_rel_bias = vec![0.0f32; 2 * seq - 1];
 
-                // Градиент по входу (column-major) обнуляем
                 for i in 0..(batch * total_tokens) {
                     gi[i] = 0.0;
                 }
 
-                // Преобразуем вход и градиент выхода в row-major
                 let mut x_rows = vec![0.0f32; batch * total_tokens];
                 let mut go_rows = vec![0.0f32; batch * total_tokens];
                 for r in 0..batch {
@@ -276,7 +261,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                     }
                 }
 
-                // 1. Градиенты по attn_out и параметрам выходного линейного слоя
                 let mut d_attn_out = vec![0.0f32; batch * total_tokens];
                 for r in 0..batch {
                     for t in 0..seq {
@@ -294,7 +278,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                     }
                 }
 
-                // 2. Градиенты по v и attention_weights
                 let mut d_v = vec![0.0f32; batch * total_tokens];
                 let mut d_weights = vec![0.0f32; batch * seq * seq];
                 for r in 0..batch {
@@ -312,12 +295,10 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                     }
                 }
 
-                // 3. Градиенты по scores (softmax производная)
                 let mut d_scores = vec![0.0f32; batch * seq * seq];
                 for r in 0..batch {
                     for t in 0..seq {
                         let weight_offset = r * seq * seq + t * seq;
-                        // dot = sum_s weight * d_weight
                         let mut dot = 0.0;
                         for s in 0..seq {
                             dot += cache.attention_weights[weight_offset + s] * d_weights[weight_offset + s];
@@ -330,7 +311,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                     }
                 }
 
-                // 4. Градиенты по q, k, relative_bias
                 let mut d_q = vec![0.0f32; batch * total_tokens];
                 let mut d_k = vec![0.0f32; batch * total_tokens];
                 let scale = 1.0f32 / (d as f32).sqrt();
@@ -346,17 +326,15 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                                 d_q[q_offset + j] += ds * cache.k[k_offset + j] * scale;
                                 d_k[k_offset + j] += ds * cache.q[q_offset + j] * scale;
                             }
-                            // relative_bias
                             let rel_idx = (s as isize - t as isize + (seq as isize - 1)) as usize;
                             grad_rel_bias[rel_idx] += ds;
                         }
                     }
                 }
 
-                // 5. Градиенты по линейным преобразованиям Q, K, V и по входу
-                let mut d_q_raw = d_q; // после phi нет, поэтому совпадают
+                let mut d_q_raw = d_q;
                 let mut d_k_raw = d_k;
-                let mut d_v_raw = d_v;
+                let d_v_raw = d_v;
 
                 for r in 0..batch {
                     for t in 0..seq {
@@ -366,7 +344,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                             grad_bq[i] += dq;
                             for j in 0..d {
                                 grad_wq[i * d + j] += dq * x_rows[idx + j];
-                                // градиент по входу (column-major)
                                 gi[(t * d + j) * batch + r] += dq * p[wq_start + i * d + j];
                             }
 
@@ -387,7 +364,6 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                     }
                 }
 
-                // Записываем градиенты параметров
                 for i in 0..d {
                     gp[bq_start + i] = grad_bq[i];
                     gp[bk_start + i] = grad_bk[i];

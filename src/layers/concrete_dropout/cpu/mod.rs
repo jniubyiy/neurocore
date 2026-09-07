@@ -69,10 +69,10 @@ impl UniversalLayerBuffered for ConcreteDropout {
         slice: &ParamSlice,
         grad_params: &MatrixBufferHandle,
     ) {
-        // Извлекаем вход из контекста
+        // Извлекаем вход из контекста (новые поля игнорируем)
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
-            BufferedContext::ConcreteDropout { input } => input,
+            BufferedContext::ConcreteDropout { input, .. } => input,
             _ => panic!("Expected ConcreteDropout context"),
         };
 
@@ -127,10 +127,10 @@ impl UniversalLayerBuffered for ConcreteDropout {
                     let sigmoid = 1.0 / (1.0 + (-a).exp());
                     let dsigmoid = sigmoid * (1.0 - sigmoid);
 
-                    // Градиент по входу: dL/dx = go * mask
+                    // Градиент по входу
                     gi[i] = go[i] * sigmoid;
 
-                    // Градиент по logit_p: sum (go_i * x_i * dsigmoid / temp)
+                    // Градиент по logit_p
                     grad_logit_p += go[i] * x[i] * dsigmoid / temp;
                 }
 

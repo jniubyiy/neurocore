@@ -25,6 +25,16 @@ pub mod relative_position_attention;
 pub mod ind_rnn;
 pub mod spectral_norm_linear;
 
+// Новые слои (полные внутренние реализации)
+pub mod dual_slope_relu;
+pub mod learnable_mish;
+pub mod learnable_softplus;
+pub mod rms_norm_learnable_eps;
+pub mod adaptive_dropout;
+pub mod feature_fusion;
+pub mod sparse_feature_selection_gate;
+pub mod multi_resolution_kan_linear;
+
 pub mod layers_special;
 pub mod buffered_context;
 
@@ -59,6 +69,16 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_spectral_norm_linear(&self) -> Option<&SpectrallyNormalizedLinear> { None }
     fn as_reduce_mean(&self) -> Option<&ReduceMean> { None }
     fn as_unsqueeze(&self) -> Option<&Unsqueeze> { None }
+
+    // Новые слои
+    fn as_dual_slope_relu(&self) -> Option<&DualSlopeReLU> { None }
+    fn as_learnable_mish(&self) -> Option<&LearnableMish> { None }
+    fn as_learnable_softplus(&self) -> Option<&LearnableSoftplus> { None }
+    fn as_rms_norm_learnable_eps(&self) -> Option<&RMSNormWithLearnableEpsilon> { None }
+    fn as_adaptive_dropout(&self) -> Option<&AdaptiveDropout> { None }
+    fn as_feature_fusion(&self) -> Option<&FeatureFusion> { None }
+    fn as_sparse_feature_selection_gate(&self) -> Option<&SparseFeatureSelectionGate> { None }
+    fn as_multi_resolution_kan_linear(&self) -> Option<&MultiResolutionKANLinear> { None }
 
     // Общая информация о слое, используемая планировщиком.
     // По умолчанию возвращает 0. Конкретные слои переопределяют.
@@ -125,6 +145,16 @@ pub use linear_attention::LinearAttention;
 pub use relative_position_attention::RelativePositionAttention;
 pub use ind_rnn::IndRNN;
 pub use spectral_norm_linear::SpectrallyNormalizedLinear;
+
+// Новые реэкспорты
+pub use dual_slope_relu::DualSlopeReLU;
+pub use learnable_mish::LearnableMish;
+pub use learnable_softplus::LearnableSoftplus;
+pub use rms_norm_learnable_eps::RMSNormWithLearnableEpsilon;
+pub use adaptive_dropout::AdaptiveDropout;
+pub use feature_fusion::FeatureFusion;
+pub use sparse_feature_selection_gate::SparseFeatureSelectionGate;
+pub use multi_resolution_kan_linear::MultiResolutionKANLinear;
 
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 pub use buffered_context::BufferedContext;

@@ -27,6 +27,8 @@ use crate::compute_manager::memory_executor::matrix_entry::MatrixStorage;
 
 use super::super::init::GpuContext;
 use super::super::pipeline::PipelineCache;
+
+// Импорты пайплайнов слоёв
 use crate::layers::relu::gpu::pipeline::ReLUPipelines;
 use crate::layers::sigmoid::gpu::pipeline::SigmoidPipelines;
 use crate::layers::tanh::gpu::pipeline::TanhPipelines;
@@ -39,9 +41,25 @@ use crate::layers::softmax::gpu::pipeline::SoftmaxPipelines;
 use crate::layers::memory::gpu::pipeline::MemoryPipelines;
 use crate::layers::splitter::gpu::pipeline::SplitterPipelines;
 use crate::layers::combiner::gpu::pipeline::CombinerPipelines;
-use crate::layers::adaptive_activation::gpu::pipeline::AdaptivePerFeatureActivationPipelines; // <-- добавлен импорт
+use crate::layers::adaptive_activation::gpu::pipeline::AdaptivePerFeatureActivationPipelines;
 
-// Новые пайплайны оптимизаторов
+// Новые слои
+use crate::layers::dual_slope_relu::gpu::pipeline::DualSlopeReLUPipelines;
+use crate::layers::learnable_mish::gpu::pipeline::LearnableMishPipelines;
+use crate::layers::learnable_softplus::gpu::pipeline::LearnableSoftplusPipelines;
+use crate::layers::rms_norm_learnable_eps::gpu::pipeline::RMSNormWithLearnableEpsilonPipelines;
+use crate::layers::adaptive_dropout::gpu::pipeline::AdaptiveDropoutPipelines;
+use crate::layers::feature_fusion::gpu::pipeline::FeatureFusionPipelines;
+use crate::layers::sparse_feature_selection_gate::gpu::pipeline::SparseFeatureSelectionGatePipelines;
+use crate::layers::multi_resolution_kan_linear::gpu::pipeline::MultiResolutionKANLinearPipelines;
+use crate::layers::adaptive_normalization::gpu::pipeline::AdaptiveNormalizationPipelines;
+use crate::layers::batch_renorm::gpu::pipeline::BatchRenormPipelines;
+use crate::layers::concrete_dropout::gpu::pipeline::ConcreteDropoutPipelines;
+use crate::layers::mamba::gpu::pipeline::MambaPipelines;
+use crate::layers::ind_rnn::gpu::pipeline::IndRNNPipelines;
+use crate::layers::spectral_norm_linear::gpu::pipeline::SpectrallyNormalizedLinearPipelines;
+
+// Пайплайны оптимизаторов
 use crate::optimizers::scale_gradient::gpu::pipeline::ScaleGradientPipelines;
 use crate::optimizers::add_weight_decay::gpu::pipeline::AddWeightDecayPipelines;
 use crate::optimizers::gradient_clip::gpu::pipeline::GradientClipPipelines;
@@ -50,7 +68,7 @@ use crate::optimizers::nesterov_momentum::gpu::pipeline::NesterovMomentumPipelin
 use crate::optimizers::adam::gpu::pipeline::AdamPipelines;
 use crate::optimizers::apply_update::gpu::pipeline::ApplyUpdatePipelines;
 
-// Новые пайплайны функций потерь
+// Пайплайны функций потерь
 use crate::losses::sub::gpu::pipeline::SubPipelines;
 use crate::losses::square::gpu::pipeline::SquarePipelines;
 use crate::losses::abs::gpu::pipeline::AbsPipelines;
@@ -73,8 +91,6 @@ pub struct GpuCompute {
     /// Хранилище состояний для каждого слоя Memory по индексу (memory_idx).
     pub memory_states: Mutex<HashMap<usize, (Subbuffer<[f32]>, RawBufferId)>>,
 
-    // Внутренний мьютекс для сериализации доступа к очереди Vulkan.
-    // Позволяет использовать GpuCompute из нескольких потоков без внешнего Mutex.
     queue_lock: Mutex<()>,
 
     // Пайплайны слоёв (ленивая инициализация)
@@ -86,13 +102,29 @@ pub struct GpuCompute {
     soft_sparse_gate_pipelines: OnceLock<SoftSparseGatePipelines>,
     soft_keep_gate_pipelines: OnceLock<SoftKeepGatePipelines>,
     dual_anchor_pipelines: OnceLock<DualAnchorPipelines>,
-    adaptive_activation_pipelines: OnceLock<AdaptivePerFeatureActivationPipelines>, // <-- добавлено поле
+    adaptive_activation_pipelines: OnceLock<AdaptivePerFeatureActivationPipelines>,
     softmax_pipelines: OnceLock<SoftmaxPipelines>,
     memory_pipelines: OnceLock<MemoryPipelines>,
     splitter_pipelines: OnceLock<SplitterPipelines>,
     combiner_pipelines: OnceLock<CombinerPipelines>,
 
-    // Пайплайны оптимизаторов (ленивая инициализация)
+    // Новые слои
+    dual_slope_relu_pipelines: OnceLock<DualSlopeReLUPipelines>,
+    learnable_mish_pipelines: OnceLock<LearnableMishPipelines>,
+    learnable_softplus_pipelines: OnceLock<LearnableSoftplusPipelines>,
+    rms_norm_learnable_eps_pipelines: OnceLock<RMSNormWithLearnableEpsilonPipelines>,
+    adaptive_dropout_pipelines: OnceLock<AdaptiveDropoutPipelines>,
+    feature_fusion_pipelines: OnceLock<FeatureFusionPipelines>,
+    sparse_feature_selection_gate_pipelines: OnceLock<SparseFeatureSelectionGatePipelines>,
+    multi_resolution_kan_linear_pipelines: OnceLock<MultiResolutionKANLinearPipelines>,
+    adaptive_normalization_pipelines: OnceLock<AdaptiveNormalizationPipelines>,
+    batch_renorm_pipelines: OnceLock<BatchRenormPipelines>,
+    concrete_dropout_pipelines: OnceLock<ConcreteDropoutPipelines>,
+    mamba_pipelines: OnceLock<MambaPipelines>,
+    ind_rnn_pipelines: OnceLock<IndRNNPipelines>,
+    spectral_norm_linear_pipelines: OnceLock<SpectrallyNormalizedLinearPipelines>,
+
+    // Пайплайны оптимизаторов
     scale_gradient_pipelines: OnceLock<ScaleGradientPipelines>,
     add_weight_decay_pipelines: OnceLock<AddWeightDecayPipelines>,
     gradient_clip_pipelines: OnceLock<GradientClipPipelines>,
@@ -101,7 +133,7 @@ pub struct GpuCompute {
     adam_pipelines: OnceLock<AdamPipelines>,
     apply_update_pipelines: OnceLock<ApplyUpdatePipelines>,
 
-    // Пайплайны функций потерь (ленивая инициализация)
+    // Пайплайны функций потерь
     sub_pipelines: OnceLock<SubPipelines>,
     square_pipelines: OnceLock<SquarePipelines>,
     abs_pipelines: OnceLock<AbsPipelines>,
@@ -137,6 +169,7 @@ impl GpuCompute {
             gpu_device_id,
             memory_states: Mutex::new(HashMap::new()),
             queue_lock: Mutex::new(()),
+
             relu_pipelines: OnceLock::new(),
             sigmoid_pipelines: OnceLock::new(),
             tanh_pipelines: OnceLock::new(),
@@ -145,11 +178,27 @@ impl GpuCompute {
             soft_sparse_gate_pipelines: OnceLock::new(),
             soft_keep_gate_pipelines: OnceLock::new(),
             dual_anchor_pipelines: OnceLock::new(),
-            adaptive_activation_pipelines: OnceLock::new(), // <-- добавлено
+            adaptive_activation_pipelines: OnceLock::new(),
             softmax_pipelines: OnceLock::new(),
             memory_pipelines: OnceLock::new(),
             splitter_pipelines: OnceLock::new(),
             combiner_pipelines: OnceLock::new(),
+
+            dual_slope_relu_pipelines: OnceLock::new(),
+            learnable_mish_pipelines: OnceLock::new(),
+            learnable_softplus_pipelines: OnceLock::new(),
+            rms_norm_learnable_eps_pipelines: OnceLock::new(),
+            adaptive_dropout_pipelines: OnceLock::new(),
+            feature_fusion_pipelines: OnceLock::new(),
+            sparse_feature_selection_gate_pipelines: OnceLock::new(),
+            multi_resolution_kan_linear_pipelines: OnceLock::new(),
+            adaptive_normalization_pipelines: OnceLock::new(),
+            batch_renorm_pipelines: OnceLock::new(),
+            concrete_dropout_pipelines: OnceLock::new(),
+            mamba_pipelines: OnceLock::new(),
+            ind_rnn_pipelines: OnceLock::new(),
+            spectral_norm_linear_pipelines: OnceLock::new(),
+
             scale_gradient_pipelines: OnceLock::new(),
             add_weight_decay_pipelines: OnceLock::new(),
             gradient_clip_pipelines: OnceLock::new(),
@@ -157,6 +206,7 @@ impl GpuCompute {
             nesterov_momentum_pipelines: OnceLock::new(),
             adam_pipelines: OnceLock::new(),
             apply_update_pipelines: OnceLock::new(),
+
             sub_pipelines: OnceLock::new(),
             square_pipelines: OnceLock::new(),
             abs_pipelines: OnceLock::new(),
@@ -174,162 +224,188 @@ impl GpuCompute {
     // ================ Методы доступа к пайплайнам слоёв ================
 
     pub fn relu_pipelines(&self) -> &ReLUPipelines {
-        self.relu_pipelines
-            .get_or_init(|| ReLUPipelines::new(self.context.device.clone()))
+        self.relu_pipelines.get_or_init(|| ReLUPipelines::new(self.context.device.clone()))
     }
 
     pub fn sigmoid_pipelines(&self) -> &SigmoidPipelines {
-        self.sigmoid_pipelines
-            .get_or_init(|| SigmoidPipelines::new(self.context.device.clone()))
+        self.sigmoid_pipelines.get_or_init(|| SigmoidPipelines::new(self.context.device.clone()))
     }
 
     pub fn tanh_pipelines(&self) -> &TanhPipelines {
-        self.tanh_pipelines
-            .get_or_init(|| TanhPipelines::new(self.context.device.clone()))
+        self.tanh_pipelines.get_or_init(|| TanhPipelines::new(self.context.device.clone()))
     }
 
     pub fn leaky_relu_pipelines(&self) -> &LeakyReLUPipelines {
-        self.leaky_relu_pipelines
-            .get_or_init(|| LeakyReLUPipelines::new(self.context.device.clone()))
+        self.leaky_relu_pipelines.get_or_init(|| LeakyReLUPipelines::new(self.context.device.clone()))
     }
 
     pub fn linear_pipelines(&self) -> &LinearPipelines {
-        self.linear_pipelines
-            .get_or_init(|| LinearPipelines::new(self.context.device.clone()))
+        self.linear_pipelines.get_or_init(|| LinearPipelines::new(self.context.device.clone()))
     }
 
     pub fn soft_sparse_gate_pipelines(&self) -> &SoftSparseGatePipelines {
-        self.soft_sparse_gate_pipelines
-            .get_or_init(|| SoftSparseGatePipelines::new(self.context.device.clone()))
+        self.soft_sparse_gate_pipelines.get_or_init(|| SoftSparseGatePipelines::new(self.context.device.clone()))
     }
 
     pub fn soft_keep_gate_pipelines(&self) -> &SoftKeepGatePipelines {
-        self.soft_keep_gate_pipelines
-            .get_or_init(|| SoftKeepGatePipelines::new(self.context.device.clone()))
+        self.soft_keep_gate_pipelines.get_or_init(|| SoftKeepGatePipelines::new(self.context.device.clone()))
     }
 
     pub fn dual_anchor_pipelines(&self) -> &DualAnchorPipelines {
-        self.dual_anchor_pipelines
-            .get_or_init(|| DualAnchorPipelines::new(self.context.device.clone()))
+        self.dual_anchor_pipelines.get_or_init(|| DualAnchorPipelines::new(self.context.device.clone()))
     }
 
     pub fn adaptive_activation_pipelines(&self) -> &AdaptivePerFeatureActivationPipelines {
-        self.adaptive_activation_pipelines
-            .get_or_init(|| AdaptivePerFeatureActivationPipelines::new(self.context.device.clone()))
+        self.adaptive_activation_pipelines.get_or_init(|| AdaptivePerFeatureActivationPipelines::new(self.context.device.clone()))
     }
 
     pub fn softmax_pipelines(&self) -> &SoftmaxPipelines {
-        self.softmax_pipelines
-            .get_or_init(|| SoftmaxPipelines::new(self.context.device.clone()))
+        self.softmax_pipelines.get_or_init(|| SoftmaxPipelines::new(self.context.device.clone()))
     }
 
     pub fn memory_pipelines(&self) -> &MemoryPipelines {
-        self.memory_pipelines
-            .get_or_init(|| MemoryPipelines::new(self.context.device.clone()))
+        self.memory_pipelines.get_or_init(|| MemoryPipelines::new(self.context.device.clone()))
     }
 
     pub fn splitter_pipelines(&self) -> &SplitterPipelines {
-        self.splitter_pipelines
-            .get_or_init(|| SplitterPipelines::new(self.context.device.clone()))
+        self.splitter_pipelines.get_or_init(|| SplitterPipelines::new(self.context.device.clone()))
     }
 
     pub fn combiner_pipelines(&self) -> &CombinerPipelines {
-        self.combiner_pipelines
-            .get_or_init(|| CombinerPipelines::new(self.context.device.clone()))
+        self.combiner_pipelines.get_or_init(|| CombinerPipelines::new(self.context.device.clone()))
+    }
+
+    // Новые слои
+    pub fn dual_slope_relu_pipelines(&self) -> &DualSlopeReLUPipelines {
+        self.dual_slope_relu_pipelines.get_or_init(|| DualSlopeReLUPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn learnable_mish_pipelines(&self) -> &LearnableMishPipelines {
+        self.learnable_mish_pipelines.get_or_init(|| LearnableMishPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn learnable_softplus_pipelines(&self) -> &LearnableSoftplusPipelines {
+        self.learnable_softplus_pipelines.get_or_init(|| LearnableSoftplusPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn rms_norm_learnable_eps_pipelines(&self) -> &RMSNormWithLearnableEpsilonPipelines {
+        self.rms_norm_learnable_eps_pipelines.get_or_init(|| RMSNormWithLearnableEpsilonPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn adaptive_dropout_pipelines(&self) -> &AdaptiveDropoutPipelines {
+        self.adaptive_dropout_pipelines.get_or_init(|| AdaptiveDropoutPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn feature_fusion_pipelines(&self) -> &FeatureFusionPipelines {
+        self.feature_fusion_pipelines.get_or_init(|| FeatureFusionPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn sparse_feature_selection_gate_pipelines(&self) -> &SparseFeatureSelectionGatePipelines {
+        self.sparse_feature_selection_gate_pipelines.get_or_init(|| SparseFeatureSelectionGatePipelines::new(self.context.device.clone()))
+    }
+
+    pub fn multi_resolution_kan_linear_pipelines(&self) -> &MultiResolutionKANLinearPipelines {
+        self.multi_resolution_kan_linear_pipelines.get_or_init(|| MultiResolutionKANLinearPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn adaptive_normalization_pipelines(&self) -> &AdaptiveNormalizationPipelines {
+        self.adaptive_normalization_pipelines.get_or_init(|| AdaptiveNormalizationPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn batch_renorm_pipelines(&self) -> &BatchRenormPipelines {
+        self.batch_renorm_pipelines.get_or_init(|| BatchRenormPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn concrete_dropout_pipelines(&self) -> &ConcreteDropoutPipelines {
+        self.concrete_dropout_pipelines.get_or_init(|| ConcreteDropoutPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn mamba_pipelines(&self) -> &MambaPipelines {
+        self.mamba_pipelines.get_or_init(|| MambaPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn ind_rnn_pipelines(&self) -> &IndRNNPipelines {
+        self.ind_rnn_pipelines.get_or_init(|| IndRNNPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn spectral_norm_linear_pipelines(&self) -> &SpectrallyNormalizedLinearPipelines {
+        self.spectral_norm_linear_pipelines.get_or_init(|| SpectrallyNormalizedLinearPipelines::new(self.context.device.clone()))
     }
 
     // ================ Методы доступа к пайплайнам оптимизаторов ================
 
     pub fn scale_gradient_pipelines(&self) -> &ScaleGradientPipelines {
-        self.scale_gradient_pipelines
-            .get_or_init(|| ScaleGradientPipelines::new(self.context.device.clone()))
+        self.scale_gradient_pipelines.get_or_init(|| ScaleGradientPipelines::new(self.context.device.clone()))
     }
 
     pub fn add_weight_decay_pipelines(&self) -> &AddWeightDecayPipelines {
-        self.add_weight_decay_pipelines
-            .get_or_init(|| AddWeightDecayPipelines::new(self.context.device.clone()))
+        self.add_weight_decay_pipelines.get_or_init(|| AddWeightDecayPipelines::new(self.context.device.clone()))
     }
 
     pub fn gradient_clip_pipelines(&self) -> &GradientClipPipelines {
-        self.gradient_clip_pipelines
-            .get_or_init(|| GradientClipPipelines::new(self.context.device.clone()))
+        self.gradient_clip_pipelines.get_or_init(|| GradientClipPipelines::new(self.context.device.clone()))
     }
 
     pub fn momentum_pipelines(&self) -> &MomentumPipelines {
-        self.momentum_pipelines
-            .get_or_init(|| MomentumPipelines::new(self.context.device.clone()))
+        self.momentum_pipelines.get_or_init(|| MomentumPipelines::new(self.context.device.clone()))
     }
 
     pub fn nesterov_momentum_pipelines(&self) -> &NesterovMomentumPipelines {
-        self.nesterov_momentum_pipelines
-            .get_or_init(|| NesterovMomentumPipelines::new(self.context.device.clone()))
+        self.nesterov_momentum_pipelines.get_or_init(|| NesterovMomentumPipelines::new(self.context.device.clone()))
     }
 
     pub fn adam_pipelines(&self) -> &AdamPipelines {
-        self.adam_pipelines
-            .get_or_init(|| AdamPipelines::new(self.context.device.clone()))
+        self.adam_pipelines.get_or_init(|| AdamPipelines::new(self.context.device.clone()))
     }
 
     pub fn apply_update_pipelines(&self) -> &ApplyUpdatePipelines {
-        self.apply_update_pipelines
-            .get_or_init(|| ApplyUpdatePipelines::new(self.context.device.clone()))
+        self.apply_update_pipelines.get_or_init(|| ApplyUpdatePipelines::new(self.context.device.clone()))
     }
 
     // ================ Методы доступа к пайплайнам функций потерь ================
 
     pub fn sub_pipelines(&self) -> &SubPipelines {
-        self.sub_pipelines
-            .get_or_init(|| SubPipelines::new(self.context.device.clone()))
+        self.sub_pipelines.get_or_init(|| SubPipelines::new(self.context.device.clone()))
     }
 
     pub fn square_pipelines(&self) -> &SquarePipelines {
-        self.square_pipelines
-            .get_or_init(|| SquarePipelines::new(self.context.device.clone()))
+        self.square_pipelines.get_or_init(|| SquarePipelines::new(self.context.device.clone()))
     }
 
     pub fn abs_pipelines(&self) -> &AbsPipelines {
-        self.abs_pipelines
-            .get_or_init(|| AbsPipelines::new(self.context.device.clone()))
+        self.abs_pipelines.get_or_init(|| AbsPipelines::new(self.context.device.clone()))
     }
 
     pub fn log1p_pipelines(&self) -> &Log1pPipelines {
-        self.log1p_pipelines
-            .get_or_init(|| Log1pPipelines::new(self.context.device.clone()))
+        self.log1p_pipelines.get_or_init(|| Log1pPipelines::new(self.context.device.clone()))
     }
 
     pub fn abs_diff_pipelines(&self) -> &AbsDiffPipelines {
-        self.abs_diff_pipelines
-            .get_or_init(|| AbsDiffPipelines::new(self.context.device.clone()))
+        self.abs_diff_pipelines.get_or_init(|| AbsDiffPipelines::new(self.context.device.clone()))
     }
 
     pub fn log_pipelines(&self) -> &LogPipelines {
-        self.log_pipelines
-            .get_or_init(|| LogPipelines::new(self.context.device.clone()))
+        self.log_pipelines.get_or_init(|| LogPipelines::new(self.context.device.clone()))
     }
 
     pub fn neg_pipelines(&self) -> &NegPipelines {
-        self.neg_pipelines
-            .get_or_init(|| NegPipelines::new(self.context.device.clone()))
+        self.neg_pipelines.get_or_init(|| NegPipelines::new(self.context.device.clone()))
     }
 
     pub fn mul_pipelines(&self) -> &MulPipelines {
-        self.mul_pipelines
-            .get_or_init(|| MulPipelines::new(self.context.device.clone()))
+        self.mul_pipelines.get_or_init(|| MulPipelines::new(self.context.device.clone()))
     }
 
     pub fn add_scalar_pipelines(&self) -> &AddScalarPipelines {
-        self.add_scalar_pipelines
-            .get_or_init(|| AddScalarPipelines::new(self.context.device.clone()))
+        self.add_scalar_pipelines.get_or_init(|| AddScalarPipelines::new(self.context.device.clone()))
     }
 
     pub fn cross_entropy_pipelines(&self) -> &CrossEntropyPipelines {
-        self.cross_entropy_pipelines
-            .get_or_init(|| CrossEntropyPipelines::new(self.context.device.clone()))
+        self.cross_entropy_pipelines.get_or_init(|| CrossEntropyPipelines::new(self.context.device.clone()))
     }
 
     pub fn sum_columns_pipelines(&self) -> &SumColumnsPipelines {
-        self.sum_columns_pipelines
-            .get_or_init(|| SumColumnsPipelines::new(self.context.device.clone()))
+        self.sum_columns_pipelines.get_or_init(|| SumColumnsPipelines::new(self.context.device.clone()))
     }
 
     // --- Временные буферы ---
@@ -388,8 +464,6 @@ impl GpuCompute {
 
     // --- Копирование между Subbuffer'ами ---
 
-    /// Синхронно копирует данные между двумя Vulkan-буферами.
-    /// Захватывает внутренний мьютекс очереди.
     pub fn copy_buffer_sync(&self, src: Subbuffer<[f32]>, dst: Subbuffer<[f32]>) {
         let _lock = self.queue_lock.lock().unwrap();
 
@@ -413,8 +487,6 @@ impl GpuCompute {
 
     // --- Диспатч ---
 
-    /// Запускает compute shader с автоматическим вычислением dispatch.
-    /// `pipeline` – ссылка на Arc<ComputePipeline>, чтобы избежать лишних клонирований.
     pub fn run_compute_shader<const N: usize>(
         &self,
         pipeline: &Arc<vulkano::pipeline::ComputePipeline>,
@@ -426,7 +498,6 @@ impl GpuCompute {
         self.run_compute_shader_with_dispatch(pipeline, buffers, push_constants, dispatch_dim);
     }
 
-    /// Запускает compute shader с явно заданным dispatch.
     pub fn run_compute_shader_with_dispatch<const N: usize>(
         &self,
         pipeline: &Arc<vulkano::pipeline::ComputePipeline>,
@@ -459,7 +530,7 @@ impl GpuCompute {
 
         unsafe {
             builder
-                .bind_pipeline_compute(pipeline.clone()) // единственное неизбежное клонирование Arc для Vulkan
+                .bind_pipeline_compute(pipeline.clone())
                 .unwrap()
                 .bind_descriptor_sets(
                     PipelineBindPoint::Compute,
@@ -483,7 +554,6 @@ impl GpuCompute {
         future.wait(None).unwrap();
     }
 
-    /// Запускает compute shader с явным dispatch (2D-вариант).
     pub fn run_compute_shader_2d<const N: usize>(
         &self,
         pipeline: &Arc<vulkano::pipeline::ComputePipeline>,
@@ -547,7 +617,6 @@ impl GpuCompute {
         self.release_staging_buffer(staging_buf, staging_raw);
     }
 
-    /// Скачивает данные из GPU в управляемый CPU‑буфер.
     pub fn download_gpu_handle_to_cpu_handle(&self, handle: &MatrixBufferHandle) -> MatrixBufferHandle {
         assert!(handle.is_gpu(), "Handle must be GPU");
         let elements = handle.rows() * handle.cols();
@@ -570,8 +639,6 @@ impl GpuCompute {
         cpu_handle
     }
 
-    /// Скачивает данные из GPU напрямую в `Vec<f32>` без создания CPU‑буфера.
-    /// Предназначен для случаев, когда нужен числовой доступ к данным.
     pub fn download_gpu_handle_to_vec(&self, handle: &MatrixBufferHandle) -> Vec<f32> {
         assert!(handle.is_gpu(), "Handle must be GPU");
         let elements = handle.rows() * handle.cols();

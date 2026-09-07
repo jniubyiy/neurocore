@@ -38,36 +38,29 @@ impl UniversalLayerBuffered for IndRNN {
             let u_start = w_start + d * d;
             let b_start = u_start + d;
 
-            // Сохраняем вход и скрытые состояния
             let mut hidden_states = vec![0.0f32; batch * seq * d];
             let input_copy = x.to_vec();
 
-            let mut h_prev = vec![0.0f32; batch * d]; // инициализация нулями
+            let mut h_prev = vec![0.0f32; batch * d];
 
             for t in 0..seq {
                 for r in 0..batch {
                     for j in 0..d {
-                        let mut sum = p[b_start + j]; // bias
-                        // W x_t
+                        let mut sum = p[b_start + j];
                         for i in 0..d {
                             let x_idx = (t * d + i) * batch + r;
                             sum += x[x_idx] * p[w_start + j * d + i];
                         }
-                        // u ⊙ h_prev
                         sum += p[u_start + j] * h_prev[r * d + j];
-                        // ReLU
                         let h = if sum > 0.0 { sum } else { 0.0 };
                         hidden_states[(r * seq + t) * d + j] = h;
-                        // сохраняем для следующего шага
                         h_prev[r * d + j] = h;
-                        // Выход
                         let out_idx = (t * d + j) * batch + r;
                         y[out_idx] = h;
                     }
                 }
             }
 
-            // Сохраняем кэш
             self.store_cache(IndRNNForwardCache {
                 input: input_copy,
                 hidden_states,
@@ -86,7 +79,7 @@ impl UniversalLayerBuffered for IndRNN {
     ) {
         let DynamicContext::Buffered(bc) = ctx;
         let _input_handle = match bc {
-            BufferedContext::IndRNN { input } => input,
+            BufferedContext::IndRNN { input, .. } => input,
             _ => panic!("Expected IndRNN context"),
         };
 
@@ -100,7 +93,6 @@ impl UniversalLayerBuffered for IndRNN {
         debug_assert!(slice.start + self.param_len() <= params.rows() * params.cols());
         debug_assert!(slice.start + self.param_len() <= grad_params.rows() * grad_params.cols());
 
-        // Извлекаем кэш
         let cache = self
             .take_cache()
             .expect("IndRNN backward called without forward cache");
@@ -130,64 +122,50 @@ impl UniversalLayerBuffered for IndRNN {
                 let u_start = w_start + d * d;
                 let b_start = u_start + d;
 
-                // Инициализируем градиенты параметров нулями
                 for i in 0..self.param_len() {
                     gp[base + i] = 0.0;
                 }
 
-                // Локальные накопители
                 let mut grad_W = vec![0.0f32; d * d];
                 let mut grad_u = vec![0.0f32; d];
                 let mut grad_b = vec![0.0f32; d];
 
-                // Градиент по входу обнуляем
                 for i in 0..(batch * seq * d) {
                     gi[i] = 0.0;
                 }
 
-                // delta_next хранит dL/dpre_t для следующего шага (инициализируем нулями для t=seq)
                 let mut delta_next = vec![0.0f32; batch * d];
 
-                // BPTT
                 for t in (0..seq).rev() {
                     for r in 0..batch {
                         for j in 0..d {
                             let h_t = cache.hidden_states[(r * seq + t) * d + j];
                             let grad_out_t = go[(t * d + j) * batch + r];
 
-                            // dL/dh_t = grad_out_t + u[j] * delta_next[r*d + j]
                             let dL_dh = grad_out_t + p[u_start + j] * delta_next[r * d + j];
 
-                            // Производная ReLU: d_relu = 1 если h_t > 0
                             let d_relu = if h_t > 0.0 { 1.0 } else { 0.0 };
 
-                            // delta_t = dL/dpre_t = dL_dh * d_relu
                             let delta_t = dL_dh * d_relu;
 
-                            // Градиенты по параметрам
                             grad_b[j] += delta_t;
 
-                            // u: dpre_t/du_j = h_{t-1}
                             if t > 0 {
                                 let h_prev = cache.hidden_states[(r * seq + t - 1) * d + j];
                                 grad_u[j] += delta_t * h_prev;
-                            } // при t=0 h_prev=0, вклад нулевой
+                            }
 
-                            // W: dpre_t/dW[j,i] = x_t[i]
                             for i in 0..d {
                                 let x_t_i = cache.input[(t * d + i) * batch + r];
                                 grad_W[j * d + i] += delta_t * x_t_i;
-                                // Вклад в градиент по входу: dx_t_i = sum_j delta_t * W[j,i]
                                 gi[(t * d + i) * batch + r] += delta_t * p[w_start + j * d + i];
                             }
 
-                            // Обновляем delta_next для предыдущего шага
                             delta_next[r * d + j] = delta_t;
                         }
                     }
                 }
 
-                // Записываем градиенты параметров
                 for j in 0..d {
                     gp[b_start + j] = grad_b[j];
                     gp[u_start + j] = grad_u[j];

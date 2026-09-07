@@ -10,12 +10,14 @@ use crate::layers::{
     UniversalLayer, UniversalLayerBuffered,
     Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
     Memory, SoftSparseGate, SoftKeepGate, DualAnchor, AdaptivePerFeatureActivation,
+    DualSlopeReLU, LearnableMish, LearnableSoftplus, RMSNormWithLearnableEpsilon,
+    AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
+    AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
+    SpectrallyNormalizedLinear,
 };
 use crate::model_plan::param_store::ParamSlice;
 
 impl MixedModel {
-    // CPU-путь с использованием MatrixBufferHandle
-    // Теперь возвращает Vec<DynamicContext> для единственного чанка (весь батч)
     pub(crate) fn process_universal_processor_forward_buffered(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -34,13 +36,11 @@ impl MixedModel {
         let layers = proc.as_ref();
         let num_layers = layers.len();
 
-        // Клонируем входные дескрипторы для неактивных потоков (они не меняются)
         let mut new_stream: Vec<Option<MatrixBufferHandle>> = stream_buffers
             .iter()
             .map(|handle| Some(handle.clone()))
             .collect();
 
-        // Сюда будем собирать контексты для всех активных потоков (но в текущей модели обычно один поток)
         let mut result_ctxs = Vec::new();
 
         for &stream_idx in &active_indices {
@@ -53,26 +53,21 @@ impl MixedModel {
                 let layer = &layers[i];
                 let slice = &slices[i];
 
-                // Определяем размер выходного буфера
                 let out_features = get_buffered_output_features(layer, &current_input);
                 let output_handle = pool.acquire(batch_size, out_features);
 
-                // Выполняем прямой проход
                 call_forward_buffered(layer, &current_input, &output_handle, params, slice);
 
-                // Создаём контекст для обратного прохода
-                let buffered_ctx = build_buffered_context(layer, &current_input, &output_handle);
+                let buffered_ctx = build_buffered_context(layer, &current_input, &output_handle, pool);
                 layer_ctxs.push(DynamicContext::Buffered(buffered_ctx));
 
                 current_input = output_handle;
             }
 
-            // Записываем результат для этого потока
             new_stream[stream_idx] = Some(current_input);
-            result_ctxs = layer_ctxs; // предполагаем один активный поток
+            result_ctxs = layer_ctxs;
         }
 
-        // Обновляем stream_buffers
         *stream_buffers = new_stream
             .into_iter()
             .map(|opt| opt.expect("Missing stream buffer after forward"))
@@ -82,13 +77,21 @@ impl MixedModel {
     }
 }
 
-// Вспомогательные функции
-
-/// Возвращает количество выходных признаков слоя, используя UniversalLayerBuffered.
 fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
     if let Some(l) = layer.as_linear() {
-        <dyn UniversalLayerBuffered>::output_features(l)
-    } else if layer.as_relu().is_some()
+        return <Linear as UniversalLayerBuffered>::output_features(l);
+    }
+    if let Some(l) = layer.as_feature_fusion() {
+        return <FeatureFusion as UniversalLayerBuffered>::output_features(l);
+    }
+    if let Some(l) = layer.as_multi_resolution_kan_linear() {
+        return <MultiResolutionKANLinear as UniversalLayerBuffered>::output_features(l);
+    }
+    if let Some(l) = layer.as_spectral_norm_linear() {
+        return <SpectrallyNormalizedLinear as UniversalLayerBuffered>::output_features(l);
+    }
+
+    if layer.as_relu().is_some()
         || layer.as_sigmoid().is_some()
         || layer.as_tanh().is_some()
         || layer.as_leaky_relu().is_some()
@@ -98,17 +101,25 @@ fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixB
         || layer.as_soft_sparse_gate().is_some()
         || layer.as_soft_keep_gate().is_some()
         || layer.as_dual_anchor().is_some()
-        || layer.as_adaptive_activation().is_some()   // <-- добавлено
+        || layer.as_adaptive_activation().is_some()
+        || layer.as_dual_slope_relu().is_some()
+        || layer.as_learnable_mish().is_some()
+        || layer.as_learnable_softplus().is_some()
+        || layer.as_rms_norm_learnable_eps().is_some()
+        || layer.as_adaptive_dropout().is_some()
+        || layer.as_sparse_feature_selection_gate().is_some()
+        || layer.as_adaptive_normalization().is_some()
+        || layer.as_batch_renorm().is_some()
+        || layer.as_concrete_dropout().is_some()
+        || layer.as_ind_rnn().is_some()
+        || layer.as_mamba().is_some()
     {
-        // Для этих слоёв выходная размерность равна входной
-        input.cols()
-    } else {
-        // Fallback
-        input.cols()
+        return input.cols();
     }
+
+    input.cols()
 }
 
-/// Вызывает буферизованный прямой проход для слоя.
 fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,
@@ -117,29 +128,57 @@ fn call_forward_buffered(
     slice: &ParamSlice,
 ) {
     if let Some(l) = layer.as_linear() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <Linear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_relu() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <ReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_sigmoid() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <Sigmoid as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_tanh() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <Tanh as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_leaky_relu() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <LeakyReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_identity() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <Identity as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_softmax() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <Softmax as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_memory() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <Memory as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_soft_sparse_gate() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <SoftSparseGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_soft_keep_gate() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <SoftKeepGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_dual_anchor() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <DualAnchor as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_adaptive_activation() {
-        <dyn UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+        <AdaptivePerFeatureActivation as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_dual_slope_relu() {
+        <DualSlopeReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_learnable_mish() {
+        <LearnableMish as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_learnable_softplus() {
+        <LearnableSoftplus as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_rms_norm_learnable_eps() {
+        <RMSNormWithLearnableEpsilon as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_adaptive_dropout() {
+        <AdaptiveDropout as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_feature_fusion() {
+        <FeatureFusion as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_sparse_feature_selection_gate() {
+        <SparseFeatureSelectionGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_multi_resolution_kan_linear() {
+        <MultiResolutionKANLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_adaptive_normalization() {
+        <AdaptiveNormalization as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_batch_renorm() {
+        <BatchRenorm1d as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_concrete_dropout() {
+        <ConcreteDropout as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_ind_rnn() {
+        <IndRNN as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_mamba() {
+        <Mamba as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_spectral_norm_linear() {
+        <SpectrallyNormalizedLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else {
         unreachable!(
             "Layer {:?} does not implement UniversalLayerBuffered for CPU path",
@@ -148,11 +187,11 @@ fn call_forward_buffered(
     }
 }
 
-/// Создаёт буферизованный контекст для слоя.
 fn build_buffered_context(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,
     output: &MatrixBufferHandle,
+    pool: &mut TempMatrixPool,
 ) -> BufferedContext {
     if layer.as_linear().is_some() {
         BufferedContext::Linear { input: input.clone() }
@@ -178,8 +217,59 @@ fn build_buffered_context(
         BufferedContext::DualAnchor1D { input: input.clone() }
     } else if layer.as_adaptive_activation().is_some() {
         BufferedContext::AdaptiveActivation { input: input.clone() }
+    } else if layer.as_dual_slope_relu().is_some() {
+        BufferedContext::DualSlopeReLU { input: input.clone() }
+    } else if layer.as_learnable_mish().is_some() {
+        BufferedContext::LearnableMish { input: input.clone() }
+    } else if layer.as_learnable_softplus().is_some() {
+        BufferedContext::LearnableSoftplus { input: input.clone() }
+    } else if layer.as_rms_norm_learnable_eps().is_some() {
+        BufferedContext::RMSNormWithLearnableEpsilon { input: input.clone() }
+    } else if layer.as_adaptive_dropout().is_some() {
+        // Для CPU-ветки mask и arg не нужны, создаём пустые handle
+        let empty_mask = pool.acquire(0, 0);
+        let empty_arg = pool.acquire(0, 0);
+        BufferedContext::AdaptiveDropout {
+            input: input.clone(),
+            mask: empty_mask,
+            arg: empty_arg,
+        }
+    } else if layer.as_feature_fusion().is_some() {
+        BufferedContext::FeatureFusion { input: input.clone() }
+    } else if layer.as_sparse_feature_selection_gate().is_some() {
+        BufferedContext::SparseFeatureSelectionGate { input: input.clone() }
+    } else if layer.as_multi_resolution_kan_linear().is_some() {
+        BufferedContext::MultiResolutionKANLinear { input: input.clone() }
+    } else if layer.as_adaptive_normalization().is_some() {
+        BufferedContext::AdaptiveNormalization { input: input.clone() }
+    } else if layer.as_batch_renorm().is_some() {
+        BufferedContext::BatchRenorm {
+            input: input.clone(),
+            mean: Vec::new(),
+            var: Vec::new(),
+            use_batch_stats: true, // заменить на слой если нужно
+        }
+    } else if layer.as_concrete_dropout().is_some() {
+        let empty_arg = pool.acquire(0, 0);
+        BufferedContext::ConcreteDropout {
+            input: input.clone(),
+            arg: empty_arg,
+        }
+    } else if layer.as_ind_rnn().is_some() {
+        let empty_h = pool.acquire(0, 0);
+        BufferedContext::IndRNN {
+            input: input.clone(),
+            h_all: empty_h,
+        }
+    } else if layer.as_mamba().is_some() {
+        let empty_h = pool.acquire(0, 0);
+        BufferedContext::Mamba {
+            input: input.clone(),
+            h_all: empty_h,
+        }
+    } else if layer.as_spectral_norm_linear().is_some() {
+        BufferedContext::SpectralNormLinear { input: input.clone() }
     } else {
-        // Fallback: Identity
         BufferedContext::Identity { input: input.clone() }
     }
 }

@@ -83,11 +83,13 @@ pub enum BufferedContext {
     /// Вход ConcreteDropout.
     ConcreteDropout {
         input: MatrixBufferHandle,
+        arg: MatrixBufferHandle,
     },
 
     /// Вход Mamba (состояния и промежуточные данные хранятся в самом слое).
     Mamba {
         input: MatrixBufferHandle,
+        h_all: MatrixBufferHandle,
     },
 
     /// Вход LinearAttention (промежуточные данные хранятся в самом слое).
@@ -103,6 +105,7 @@ pub enum BufferedContext {
     /// Вход IndRNN (промежуточные данные хранятся в самом слое).
     IndRNN {
         input: MatrixBufferHandle,
+        h_all: MatrixBufferHandle,
     },
 
     /// Вход SpectrallyNormalizedLinear (сохранение sigma производится в самом слое).
@@ -139,5 +142,49 @@ pub enum BufferedContext {
         input_a: MatrixBufferHandle,
         input_b: MatrixBufferHandle,
         pre_act: MatrixBufferHandle,
+    },
+
+    // ================= Новые слои =================
+
+    /// Вход DualSlopeReLU.
+    DualSlopeReLU {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход LearnableMish.
+    LearnableMish {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход LearnableSoftplus.
+    LearnableSoftplus {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход RMSNormWithLearnableEpsilon.
+    RMSNormWithLearnableEpsilon {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход AdaptiveDropout.
+    AdaptiveDropout {
+        input: MatrixBufferHandle,
+        mask: MatrixBufferHandle,
+        arg: MatrixBufferHandle,
+    },
+
+    /// Вход FeatureFusion.
+    FeatureFusion {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход SparseFeatureSelectionGate.
+    SparseFeatureSelectionGate {
+        input: MatrixBufferHandle,
+    },
+
+    /// Вход MultiResolutionKANLinear.
+    MultiResolutionKANLinear {
+        input: MatrixBufferHandle,
     },
 }

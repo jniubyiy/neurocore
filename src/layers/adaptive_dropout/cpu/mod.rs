@@ -22,7 +22,6 @@ impl UniversalLayerBuffered for AdaptiveDropout {
         debug_assert_eq!(cols, self.features);
         debug_assert!(slice.start + self.param_len() <= params.rows() * params.cols());
 
-        // Читаем параметры (θ, T)
         let (theta, temp) = {
             let p_guard = params.read();
             let p = p_guard.as_slice().unwrap();
@@ -38,7 +37,6 @@ impl UniversalLayerBuffered for AdaptiveDropout {
         let mut rng = rand::thread_rng();
         let total = rows * cols;
 
-        // Генерируем маску и вероятности
         let mut mask = vec![0.0f32; total];
         let mut probs = vec![0.0f32; total];
 
@@ -48,24 +46,20 @@ impl UniversalLayerBuffered for AdaptiveDropout {
 
             for c in 0..cols {
                 let theta_c = theta[c];
-                let temp_c = temp[c].abs() + eps; // гарантируем положительность
+                let temp_c = temp[c].abs() + eps;
                 for r in 0..rows {
                     let idx = c * rows + r;
                     let x_val = x[idx].abs();
-                    // p = sigmoid( (|x| - θ) / T )
                     let p = 1.0 / (1.0 + (-(x_val - theta_c) / temp_c).exp());
                     probs[idx] = p;
-                    // z ~ Bernoulli(p)
                     let keep = rng.gen::<f32>() < p;
                     mask[idx] = if keep { 1.0 } else { 0.0 };
                 }
             }
         }
 
-        // Сохраняем маску для обратного прохода
         *self.mask.lock().unwrap() = Some(mask.clone());
 
-        // Вычисляем выход: y = x * z / (p + eps)
         {
             let input_guard = input.read();
             let x = input_guard.as_slice().unwrap();
@@ -88,7 +82,7 @@ impl UniversalLayerBuffered for AdaptiveDropout {
     ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
-            BufferedContext::AdaptiveDropout { input } => input,
+            BufferedContext::AdaptiveDropout { input, .. } => input,
             _ => panic!("Expected AdaptiveDropout context"),
         };
 
@@ -145,18 +139,12 @@ impl UniversalLayerBuffered for AdaptiveDropout {
                         let prob = 1.0 / (1.0 + (-(x_val.abs() - theta_c) / temp_c).exp());
                         let z = mask[idx];
 
-                        // Градиент по входу: dL/dx = gout * z / (prob + eps)
                         gi[idx] = gout * z / (prob + eps);
 
-                        // Производные sigmoid по параметрам
                         let dsig_darg = prob * (1.0 - prob);
-                        // d(prob)/d(theta) = - dsig_darg / temp_c
                         let dprob_dtheta = -dsig_darg / temp_c;
-                        // d(prob)/d(temp) = - dsig_darg * (x_abs - theta_c) / (temp_c^2)
                         let dprob_dtemp = -dsig_darg * (x_val.abs() - theta_c) / (temp_c * temp_c);
 
-                        // Градиент по θ: dL/dθ = sum_r dL/dy * dy/dprob * dprob/dθ
-                        // dy/dprob = - x * z / (prob + eps)^2
                         let dy_dprob = -x_val * z / ((prob + eps) * (prob + eps));
                         d_theta_acc += gout * dy_dprob * dprob_dtheta;
                         d_temp_acc += gout * dy_dprob * dprob_dtemp;
@@ -166,7 +154,6 @@ impl UniversalLayerBuffered for AdaptiveDropout {
                     grad_temp[c] = d_temp_acc;
                 }
 
-                // Записываем градиенты параметров
                 for c in 0..self.features {
                     gp[theta_start + c] = grad_theta[c];
                     gp[temp_start + c] = grad_temp[c];

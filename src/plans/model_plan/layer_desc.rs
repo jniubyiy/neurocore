@@ -116,11 +116,95 @@ impl LayerDesc {
                 let in_features = self.input_shape.streams[0];
                 let num_activations = self.extra.get(0)
                     .map(|v| *v as usize)
-                    .unwrap_or(4); // по умолчанию 4 базовые активации
+                    .unwrap_or(4);
                 in_features * num_activations
             }
             LayerKind::SplitterConnector | LayerKind::CombinerConnector => 0,
             LayerKind::Unsqueeze | LayerKind::ReduceMean => 0,
+
+            // Новые слои
+            LayerKind::DualSlopeReLU => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "DualSlopeReLU expects one input stream");
+                2 * self.input_shape.streams[0]
+            }
+            LayerKind::LearnableMish => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "LearnableMish expects one input stream");
+                1 // один обучаемый параметр λ
+            }
+            LayerKind::LearnableSoftplus => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "LearnableSoftplus expects one input stream");
+                2 * self.input_shape.streams[0]
+            }
+            LayerKind::AdaptiveNormalization => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "AdaptiveNormalization expects one input stream");
+                7 * self.input_shape.streams[0]
+            }
+            LayerKind::BatchRenorm1d => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "BatchRenorm1d expects one input stream");
+                4 * self.input_shape.streams[0]
+            }
+            LayerKind::RMSNormWithLearnableEpsilon => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "RMSNormWithLearnableEpsilon expects one input stream");
+                2 * self.input_shape.streams[0]
+            }
+            LayerKind::ConcreteDropout => 1, // только logit_p
+            LayerKind::AdaptiveDropout => {
+                assert_eq!(self.input_shape.streams.len(), 1,
+                    "AdaptiveDropout expects one input stream");
+                2 * self.input_shape.streams[0]
+            }
+            LayerKind::LinearAttention => {
+                // Ожидаем extra = [seq_len, d_model]
+                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                4 * (d_model * d_model + d_model)
+            }
+            LayerKind::RelativePositionAttention => {
+                // extra = [seq_len, d_model]
+                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                4 * (d_model * d_model + d_model) + (2 * seq_len - 1)
+            }
+            LayerKind::IndRNN => {
+                // extra = [input_dim, seq_len]
+                let input_dim = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let seq_len = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                input_dim * input_dim + 2 * input_dim
+            }
+            LayerKind::Mamba => {
+                // extra = [seq_len, input_dim, state_dim]
+                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let input_dim = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                let state_dim = self.extra.get(2).copied().unwrap_or(1.0) as usize;
+                state_dim * state_dim + state_dim * input_dim + input_dim * state_dim + 2
+            }
+            LayerKind::FeatureFusion => {
+                let in_features = self.input_shape.streams[0];
+                let out_features = self.output_shape.streams[0];
+                out_features * (in_features + 1)
+            }
+            LayerKind::SpectrallyNormalizedLinear => {
+                let in_features = self.input_shape.streams[0];
+                let out_features = self.output_shape.streams[0];
+                in_features * out_features + out_features + 1
+            }
+            LayerKind::SparseFeatureSelectionGate => {
+                let features = self.input_shape.streams[0];
+                features + 1
+            }
+            LayerKind::MultiResolutionKANLinear => {
+                let in_features = self.input_shape.streams[0];
+                let out_features = self.output_shape.streams[0];
+                let coarse = 4;
+                let fine = 8;
+                in_features * out_features * (coarse + fine) + out_features
+            }
             _ => 0,
         }
     }
@@ -163,11 +247,84 @@ impl LayerDesc {
                 let in_features = self.input_shape.streams[0];
                 let num_activations = self.extra.get(0)
                     .map(|v| *v as usize)
-                    .unwrap_or(4); // по умолчанию 4 базовые активации
+                    .unwrap_or(4);
                 Box::new(crate::layers::AdaptivePerFeatureActivation::new(
                     in_features,
                     num_activations,
                 ))
+            }
+            // Новые слои
+            LayerKind::DualSlopeReLU => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::DualSlopeReLU::new(features))
+            }
+            LayerKind::LearnableMish => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::LearnableMish::new(features))
+            }
+            LayerKind::LearnableSoftplus => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::LearnableSoftplus::new(features))
+            }
+            LayerKind::AdaptiveNormalization => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::AdaptiveNormalization::new(features))
+            }
+            LayerKind::BatchRenorm1d => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::BatchRenorm1d::new(features))
+            }
+            LayerKind::RMSNormWithLearnableEpsilon => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::RMSNormWithLearnableEpsilon::new(features))
+            }
+            LayerKind::ConcreteDropout => {
+                let temp = self.extra.get(0).copied().unwrap_or(0.1);
+                Box::new(crate::layers::ConcreteDropout::new(temp))
+            }
+            LayerKind::AdaptiveDropout => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::AdaptiveDropout::new(features))
+            }
+            LayerKind::LinearAttention => {
+                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                Box::new(crate::layers::LinearAttention::new(seq_len, d_model))
+            }
+            LayerKind::RelativePositionAttention => {
+                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                Box::new(crate::layers::RelativePositionAttention::new(seq_len, d_model))
+            }
+            LayerKind::IndRNN => {
+                let input_dim = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let seq_len = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                Box::new(crate::layers::IndRNN::new(input_dim, seq_len))
+            }
+            LayerKind::Mamba => {
+                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let input_dim = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                let state_dim = self.extra.get(2).copied().unwrap_or(1.0) as usize;
+                Box::new(crate::layers::Mamba::new(seq_len, input_dim, state_dim))
+            }
+            LayerKind::FeatureFusion => {
+                let in_features = self.input_shape.streams[0];
+                let out_features = self.output_shape.streams[0];
+                Box::new(crate::layers::FeatureFusion::new(in_features, out_features))
+            }
+            LayerKind::SpectrallyNormalizedLinear => {
+                let in_features = self.input_shape.streams[0];
+                let out_features = self.output_shape.streams[0];
+                Box::new(crate::layers::SpectrallyNormalizedLinear::new(in_features, out_features))
+            }
+            LayerKind::SparseFeatureSelectionGate => {
+                let features = self.input_shape.streams[0];
+                Box::new(crate::layers::SparseFeatureSelectionGate::new(features))
+            }
+            LayerKind::MultiResolutionKANLinear => {
+                let in_features = self.input_shape.streams[0];
+                let out_features = self.output_shape.streams[0];
+                Box::new(crate::layers::MultiResolutionKANLinear::new(in_features, out_features))
             }
             _ => panic!("Unsupported layer kind for UniversalLayer: {:?}", self.kind),
         }

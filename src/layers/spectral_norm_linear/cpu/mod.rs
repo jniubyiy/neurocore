@@ -39,6 +39,10 @@ impl UniversalLayerBuffered for SpectrallyNormalizedLinear {
 
             // Обновляем u и v степенным методом
             let mut state = self.state.lock().unwrap();
+            // Разрешаем одновременное мутабельное заимствование полей,
+            // преобразовав MutexGuard в обычную мутабельную ссылку.
+            let state = &mut *state;
+
             if !state.initialized {
                 state.u.fill(1.0);
                 state.v.fill(1.0);
@@ -175,7 +179,6 @@ impl UniversalLayerBuffered for SpectrallyNormalizedLinear {
                         grad_b[i] += gout;
 
                         // Градиент по scale: dL/dscale = sum (gout * (W x)_i) / sigma
-                        // (W x)_i = sum_j W[i,j] * x[j,r]
                         let mut wx = 0.0f32;
                         for j in 0..in_feat {
                             wx += p[w_start + i * in_feat + j] * x[j * batch + r];

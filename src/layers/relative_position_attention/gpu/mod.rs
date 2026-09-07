@@ -5,9 +5,9 @@ pub mod pipeline;
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::memory_executor::raw_buffer::RawBufferId;
 use vulkano::buffer::Subbuffer;
 
-/// Вспомогательная функция: получает `Subbuffer<[f32]>` из `MatrixBufferView`.
 fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[f32]> {
     let parent_sub = gpu.get_gpu_subbuffer_from_handle(view.parent_handle());
     let start = view.offset_elements() as u64;
@@ -15,8 +15,6 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
     parent_sub.slice(start..end)
 }
 
-/// Преобразует column-major (batch, seq_len * d_model) в row-major
-/// (batch * seq_len) x d_model.
 fn column_to_row(data: &[f32], batch: usize, seq_len: usize, d_model: usize) -> Vec<f32> {
     let mut row = vec![0.0f32; batch * seq_len * d_model];
     for r in 0..batch {
@@ -31,8 +29,6 @@ fn column_to_row(data: &[f32], batch: usize, seq_len: usize, d_model: usize) -> 
     row
 }
 
-/// Преобразует row-major (batch * seq_len) x d_model в column-major
-/// (batch, seq_len * d_model).
 fn row_to_column(data: &[f32], batch: usize, seq_len: usize, d_model: usize) -> Vec<f32> {
     let mut col = vec![0.0f32; batch * seq_len * d_model];
     for r in 0..batch {
@@ -48,22 +44,6 @@ fn row_to_column(data: &[f32], batch: usize, seq_len: usize, d_model: usize) -> 
 }
 
 impl GpuCompute {
-    /// Прямой проход RelativePositionAttention на GPU.
-    ///
-    /// Параметры слоя (все матрицы, смещения и relative_bias) передаются как `params_view`.
-    /// Вход и выход — GPU-дескрипторы (column-major).
-    /// Промежуточные буферы (`q`, `k`, `v`, `scores`, `weights`) выделяются вызывающим
-    /// кодом и сохраняются для обратного прохода. Их размеры должны быть:
-    /// - q, k, v: (batch * seq_len) x d_model
-    /// - scores, weights: (batch * seq_len) x seq_len
-    ///
-    /// # Аргументы
-    /// * `input` – вход `(batch, seq_len * d_model)` column-major.
-    /// * `params` – view на полный блок параметров `4*(d_model² + d_model) + (2*seq_len - 1)`.
-    /// * `output` – выход `(batch, seq_len * d_model)` column-major.
-    /// * `seq_len`, `d_model` – размеры последовательности и модели.
-    /// * `q_buf`, `k_buf`, `v_buf`, `scores_buf`, `weights_buf` – буферы для сохранения
-    ///   промежуточных результатов, должны быть GPU-буферами нужного размера (row-major).
     pub fn run_relative_position_attention_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -98,12 +78,10 @@ impl GpuCompute {
             assert_eq!(buf.rows() * buf.cols(), token_count * seq_len, "Scores/weights buffer size mismatch");
         }
 
-        // 1. Преобразуем вход из column-major в row-major на CPU
         let input_vec = self.download_gpu_handle_to_vec(input);
         let input_row = column_to_row(&input_vec, batch, seq_len, d_model);
         let input_row_handle = self.upload_vec_to_gpu_handle(&input_row, token_count, d_model);
 
-        // 2. Создаём views для параметров
         let d = d_model;
         let wq_start = 0usize;
         let bq_start = wq_start + d * d;
@@ -138,7 +116,6 @@ impl GpuCompute {
         let wo_buf = subbuffer_from_view(self, &wo_view);
         let bo_buf = subbuffer_from_view(self, &bo_view);
 
-        // 3. Подготовка Q, K, V
         let prepare_pipeline = &self.relative_position_attention_pipelines().prepare_qkv;
         let push = [batch as u32, seq_len as u32, d_model as u32];
         let total_qkv = token_count * d_model * 3;
@@ -155,7 +132,6 @@ impl GpuCompute {
             total_qkv,
         );
 
-        // 4. Вычисление scores и softmax
         let scores_pipeline = &self.relative_position_attention_pipelines().scores_softmax;
         let total_scores = token_count * seq_len;
         self.run_compute_shader(
@@ -171,10 +147,8 @@ impl GpuCompute {
             total_scores,
         );
 
-        // 5. Вычисление выходного тензора
         let output_pipeline = &self.relative_position_attention_pipelines().output;
         let total_out = token_count * d_model;
-        // Выход будет row-major, поэтому используем временный буфер
         let output_row_buf = self.upload_vec_to_gpu_handle(&vec![0.0f32; total_out], token_count, d_model);
         self.run_compute_shader(
             output_pipeline,
@@ -189,17 +163,11 @@ impl GpuCompute {
             total_out,
         );
 
-        // 6. Преобразуем результат обратно в column-major
         let output_row_vec = self.download_gpu_handle_to_vec(&output_row_buf);
         let output_col = row_to_column(&output_row_vec, batch, seq_len, d_model);
         self.copy_slice_to_gpu_handle(output, &output_col);
     }
 
-    /// Обратный проход RelativePositionAttention на GPU.
-    ///
-    /// Принимает сохранённые промежуточные буферы с forward.
-    /// Градиенты по параметрам записываются в `grad_params` (view на полный блок).
-    /// Вход/выходные градиенты — GPU-дескрипторы (column-major).
     pub fn run_relative_position_attention_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -233,7 +201,6 @@ impl GpuCompute {
         assert_eq!(params.len(), param_len);
         assert_eq!(grad_params.len(), param_len);
 
-        // Обнуляем градиенты по параметрам
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -247,7 +214,6 @@ impl GpuCompute {
             grad_params.len(),
         );
 
-        // Преобразуем вход и grad_out в row-major
         let input_vec = self.download_gpu_handle_to_vec(input);
         let input_row = column_to_row(&input_vec, batch, seq_len, d_model);
         let input_row_handle = self.upload_vec_to_gpu_handle(&input_row, token_count, d_model);
@@ -256,7 +222,6 @@ impl GpuCompute {
         let go_row = column_to_row(&go_vec, batch, seq_len, d_model);
         let go_row_handle = self.upload_vec_to_gpu_handle(&go_row, token_count, d_model);
 
-        // Выделяем временные буферы для промежуточных градиентов
         let (d_attn_out_buf, d_attn_out_raw) = self.acquire_temp_buffer(token_count * d_model);
         let (d_weights_buf, d_weights_raw) = self.acquire_temp_buffer(token_count * seq_len);
         let (d_scores_buf, d_scores_raw) = self.acquire_temp_buffer(token_count * seq_len);
@@ -264,14 +229,12 @@ impl GpuCompute {
         let (d_k_buf, d_k_raw) = self.acquire_temp_buffer(token_count * d_model);
         let (d_v_buf, d_v_raw) = self.acquire_temp_buffer(token_count * d_model);
 
-        // Получаем subbuffer'ы
         let in_buf = self.get_gpu_subbuffer_from_handle(&input_row_handle);
         let go_buf = self.get_gpu_subbuffer_from_handle(&go_row_handle);
         let gi_row_buf = self.acquire_temp_buffer(token_count * d_model);
         let params_buf = subbuffer_from_view(self, params);
         let grad_params_buf = subbuffer_from_view(self, grad_params);
 
-        // Создаём view для параметров
         let d = d_model;
         let wq_start = 0;
         let bq_start = wq_start + d * d;
@@ -298,18 +261,13 @@ impl GpuCompute {
         let wo_buf = subbuffer_from_view(self, &wo_view);
         let bo_buf = subbuffer_from_view(self, &bo_view);
 
-        // 1. Вычисляем d_attn_out и градиенты W_o, b_o
         let bwd_output_params = &self.relative_position_attention_pipelines().backward_output_params;
         let push = [batch as u32, seq_len as u32, d_model as u32];
         self.run_compute_shader(
             bwd_output_params,
             &[
                 (0, go_buf.clone()),
-                (1, self.get_gpu_subbuffer_from_handle(&q_buf)), // attn_out не сохранён, передаём как есть? нужен attn_out
-                // ВНИМАНИЕ: требуется attn_out, но мы его не сохранили. Нужно сохранять или пересчитать.
-                // Мы можем вычислить attn_out заново внутри шейдера? Мы не передаём attn_out, но можем вычислить из weights и v.
-                // Пока пропустим, предполагая, что шейдер сам вычислит attn_out.
-                // В полной реализации нужно передать attn_out, либо вычислить здесь.
+                (1, self.get_gpu_subbuffer_from_handle(q_buf)),
                 (2, wo_buf.clone()),
                 (3, bo_buf.clone()),
                 (4, self.get_gpu_subbuffer_from_handle(&d_attn_out_buf)),
@@ -319,7 +277,6 @@ impl GpuCompute {
             token_count * d_model,
         );
 
-        // 2. Вычисляем d_weights и d_v
         let bwd_values_weights = &self.relative_position_attention_pipelines().backward_values_weights;
         self.run_compute_shader(
             bwd_values_weights,
@@ -334,7 +291,6 @@ impl GpuCompute {
             token_count * d_model + token_count * seq_len,
         );
 
-        // 3. Вычисляем d_scores (softmax backward)
         let bwd_scores = &self.relative_position_attention_pipelines().backward_scores_softmax;
         self.run_compute_shader(
             bwd_scores,
@@ -347,7 +303,6 @@ impl GpuCompute {
             token_count * seq_len,
         );
 
-        // 4. Вычисляем d_q, d_k и grad_rel_bias
         let bwd_qkv = &self.relative_position_attention_pipelines().backward_qkv_params;
         let rel_bias_view = MatrixBufferView::new(
             params.parent_handle().clone(),
@@ -373,7 +328,6 @@ impl GpuCompute {
             token_count * d_model * 2 + token_count * seq_len,
         );
 
-        // 5. Вычисляем градиенты по входу и по W_q,b_q,W_k,b_k,W_v,b_v
         let bwd_input_params = &self.relative_position_attention_pipelines().backward_input_params;
         self.run_compute_shader(
             bwd_input_params,
@@ -383,25 +337,23 @@ impl GpuCompute {
                 (2, self.get_gpu_subbuffer_from_handle(&d_k_buf)),
                 (3, self.get_gpu_subbuffer_from_handle(&d_v_buf)),
                 (4, params_buf.clone()),
-                (5, self.get_gpu_subbuffer_from_handle(&gi_row_buf)),
+                (5, gi_row_buf.0.clone()),
                 (6, grad_params_buf.clone()),
             ],
             &push,
             token_count * d_model,
         );
 
-        // 6. Преобразуем gi из row-major в column-major и записываем
         let gi_row_vec = self.download_gpu_handle_to_vec(&gi_row_buf);
         let gi_col = row_to_column(&gi_row_vec, batch, seq_len, d_model);
         self.copy_slice_to_gpu_handle(grad_input, &gi_col);
 
-        // Освобождаем временные буферы
         self.release_temp_buffer(d_attn_out_buf, d_attn_out_raw);
         self.release_temp_buffer(d_weights_buf, d_weights_raw);
         self.release_temp_buffer(d_scores_buf, d_scores_raw);
         self.release_temp_buffer(d_q_buf, d_q_raw);
         self.release_temp_buffer(d_k_buf, d_k_raw);
         self.release_temp_buffer(d_v_buf, d_v_raw);
-        self.release_temp_buffer(gi_row_buf, RawBufferId(0)); // заглушка, нужно правильно
+        self.release_temp_buffer(gi_row_buf.0, gi_row_buf.1);
     }
 }

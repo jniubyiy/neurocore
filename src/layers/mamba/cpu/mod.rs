@@ -10,8 +10,6 @@ use super::super::mamba::mamba::{Mamba, MambaForwardCache};
 
 // Вспомогательные функции линейной алгебры
 
-/// Умножение матрицы (n x m) на вектор (m) -> вектор (n).
-/// Матрица хранится row-major.
 fn mat_vec_mul(mat: &[f32], vec: &[f32], n: usize, m: usize) -> Vec<f32> {
     let mut res = vec![0.0f32; n];
     for i in 0..n {
@@ -24,7 +22,6 @@ fn mat_vec_mul(mat: &[f32], vec: &[f32], n: usize, m: usize) -> Vec<f32> {
     res
 }
 
-/// Транспонированное умножение матрицы (n x m) на вектор (n) -> вектор (m).
 fn mat_transpose_vec_mul(mat: &[f32], vec: &[f32], n: usize, m: usize) -> Vec<f32> {
     let mut res = vec![0.0f32; m];
     for j in 0..m {
@@ -37,16 +34,13 @@ fn mat_transpose_vec_mul(mat: &[f32], vec: &[f32], n: usize, m: usize) -> Vec<f3
     res
 }
 
-/// Приближённая матричная экспонента через ряд Тейлора (10 членов).
 fn expm_taylor(mat: &[f32], n: usize) -> Vec<f32> {
     let mut result = vec![0.0f32; n * n];
     let mut term = vec![0.0f32; n * n];
-    // term = I
     for i in 0..n {
         term[i * n + i] = 1.0;
     }
     for k in 1..=10 {
-        // term = term * mat / k
         let mut next = vec![0.0f32; n * n];
         for i in 0..n {
             for j in 0..n {
@@ -99,46 +93,36 @@ impl UniversalLayerBuffered for Mamba {
 
             let base = slice.start;
 
-            // Смещения параметров
             let a_start = base;
             let b_start = a_start + n * n;
             let c_start = b_start + n * d;
             let d_idx = c_start + d * n;
             let delta_idx = d_idx + 1;
 
-            // Извлекаем параметры
             let A = &p[a_start..a_start + n * n];
             let B = &p[b_start..b_start + n * d];
             let C = &p[c_start..c_start + d * n];
             let D = p[d_idx];
             let delta = p[delta_idx];
 
-            // Дискретизация
-            // A_bar = exp(delta * A)
             let mut delta_A = vec![0.0f32; n * n];
             for i in 0..n * n {
                 delta_A[i] = delta * A[i];
             }
             let A_bar = expm_taylor(&delta_A, n);
-
-            // B_bar = delta * B
             let B_bar: Vec<f32> = B.iter().map(|v| delta * v).collect();
 
-            // Кэш для обратного прохода
             let mut h_all = vec![0.0f32; batch * seq * n];
-            let input_copy = x.to_vec(); // сохраняем копию входа
+            let input_copy = x.to_vec();
 
-            // Прямой проход
             for r in 0..batch {
                 let mut h_prev = vec![0.0f32; n];
                 for t in 0..seq {
-                    // Извлекаем x_t для этого r и t (длина d)
                     let mut x_t = vec![0.0f32; d];
                     for j in 0..d {
                         x_t[j] = x[(t * d + j) * batch + r];
                     }
 
-                    // h_t = A_bar @ h_prev + B_bar @ x_t
                     let ah = mat_vec_mul(&A_bar, &h_prev, n, n);
                     let bx = mat_vec_mul(&B_bar, &x_t, n, d);
                     let mut h_t = vec![0.0f32; n];
@@ -146,20 +130,17 @@ impl UniversalLayerBuffered for Mamba {
                         h_t[i] = ah[i] + bx[i];
                     }
 
-                    // y_t = C @ h_t + D * x_t
                     let ch = mat_vec_mul(C, &h_t, d, n);
                     let mut y_t = vec![0.0f32; d];
                     for j in 0..d {
                         y_t[j] = ch[j] + D * x_t[j];
                     }
 
-                    // Сохраняем h_t
                     let h_offset = (r * seq + t) * n;
                     for i in 0..n {
                         h_all[h_offset + i] = h_t[i];
                     }
 
-                    // Сохраняем y_t в выходной буфер (column-major)
                     for j in 0..d {
                         let out_idx = (t * d + j) * batch + r;
                         y[out_idx] = y_t[j];
@@ -169,7 +150,6 @@ impl UniversalLayerBuffered for Mamba {
                 }
             }
 
-            // Сохраняем кэш
             self.store_cache(MambaForwardCache {
                 input: input_copy,
                 h_all,
@@ -190,7 +170,7 @@ impl UniversalLayerBuffered for Mamba {
     ) {
         let DynamicContext::Buffered(bc) = ctx;
         let _input_handle = match bc {
-            BufferedContext::Mamba { input } => input,
+            BufferedContext::Mamba { input, .. } => input,
             _ => panic!("Expected Mamba context"),
         };
 
@@ -212,7 +192,6 @@ impl UniversalLayerBuffered for Mamba {
             "Mamba backward: grad parameter slice out of bounds"
         );
 
-        // Извлекаем кэш
         let cache = self
             .take_cache()
             .expect("Mamba backward called without forward cache");
@@ -256,36 +235,29 @@ impl UniversalLayerBuffered for Mamba {
                 let x = &cache.input;
                 let h_all = &cache.h_all;
 
-                // Инициализируем градиенты параметров нулями
                 for i in 0..self.param_len() {
                     gp[base + i] = 0.0;
                 }
 
-                // Локальные накопители
                 let mut grad_A = vec![0.0f32; n * n];
                 let mut grad_B = vec![0.0f32; n * d];
                 let mut grad_C = vec![0.0f32; d * n];
                 let mut grad_D = 0.0f32;
                 let mut grad_delta = 0.0f32;
 
-                // Инициализируем градиент по входу нулями
                 for i in 0..(batch * total_tokens) {
                     gi[i] = 0.0;
                 }
 
-                // Для каждого r храним dh_next (градиент от будущих шагов)
                 let mut dh_next = vec![0.0f32; batch * n];
 
-                // Обратное распространение во времени
                 for t in (0..seq).rev() {
                     for r in 0..batch {
-                        // Извлекаем dy_t из grad_output
                         let mut dy_t = vec![0.0f32; d];
                         for j in 0..d {
                             dy_t[j] = go[(t * d + j) * batch + r];
                         }
 
-                        // dh_t = C^T @ dy_t + A_bar^T @ dh_next[r]
                         let c_t_dy = mat_transpose_vec_mul(C, &dy_t, d, n);
                         let at_dh = mat_transpose_vec_mul(A_bar, &dh_next[r * n..(r + 1) * n], n, n);
                         let mut dh_t = vec![0.0f32; n];
@@ -293,7 +265,6 @@ impl UniversalLayerBuffered for Mamba {
                             dh_t[i] = c_t_dy[i] + at_dh[i];
                         }
 
-                        // Градиенты по C и D
                         for j in 0..d {
                             for i in 0..n {
                                 grad_C[j * n + i] += dy_t[j] * h_all[(r * seq + t) * n + i];
@@ -304,25 +275,21 @@ impl UniversalLayerBuffered for Mamba {
                             grad_D += dy_t[j] * x_t;
                         }
 
-                        // Градиент по x_t = B_bar^T @ dh_t + D * dy_t
                         let b_t_dh = mat_transpose_vec_mul(B_bar, &dh_t, n, d);
                         for j in 0..d {
                             let dx = b_t_dh[j] + D * dy_t[j];
                             gi[(t * d + j) * batch + r] = dx;
                         }
 
-                        // Градиенты по A_bar и B_bar
                         let h_prev = if t > 0 {
                             &h_all[(r * seq + t - 1) * n..(r * seq + t - 1) * n + n]
                         } else {
-                            // на первом шаге h_prev = 0, поэтому вклад нулевой
                             &vec![0.0f32; n]
                         };
                         let x_t: Vec<f32> = (0..d)
                             .map(|j| x[(t * d + j) * batch + r])
                             .collect();
 
-                        // dA_bar += dh_t ⊗ h_prev
                         for i in 0..n {
                             for j in 0..n {
                                 grad_A[i * n + j] += delta * dh_t[i] * h_prev[j];
@@ -336,12 +303,10 @@ impl UniversalLayerBuffered for Mamba {
                             }
                         }
 
-                        // Обновляем dh_next для предыдущего шага
                         dh_next[r * n..(r + 1) * n].copy_from_slice(&dh_t);
                     }
                 }
 
-                // Записываем градиенты параметров
                 for i in 0..n * n {
                     gp[a_start + i] = grad_A[i];
                 }

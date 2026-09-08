@@ -92,14 +92,38 @@ pub enum BufferedContext {
         h_all: MatrixBufferHandle,
     },
 
-    /// Вход LinearAttention (промежуточные данные хранятся в самом слое).
+    /// Вход LinearAttention.
+    ///
+    /// Для CPU-реализации промежуточные результаты хранятся внутри слоя,
+    /// поэтому здесь достаточно только `input`.
+    /// Для GPU-реализации все промежуточные буферы должны быть сохранены,
+    /// так как GPU-обратный проход не имеет доступа к внутреннему состоянию слоя.
+    /// Поэтому поля, начиная с `q_raw`, являются `Option<MatrixBufferHandle>`:
+    /// - `None` для CPU
+    /// - `Some(handle)` для GPU
     LinearAttention {
         input: MatrixBufferHandle,
+        q_raw: Option<MatrixBufferHandle>,
+        k_raw: Option<MatrixBufferHandle>,
+        v_raw: Option<MatrixBufferHandle>,
+        q_phi: Option<MatrixBufferHandle>,
+        k_phi: Option<MatrixBufferHandle>,
+        kv: Option<MatrixBufferHandle>,
+        z: Option<MatrixBufferHandle>,
     },
 
-    /// Вход RelativePositionAttention (промежуточные данные хранятся в самом слое).
+    /// Вход RelativePositionAttention.
+    ///
+    /// Аналогично LinearAttention, для CPU достаточно только `input`,
+    /// для GPU необходимо сохранять промежуточные буферы.
+    /// Поля `q`, `k`, `v`, `scores`, `weights` являются `Option<MatrixBufferHandle>`.
     RelativePositionAttention {
         input: MatrixBufferHandle,
+        q: Option<MatrixBufferHandle>,
+        k: Option<MatrixBufferHandle>,
+        v: Option<MatrixBufferHandle>,
+        scores: Option<MatrixBufferHandle>,
+        weights: Option<MatrixBufferHandle>,
     },
 
     /// Вход IndRNN (промежуточные данные хранятся в самом слое).

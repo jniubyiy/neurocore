@@ -5,7 +5,6 @@ pub mod pipeline;
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::compute_manager::memory_executor::raw_buffer::RawBufferId;
 use vulkano::buffer::Subbuffer;
 
 fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[f32]> {
@@ -231,7 +230,7 @@ impl GpuCompute {
 
         let in_buf = self.get_gpu_subbuffer_from_handle(&input_row_handle);
         let go_buf = self.get_gpu_subbuffer_from_handle(&go_row_handle);
-        let gi_row_buf = self.acquire_temp_buffer(token_count * d_model);
+        let (gi_row_buf, gi_row_raw) = self.acquire_temp_buffer(token_count * d_model);
         let params_buf = subbuffer_from_view(self, params);
         let grad_params_buf = subbuffer_from_view(self, grad_params);
 
@@ -270,7 +269,7 @@ impl GpuCompute {
                 (1, self.get_gpu_subbuffer_from_handle(q_buf)),
                 (2, wo_buf.clone()),
                 (3, bo_buf.clone()),
-                (4, self.get_gpu_subbuffer_from_handle(&d_attn_out_buf)),
+                (4, d_attn_out_buf.clone()),
                 (5, grad_params_buf.clone()),
             ],
             &push,
@@ -281,11 +280,11 @@ impl GpuCompute {
         self.run_compute_shader(
             bwd_values_weights,
             &[
-                (0, self.get_gpu_subbuffer_from_handle(&d_attn_out_buf)),
+                (0, d_attn_out_buf.clone()),
                 (1, self.get_gpu_subbuffer_from_handle(v_buf)),
                 (2, self.get_gpu_subbuffer_from_handle(weights_buf)),
-                (3, self.get_gpu_subbuffer_from_handle(&d_weights_buf)),
-                (4, self.get_gpu_subbuffer_from_handle(&d_v_buf)),
+                (3, d_weights_buf.clone()),
+                (4, d_v_buf.clone()),
             ],
             &push,
             token_count * d_model + token_count * seq_len,
@@ -296,8 +295,8 @@ impl GpuCompute {
             bwd_scores,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(weights_buf)),
-                (1, self.get_gpu_subbuffer_from_handle(&d_weights_buf)),
-                (2, self.get_gpu_subbuffer_from_handle(&d_scores_buf)),
+                (1, d_weights_buf.clone()),
+                (2, d_scores_buf.clone()),
             ],
             &push,
             token_count * seq_len,
@@ -319,9 +318,9 @@ impl GpuCompute {
             &[
                 (0, self.get_gpu_subbuffer_from_handle(q_buf)),
                 (1, self.get_gpu_subbuffer_from_handle(k_buf)),
-                (2, self.get_gpu_subbuffer_from_handle(&d_scores_buf)),
-                (3, self.get_gpu_subbuffer_from_handle(&d_q_buf)),
-                (4, self.get_gpu_subbuffer_from_handle(&d_k_buf)),
+                (2, d_scores_buf.clone()),
+                (3, d_q_buf.clone()),
+                (4, d_k_buf.clone()),
                 (5, subbuffer_from_view(self, &grad_rel_bias_view)),
             ],
             &push,
@@ -333,27 +332,36 @@ impl GpuCompute {
             bwd_input_params,
             &[
                 (0, in_buf.clone()),
-                (1, self.get_gpu_subbuffer_from_handle(&d_q_buf)),
-                (2, self.get_gpu_subbuffer_from_handle(&d_k_buf)),
-                (3, self.get_gpu_subbuffer_from_handle(&d_v_buf)),
+                (1, d_q_buf.clone()),
+                (2, d_k_buf.clone()),
+                (3, d_v_buf.clone()),
                 (4, params_buf.clone()),
-                (5, gi_row_buf.0.clone()),
+                (5, gi_row_buf.clone()),
                 (6, grad_params_buf.clone()),
             ],
             &push,
             token_count * d_model,
         );
 
-        let gi_row_vec = self.download_gpu_handle_to_vec(&gi_row_buf);
+        // Чтение gi_row_buf из GPU в CPU через staging
+        let (staging_buf, staging_raw) = self.acquire_staging_buffer(token_count * d_model);
+        self.copy_buffer_sync(gi_row_buf.clone(), staging_buf.clone());
+        let gi_row_vec = {
+            let guard = staging_buf.read().expect("read staging buffer");
+            guard[..token_count * d_model].to_vec()
+        };
+        self.release_staging_buffer(staging_buf, staging_raw);
+
         let gi_col = row_to_column(&gi_row_vec, batch, seq_len, d_model);
         self.copy_slice_to_gpu_handle(grad_input, &gi_col);
 
+        // Освобождаем временные буферы
         self.release_temp_buffer(d_attn_out_buf, d_attn_out_raw);
         self.release_temp_buffer(d_weights_buf, d_weights_raw);
         self.release_temp_buffer(d_scores_buf, d_scores_raw);
         self.release_temp_buffer(d_q_buf, d_q_raw);
         self.release_temp_buffer(d_k_buf, d_k_raw);
         self.release_temp_buffer(d_v_buf, d_v_raw);
-        self.release_temp_buffer(gi_row_buf.0, gi_row_buf.1);
+        self.release_temp_buffer(gi_row_buf, gi_row_raw);
     }
 }

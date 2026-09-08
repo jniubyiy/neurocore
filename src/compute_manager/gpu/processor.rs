@@ -270,7 +270,7 @@ pub fn process_forward_gpu_buffered(
             let mask_out = gpu_compute.allocate_gpu_matrix_handle(batch, features);
             let arg_out = gpu_compute.allocate_gpu_matrix_handle(batch, features);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(batch, features);
-            let seed = 0u32; // можно использовать rand, для простоты 0
+            let seed = adrop.seed as u32; // Приведение u64 -> u32
             gpu_compute.run_adaptive_dropout_forward_buffered_handle(
                 &current,
                 &params_view,
@@ -367,7 +367,7 @@ pub fn process_forward_gpu_buffered(
             let batch = current.rows();
             let arg_out = gpu_compute.allocate_gpu_matrix_handle(batch * current.cols(), 1);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(batch, current.cols());
-            let seed = 0u32;
+            let seed = cdrop.seed as u32; // Приведение u64 -> u32
             gpu_compute.run_concrete_dropout_forward_buffered_handle(
                 &current,
                 &logit_view,
@@ -425,6 +425,90 @@ pub fn process_forward_gpu_buffered(
                 h_all,
             }));
             current = out_handle;
+        } else if let Some(lin_att) = layer.as_linear_attention() {
+            let seq_len = lin_att.seq_len;
+            let d_model = lin_att.d_model;
+            let batch = current.rows();
+            let total_tokens = batch * seq_len;
+
+            let q_raw = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let k_raw = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let v_raw = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let q_phi = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let k_phi = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let kv = gpu_compute.allocate_gpu_matrix_handle(d_model * d_model, 1);
+            let z = gpu_compute.allocate_gpu_matrix_handle(d_model, 1);
+
+            let param_len = lin_att.param_len();
+            let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, param_len);
+
+            let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), lin_att.output_features());
+
+            gpu_compute.run_linear_attention_forward_buffered_handle_with_dims(
+                &current,
+                &params_view,
+                &out_handle,
+                seq_len,
+                d_model,
+                &q_raw,
+                &k_raw,
+                &v_raw,
+                &q_phi,
+                &k_phi,
+                &kv,
+                &z,
+            );
+
+            ctxs.push(DynamicContext::Buffered(BufferedContext::LinearAttention {
+                input: current.clone(),
+                q_raw: Some(q_raw),
+                k_raw: Some(k_raw),
+                v_raw: Some(v_raw),
+                q_phi: Some(q_phi),
+                k_phi: Some(k_phi),
+                kv: Some(kv),
+                z: Some(z),
+            }));
+            current = out_handle;
+        } else if let Some(rel_att) = layer.as_relative_position_attention() {
+            let seq_len = rel_att.seq_len;
+            let d_model = rel_att.d_model;
+            let batch = current.rows();
+            let total_tokens = batch * seq_len;
+
+            let q = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let k = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let v = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
+            let scores = gpu_compute.allocate_gpu_matrix_handle(total_tokens, seq_len);
+            let weights = gpu_compute.allocate_gpu_matrix_handle(total_tokens, seq_len);
+
+            let param_len = rel_att.param_len();
+            let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, param_len);
+
+            let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), rel_att.output_features());
+
+            gpu_compute.run_relative_position_attention_forward_buffered_handle(
+                &current,
+                &params_view,
+                &out_handle,
+                seq_len,
+                d_model,
+                &q,
+                &k,
+                &v,
+                &scores,
+                &weights,
+            );
+
+            ctxs.push(DynamicContext::Buffered(BufferedContext::RelativePositionAttention {
+                input: current.clone(),
+                q: Some(q),
+                k: Some(k),
+                v: Some(v),
+                scores: Some(scores),
+                weights: Some(weights),
+            }));
+            current = out_handle;
         } else if let Some(sn) = layer.as_spectral_norm_linear() {
             let in_feat = sn.in_features;
             let out_feat = sn.out_features;
@@ -434,14 +518,23 @@ pub fn process_forward_gpu_buffered(
             let u_state = gpu_compute.allocate_gpu_matrix_handle(in_feat, 1);
             let v_state = gpu_compute.allocate_gpu_matrix_handle(out_feat, 1);
             let sigma_state = gpu_compute.allocate_gpu_matrix_handle(1, 1);
-            // Загружаем текущие CPU-состояния в GPU (упрощённо: инициализация единицами)
+            // Загружаем начальные значения (можно инициализировать единицами)
             gpu_compute.fill_gpu_handle(&u_state, 1.0);
             gpu_compute.fill_gpu_handle(&v_state, 1.0);
             gpu_compute.fill_gpu_handle(&sigma_state, 1.0);
-            // Извлекаем scale из params (последний элемент)
-            // Так как GPU forward требует scale отдельно, можно скачать параметры? Проще передать из слоя.
-            let scale = 1.0f32; // заглушка, нужно брать из params, но мы не можем быстро извлечь
-            // В реальной интеграции scale хранится в слое, но для простоты примем 1.0
+
+            // Извлекаем scale из параметров (последний элемент)
+            let scale_view = MatrixBufferView::new(
+                params_handle.clone(),
+                slice.start + in_feat * out_feat + out_feat,
+                1,
+            );
+            let scale_cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(scale_view.parent_handle());
+            let scale = {
+                let guard = scale_cpu_handle.read();
+                guard.as_slice().unwrap()[scale_view.offset_elements()]
+            };
+
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), out_feat);
             gpu_compute.run_spectral_norm_linear_forward_buffered_handle(
                 &current,
@@ -452,8 +545,12 @@ pub fn process_forward_gpu_buffered(
                 &v_state,
                 &sigma_state,
             );
-            // Обновляем CPU-состояния слоя (заглушка)
-            // ctxs.push...
+
+            // После forward получаем sigma с GPU и сохраняем в слое
+            let sigma_vec = gpu_compute.download_gpu_handle_to_vec(&sigma_state);
+            let sigma = sigma_vec[0];
+            sn.set_last_sigma(sigma);
+
             ctxs.push(DynamicContext::Buffered(BufferedContext::SpectralNormLinear {
                 input: current.clone(),
             }));
@@ -983,6 +1080,72 @@ pub fn process_backward_gpu_buffered(
                 &h_all_handle,
             );
             current_grad = grad_input_handle;
+        } else if let Some(lin_att) = layer.as_linear_attention() {
+            let seq_len = lin_att.seq_len;
+            let d_model = lin_att.d_model;
+            let DynamicContext::Buffered(bc) = ctx;
+            let (input_handle, q_raw, k_raw, v_raw, q_phi, k_phi, kv, z) = match bc {
+                BufferedContext::LinearAttention { input, q_raw, k_raw, v_raw, q_phi, k_phi, kv, z } => {
+                    (input.clone(), q_raw.clone().unwrap(), k_raw.clone().unwrap(), v_raw.clone().unwrap(), q_phi.clone().unwrap(), k_phi.clone().unwrap(), kv.clone().unwrap(), z.clone().unwrap())
+                },
+                _ => panic!("Expected LinearAttention Buffered context"),
+            };
+
+            let param_len = lin_att.param_len();
+            let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, param_len);
+            let grad_params_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start, param_len);
+
+            let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), lin_att.input_features());
+
+            gpu_compute.run_linear_attention_backward_buffered_handle_with_dims(
+                &input_handle,
+                &current_grad,
+                &params_view,
+                &grad_input_handle,
+                &grad_params_view,
+                seq_len,
+                d_model,
+                &q_raw,
+                &k_raw,
+                &v_raw,
+                &q_phi,
+                &k_phi,
+                &kv,
+                &z,
+            );
+            current_grad = grad_input_handle;
+        } else if let Some(rel_att) = layer.as_relative_position_attention() {
+            let seq_len = rel_att.seq_len;
+            let d_model = rel_att.d_model;
+            let DynamicContext::Buffered(bc) = ctx;
+            let (input_handle, q, k, v, scores, weights) = match bc {
+                BufferedContext::RelativePositionAttention { input, q, k, v, scores, weights } => {
+                    (input.clone(), q.clone().unwrap(), k.clone().unwrap(), v.clone().unwrap(), scores.clone().unwrap(), weights.clone().unwrap())
+                },
+                _ => panic!("Expected RelativePositionAttention Buffered context"),
+            };
+
+            let param_len = rel_att.param_len();
+            let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, param_len);
+            let grad_params_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start, param_len);
+
+            let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), rel_att.input_features());
+
+            gpu_compute.run_relative_position_attention_backward_buffered_handle(
+                &input_handle,
+                &current_grad,
+                &params_view,
+                &grad_input_handle,
+                &grad_params_view,
+                seq_len,
+                d_model,
+                &q,
+                &k,
+                &v,
+                &scores,
+                &weights,
+            );
+            current_grad = grad_input_handle;
         } else if let Some(sn) = layer.as_spectral_norm_linear() {
             let in_feat = sn.in_features;
             let out_feat = sn.out_features;
@@ -995,9 +1158,21 @@ pub fn process_backward_gpu_buffered(
             let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, params_len);
             let grad_params_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start, params_len);
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), in_feat);
-            // Используем sigma из слоя (CPU), загружаем в GPU? Метод требует sigma как f32
+
+            // Извлекаем scale из параметров
+            let scale_view = MatrixBufferView::new(
+                params_handle.clone(),
+                slice.start + in_feat * out_feat + out_feat,
+                1,
+            );
+            let scale_cpu_handle = gpu_compute.download_gpu_handle_to_cpu_handle(scale_view.parent_handle());
+            let scale = {
+                let guard = scale_cpu_handle.read();
+                guard.as_slice().unwrap()[scale_view.offset_elements()]
+            };
+
             let sigma = sn.get_last_sigma();
-            let scale = 1.0f32; // заглушка
+
             gpu_compute.run_spectral_norm_linear_backward_buffered_handle(
                 &input_handle,
                 &current_grad,

@@ -168,7 +168,7 @@ impl UniversalLayerBuffered for RelativePositionAttention {
     ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
-            BufferedContext::RelativePositionAttention { input } => input,
+            BufferedContext::RelativePositionAttention { input, .. } => input,
             _ => panic!("Expected RelativePositionAttention context"),
         };
 
@@ -332,8 +332,8 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                     }
                 }
 
-                let mut d_q_raw = d_q;
-                let mut d_k_raw = d_k;
+                let d_q_raw = d_q;
+                let d_k_raw = d_k;
                 let d_v_raw = d_v;
 
                 for r in 0..batch {

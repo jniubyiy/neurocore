@@ -16,18 +16,27 @@ use crate::layers::UniversalLayer;
 pub struct ConcreteDropout {
     /// Температура Gumbel-Softmax. Обычно около 0.1.
     pub temperature: f32,
+    /// Зерно для генератора случайных чисел. Используется для воспроизводимости.
+    pub seed: u64,
     /// Сохранённый аргумент сигмоиды (для обратного прохода).
-    /// В forward сохраняем `arg = (logit_p + log(u) - log(1-u)) / temperature`,
-    /// чтобы в backward вычислить производную маски.
     pub(crate) mask_state: Mutex<Option<Vec<f32>>>,
 }
 
 impl ConcreteDropout {
-    /// Создаёт слой с заданной температурой.
+    /// Создаёт слой с заданной температурой и seed = 0.
     pub fn new(temperature: f32) -> Self {
+        Self::new_with_seed(temperature, 0)
+    }
+
+    /// Создаёт слой с заданной температурой и seed.
+    ///
+    /// # Паника
+    /// Паникует, если `temperature <= 0`.
+    pub fn new_with_seed(temperature: f32, seed: u64) -> Self {
         assert!(temperature > 0.0, "ConcreteDropout: temperature must be positive");
         Self {
             temperature,
+            seed,
             mask_state: Mutex::new(None),
         }
     }

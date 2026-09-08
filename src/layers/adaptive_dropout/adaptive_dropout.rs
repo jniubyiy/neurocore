@@ -13,15 +13,27 @@ use crate::layers::UniversalLayer;
 /// Для обратного прохода маска сохраняется в слое (Mutex).
 pub struct AdaptiveDropout {
     pub features: usize,
+    /// Зерно для генератора случайных чисел. Используется для воспроизводимости.
+    pub seed: u64,
     /// Маска последнего прямого прохода. Используется только в обратном.
     pub(crate) mask: Mutex<Option<Vec<f32>>>,
 }
 
 impl AdaptiveDropout {
+    /// Создаёт новый слой с seed = 0 (для обратной совместимости).
     pub fn new(features: usize) -> Self {
+        Self::new_with_seed(features, 0)
+    }
+
+    /// Создаёт новый слой с заданным seed.
+    ///
+    /// # Паника
+    /// Паникует, если `features == 0`.
+    pub fn new_with_seed(features: usize, seed: u64) -> Self {
         assert!(features > 0, "AdaptiveDropout: features must be positive");
         Self {
             features,
+            seed,
             mask: Mutex::new(None),
         }
     }

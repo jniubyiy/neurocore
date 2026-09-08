@@ -105,7 +105,7 @@ impl UniversalLayerBuffered for LinearAttention {
                     let idx = r * tokens_per_batch + t * d;
                     for i in 0..d {
                         let ki = k_phi[idx + i];
-                        let vi = v_raw[idx + i];
+                        let _vi = v_raw[idx + i]; // переименовано для устранения предупреждения
                         z[i] += ki;
                         for j in 0..d {
                             kv[i * d + j] += ki * v_raw[idx + j];
@@ -173,7 +173,7 @@ impl UniversalLayerBuffered for LinearAttention {
     ) {
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
-            BufferedContext::LinearAttention { input } => input,
+            BufferedContext::LinearAttention { input, .. } => input, // исправлено: игнорируем доп. поля
             _ => panic!("Expected LinearAttention context"),
         };
 
@@ -185,7 +185,7 @@ impl UniversalLayerBuffered for LinearAttention {
         let seq = self.seq_len;
         let d = self.d_model;
         let tokens_per_batch = seq * d;
-        let total_tokens = batch * tokens_per_batch;
+        // total_tokens не используется, поэтому удалён
 
         debug_assert_eq!(grad_output.cols(), tokens_per_batch);
         debug_assert_eq!(grad_input.rows(), batch);
@@ -362,14 +362,14 @@ impl UniversalLayerBuffered for LinearAttention {
                     for t in 0..seq {
                         let idx = r * tokens_per_batch + t * d;
                         for i in 0..d {
-                            let mut q_raw = p[bq_start + i];
-                            let mut k_raw = p[bk_start + i];
+                            let mut q_raw_val = p[bq_start + i];
+                            let mut k_raw_val = p[bk_start + i];
                             for j in 0..d {
-                                q_raw += x_rows[idx + j] * p[wq_start + i * d + j];
-                                k_raw += x_rows[idx + j] * p[wk_start + i * d + j];
+                                q_raw_val += x_rows[idx + j] * p[wq_start + i * d + j];
+                                k_raw_val += x_rows[idx + j] * p[wk_start + i * d + j];
                             }
-                            d_q_raw[idx + i] = d_q_phi[idx + i] * phi_derivative(q_raw);
-                            d_k_raw[idx + i] = d_k_phi[idx + i] * phi_derivative(k_raw);
+                            d_q_raw[idx + i] = d_q_phi[idx + i] * phi_derivative(q_raw_val);
+                            d_k_raw[idx + i] = d_k_phi[idx + i] * phi_derivative(k_raw_val);
                         }
                     }
                 }

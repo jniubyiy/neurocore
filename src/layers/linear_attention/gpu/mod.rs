@@ -267,12 +267,12 @@ impl GpuCompute {
         let zero_kvz = self.upload_vec_to_gpu_handle(&vec![0.0f32; d * d], d * d, 1);
         self.copy_buffer_sync(
             self.get_gpu_subbuffer_from_handle(&zero_kvz),
-            self.get_gpu_subbuffer_from_handle(&d_kv_buf),
+            d_kv_buf.clone(),
         );
         let zero_z = self.upload_vec_to_gpu_handle(&vec![0.0f32; d], d, 1);
         self.copy_buffer_sync(
             self.get_gpu_subbuffer_from_handle(&zero_z),
-            self.get_gpu_subbuffer_from_handle(&d_z_buf),
+            d_z_buf.clone(),
         );
 
         // Получаем subbuffer'ы для параметров
@@ -296,10 +296,10 @@ impl GpuCompute {
                 (2, self.get_gpu_subbuffer_from_handle(q_phi)),
                 (3, self.get_gpu_subbuffer_from_handle(kv)),
                 (4, self.get_gpu_subbuffer_from_handle(z)),
-                (5, self.get_gpu_subbuffer_from_handle(&d_attn_out_buf)),
-                (6, self.get_gpu_subbuffer_from_handle(&d_q_phi_buf)),
-                (7, self.get_gpu_subbuffer_from_handle(&d_kv_buf)),
-                (8, self.get_gpu_subbuffer_from_handle(&d_z_buf)),
+                (5, d_attn_out_buf.clone()),
+                (6, d_q_phi_buf.clone()),
+                (7, d_kv_buf.clone()),
+                (8, d_z_buf.clone()),
             ],
             &push_bwd_main,
             token_count,
@@ -319,9 +319,9 @@ impl GpuCompute {
                 (5, self.get_gpu_subbuffer_from_handle(v_raw)),
                 (6, self.get_gpu_subbuffer_from_handle(q_raw)),
                 (7, self.get_gpu_subbuffer_from_handle(k_raw)),
-                (8, self.get_gpu_subbuffer_from_handle(&d_q_phi_buf)), // d_q_phi
-                (9, self.get_gpu_subbuffer_from_handle(&d_kv_buf)),   // d_kv
-                (10, self.get_gpu_subbuffer_from_handle(&d_z_buf)),   // d_z
+                (8, d_q_phi_buf.clone()), // d_q_phi
+                (9, d_kv_buf.clone()),   // d_kv
+                (10, d_z_buf.clone()),   // d_z
                 (11, self.get_gpu_subbuffer_from_handle(grad_input)), // gi
                 (12, subbuffer_from_view(self, grad_params)),        // grad_params
                 // Дополнительные буферы kv и z для вычисления attn_out внутри шейдера

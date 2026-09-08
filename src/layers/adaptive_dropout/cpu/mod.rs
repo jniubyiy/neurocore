@@ -1,6 +1,7 @@
 // src/layers/adaptive_dropout/cpu/mod.rs
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
@@ -34,7 +35,7 @@ impl UniversalLayerBuffered for AdaptiveDropout {
         };
 
         let eps = 1e-6;
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(self.seed);
         let total = rows * cols;
 
         let mut mask = vec![0.0f32; total];

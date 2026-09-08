@@ -9,7 +9,7 @@ pub struct LayerDesc {
     pub kind: LayerKind,
     pub input_shape: Shape,
     pub output_shape: Shape,
-    pub extra: Vec<f32>,   // дополнительные гиперпараметры (alpha, temperature и т.п.)
+    pub extra: Vec<f32>,   // дополнительные гиперпараметры (alpha, temperature, seed и т.п.)
 }
 
 impl LayerDesc {
@@ -280,11 +280,15 @@ impl LayerDesc {
             }
             LayerKind::ConcreteDropout => {
                 let temp = self.extra.get(0).copied().unwrap_or(0.1);
-                Box::new(crate::layers::ConcreteDropout::new(temp))
+                // seed хранится во втором элементе extra (если есть)
+                let seed = self.extra.get(1).copied().unwrap_or(0.0) as u64;
+                Box::new(crate::layers::ConcreteDropout::new_with_seed(temp, seed))
             }
             LayerKind::AdaptiveDropout => {
                 let features = self.input_shape.streams[0];
-                Box::new(crate::layers::AdaptiveDropout::new(features))
+                // seed хранится в первом элементе extra (если есть)
+                let seed = self.extra.get(0).copied().unwrap_or(0.0) as u64;
+                Box::new(crate::layers::AdaptiveDropout::new_with_seed(features, seed))
             }
             LayerKind::LinearAttention => {
                 let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;

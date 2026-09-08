@@ -59,6 +59,10 @@ use crate::layers::mamba::gpu::pipeline::MambaPipelines;
 use crate::layers::ind_rnn::gpu::pipeline::IndRNNPipelines;
 use crate::layers::spectral_norm_linear::gpu::pipeline::SpectrallyNormalizedLinearPipelines;
 
+// ВНИМАНИЕ: добавлены импорты для LinearAttention и RelativePositionAttention
+use crate::layers::linear_attention::gpu::pipeline::LinearAttentionPipelines;
+use crate::layers::relative_position_attention::gpu::pipeline::RelativePositionAttentionPipelines;
+
 // Пайплайны оптимизаторов
 use crate::optimizers::scale_gradient::gpu::pipeline::ScaleGradientPipelines;
 use crate::optimizers::add_weight_decay::gpu::pipeline::AddWeightDecayPipelines;
@@ -123,6 +127,10 @@ pub struct GpuCompute {
     mamba_pipelines: OnceLock<MambaPipelines>,
     ind_rnn_pipelines: OnceLock<IndRNNPipelines>,
     spectral_norm_linear_pipelines: OnceLock<SpectrallyNormalizedLinearPipelines>,
+
+    // ВНИМАНИЕ: добавлены поля для новых пайплайнов
+    linear_attention_pipelines: OnceLock<LinearAttentionPipelines>,
+    relative_position_attention_pipelines: OnceLock<RelativePositionAttentionPipelines>,
 
     // Пайплайны оптимизаторов
     scale_gradient_pipelines: OnceLock<ScaleGradientPipelines>,
@@ -198,6 +206,10 @@ impl GpuCompute {
             mamba_pipelines: OnceLock::new(),
             ind_rnn_pipelines: OnceLock::new(),
             spectral_norm_linear_pipelines: OnceLock::new(),
+
+            // ВНИМАНИЕ: инициализация новых полей
+            linear_attention_pipelines: OnceLock::new(),
+            relative_position_attention_pipelines: OnceLock::new(),
 
             scale_gradient_pipelines: OnceLock::new(),
             add_weight_decay_pipelines: OnceLock::new(),
@@ -330,6 +342,15 @@ impl GpuCompute {
 
     pub fn spectral_norm_linear_pipelines(&self) -> &SpectrallyNormalizedLinearPipelines {
         self.spectral_norm_linear_pipelines.get_or_init(|| SpectrallyNormalizedLinearPipelines::new(self.context.device.clone()))
+    }
+
+    // ВНИМАНИЕ: добавлены методы для новых пайплайнов
+    pub fn linear_attention_pipelines(&self) -> &LinearAttentionPipelines {
+        self.linear_attention_pipelines.get_or_init(|| LinearAttentionPipelines::new(self.context.device.clone()))
+    }
+
+    pub fn relative_position_attention_pipelines(&self) -> &RelativePositionAttentionPipelines {
+        self.relative_position_attention_pipelines.get_or_init(|| RelativePositionAttentionPipelines::new(self.context.device.clone()))
     }
 
     // ================ Методы доступа к пайплайнам оптимизаторов ================

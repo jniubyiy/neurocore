@@ -7,53 +7,53 @@ layout(push_constant) uniform PushConsts {
     uint features;
 } pc;
 
-// Входной тензор
+// Входной тензор (column-major: x[c * batch + r])
 layout(binding = 0, std430) readonly buffer InputBuf {
     float x[];
 };
 
-// Градиент по выходу
+// Градиент по выходу (column-major: go[c * batch + r])
 layout(binding = 1, std430) readonly buffer GradOutBuf {
     float go[];
 };
 
-// Параметры слоя
+// Параметры слоя (7 * features элементов)
 layout(binding = 2, std430) readonly buffer ParamsBuf {
-    float params[];   // 7 * features
+    float params[];
 };
 
-// Градиент по входу
+// Градиент по входу (column-major: gi[c * batch + r])
 layout(binding = 3, std430) writeonly buffer GradInBuf {
     float gi[];
 };
 
-// Градиенты по параметрам (атомарное накопление)
+// Градиенты по параметрам (атомарное накопление, uint битовое представление float)
 layout(binding = 4, std430) buffer GradParamsBuf {
-    uint grad_params[]; // битовое представление float
+    uint grad_params[];
 };
 
-// Статистики (вычислены заранее)
+// Статистики, вычисленные заранее
 layout(binding = 5, std430) readonly buffer RowMeanBuf {
-    float row_mean[];
+    float row_mean[];    // размер batch
 };
 
 layout(binding = 6, std430) readonly buffer RowVarBuf {
-    float row_var[];
+    float row_var[];     // размер batch
 };
 
 layout(binding = 7, std430) readonly buffer RowRmsSqBuf {
-    float row_rms_sq[];
+    float row_rms_sq[];  // размер batch
 };
 
 layout(binding = 8, std430) readonly buffer ColMeanBuf {
-    float col_mean[];
+    float col_mean[];    // размер features
 };
 
 layout(binding = 9, std430) readonly buffer ColVarBuf {
-    float col_var[];
+    float col_var[];     // размер features
 };
 
-// Макрос атомарного сложения float
+// Макрос атомарного сложения float через CAS
 #define ATOMIC_ADD_FLOAT(target, value) \
 { \
     uint expected = target; \
@@ -72,10 +72,13 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= total) return;
 
+    // Определяем номер строки r и столбца c
     uint r = idx % pc.batch;
     uint c = idx / pc.batch;
 
-    // Параметры для признака c
+    float eps = 1e-5;
+
+    // Читаем параметры для признака c
     float ln_gamma   = params[0 * pc.features + c];
     float ln_beta    = params[1 * pc.features + c];
     float rms_gamma  = params[2 * pc.features + c];
@@ -83,11 +86,9 @@ void main() {
     float bn_beta    = params[4 * pc.features + c];
     float logits_ln  = params[5 * pc.features + c];
     float logits_rms = params[6 * pc.features + c];
-    // логит для BN фиксирован как 0
+    // логит для BatchNorm фиксирован и равен 0
 
-    float eps = 1e-5;
-
-    // Статистики с добавлением eps
+    // Статистики
     float var_r    = max(row_var[r], 0.0) + eps;
     float rms_sq_r = max(row_rms_sq[r], 0.0) + eps;
     float var_c    = max(col_var[c], 0.0) + eps;
@@ -112,14 +113,100 @@ void main() {
 
     float y_combined = w_ln * ln + w_rms * rms + w_bn * bn;
 
-    // 1. Градиент по входу (без учёта влияния на статистики)
-    float dln_dx  = ln_gamma  / sqrt(var_r);
-    float drms_dx = rms_gamma / sqrt(rms_sq_r);
-    float dbn_dx  = bn_gamma  / sqrt(var_c);
-    float grad_x = gout * (w_ln * dln_dx + w_rms * drms_dx + w_bn * dbn_dx);
-    gi[idx] = grad_x;
+    // Промежуточные производные
+    float dln  = gout * w_ln;
+    float drms = gout * w_rms;
+    float dbn  = gout * w_bn;
 
-    // 2. Градиенты по параметрам нормализации (атомарно накапливаем)
+    // ------------------------------------------------------------
+    // Вычисляем суммы для корректировки статистик
+    // (повторяем циклы по строке и столбцу внутри каждого потока)
+    // ------------------------------------------------------------
+
+    // Суммы по строке r (для LayerNorm и RMSNorm)
+    float sum_dln_per_row = 0.0;
+    float sum_dln_x_per_row = 0.0;
+    float sum_drms_x_per_row = 0.0;
+    for (uint cc = 0; cc < pc.features; ++cc) {
+        uint idx2 = cc * pc.batch + r; // column-major: idx2 = cc * batch + r
+        float x2 = x[idx2];
+        float go2 = go[idx2];
+
+        // Для этого столбца cc нужно вычислить свои w_ln, w_rms и т.д.
+        float logit_ln_cc   = params[5 * pc.features + cc];
+        float logit_rms_cc  = params[6 * pc.features + cc];
+        float max_l_cc = max(logit_ln_cc, max(logit_rms_cc, 0.0));
+        float e0_cc = exp(logit_ln_cc - max_l_cc);
+        float e1_cc = exp(logit_rms_cc - max_l_cc);
+        float e2_cc = exp(0.0 - max_l_cc);
+        float sum_exp_cc = e0_cc + e1_cc + e2_cc;
+        float w_ln_cc  = e0_cc / sum_exp_cc;
+        float w_rms_cc = e1_cc / sum_exp_cc;
+
+        float dln_cc  = go2 * w_ln_cc;
+        float drms_cc = go2 * w_rms_cc;
+
+        sum_dln_per_row += dln_cc;
+        sum_dln_x_per_row += dln_cc * (x2 - row_mean[r]);
+        sum_drms_x_per_row += drms_cc * x2;
+    }
+
+    // Суммы по столбцу c (для BatchNorm)
+    float sum_dbn_per_col = 0.0;
+    float sum_dbn_x_per_col = 0.0;
+    for (uint rr = 0; rr < pc.batch; ++rr) {
+        uint idx2 = c * pc.batch + rr;
+        float x2 = x[idx2];
+        float go2 = go[idx2];
+
+        // для BatchNorm w_bn зависит только от c
+        float logit_ln_c   = params[5 * pc.features + c];
+        float logit_rms_c  = params[6 * pc.features + c];
+        float max_l_c = max(logit_ln_c, max(logit_rms_c, 0.0));
+        float e0_c = exp(logit_ln_c - max_l_c);
+        float e1_c = exp(logit_rms_c - max_l_c);
+        float e2_c = exp(0.0 - max_l_c);
+        float sum_exp_c = e0_c + e1_c + e2_c;
+        float w_bn_c = e2_c / sum_exp_c;
+
+        float dbn_rr = go2 * w_bn_c;
+
+        sum_dbn_per_col += dbn_rr;
+        sum_dbn_x_per_col += dbn_rr * (x2 - col_mean[c]);
+    }
+
+    // ------------------------------------------------------------
+    // Вычисляем градиент по входу gi[idx]
+    // ------------------------------------------------------------
+    float inv_std_ln  = 1.0 / sqrt(var_r);
+    float inv_std_rms = 1.0 / sqrt(rms_sq_r);
+    float inv_std_bn  = 1.0 / sqrt(var_c);
+
+    // Вклад LayerNorm
+    float term_ln = ln_gamma * inv_std_ln * (
+        dln
+        - sum_dln_per_row / float(pc.features)
+        - (x_val - row_mean[r]) / (float(pc.features) * var_r) * sum_dln_x_per_row
+    );
+
+    // Вклад RMSNorm
+    float term_rms = rms_gamma * inv_std_rms * (
+        drms
+        - (x_val / (float(pc.features) * rms_sq_r)) * sum_drms_x_per_row
+    );
+
+    // Вклад BatchNorm
+    float term_bn = bn_gamma * inv_std_bn * (
+        dbn
+        - sum_dbn_per_col / float(pc.batch)
+        - (x_val - col_mean[c]) / (float(pc.batch) * var_c) * sum_dbn_x_per_col
+    );
+
+    gi[idx] = term_ln + term_rms + term_bn;
+
+    // ------------------------------------------------------------
+    // Атомарно накапливаем градиенты параметров
+    // ------------------------------------------------------------
     uint base_ln_gamma   = 0 * pc.features + c;
     uint base_ln_beta    = 1 * pc.features + c;
     uint base_rms_gamma  = 2 * pc.features + c;
@@ -128,22 +215,20 @@ void main() {
     uint base_logits_ln  = 5 * pc.features + c;
     uint base_logits_rms = 6 * pc.features + c;
 
-    float d_ln_gamma  = gout * w_ln * (x_val - row_mean[r]) / sqrt(var_r);
-    float d_ln_beta   = gout * w_ln;
-    float d_rms_gamma = gout * w_rms * x_val / sqrt(rms_sq_r);
-    float d_bn_gamma  = gout * w_bn * (x_val - col_mean[c]) / sqrt(var_c);
-    float d_bn_beta   = gout * w_bn;
+    float d_gamma_ln   = dln  * (x_val - row_mean[r]) / sqrt(var_r);
+    float d_beta_ln    = dln;
+    float d_gamma_rms  = drms * x_val / sqrt(rms_sq_r);
+    float d_gamma_bn   = dbn  * (x_val - col_mean[c]) / sqrt(var_c);
+    float d_beta_bn    = dbn;
 
-    ATOMIC_ADD_FLOAT(grad_params[base_ln_gamma],   d_ln_gamma);
-    ATOMIC_ADD_FLOAT(grad_params[base_ln_beta],    d_ln_beta);
-    ATOMIC_ADD_FLOAT(grad_params[base_rms_gamma],  d_rms_gamma);
-    ATOMIC_ADD_FLOAT(grad_params[base_bn_gamma],   d_bn_gamma);
-    ATOMIC_ADD_FLOAT(grad_params[base_bn_beta],    d_bn_beta);
-
-    // 3. Градиенты по логитам
     float d_logits_ln  = gout * w_ln  * (ln  - y_combined);
     float d_logits_rms = gout * w_rms * (rms - y_combined);
 
+    ATOMIC_ADD_FLOAT(grad_params[base_ln_gamma],   d_gamma_ln);
+    ATOMIC_ADD_FLOAT(grad_params[base_ln_beta],    d_beta_ln);
+    ATOMIC_ADD_FLOAT(grad_params[base_rms_gamma],  d_gamma_rms);
+    ATOMIC_ADD_FLOAT(grad_params[base_bn_gamma],   d_gamma_bn);
+    ATOMIC_ADD_FLOAT(grad_params[base_bn_beta],    d_beta_bn);
     ATOMIC_ADD_FLOAT(grad_params[base_logits_ln],  d_logits_ln);
     ATOMIC_ADD_FLOAT(grad_params[base_logits_rms], d_logits_rms);
 }

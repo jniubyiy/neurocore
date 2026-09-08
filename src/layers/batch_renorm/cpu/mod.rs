@@ -107,13 +107,8 @@ impl UniversalLayerBuffered for BatchRenorm1d {
         grad_params: &MatrixBufferHandle,
     ) {
         let DynamicContext::Buffered(bc) = ctx;
-        let (input_handle, mean, var, use_batch_stats) = match bc {
-            BufferedContext::BatchRenorm {
-                input,
-                mean,
-                var,
-                use_batch_stats,
-            } => (input, mean, var, *use_batch_stats),
+        let input_handle = match bc {
+            BufferedContext::BatchRenorm { input, .. } => input,
             _ => panic!("Expected BatchRenorm context"),
         };
 
@@ -167,6 +162,32 @@ impl UniversalLayerBuffered for BatchRenorm1d {
                     gp[base + i] = 0.0f32;
                 }
 
+                // Пересчитываем статистики (batch или running) аналогично forward
+                let (mean, var) = if self.training {
+                    // Вычисляем batch-статистики заново
+                    let mut batch_mean = vec![0.0f32; f];
+                    let mut batch_var = vec![0.0f32; f];
+                    for c in 0..cols {
+                        let mut sum = 0.0f32;
+                        let mut sum_sq = 0.0f32;
+                        for r in 0..rows {
+                            let idx = c * rows + r;
+                            let v = x[idx];
+                            sum += v;
+                            sum_sq += v * v;
+                        }
+                        let mean = sum / rows as f32;
+                        let var = (sum_sq / rows as f32) - mean * mean;
+                        batch_mean[c] = mean;
+                        batch_var[c] = var.max(0.0f32);
+                    }
+                    (batch_mean, batch_var)
+                } else {
+                    // Используем текущие скользящие статистики
+                    let state = self.state.lock().unwrap();
+                    (state.running_mean.clone(), state.running_var.clone())
+                };
+
                 // Локальные накопители для градиентов параметров
                 let mut grad_gamma = vec![0.0f32; f];
                 let mut grad_beta = vec![0.0f32; f];
@@ -186,7 +207,7 @@ impl UniversalLayerBuffered for BatchRenorm1d {
                     // Суммы для градиентов по статистикам (если используется batch)
                     let mut sum_gamma_r = 0.0f32;
                     let mut sum_gamma_r_xhat = 0.0f32;
-                    let mut sum_gamma_r_xhat_2 = 0.0f32; // для вариации
+                    let mut sum_gamma_r_xhat_2 = 0.0f32;
 
                     // Проходим по строкам для данного признака
                     for row in 0..rows {
@@ -202,7 +223,7 @@ impl UniversalLayerBuffered for BatchRenorm1d {
                         grad_d[c] += gout * gamma;
 
                         // Накопления для batch статистик
-                        if use_batch_stats {
+                        if self.training {
                             let gy = gout * gamma * r;
                             sum_gamma_r += gy;
                             sum_gamma_r_xhat += gy * x_hat;
@@ -216,7 +237,7 @@ impl UniversalLayerBuffered for BatchRenorm1d {
                         let gout = go[idx];
                         let x_hat = (x[idx] - mean_c) * inv_std;
 
-                        if use_batch_stats {
+                        if self.training {
                             // Полная производная с учётом batch статистик
                             let n = rows as f32;
                             let term1 = gout * gamma * r * inv_std;

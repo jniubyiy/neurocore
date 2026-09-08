@@ -1,6 +1,7 @@
 // src/layers/concrete_dropout/cpu/mod.rs
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
@@ -33,7 +34,7 @@ impl UniversalLayerBuffered for ConcreteDropout {
         };
 
         let temp = self.temperature;
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(self.seed);
         let eps = 1e-8f32;
 
         // Генерируем аргументы сигмоиды и маску
@@ -69,14 +70,12 @@ impl UniversalLayerBuffered for ConcreteDropout {
         slice: &ParamSlice,
         grad_params: &MatrixBufferHandle,
     ) {
-        // Извлекаем вход из контекста (новые поля игнорируем)
         let DynamicContext::Buffered(bc) = ctx;
         let input_handle = match bc {
             BufferedContext::ConcreteDropout { input, .. } => input,
             _ => panic!("Expected ConcreteDropout context"),
         };
 
-        // Извлекаем сохранённый аргумент
         let arg = self
             .take_mask()
             .expect("ConcreteDropout backward called without forward state");

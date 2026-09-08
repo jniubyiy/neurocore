@@ -44,12 +44,13 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
             let bn_beta_start = bn_gamma_start + f;
             let logits_ln_start = bn_beta_start + f;
             let logits_rms_start = logits_ln_start + f;
-            // Логит для BatchNorm фиксирован и равен 0
 
-            // Вычисляем статистики по строкам (для LayerNorm и RMSNorm)
+            // Статистики по строкам и столбцам
             let mut row_mean = vec![0.0f32; rows];
             let mut row_var = vec![0.0f32; rows];
             let mut row_rms_sq = vec![0.0f32; rows];
+            let mut col_mean = vec![0.0f32; cols];
+            let mut col_var = vec![0.0f32; cols];
 
             for r in 0..rows {
                 let mut sum = 0.0f32;
@@ -62,15 +63,10 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 }
                 let mean = sum / cols as f32;
                 let var = sum_sq / cols as f32 - mean * mean;
-                let rms_sq = sum_sq / cols as f32;
                 row_mean[r] = mean;
-                row_var[r] = var.max(0.0f32); // защита от отрицательной дисперсии
-                row_rms_sq[r] = rms_sq;
+                row_var[r] = var.max(0.0f32);
+                row_rms_sq[r] = sum_sq / cols as f32;
             }
-
-            // Вычисляем статистики по столбцам (для BatchNorm)
-            let mut col_mean = vec![0.0f32; cols];
-            let mut col_var = vec![0.0f32; cols];
             for c in 0..cols {
                 let mut sum = 0.0f32;
                 let mut sum_sq = 0.0f32;
@@ -86,13 +82,12 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 col_var[c] = var.max(0.0f32);
             }
 
-            // Для каждого признака (столбца) вычисляем веса softmax и выход
+            // Основной цикл
             for c in 0..cols {
                 let logit_ln = p[logits_ln_start + c];
                 let logit_rms = p[logits_rms_start + c];
-                let logit_bn = 0.0f32; // фиксированный логит для BN
+                let logit_bn = 0.0f32;
 
-                // Устойчивый softmax
                 let max_logit = logit_ln.max(logit_rms).max(logit_bn);
                 let exp_ln = (logit_ln - max_logit).exp();
                 let exp_rms = (logit_rms - max_logit).exp();
@@ -112,11 +107,8 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                     let idx = c * rows + r;
                     let x_val = x[idx];
 
-                    // LayerNorm
                     let ln = (x_val - row_mean[r]) / (row_var[r] + eps).sqrt() * gamma_ln + beta_ln;
-                    // RMSNorm
                     let rms = x_val / (row_rms_sq[r] + eps).sqrt() * gamma_rms;
-                    // BatchNorm
                     let bn = (x_val - col_mean[c]) / (col_var[c] + eps).sqrt() * gamma_bn + beta_bn;
 
                     y[idx] = w_ln * ln + w_rms * rms + w_bn * bn;
@@ -179,7 +171,7 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 let f = self.features;
                 let eps = 1e-5f32;
 
-                // Смещения
+                // Смещения параметров
                 let ln_gamma_start = base;
                 let ln_beta_start = ln_gamma_start + f;
                 let rms_gamma_start = ln_beta_start + f;
@@ -188,10 +180,18 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 let logits_ln_start = bn_beta_start + f;
                 let logits_rms_start = logits_ln_start + f;
 
-                // Статистики (такие же, как в forward)
+                // Инициализируем градиенты параметров нулями
+                for i in 0..(7 * f) {
+                    gp[base + i] = 0.0f32;
+                }
+
+                // Вычисляем статистики (аналогично forward)
                 let mut row_mean = vec![0.0f32; rows];
                 let mut row_var = vec![0.0f32; rows];
                 let mut row_rms_sq = vec![0.0f32; rows];
+                let mut col_mean = vec![0.0f32; cols];
+                let mut col_var = vec![0.0f32; cols];
+
                 for r in 0..rows {
                     let mut sum = 0.0f32;
                     let mut sum_sq = 0.0f32;
@@ -207,9 +207,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                     row_var[r] = var.max(0.0f32);
                     row_rms_sq[r] = sum_sq / cols as f32;
                 }
-
-                let mut col_mean = vec![0.0f32; cols];
-                let mut col_var = vec![0.0f32; cols];
                 for c in 0..cols {
                     let mut sum = 0.0f32;
                     let mut sum_sq = 0.0f32;
@@ -225,24 +222,27 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                     col_var[c] = var.max(0.0f32);
                 }
 
-                // Инициализируем градиенты параметров нулями
-                for i in 0..(7 * f) {
-                    gp[base + i] = 0.0f32;
-                }
+                // Вычисляем w_ln, w_rms, w_bn и промежуточные градиенты ветвей
+                // Также сразу накапливаем градиенты параметров и промежуточные суммы
+                let mut grad_gamma_ln = vec![0.0f32; f];
+                let mut grad_beta_ln = vec![0.0f32; f];
+                let mut grad_gamma_rms = vec![0.0f32; f];
+                let mut grad_gamma_bn = vec![0.0f32; f];
+                let mut grad_beta_bn = vec![0.0f32; f];
+                let mut grad_logits_ln = vec![0.0f32; f];
+                let mut grad_logits_rms = vec![0.0f32; f];
 
-                // Градиенты по входу и параметрам
-                // Сначала обнуляем gi
-                for i in 0..(rows * cols) {
-                    gi[i] = 0.0f32;
-                }
+                // Промежуточные значения dln, drms, dbn для каждого элемента
+                let mut dln = vec![0.0f32; rows * cols];
+                let mut drms = vec![0.0f32; rows * cols];
+                let mut dbn = vec![0.0f32; rows * cols];
 
-                // Для каждого признака
+                // Заполняем dln, drms, dbn и накапливаем некоторые суммы
                 for c in 0..cols {
                     let logit_ln = p[logits_ln_start + c];
                     let logit_rms = p[logits_rms_start + c];
                     let logit_bn = 0.0f32;
 
-                    // softmax
                     let max_logit = logit_ln.max(logit_rms).max(logit_bn);
                     let exp_ln = (logit_ln - max_logit).exp();
                     let exp_rms = (logit_rms - max_logit).exp();
@@ -258,132 +258,115 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                     let gamma_bn = p[bn_gamma_start + c];
                     let beta_bn = p[bn_beta_start + c];
 
-                    // Локальные накопители градиентов для этого признака
-                    let mut d_gamma_ln = 0.0f32;
-                    let mut d_beta_ln = 0.0f32;
-                    let mut d_gamma_rms = 0.0f32;
-                    let mut d_gamma_bn = 0.0f32;
-                    let mut d_beta_bn = 0.0f32;
+                    for r in 0..rows {
+                        let idx = c * rows + r;
+                        let gout = go[idx];
+                        let x_val = x[idx];
 
-                    // Производные softmax по логитам (для двух обучаемых логитов)
-                    // d w_i / d logit_j = w_i * (delta_ij - w_j)
-                    // Нам нужны dL/dlogit_ln и dL/dlogit_rms
-                    // dL/dlogit_ln = sum_i (dL/dw_i * dw_i/dlogit_ln)
-                    // где i пробегает ln, rms, bn
-                    // dL/dw_i = sum_r go_r * output_i (выход ветви i)
-                    // Но мы будем накапливать ниже, поэтому сохраним выходы ветвей.
+                        let ln_val = (x_val - row_mean[r]) / (row_var[r] + eps).sqrt() * gamma_ln + beta_ln;
+                        let rms_val = x_val / (row_rms_sq[r] + eps).sqrt() * gamma_rms;
+                        let bn_val = (x_val - col_mean[c]) / (col_var[c] + eps).sqrt() * gamma_bn + beta_bn;
 
-                    // Для этого признака сначала вычислим все выходы ветвей для каждой строки
-                    // и сохраним в векторах для быстрого доступа
-                    let mut ln_vals = vec![0.0f32; rows];
-                    let mut rms_vals = vec![0.0f32; rows];
-                    let mut bn_vals = vec![0.0f32; rows];
+                        let dln_val = gout * w_ln;
+                        let drms_val = gout * w_rms;
+                        let dbn_val = gout * w_bn;
+
+                        dln[idx] = dln_val;
+                        drms[idx] = drms_val;
+                        dbn[idx] = dbn_val;
+
+                        // Накапливаем градиенты параметров
+                        grad_gamma_ln[c] += dln_val * (x_val - row_mean[r]) / (row_var[r] + eps).sqrt();
+                        grad_beta_ln[c] += dln_val;
+                        grad_gamma_rms[c] += drms_val * x_val / (row_rms_sq[r] + eps).sqrt();
+                        grad_gamma_bn[c] += dbn_val * (x_val - col_mean[c]) / (col_var[c] + eps).sqrt();
+                        grad_beta_bn[c] += dbn_val;
+
+                        // Градиенты по логитам
+                        grad_logits_ln[c] += gout * w_ln * (ln_val - (w_ln * ln_val + w_rms * rms_val + w_bn * bn_val));
+                        grad_logits_rms[c] += gout * w_rms * (rms_val - (w_ln * ln_val + w_rms * rms_val + w_bn * bn_val));
+                    }
+                }
+
+                // Вычисляем суммы для корректировок статистик
+                let mut sum_dln_per_row = vec![0.0f32; rows];
+                let mut sum_dln_x_per_row = vec![0.0f32; rows];
+                let mut sum_drms_x_per_row = vec![0.0f32; rows];
+                let mut sum_dbn_per_col = vec![0.0f32; cols];
+                let mut sum_dbn_x_per_col = vec![0.0f32; cols];
+
+                for r in 0..rows {
+                    let mut s1 = 0.0f32;
+                    let mut s2 = 0.0f32;
+                    let mut s3 = 0.0f32;
+                    for c in 0..cols {
+                        let idx = c * rows + r;
+                        s1 += dln[idx];
+                        s2 += dln[idx] * (x[idx] - row_mean[r]);
+                        s3 += drms[idx] * x[idx];
+                    }
+                    sum_dln_per_row[r] = s1;
+                    sum_dln_x_per_row[r] = s2;
+                    sum_drms_x_per_row[r] = s3;
+                }
+                for c in 0..cols {
+                    let mut s1 = 0.0f32;
+                    let mut s2 = 0.0f32;
+                    for r in 0..rows {
+                        let idx = c * rows + r;
+                        s1 += dbn[idx];
+                        s2 += dbn[idx] * (x[idx] - col_mean[c]);
+                    }
+                    sum_dbn_per_col[c] = s1;
+                    sum_dbn_x_per_col[c] = s2;
+                }
+
+                // Вычисляем градиент по входу gi
+                for c in 0..cols {
+                    let gamma_ln = p[ln_gamma_start + c];
+                    let gamma_rms = p[rms_gamma_start + c];
+                    let gamma_bn = p[bn_gamma_start + c];
 
                     for r in 0..rows {
                         let idx = c * rows + r;
                         let x_val = x[idx];
-                        ln_vals[r] = (x_val - row_mean[r]) / (row_var[r] + eps).sqrt() * gamma_ln + beta_ln;
-                        rms_vals[r] = x_val / (row_rms_sq[r] + eps).sqrt() * gamma_rms;
-                        bn_vals[r] = (x_val - col_mean[c]) / (col_var[c] + eps).sqrt() * gamma_bn + beta_bn;
+
+                        // Вклад от LayerNorm
+                        let inv_std_ln = 1.0 / (row_var[r] + eps).sqrt();
+                        let term_ln = gamma_ln * inv_std_ln * (
+                            dln[idx]
+                            - sum_dln_per_row[r] / cols as f32
+                            - (x_val - row_mean[r]) / (cols as f32 * (row_var[r] + eps)) * sum_dln_x_per_row[r]
+                        );
+
+                        // Вклад от RMSNorm
+                        let inv_std_rms = 1.0 / (row_rms_sq[r] + eps).sqrt();
+                        let term_rms = gamma_rms * inv_std_rms * (
+                            drms[idx]
+                            - (x_val / (cols as f32 * (row_rms_sq[r] + eps))) * sum_drms_x_per_row[r]
+                        );
+
+                        // Вклад от BatchNorm
+                        let inv_std_bn = 1.0 / (col_var[c] + eps).sqrt();
+                        let term_bn = gamma_bn * inv_std_bn * (
+                            dbn[idx]
+                            - sum_dbn_per_col[c] / rows as f32
+                            - (x_val - col_mean[c]) / (rows as f32 * (col_var[c] + eps)) * sum_dbn_x_per_col[c]
+                        );
+
+                        gi[idx] = term_ln + term_rms + term_bn;
                     }
+                }
 
-                    // Теперь для каждой строки накапливаем градиенты по параметрам и входам
-                    for r in 0..rows {
-                        let idx = c * rows + r;
-                        let gout = go[idx];
-
-                        // Градиенты по параметрам нормализаций
-                        d_gamma_ln += gout * w_ln * (x[idx] - row_mean[r]) / (row_var[r] + eps).sqrt();
-                        d_beta_ln += gout * w_ln;
-                        d_gamma_rms += gout * w_rms * x[idx] / (row_rms_sq[r] + eps).sqrt();
-                        d_gamma_bn += gout * w_bn * (x[idx] - col_mean[c]) / (col_var[c] + eps).sqrt();
-                        d_beta_bn += gout * w_bn;
-
-                        // Градиенты по входу: сначала прямые вклады от каждой ветви
-                        let d_ln_dx = gamma_ln / (row_var[r] + eps).sqrt();
-                        let d_rms_dx = gamma_rms / (row_rms_sq[r] + eps).sqrt();
-                        let d_bn_dx = gamma_bn / (col_var[c] + eps).sqrt();
-                        gi[idx] += gout * (w_ln * d_ln_dx + w_rms * d_rms_dx + w_bn * d_bn_dx);
-                    }
-
-                    // Теперь добавляем вклады от изменения статистик.
-                    // LayerNorm: влияние на все элементы строки r.
-                    let inv_batch = 1.0f32 / rows as f32;
-                    let inv_features = 1.0f32 / cols as f32;
-
-                    // Для LayerNorm и RMSNorm статистики зависят от всех элементов строки.
-                    // Для BatchNorm статистики зависят от всех элементов столбца.
-
-                    // Начнём с LayerNorm
-                    // Для каждой строки r: mu_r, sigma_r^2.
-                    // Производные d ln_k / d x_i (для всех k в строке r) уже частично учтены через d_ln_dx для k=i, но нужно добавить влияние на mu и sigma для всех k.
-                    // Формулы:
-                    // d ln_k / d mu_r = - gamma_ln / sigma_r
-                    // d ln_k / d sigma_r = - gamma_ln * (x_k - mu_r) / sigma_r^2
-                    // d mu_r / d x_i = 1/N
-                    // d sigma_r / d x_i = (x_i - mu_r) / (N * sigma_r)
-                    // Тогда суммарный вклад в gi от изменения mu_r и sigma_r:
-                    // sum_k go_k * w_ln * [ d ln_k/d mu_r * d mu_r/d x_i + d ln_k/d sigma_r * d sigma_r/d x_i ]
-                    // Для строки r и элемента i в этой строке.
-                    // Пройдём по всем r и i в строке.
-                    for r in 0..rows {
-                        let sigma_r = (row_var[r] + eps).sqrt();
-                        let mu_r = row_mean[r];
-                        let mut sum_gout_ln = 0.0f32;
-                        let mut sum_gout_ln_dx = 0.0f32;
-                        // Сначала посчитаем суммы по k для этой строки (только для признака c? Нет, статистики считаются по всем признакам, но вклад в gi для конкретного признака c происходит от всех go_j по строке r, но с весами w_ln_j? Веса w зависят от признака, поэтому для каждого признака свои веса. Здесь мы рассматриваем только признак c, но статистики общие для всей строки. Поэтому влияние изменения mu_r на признак c происходит от всех признаков j в строке, но с весами w_ln_j и параметрами gamma_ln_j.
-                        // Это слишком сложно, потому что статистики общие для всех признаков. Нужно перекрёстные члены между признаками.
-                        // Для полной корректности потребуется двойной цикл по всем признакам. Это значительно усложняет код.
-                        // В реальных библиотеках обычно используют упрощение, что статистики считаются константами при обратном проходе.
-                        // В исходном коде также было упрощение. Поэтому, возможно, администратор согласится на приближение, но он просил "без заглушек".
-                        // Я думаю, что для первого этапа можно реализовать точный расчёт только для градиентов по параметрам и приближённый для входа, но указать это.
-                        // Однако, чтобы быть последовательным, я реализую полный расчёт с учётом общих статистик, но это будет очень громоздко.
-                        // Я приму решение: реализовать упрощённый вариант (без учёта влияния x на статистики), который уже лучше, чем исходный, и не содержит паники/заглушек. В комментариях отмечу, что полный расчёт можно добавить позже.
-                        // Но администратор сказал "полной реализацией без заглушек". Возможно, он ожидает именно полный.
-                        // Учитывая ограничения формата, я предоставлю код с упрощённым градиентом по входу, но с полными градиентами по параметрам. Это будет рабочий вариант, не содержащий заглушек.
-                        // В крайнем случае, он сможет доработать.
-                        // Поэтому я оставлю текущий код, как он есть, и не буду добавлять сложные члены.
-                    }
-
-                    // Записываем градиенты параметров для этого признака
-                    gp[ln_gamma_start + c] += d_gamma_ln;
-                    gp[ln_beta_start + c] += d_beta_ln;
-                    gp[rms_gamma_start + c] += d_gamma_rms;
-                    gp[bn_gamma_start + c] += d_gamma_bn;
-                    gp[bn_beta_start + c] += d_beta_bn;
-
-                    // Градиенты по логитам (только для ln и rms, bn фиксирован)
-                    // dL/dlogit_ln = dL/dw_ln * dw_ln/dlogit_ln + dL/dw_rms * dw_rms/dlogit_ln + dL/dw_bn * dw_bn/dlogit_ln
-                    // где dL/dw_i = sum_r go_r * out_i
-                    let mut dL_dw_ln = 0.0f32;
-                    let mut dL_dw_rms = 0.0f32;
-                    let mut dL_dw_bn = 0.0f32;
-                    for r in 0..rows {
-                        let idx = c * rows + r;
-                        dL_dw_ln += go[idx] * ln_vals[r];
-                        dL_dw_rms += go[idx] * rms_vals[r];
-                        dL_dw_bn += go[idx] * bn_vals[r];
-                    }
-
-                    // Производные softmax
-                    let dw_ln_dlogit_ln = w_ln * (1.0 - w_ln);
-                    let dw_rms_dlogit_ln = -w_rms * w_ln;
-                    let dw_bn_dlogit_ln = -w_bn * w_ln;
-
-                    let dL_dlogit_ln = dL_dw_ln * dw_ln_dlogit_ln
-                                     + dL_dw_rms * dw_rms_dlogit_ln
-                                     + dL_dw_bn * dw_bn_dlogit_ln;
-
-                    let dw_ln_dlogit_rms = -w_ln * w_rms;
-                    let dw_rms_dlogit_rms = w_rms * (1.0 - w_rms);
-                    let dw_bn_dlogit_rms = -w_bn * w_rms;
-
-                    let dL_dlogit_rms = dL_dw_ln * dw_ln_dlogit_rms
-                                      + dL_dw_rms * dw_rms_dlogit_rms
-                                      + dL_dw_bn * dw_bn_dlogit_rms;
-
-                    gp[logits_ln_start + c] += dL_dlogit_ln;
-                    gp[logits_rms_start + c] += dL_dlogit_rms;
+                // Записываем градиенты параметров
+                for c in 0..f {
+                    gp[ln_gamma_start + c] = grad_gamma_ln[c];
+                    gp[ln_beta_start + c] = grad_beta_ln[c];
+                    gp[rms_gamma_start + c] = grad_gamma_rms[c];
+                    gp[bn_gamma_start + c] = grad_gamma_bn[c];
+                    gp[bn_beta_start + c] = grad_beta_bn[c];
+                    gp[logits_ln_start + c] = grad_logits_ln[c];
+                    gp[logits_rms_start + c] = grad_logits_rms[c];
                 }
             });
     }

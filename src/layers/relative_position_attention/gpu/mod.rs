@@ -24,6 +24,12 @@ impl GpuCompute {
     ///
     /// Параметры (Wq, bq, Wk, bk, Wv, bv, Wo, bo, rel_bias) передаются
     /// через плоский `params`. Веса — row-major, смещения и rel_bias — линейные.
+    ///
+    /// Промежуточные буферы (q_buf, k_buf, v_buf, scores_buf, weights_buf)
+    /// передаются вызывающим кодом и сохраняются в
+    /// `BufferedContext::RelativePositionAttention` для последующего
+    /// обратного прохода — состояние слоя (RwLock<...State>) в GPU-пути
+    /// не используется.
     pub fn run_relative_position_attention_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -149,6 +155,8 @@ impl GpuCompute {
     ///
     /// Принимает сохранённые промежуточные буферы с forward. Градиенты по
     /// параметрам записываются в `grad_params` через атомарное накопление.
+    /// Состояние слоя (RwLock<RelativePositionAttentionState>) в GPU-пути
+    /// не используется — все промежуточные тензоры приходят через аргументы.
     pub fn run_relative_position_attention_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -246,6 +254,8 @@ impl GpuCompute {
 
         // 4. Вычисление attn_out = weights · V через shader `output`
         //    с единичной матрицей W_o и нулевым b_o.
+        //    Так как y = b_o + Σ_s weights[r,t,s] · (Σ_i v[r,s,i]·W_o[j,i]),
+        //    при W_o = I, b_o = 0 получаем y = Σ_s weights[r,t,s] · v[r,s,j] = attn_out.
         let mut identity = vec![0.0f32; d * d];
         for i in 0..d {
             identity[i * d + i] = 1.0;

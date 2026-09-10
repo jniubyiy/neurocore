@@ -23,7 +23,8 @@ impl GpuCompute {
     /// (размер 1) в общем GPU-буфере параметров.
     /// `arg_out` — GPU-буфер размера `batch * features`, в который записываются
     /// аргументы сигмоиды `a = (logit_p + log(u) - log(1-u)) / temperature`
-    /// для последующего обратного прохода.
+    /// для последующего обратного прохода. Буфер сохраняется в контексте слоя,
+    /// а не в состоянии слоя.
     /// `seed` — 32-битное зерно для генератора псевдослучайных чисел на GPU.
     pub fn run_concrete_dropout_forward_buffered_handle(
         &self,
@@ -70,7 +71,8 @@ impl GpuCompute {
 
     /// Обратный проход ConcreteDropout на GPU.
     ///
-    /// `arg_in` — GPU-буфер, содержащий аргументы `a`, сохранённые при прямом проходе.
+    /// `arg_in` — GPU-буфер, содержащий аргументы `a`, сохранённые при прямом
+    /// проходе (в контексте слоя).
     /// `grad_logit_p_view` — представление градиента по параметру `logit_p`
     /// (размер 1) в общем GPU-буфере градиентов.
     /// Перед вызовом область `grad_logit_p_view` обнуляется, так как шейдер
@@ -90,7 +92,10 @@ impl GpuCompute {
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
         assert!(arg_in.is_gpu(), "arg_in handle must be GPU");
         assert!(logit_p_view.is_gpu(), "logit_p view must point to GPU buffer");
-        assert!(grad_logit_p_view.is_gpu(), "grad_logit_p view must point to GPU buffer");
+        assert!(
+            grad_logit_p_view.is_gpu(),
+            "grad_logit_p view must point to GPU buffer"
+        );
         assert_eq!(logit_p_view.len(), 1, "logit_p length must be 1");
         assert_eq!(grad_logit_p_view.len(), 1, "grad_logit_p length must be 1");
 
@@ -103,12 +108,8 @@ impl GpuCompute {
         assert_eq!(grad_input.cols(), features);
         assert_eq!(arg_in.rows() * arg_in.cols(), total, "arg_in size mismatch");
 
-        // Обнуляем градиент по logit_p
-        let zero_handle = self.upload_vec_to_gpu_handle(
-            &[0.0f32],
-            1,
-            1,
-        );
+        // Обнуляем градиент по logit_p.
+        let zero_handle = self.upload_vec_to_gpu_handle(&[0.0f32], 1, 1);
         self.copy_gpu_handle_region(
             &zero_handle,
             grad_logit_p_view.parent_handle(),

@@ -32,7 +32,11 @@ fn activation_value(idx: usize, x: f32) -> f32 {
 fn activation_derivative(idx: usize, x: f32) -> f32 {
     match idx {
         0 => {
-            if x > 0.0 { 1.0 } else { 0.0 }
+            if x > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
         }
         1 => {
             let sig = 1.0 / (1.0 + (-1.702 * x).exp());
@@ -47,7 +51,11 @@ fn activation_derivative(idx: usize, x: f32) -> f32 {
             1.0 - t * t
         }
         _ => {
-            if x > 0.0 { 1.0 } else { 0.0 }
+            if x > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
         }
     }
 }
@@ -88,7 +96,7 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
             let num_act = self.num_activations;
 
             for c in 0..cols {
-                // вычисляем softmax логитов для признака c
+                // Вычисляем softmax логитов для признака c.
                 let mut exp_sum = 0.0f32;
                 let mut w = [0.0f32; MAX_ACTIVATIONS];
                 for k in 0..num_act {
@@ -176,11 +184,14 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
                 let num_act = self.num_activations;
                 let param_len = num_act * features;
 
-                // локальный аккумулятор для градиентов по логитам
-                let mut grad_logits = vec![0.0f32; param_len];
+                // Обнуляем весь диапазон градиентов параметров слоя.
+                // Дальше накапливаем градиенты логитов напрямую в gp.
+                for i in 0..param_len {
+                    gp[base + i] = 0.0;
+                }
 
                 for c in 0..cols {
-                    // softmax логитов
+                    // softmax логитов.
                     let mut exp_sum = 0.0f32;
                     let mut w = [0.0f32; MAX_ACTIVATIONS];
                     for k in 0..num_act {
@@ -198,30 +209,26 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
                         let x_val = x[idx];
                         let gout = go[idx];
 
-                        // пересчитываем выход для градиента по логитам
+                        // Пересчитываем выход для градиента по логитам.
                         let mut y_val = 0.0;
                         for k in 0..num_act {
                             y_val += w[k] * activation_value(k, x_val);
                         }
 
-                        // градиент по входу
+                        // Градиент по входу.
                         let mut sum_der = 0.0;
                         for k in 0..num_act {
                             sum_der += w[k] * activation_derivative(k, x_val);
                         }
                         gi[idx] = gout * sum_der;
 
-                        // градиенты по логитам
+                        // Градиенты по логитам накапливаем напрямую в gp
+                        // (без промежуточного Vec<f32>).
                         for k in 0..num_act {
                             let d_l = gout * (activation_value(k, x_val) - y_val) * w[k];
-                            grad_logits[k * features + c] += d_l;
+                            gp[base + k * features + c] += d_l;
                         }
                     }
-                }
-
-                // записываем накопленные градиенты по логитам в общий буфер
-                for i in 0..param_len {
-                    gp[base + i] = grad_logits[i];
                 }
             });
     }

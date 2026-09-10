@@ -1,15 +1,31 @@
 // src/layers/batch_renorm/batch_renorm.rs
 
-use std::sync::Mutex;
+use std::sync::RwLock;
 use crate::layers::UniversalLayer;
+
+/// Внутреннее состояние слоя BatchRenorm1d.
+///
+/// Содержит скользящие статистики (`running_mean`, `running_var`),
+/// обновляемые во время обучения, и флаг режима `training`.
+/// Режим хранится внутри состояния, чтобы его чтение и запись
+/// выполнялись под одним замком вместе со статистиками.
+pub(crate) struct BatchRenormState {
+    pub running_mean: Vec<f32>,
+    pub running_var: Vec<f32>,
+    pub training: bool,
+}
 
 /// Слой BatchRenorm1d — улучшенный BatchNorm с обучаемыми поправками r и d.
 ///
 /// Формула:
-/// y = (x - μ_B) / σ_B * r * γ + (d * γ + β),
-/// где μ_B, σ_B — статистики текущего батча (в режиме обучения) или скользящие средние (в режиме инференса),
+///   y = (x - μ_B) / σ_B * r * γ + (d * γ + β),
+/// где μ_B, σ_B — статистики текущего батча (в режиме обучения) или
+/// скользящие средние (в режиме инференса),
 /// r и d — обучаемые параметры коррекции (инициализируются 1 и 0),
 /// γ и β — обычные параметры BatchNorm.
+///
+/// Параметры слоя (в порядке в общем буфере):
+///   γ (features), β (features), r (features), d (features).
 pub struct BatchRenorm1d {
     /// Количество признаков (столбцов матрицы).
     pub features: usize,
@@ -17,16 +33,8 @@ pub struct BatchRenorm1d {
     pub momentum: f32,
     /// Эпсилон для численной стабильности.
     pub eps: f32,
-    /// Текущий режим: true — обучение (используются батч-статистики), false — инференс (используются running статистики).
-    pub(crate) training: bool,
-    /// Состояние скользящих статистик.
-    pub(crate) state: Mutex<BatchRenormState>,
-}
-
-/// Внутреннее состояние для хранения скользящих средних и дисперсий.
-pub(crate) struct BatchRenormState {
-    pub running_mean: Vec<f32>,
-    pub running_var: Vec<f32>,
+    /// Состояние слоя (running stats + режим).
+    pub(crate) state: RwLock<BatchRenormState>,
 }
 
 impl BatchRenorm1d {
@@ -38,52 +46,49 @@ impl BatchRenorm1d {
     /// # Паника
     /// Паникует, если `features == 0`.
     pub fn new(features: usize) -> Self {
-        assert!(features > 0, "BatchRenorm1d: features must be positive");
-        Self {
-            features,
-            momentum: 0.1,
-            eps: 1e-5,
-            training: true,
-            state: Mutex::new(BatchRenormState {
-                running_mean: vec![0.0; features],
-                running_var: vec![1.0; features],
-            }),
-        }
+        Self::with_params(features, 0.1, 1e-5)
     }
 
     /// Создаёт слой с заданным числом признаков и параметрами моментума/эпсилон.
+    ///
+    /// # Паника
+    /// Паникует, если `features == 0`, `momentum` вне `[0, 1]` или `eps <= 0`.
     pub fn with_params(features: usize, momentum: f32, eps: f32) -> Self {
         assert!(features > 0, "BatchRenorm1d: features must be positive");
-        assert!(momentum >= 0.0 && momentum <= 1.0, "BatchRenorm1d: momentum must be in [0,1]");
+        assert!(
+            momentum >= 0.0 && momentum <= 1.0,
+            "BatchRenorm1d: momentum must be in [0,1]"
+        );
         assert!(eps > 0.0, "BatchRenorm1d: eps must be positive");
         Self {
             features,
             momentum,
             eps,
-            training: true,
-            state: Mutex::new(BatchRenormState {
+            state: RwLock::new(BatchRenormState {
                 running_mean: vec![0.0; features],
                 running_var: vec![1.0; features],
+                training: true,
             }),
         }
     }
 
     /// Устанавливает режим обучения.
-    pub fn set_training(&mut self, training: bool) {
-        self.training = training;
+    pub fn set_training(&self, training: bool) {
+        let mut guard = self.state.write().unwrap();
+        guard.training = training;
     }
 
     /// Возвращает текущий режим обучения.
     pub fn is_training(&self) -> bool {
-        self.training
+        self.state.read().unwrap().training
     }
 
     /// Сбрасывает скользящие статистики к начальным значениям.
-    pub fn reset_running_stats(&mut self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.running_mean = vec![0.0; self.features];
-            state.running_var = vec![1.0; self.features];
-        }
+    /// Флаг `training` не изменяется.
+    pub fn reset_running_stats(&self) {
+        let mut guard = self.state.write().unwrap();
+        guard.running_mean = vec![0.0; self.features];
+        guard.running_var = vec![1.0; self.features];
     }
 }
 

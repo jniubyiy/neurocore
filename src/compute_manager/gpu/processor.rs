@@ -770,9 +770,13 @@ pub fn process_backward_gpu_buffered(
             let max_view = MatrixBufferView::new(params_handle.clone(), slice.start + features, features);
             let alpha_view = MatrixBufferView::new(params_handle.clone(), slice.start + 2 * features, 1);
 
-            let grad_min_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start, features);
-            let grad_max_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start + features, features);
-            let grad_alpha_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start + 2 * features, 1);
+            // Единый view на весь блок градиентов параметров слоя:
+            // [grad_min (features), grad_max (features), grad_alpha (1)].
+            let grad_params_view = MatrixBufferView::new(
+                grad_params_handle.clone(),
+                slice.start,
+                2 * features + 1,
+            );
 
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), current_grad.cols());
             gpu_compute.run_dualanchor_backward_buffered_handle(
@@ -782,9 +786,7 @@ pub fn process_backward_gpu_buffered(
                 &max_view,
                 &alpha_view,
                 &grad_input_handle,
-                &grad_min_view,
-                &grad_max_view,
-                &grad_alpha_view,
+                &grad_params_view,
             );
             current_grad = grad_input_handle;
         } else if let Some(adaptive) = layer.as_adaptive_activation() {

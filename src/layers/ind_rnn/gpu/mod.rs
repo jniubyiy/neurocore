@@ -7,6 +7,8 @@ use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use vulkano::buffer::Subbuffer;
 
+/// Вспомогательная функция: получает `Subbuffer<[f32]>` из `MatrixBufferView`,
+/// используя смещение и длину. Родительский буфер должен быть GPU.
 fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[f32]> {
     let parent_sub = gpu.get_gpu_subbuffer_from_handle(view.parent_handle());
     let start = view.offset_elements() as u64;
@@ -17,9 +19,11 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 impl GpuCompute {
     /// Прямой проход IndRNN на GPU.
     ///
-    /// Параметры (W: input_dim×input_dim, u: input_dim, b: input_dim) передаются как
-    /// `MatrixBufferView` на полный блок. Вход/выход — GPU-дескрипторы (column-major).
-    /// Скрытые состояния h_all хранятся в row-major: (r * seq_len + t) * input_dim + i.
+    /// Параметры (W: input_dim×input_dim, u: input_dim, b: input_dim) передаются
+    /// как `MatrixBufferView` на полный блок. Вход/выход — GPU-дескрипторы (column-major).
+    /// Скрытые состояния `h_all` хранятся в row-major:
+    ///   `(r * seq_len + t) * input_dim + i`
+    /// и передаются как GPU-дескриптор из контекста слоя.
     pub fn run_ind_rnn_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -48,7 +52,7 @@ impl GpuCompute {
         let param_len = d * d + 2 * d;
         assert_eq!(params.len(), param_len, "Params length mismatch");
 
-        // Создаём view для W, u, b
+        // Создаём view для W, u, b.
         let w_view = MatrixBufferView::with_shape(
             params.parent_handle().clone(),
             params.offset_elements(),
@@ -102,8 +106,9 @@ impl GpuCompute {
 
     /// Обратный проход IndRNN на GPU.
     ///
-    /// Градиенты по параметрам записываются в `grad_params` (view на W,u,b) атомарно.
-    /// Вход/выходные градиенты — GPU-дескрипторы (column-major).
+    /// Градиенты по параметрам записываются в `grad_params` (view на W, u, b)
+    /// через атомарное накопление. Вход/выходные градиенты — GPU-дескрипторы
+    /// (column-major). Скрытые состояния `h_all` приходят из контекста слоя.
     pub fn run_ind_rnn_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -137,7 +142,7 @@ impl GpuCompute {
             "h_all size mismatch"
         );
 
-        // Обнуляем grad_params
+        // Обнуляем grad_params.
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -150,10 +155,11 @@ impl GpuCompute {
             grad_params.offset_elements(),
             grad_params.len(),
         );
-        // Обнуляем grad_input
+
+        // Обнуляем grad_input.
         self.fill_gpu_handle(grad_input, 0.0);
 
-        // Создаём view для W,u,b и их градиентов
+        // Создаём view для W, u, b и их градиентов.
         let w_view = MatrixBufferView::with_shape(
             params.parent_handle().clone(),
             params.offset_elements(),
@@ -202,12 +208,13 @@ impl GpuCompute {
         let gu_buf = subbuffer_from_view(self, &gu_view);
         let gb_buf = subbuffer_from_view(self, &gb_view);
 
-        // Временные буферы для delta_next (ping-pong)
+        // Временные буферы для delta_next (ping-pong).
         let (delta_next_a_buf, delta_next_a_raw) = self.acquire_temp_buffer(batch * d);
         let (delta_next_b_buf, delta_next_b_raw) = self.acquire_temp_buffer(batch * d);
 
-        // Инициализируем delta_next_a нулями
-        let zero_delta = self.upload_vec_to_gpu_handle(&vec![0.0f32; batch * d], batch * d, 1);
+        // Инициализируем delta_next_a нулями.
+        let zero_delta =
+            self.upload_vec_to_gpu_handle(&vec![0.0f32; batch * d], batch * d, 1);
         self.copy_buffer_sync(
             self.get_gpu_subbuffer_from_handle(&zero_delta),
             delta_next_a_buf.clone(),
@@ -247,7 +254,7 @@ impl GpuCompute {
             std::mem::swap(&mut current_delta_in, &mut current_delta_out);
         }
 
-        // Освобождаем временные буферы
+        // Освобождаем временные буферы.
         self.release_temp_buffer(delta_next_a_buf, delta_next_a_raw);
         self.release_temp_buffer(delta_next_b_buf, delta_next_b_raw);
     }

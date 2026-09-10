@@ -24,6 +24,11 @@ impl GpuCompute {
     ///
     /// Параметры (Wq, bq, Wk, bk, Wv, bv, Wo, bo) передаются как единый view на
     /// плоский блок в `params`. Веса — row-major, смещения — линейные векторы.
+    ///
+    /// Промежуточные буферы (q_raw, k_raw, v_raw, q_phi, k_phi, kv, z) передаются
+    /// вызывающим кодом и сохраняются в `BufferedContext::LinearAttention` для
+    /// последующего обратного прохода — состояние слоя (RwLock<LinearAttentionState>)
+    /// в GPU-пути не используется.
     pub fn run_linear_attention_forward_buffered_handle_with_dims(
         &self,
         input: &MatrixBufferHandle,
@@ -174,6 +179,8 @@ impl GpuCompute {
     ///
     /// Принимает сохранённые промежуточные буферы с forward. Градиенты по
     /// параметрам записываются в `grad_params` через атомарное накопление.
+    /// Состояние слоя (RwLock<LinearAttentionState>) не используется —
+    /// все промежуточные тензоры приходят через аргументы из BufferedContext.
     pub fn run_linear_attention_backward_buffered_handle_with_dims(
         &self,
         input: &MatrixBufferHandle,

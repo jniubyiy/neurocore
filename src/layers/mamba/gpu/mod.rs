@@ -16,6 +16,13 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 }
 
 impl GpuCompute {
+    /// Прямой проход Mamba на GPU.
+    ///
+    /// Параметры (A, B, C, D, delta) передаются как `MatrixBufferView` на полный
+    /// блок. Вход/выход — GPU-дескрипторы (column-major).
+    ///
+    /// Скрытые состояния `h_all` хранятся в row-major: `(r * seq_len + t) * state_dim + i`
+    /// и передаются как GPU-дескриптор из контекста слоя.
     pub fn run_mamba_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -29,6 +36,7 @@ impl GpuCompute {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(output.is_gpu(), "Output handle must be GPU");
         assert!(params.is_gpu(), "Params view must point to GPU buffer");
+        assert!(h_all.is_gpu(), "h_all handle must be GPU");
 
         let batch = input.rows();
         let d = input_dim;
@@ -36,12 +44,16 @@ impl GpuCompute {
         assert_eq!(input.cols(), seq_len * d, "Input cols mismatch");
         assert_eq!(output.rows(), batch);
         assert_eq!(output.cols(), seq_len * d, "Output cols mismatch");
-        assert_eq!(h_all.rows() * h_all.cols(), batch * seq_len * n, "h_all size mismatch");
+        assert_eq!(
+            h_all.rows() * h_all.cols(),
+            batch * seq_len * n,
+            "h_all size mismatch"
+        );
 
         let param_len = n * n + n * d + d * n + 2;
         assert_eq!(params.len(), param_len, "Params length mismatch");
 
-        // Создаём view для параметров
+        // Создаём view для параметров.
         let a_start = 0usize;
         let b_start = a_start + n * n;
         let c_start = b_start + n * d;
@@ -80,19 +92,20 @@ impl GpuCompute {
             1,
         );
 
-        // Скачиваем delta для push-константы дискретизации
+        // Скачиваем delta для push-константы дискретизации.
         let delta_val = {
-            let handle = self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
+            let handle =
+                self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
             let guard = handle.read();
             let slice = guard.as_slice().unwrap();
             slice[delta_view.offset_elements()]
         };
 
-        // Выделяем временные буферы A_bar и B_bar
+        // Выделяем временные буферы A_bar и B_bar.
         let (a_bar_buf, a_bar_raw) = self.acquire_temp_buffer(n * n);
         let (b_bar_buf, b_bar_raw) = self.acquire_temp_buffer(n * d);
 
-        // Subbuffer'ы
+        // Subbuffer'ы.
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
         let h_buf = self.get_gpu_subbuffer_from_handle(h_all);
@@ -101,7 +114,7 @@ impl GpuCompute {
         let c_buf = subbuffer_from_view(self, &c_view);
         let d_buf = subbuffer_from_view(self, &d_view);
 
-        // Запускаем дискретизацию
+        // Запускаем дискретизацию: A_bar = exp(Δ A), B_bar = Δ B.
         let discretize_pipeline = &self.mamba_pipelines().discretize;
         let push_disc = [n as u32, d as u32, delta_val.to_bits(), 0u32];
         let total_disc = n * n + n * d;
@@ -117,11 +130,11 @@ impl GpuCompute {
             total_disc,
         );
 
-        // Последовательные шаги
+        // Последовательные шаги forward.
         let fwd_pipeline = &self.mamba_pipelines().forward_step;
 
         for t in 0..seq_len {
-            // Фаза 0: вычисление h_t
+            // Фаза 0: вычисление h_t.
             let push_h = [
                 batch as u32,
                 d as u32,
@@ -145,7 +158,7 @@ impl GpuCompute {
                 batch * n,
             );
 
-            // Фаза 1: вычисление y_t
+            // Фаза 1: вычисление y_t.
             let push_y = [
                 batch as u32,
                 d as u32,
@@ -170,11 +183,16 @@ impl GpuCompute {
             );
         }
 
-        // Освобождаем временные буферы
+        // Освобождаем временные буферы.
         self.release_temp_buffer(a_bar_buf, a_bar_raw);
         self.release_temp_buffer(b_bar_buf, b_bar_raw);
     }
 
+    /// Обратный проход Mamba на GPU.
+    ///
+    /// Градиенты по параметрам записываются в `grad_params` атомарно.
+    /// Вход/выходные градиенты — GPU-дескрипторы (column-major).
+    /// Скрытые состояния `h_all` приходят из контекста слоя.
     pub fn run_mamba_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -190,8 +208,12 @@ impl GpuCompute {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(grad_out.is_gpu(), "grad_out handle must be GPU");
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
-        assert!(grad_params.is_gpu(), "grad_params view must point to GPU buffer");
+        assert!(
+            grad_params.is_gpu(),
+            "grad_params view must point to GPU buffer"
+        );
         assert!(params.is_gpu(), "Params view must point to GPU buffer");
+        assert!(h_all.is_gpu(), "h_all handle must be GPU");
 
         let batch = input.rows();
         let d = input_dim;
@@ -205,9 +227,13 @@ impl GpuCompute {
         let param_len = n * n + n * d + d * n + 2;
         assert_eq!(params.len(), param_len, "Params length mismatch");
         assert_eq!(grad_params.len(), param_len, "Grad params length mismatch");
-        assert_eq!(h_all.rows() * h_all.cols(), batch * seq_len * n, "h_all size mismatch");
+        assert_eq!(
+            h_all.rows() * h_all.cols(),
+            batch * seq_len * n,
+            "h_all size mismatch"
+        );
 
-        // Обнуляем градиенты по параметрам и входу
+        // Обнуляем градиенты по параметрам и входу.
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -222,7 +248,7 @@ impl GpuCompute {
         );
         self.fill_gpu_handle(grad_input, 0.0);
 
-        // Создаём view для параметров и их градиентов
+        // Создаём view для параметров и их градиентов.
         let a_start = 0usize;
         let b_start = a_start + n * n;
         let c_start = b_start + n * d;
@@ -293,25 +319,24 @@ impl GpuCompute {
             1,
         );
 
-        // Скачиваем delta для push-константы дискретизации
+        // Скачиваем delta для push-константы дискретизации.
         let delta_val = {
-            let handle = self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
+            let handle =
+                self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
             let guard = handle.read();
             let slice = guard.as_slice().unwrap();
             slice[delta_view.offset_elements()]
         };
 
-        // Выделяем временные буферы A_bar, B_bar для дискретизации
+        // Временные буферы.
         let (a_bar_buf, a_bar_raw) = self.acquire_temp_buffer(n * n);
         let (b_bar_buf, b_bar_raw) = self.acquire_temp_buffer(n * d);
-        // Временные буферы для накопления градиентов A_bar, B_bar
         let (grad_a_bar_buf, grad_a_bar_raw) = self.acquire_temp_buffer(n * n);
         let (grad_b_bar_buf, grad_b_bar_raw) = self.acquire_temp_buffer(n * d);
-        // Временные буферы delta_next (две штуки для пинг-понга)
         let (delta_next_a_buf, delta_next_a_raw) = self.acquire_temp_buffer(batch * n);
         let (delta_next_b_buf, delta_next_b_raw) = self.acquire_temp_buffer(batch * n);
 
-        // Обнуляем grad_A_bar, grad_B_bar и delta_next_a
+        // Обнуляем grad_A_bar, grad_B_bar и delta_next_a.
         let zero_grad_a_bar = self.upload_to_temp_buffer(&vec![0.0f32; n * n]);
         let zero_grad_b_bar = self.upload_to_temp_buffer(&vec![0.0f32; n * d]);
         let zero_delta_next = self.upload_to_temp_buffer(&vec![0.0f32; batch * n]);
@@ -320,12 +345,12 @@ impl GpuCompute {
         self.copy_buffer_sync(zero_grad_b_bar.0.clone(), grad_b_bar_buf.clone());
         self.copy_buffer_sync(zero_delta_next.0.clone(), delta_next_a_buf.clone());
 
-        // Освобождаем zero-буферы
+        // Освобождаем zero-буферы.
         self.release_temp_buffer(zero_grad_a_bar.0, zero_grad_a_bar.1);
         self.release_temp_buffer(zero_grad_b_bar.0, zero_grad_b_bar.1);
         self.release_temp_buffer(zero_delta_next.0, zero_delta_next.1);
 
-        // Запускаем дискретизацию
+        // Запускаем дискретизацию.
         let discretize_pipeline = &self.mamba_pipelines().discretize;
         let push_disc = [n as u32, d as u32, delta_val.to_bits(), 0u32];
         self.run_compute_shader(
@@ -340,7 +365,7 @@ impl GpuCompute {
             n * n + n * d,
         );
 
-        // Получаем нужные Subbuffer'ы
+        // Subbuffer'ы.
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let h_buf = self.get_gpu_subbuffer_from_handle(h_all);
@@ -350,13 +375,19 @@ impl GpuCompute {
         let gd_buf = subbuffer_from_view(self, &gd_view);
         let d_buf = subbuffer_from_view(self, &d_view);
 
-        // Цикл обратных шагов
+        // Цикл обратных шагов по t.
         let bwd_pipeline = &self.mamba_pipelines().backward_step;
         let mut current_delta_in = delta_next_a_buf.clone();
         let mut current_delta_out = delta_next_b_buf.clone();
 
         for t in (0..seq_len).rev() {
-            let push = [batch as u32, d as u32, n as u32, seq_len as u32, t as u32];
+            let push = [
+                batch as u32,
+                d as u32,
+                n as u32,
+                seq_len as u32,
+                t as u32,
+            ];
             self.run_compute_shader(
                 bwd_pipeline,
                 &[
@@ -378,11 +409,10 @@ impl GpuCompute {
                 &push,
                 batch,
             );
-            // Меняем буферы местами для следующего шага
             std::mem::swap(&mut current_delta_in, &mut current_delta_out);
         }
 
-        // Преобразуем градиенты A_bar, B_bar в градиенты A, B, delta
+        // Преобразование градиентов A_bar, B_bar в градиенты A, B, delta.
         let convert_pipeline = &self.mamba_pipelines().convert_grads;
         let ga_buf = subbuffer_from_view(self, &ga_view);
         let gb_buf = subbuffer_from_view(self, &gb_view);
@@ -402,7 +432,7 @@ impl GpuCompute {
             n * n + n * d,
         );
 
-        // Освобождаем временные буферы
+        // Освобождаем временные буферы.
         self.release_temp_buffer(a_bar_buf, a_bar_raw);
         self.release_temp_buffer(b_bar_buf, b_bar_raw);
         self.release_temp_buffer(grad_a_bar_buf, grad_a_bar_raw);

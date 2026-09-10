@@ -26,10 +26,12 @@ impl UniversalLayerBuffered for ConcreteDropout {
             "ConcreteDropout: parameter slice out of bounds"
         );
 
-        // Читаем logit_p
+        // Читаем logit_p.
         let logit_p = {
             let p_guard = params.read();
-            let p = p_guard.as_slice().expect("ConcreteDropout: expected CPU buffer");
+            let p = p_guard
+                .as_slice()
+                .expect("ConcreteDropout: expected CPU buffer");
             p[slice.start]
         };
 
@@ -37,14 +39,17 @@ impl UniversalLayerBuffered for ConcreteDropout {
         let mut rng = StdRng::seed_from_u64(self.seed);
         let eps = 1e-8f32;
 
-        // Генерируем аргументы сигмоиды и маску
         let mut arg = vec![0.0f32; total];
 
         {
             let input_guard = input.read();
-            let x = input_guard.as_slice().expect("ConcreteDropout: expected CPU buffer");
+            let x = input_guard
+                .as_slice()
+                .expect("ConcreteDropout: expected CPU buffer");
             let mut output_guard = output.write();
-            let y = output_guard.as_slice_mut().expect("ConcreteDropout: expected CPU buffer");
+            let y = output_guard
+                .as_slice_mut()
+                .expect("ConcreteDropout: expected CPU buffer");
 
             for i in 0..total {
                 let u: f32 = rng.gen();
@@ -57,8 +62,8 @@ impl UniversalLayerBuffered for ConcreteDropout {
             }
         }
 
-        // Сохраняем аргумент для обратного прохода
-        self.store_mask(arg);
+        // Сохраняем аргумент для обратного прохода.
+        self.store_state(arg);
     }
 
     fn backward_buffered(
@@ -76,9 +81,17 @@ impl UniversalLayerBuffered for ConcreteDropout {
             _ => panic!("Expected ConcreteDropout context"),
         };
 
-        let arg = self
-            .take_mask()
-            .expect("ConcreteDropout backward called without forward state");
+        // Извлекаем состояние и инвалидируем его.
+        // std::mem::take позволяет избежать клонирования буфера.
+        let arg = {
+            let mut guard = self.state.write().unwrap();
+            assert!(
+                guard.valid,
+                "ConcreteDropout backward called without forward"
+            );
+            guard.valid = false;
+            std::mem::take(&mut guard.arg)
+        };
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
@@ -126,14 +139,14 @@ impl UniversalLayerBuffered for ConcreteDropout {
                     let sigmoid = 1.0 / (1.0 + (-a).exp());
                     let dsigmoid = sigmoid * (1.0 - sigmoid);
 
-                    // Градиент по входу
+                    // Градиент по входу.
                     gi[i] = go[i] * sigmoid;
 
-                    // Градиент по logit_p
+                    // Градиент по logit_p.
                     grad_logit_p += go[i] * x[i] * dsigmoid / temp;
                 }
 
-                // Записываем градиент по logit_p
+                // Записываем градиент по logit_p.
                 gp[slice.start] = grad_logit_p;
             });
     }

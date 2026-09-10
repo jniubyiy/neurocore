@@ -18,6 +18,11 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 
 impl GpuCompute {
     /// Прямой проход DualAnchor на GPU.
+    ///
+    /// Параметры `min_vals`, `max_vals`, `alpha` передаются как три отдельных
+    /// `MatrixBufferView`, ссылающихся на смещения `[0, features)`,
+    /// `[features, 2*features)` и `[2*features, 2*features+1)` внутри общего
+    /// блока параметров. Вход и выход — GPU-дескрипторы.
     pub fn run_dualanchor_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -71,6 +76,21 @@ impl GpuCompute {
     }
 
     /// Обратный проход DualAnchor на GPU.
+    ///
+    /// Градиенты по параметрам записываются в единый `grad_params` — тот же
+    /// блок, что и параметры слоя, но в буфере градиентов. Внутри метода
+    /// создаются три отдельных `Subbuffer` на смещениях `[0, features)`,
+    /// `[features, 2*features)` и `[2*features, 2*features+1)`, которые
+    /// передаются в шейдер как три отдельных binding.
+    ///
+    /// # Аргументы
+    /// * `input` — вход слоя (GPU, column-major).
+    /// * `grad_out` — градиент по выходу (GPU).
+    /// * `min_vals`, `max_vals`, `alpha` — представления параметров слоя
+    ///   (части общего блока параметров).
+    /// * `grad_input` — буфер для градиента по входу (GPU).
+    /// * `grad_params` — единый view на блок градиентов параметров
+    ///   длиной `2*features + 1` (min, max, alpha).
     pub fn run_dualanchor_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -79,16 +99,12 @@ impl GpuCompute {
         max_vals: &MatrixBufferView,
         alpha: &MatrixBufferView,
         grad_input: &MatrixBufferHandle,
-        grad_min: &MatrixBufferView,
-        grad_max: &MatrixBufferView,
-        grad_alpha: &MatrixBufferView,
+        grad_params: &MatrixBufferView,
     ) {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(grad_out.is_gpu(), "grad_out handle must be GPU");
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
-        assert!(grad_min.is_gpu(), "grad_min view must point to GPU buffer");
-        assert!(grad_max.is_gpu(), "grad_max view must point to GPU buffer");
-        assert!(grad_alpha.is_gpu(), "grad_alpha view must point to GPU buffer");
+        assert!(grad_params.is_gpu(), "grad_params view must point to GPU buffer");
         assert!(min_vals.is_gpu(), "min_vals view must point to GPU buffer");
         assert!(max_vals.is_gpu(), "max_vals view must point to GPU buffer");
         assert!(alpha.is_gpu(), "alpha view must point to GPU buffer");
@@ -100,18 +116,45 @@ impl GpuCompute {
         assert_eq!(grad_out.cols(), features);
         assert_eq!(grad_input.rows(), batch);
         assert_eq!(grad_input.cols(), features);
-        assert_eq!(grad_min.len(), features, "grad_min length must equal features");
-        assert_eq!(grad_max.len(), features, "grad_max length must equal features");
-        assert_eq!(grad_alpha.len(), 1, "grad_alpha length must be 1");
+
+        // Единый буфер градиентов параметров должен содержать
+        // [grad_min (features), grad_max (features), grad_alpha (1)].
+        assert_eq!(
+            grad_params.len(),
+            2 * features + 1,
+            "grad_params length must be 2*features + 1"
+        );
 
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let min_buf = subbuffer_from_view(self, min_vals);
         let max_buf = subbuffer_from_view(self, max_vals);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
-        let gmin_buf = subbuffer_from_view(self, grad_min);
-        let gmax_buf = subbuffer_from_view(self, grad_max);
-        let galpha_buf = subbuffer_from_view(self, grad_alpha);
+
+        // Разбиваем единый grad_params на три Subbuffer, соответствующих
+        // трём логическим блокам: grad_min, grad_max, grad_alpha.
+        let grad_params_parent = grad_params.parent_handle().clone();
+        let grad_params_offset = grad_params.offset_elements();
+
+        let gmin_view = MatrixBufferView::new(
+            grad_params_parent.clone(),
+            grad_params_offset,
+            features,
+        );
+        let gmax_view = MatrixBufferView::new(
+            grad_params_parent.clone(),
+            grad_params_offset + features,
+            features,
+        );
+        let galpha_view = MatrixBufferView::new(
+            grad_params_parent.clone(),
+            grad_params_offset + 2 * features,
+            1,
+        );
+
+        let gmin_buf = subbuffer_from_view(self, &gmin_view);
+        let gmax_buf = subbuffer_from_view(self, &gmax_view);
+        let galpha_buf = subbuffer_from_view(self, &galpha_view);
 
         // Читаем alpha на CPU.
         let alpha_val = {

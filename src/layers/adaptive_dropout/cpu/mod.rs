@@ -23,6 +23,7 @@ impl UniversalLayerBuffered for AdaptiveDropout {
         debug_assert_eq!(cols, self.features);
         debug_assert!(slice.start + self.param_len() <= params.rows() * params.cols());
 
+        // Считываем theta и T из общего буфера параметров.
         let (theta, temp) = {
             let p_guard = params.read();
             let p = p_guard.as_slice().unwrap();
@@ -41,6 +42,7 @@ impl UniversalLayerBuffered for AdaptiveDropout {
         let mut mask = vec![0.0f32; total];
         let mut probs = vec![0.0f32; total];
 
+        // Первый проход: генерация маски и вероятностей.
         {
             let input_guard = input.read();
             let x = input_guard.as_slice().unwrap();
@@ -59,8 +61,11 @@ impl UniversalLayerBuffered for AdaptiveDropout {
             }
         }
 
-        *self.mask.lock().unwrap() = Some(mask.clone());
+        // Сохраняем маску в состояние слоя (arg на CPU не используется).
+        // Клонируем, чтобы использовать локальную копию для второго прохода.
+        self.store_state(mask.clone(), Vec::new());
 
+        // Второй проход: вычисление выхода y = x * z / (p + eps).
         {
             let input_guard = input.read();
             let x = input_guard.as_slice().unwrap();
@@ -87,14 +92,24 @@ impl UniversalLayerBuffered for AdaptiveDropout {
             _ => panic!("Expected AdaptiveDropout context"),
         };
 
-        let mask = self.mask.lock().unwrap().take()
-            .expect("AdaptiveDropout backward called without forward mask");
+        // Извлекаем маску из состояния и инвалидируем его.
+        // std::mem::take позволяет избежать клонирования буфера маски.
+        let mask = {
+            let mut guard = self.state.write().unwrap();
+            assert!(
+                guard.valid,
+                "AdaptiveDropout backward called without forward"
+            );
+            guard.valid = false;
+            std::mem::take(&mut guard.mask)
+        };
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
         let total = rows * cols;
         debug_assert_eq!(cols, self.features);
         debug_assert_eq!(rows, input_handle.rows());
+        debug_assert_eq!(mask.len(), total);
 
         let ids = [
             input_handle.id(),
@@ -140,12 +155,16 @@ impl UniversalLayerBuffered for AdaptiveDropout {
                         let prob = 1.0 / (1.0 + (-(x_val.abs() - theta_c) / temp_c).exp());
                         let z = mask[idx];
 
+                        // Градиент по входу.
                         gi[idx] = gout * z / (prob + eps);
 
+                        // Производные сигмоиды по theta и T.
                         let dsig_darg = prob * (1.0 - prob);
                         let dprob_dtheta = -dsig_darg / temp_c;
-                        let dprob_dtemp = -dsig_darg * (x_val.abs() - theta_c) / (temp_c * temp_c);
+                        let dprob_dtemp =
+                            -dsig_darg * (x_val.abs() - theta_c) / (temp_c * temp_c);
 
+                        // Производная выхода по вероятности удержания.
                         let dy_dprob = -x_val * z / ((prob + eps) * (prob + eps));
                         d_theta_acc += gout * dy_dprob * dprob_dtheta;
                         d_temp_acc += gout * dy_dprob * dprob_dtemp;

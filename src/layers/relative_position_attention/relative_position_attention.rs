@@ -1,6 +1,6 @@
 // src/layers/relative_position_attention/relative_position_attention.rs
 
-use std::sync::Mutex;
+use std::sync::RwLock;
 use crate::layers::UniversalLayer;
 
 /// Кэш промежуточных результатов прямого прохода для обратного распространения.
@@ -40,6 +40,16 @@ pub(crate) struct RelativePositionAttentionCache {
     pub d_model: usize,
 }
 
+/// Состояние слоя RelativePositionAttention.
+///
+/// Содержит кэш последнего прямого прохода и флаг `valid`, указывающий,
+/// актуален ли кэш для предстоящего обратного прохода.
+/// Пока `valid == false`, содержимое `cache` не определено.
+pub(crate) struct RelativePositionAttentionState {
+    pub cache: RelativePositionAttentionCache,
+    pub valid: bool,
+}
+
 /// Слой RelativePositionAttention.
 ///
 /// Одноголовое внимание с относительным позиционным смещением.
@@ -55,31 +65,64 @@ pub(crate) struct RelativePositionAttentionCache {
 pub struct RelativePositionAttention {
     pub seq_len: usize,
     pub d_model: usize,
-    /// Кэш прямого прохода.
-    pub(crate) cache: Mutex<Option<RelativePositionAttentionCache>>,
+    /// Состояние слоя: кэш последнего forward.
+    pub(crate) state: RwLock<RelativePositionAttentionState>,
 }
 
 impl RelativePositionAttention {
+    /// Создаёт слой.
+    ///
+    /// # Паника
+    /// Паникует, если `seq_len == 0` или `d_model == 0`.
     pub fn new(seq_len: usize, d_model: usize) -> Self {
-        assert!(seq_len > 0, "RelativePositionAttention: seq_len must be positive");
-        assert!(d_model > 0, "RelativePositionAttention: d_model must be positive");
+        assert!(
+            seq_len > 0,
+            "RelativePositionAttention: seq_len must be positive"
+        );
+        assert!(
+            d_model > 0,
+            "RelativePositionAttention: d_model must be positive"
+        );
         Self {
             seq_len,
             d_model,
-            cache: Mutex::new(None),
+            state: RwLock::new(RelativePositionAttentionState {
+                cache: RelativePositionAttentionCache {
+                    q: Vec::new(),
+                    k: Vec::new(),
+                    v: Vec::new(),
+                    scores: Vec::new(),
+                    attention_weights: Vec::new(),
+                    attn_out: Vec::new(),
+                    batch: 0,
+                    seq: 0,
+                    d_model: 0,
+                },
+                valid: false,
+            }),
         }
     }
 
     /// Сохраняет кэш прямого прохода.
     pub(crate) fn store_cache(&self, cache: RelativePositionAttentionCache) {
-        let mut guard = self.cache.lock().unwrap();
-        *guard = Some(cache);
+        let mut guard = self.state.write().unwrap();
+        guard.cache = cache;
+        guard.valid = true;
     }
 
-    /// Извлекает кэш прямого прохода.
-    pub(crate) fn take_cache(&self) -> Option<RelativePositionAttentionCache> {
-        let mut guard = self.cache.lock().unwrap();
-        guard.take()
+    /// Помечает состояние как недействительное.
+    ///
+    /// Используется после успешного завершения обратного прохода, чтобы
+    /// повторный backward без нового forward вызывал осмысленную панику.
+    /// Данные не освобождаются, чтобы избежать лишних аллокаций.
+    pub(crate) fn invalidate(&self) {
+        let mut guard = self.state.write().unwrap();
+        guard.valid = false;
+    }
+
+    /// Возвращает `true`, если в слое сохранено актуальное состояние.
+    pub(crate) fn has_valid_state(&self) -> bool {
+        self.state.read().unwrap().valid
     }
 }
 

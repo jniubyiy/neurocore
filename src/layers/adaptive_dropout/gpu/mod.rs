@@ -23,7 +23,8 @@ impl GpuCompute {
     /// (всего 2*features элементов: сначала `theta`, затем `T`).
     /// `mask_out` и `arg_out` — GPU-буферы размера `batch * features`,
     /// в которые записываются бинарная маска `z` и аргумент `a = (|x| - theta)/T`
-    /// для последующего обратного прохода.
+    /// для последующего обратного прохода. Эти буферы сохраняются в контексте
+    /// слоя, а не в его внутреннем состоянии.
     /// `seed` — 32-битное зерно для генератора псевдослучайных чисел на GPU.
     pub fn run_adaptive_dropout_forward_buffered_handle(
         &self,
@@ -74,7 +75,7 @@ impl GpuCompute {
 
     /// Обратный проход AdaptiveDropout на GPU.
     ///
-    /// `mask` и `arg` — GPU-буферы, сохранённые при прямом проходе.
+    /// `mask` и `arg` — GPU-буферы, сохранённые при прямом проходе (в контексте).
     /// `params_view` — тот же view на параметры (theta, T).
     /// `grad_params_view` — представление градиентов по параметрам (2*features).
     /// Перед вызовом область `grad_params_view` обнуляется, так как шейдер
@@ -109,7 +110,7 @@ impl GpuCompute {
         assert_eq!(params.len(), 2 * features, "Params length mismatch");
         assert_eq!(grad_params.len(), 2 * features, "grad_params length mismatch");
 
-        // Обнуляем градиенты по параметрам перед накоплением
+        // Обнуляем градиенты по параметрам перед накоплением.
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),

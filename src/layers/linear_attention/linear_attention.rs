@@ -1,6 +1,6 @@
 // src/layers/linear_attention/linear_attention.rs
 
-use std::sync::Mutex;
+use std::sync::RwLock;
 use crate::layers::UniversalLayer;
 
 /// Кэш промежуточных результатов прямого прохода для обратного распространения.
@@ -40,6 +40,16 @@ pub(crate) struct LinearAttentionCache {
     pub d_model: usize,
 }
 
+/// Состояние слоя LinearAttention.
+///
+/// Содержит кэш последнего прямого прохода и флаг `valid`, указывающий,
+/// актуален ли кэш для предстоящего обратного прохода.
+/// Пока `valid == false`, содержимое `cache` не определено.
+pub(crate) struct LinearAttentionState {
+    pub cache: LinearAttentionCache,
+    pub valid: bool,
+}
+
 /// Слой линейного внимания (Linear Attention) с одним головным механизмом.
 ///
 /// Формула (упрощённая, без нормализации по ключам, но с ELU+1):
@@ -55,8 +65,8 @@ pub struct LinearAttention {
     pub seq_len: usize,
     /// Размерность модели (общая для Q, K, V).
     pub d_model: usize,
-    /// Кэш прямого прохода (для обратного распространения).
-    pub(crate) cache: Mutex<Option<LinearAttentionCache>>,
+    /// Состояние слоя: кэш последнего forward.
+    pub(crate) state: RwLock<LinearAttentionState>,
 }
 
 impl LinearAttention {
@@ -70,20 +80,43 @@ impl LinearAttention {
         Self {
             seq_len,
             d_model,
-            cache: Mutex::new(None),
+            state: RwLock::new(LinearAttentionState {
+                cache: LinearAttentionCache {
+                    q: Vec::new(),
+                    k: Vec::new(),
+                    v: Vec::new(),
+                    kv: Vec::new(),
+                    z: Vec::new(),
+                    attn_out: Vec::new(),
+                    batch: 0,
+                    seq: 0,
+                    d_model: 0,
+                },
+                valid: false,
+            }),
         }
     }
 
     /// Сохраняет кэш прямого прохода.
     pub(crate) fn store_cache(&self, cache: LinearAttentionCache) {
-        let mut guard = self.cache.lock().unwrap();
-        *guard = Some(cache);
+        let mut guard = self.state.write().unwrap();
+        guard.cache = cache;
+        guard.valid = true;
     }
 
-    /// Извлекает кэш прямого прохода.
-    pub(crate) fn take_cache(&self) -> Option<LinearAttentionCache> {
-        let mut guard = self.cache.lock().unwrap();
-        guard.take()
+    /// Помечает состояние как недействительное.
+    ///
+    /// Используется после успешного завершения обратного прохода, чтобы
+    /// повторный backward без нового forward вызывал осмысленную панику.
+    /// Данные не освобождаются, чтобы избежать лишних аллокаций.
+    pub(crate) fn invalidate(&self) {
+        let mut guard = self.state.write().unwrap();
+        guard.valid = false;
+    }
+
+    /// Возвращает `true`, если в слое сохранено актуальное состояние.
+    pub(crate) fn has_valid_state(&self) -> bool {
+        self.state.read().unwrap().valid
     }
 }
 

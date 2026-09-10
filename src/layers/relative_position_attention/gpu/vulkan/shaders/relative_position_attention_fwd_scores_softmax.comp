@@ -1,3 +1,31 @@
+// src/layers/relative_position_attention/gpu/vulkan/shaders/relative_position_attention_fwd_scores_softmax.comp
+//
+// Вычисление матрицы внимания scores и весов weights через softmax
+// для слоя RelativePositionAttention.
+//
+// Раскладка данных — column-major.
+//
+// Вход:
+//   q (batch, seq_len * d_model), column-major:
+//     q[(t * d_model + j) * batch + r]
+//   k (batch, seq_len * d_model), column-major:
+//     k[(s * d_model + j) * batch + r]
+//   rel_bias: длина (2 * seq_len - 1), линейный вектор
+//
+// Выходы:
+//   scores  (batch, seq_len * seq_len), column-major:
+//     scores[(t * seq_len + s) * batch + r]
+//   weights (batch, seq_len * seq_len), column-major:
+//     weights[(t * seq_len + s) * batch + r]
+//
+// Математика для каждого (r, t):
+//   dot[r,t,s]     = scale * Σ_j q[r,t,j] * k[r,s,j]
+//   score[r,t,s]   = dot[r,t,s] + rel_bias[s - t + seq_len - 1]
+//   weights[r,t,s] = softmax_s(score[r,t,s])
+//
+// Push-константы: batch, seq_len, d_model.
+// Dispatch: batch * seq_len потоков (один поток на строку (r, t)).
+
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -9,69 +37,79 @@ layout(push_constant) uniform PushConsts {
 } pc;
 
 layout(binding = 0, std430) readonly buffer QBuf {
-    float q[];          // row-major: (batch * seq_len) x d_model
+    float q[];
 };
 
 layout(binding = 1, std430) readonly buffer KBuf {
-    float k[];          // row-major: (batch * seq_len) x d_model
+    float k[];
 };
 
 layout(binding = 2, std430) readonly buffer RelBiasBuf {
-    float rel_bias[];   // длина 2*seq_len - 1
+    float rel_bias[];
 };
 
-// ScoresBuf используется и для записи, и для чтения (вычисление softmax),
-// поэтому его квалификатор не может быть writeonly.
 layout(binding = 3, std430) buffer ScoresBuf {
-    float scores[];     // (batch * seq_len) x seq_len, row-major
+    float scores[];
 };
 
 layout(binding = 4, std430) writeonly buffer WeightsBuf {
-    float weights[];    // (batch * seq_len) x seq_len, row-major
+    float weights[];
 };
 
 void main() {
-    uint row = gl_GlobalInvocationID.x; // глобальный индекс строки (batch*t)
+    uint row = gl_GlobalInvocationID.x;
     uint total_rows = pc.batch * pc.seq_len;
     if (row >= total_rows) return;
 
-    uint r = row / pc.seq_len;
-    uint t = row % pc.seq_len;
-    uint q_base = row * pc.d_model;
-    uint seq = pc.seq_len;
     uint d = pc.d_model;
+    uint seq = pc.seq_len;
+
+    uint r = row / seq;
+    uint t = row % seq;
+
+    // База для Q[r, t, 0] в column-major:
+    //   элемент (r, t, j) лежит по адресу (t*d + j) * batch + r,
+    //   значит шаг по j равен batch.
+    uint q_base = (t * d) * pc.batch + r;
+
+    // База для scores/weights[r, t, 0] в column-major:
+    //   элемент (r, t, s) лежит по адресу (t*seq + s) * batch + r,
+    //   шаг по s равен batch.
+    uint s_base = (t * seq) * pc.batch + r;
 
     float scale = inversesqrt(float(d));
 
-    // Первый проход: вычисляем все скоры и находим максимум
+    // ============ Проход 1: вычисление score и максимума ============
     float max_score = -1e30;
     for (uint s = 0u; s < seq; ++s) {
-        uint k_base = (r * seq + s) * d;
+        uint k_base = (s * d) * pc.batch + r;
+
         float dot = 0.0;
         for (uint j = 0u; j < d; ++j) {
-            dot += q[q_base + j] * k[k_base + j];
+            dot += q[q_base + j * pc.batch] * k[k_base + j * pc.batch];
         }
         dot *= scale;
 
-        // Относительный индекс смещения
         int rel_idx = int(s) - int(t) + int(seq - 1u);
         float bias_val = rel_bias[uint(rel_idx)];
 
         float score = dot + bias_val;
-        scores[row * seq + s] = score;
+        scores[s_base + s * pc.batch] = score;
         if (score > max_score) {
             max_score = score;
         }
     }
 
-    // Второй проход: softmax
+    // ============ Проход 2: softmax ============
     float sum_exp = 0.0;
     for (uint s = 0u; s < seq; ++s) {
-        float e = exp(scores[row * seq + s] - max_score);
+        float e = exp(scores[s_base + s * pc.batch] - max_score);
         sum_exp += e;
     }
+    float inv_sum = 1.0 / sum_exp;
+
     for (uint s = 0u; s < seq; ++s) {
-        float e = exp(scores[row * seq + s] - max_score);
-        weights[row * seq + s] = e / sum_exp;
+        float e = exp(scores[s_base + s * pc.batch] - max_score);
+        weights[s_base + s * pc.batch] = e * inv_sum;
     }
 }

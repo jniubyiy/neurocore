@@ -1,3 +1,38 @@
+// src/layers/relative_position_attention/gpu/vulkan/shaders/relative_position_attention_fwd_prepare_qkv.comp
+//
+// Подготовка Q, K, V для слоя RelativePositionAttention.
+//
+// Выполняет три линейных преобразования (W_q, W_k, W_v) независимо
+// к каждому токену входа. Реализовано как единый шейдер с тремя
+// ветками по значению idx, что позволяет сделать один dispatch вместо
+// трёх отдельных вызовов.
+//
+// Раскладка данных — column-major.
+//
+// Вход:
+//   x (batch, seq_len * d_model), column-major:
+//     x[(t * d_model + i) * batch + r]
+//
+// Параметры (плоский блок params):
+//   W_q: [0, d²),             row-major: W_q[j * d + i]
+//   b_q: [d², d² + d)
+//   W_k: [d² + d, 2d² + d),   row-major
+//   b_k: [2d² + d, 2d² + 2d)
+//   W_v: [2d² + 2d, 3d² + 2d), row-major
+//   b_v: [3d² + 2d, 3d² + 3d)
+//
+// Выходы:
+//   q (batch, seq_len * d_model), column-major:
+//     q[(t * d_model + j) * batch + r]
+//   k — аналогично
+//   v — аналогично
+//
+// Push-константы: batch, seq_len, d_model
+// Dispatch: 3 * batch * seq_len * d_model потоков.
+//
+// Формула для каждого (r, t, j) и соответствующего выхода:
+//   out[r,t,j] = b[j] + Σ_i x[r,t,i] * W[j, i]
+
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -9,15 +44,15 @@ layout(push_constant) uniform PushConsts {
 } pc;
 
 layout(binding = 0, std430) readonly buffer InputBuf {
-    float x[];          // row-major: (batch * seq_len) x d_model
+    float x[];
 };
 
 layout(binding = 1, std430) readonly buffer ParamsBuf {
-    float params[];     // содержит все параметры, включая W_q, b_q, W_k, b_k, W_v, b_v
+    float params[];
 };
 
 layout(binding = 2, std430) writeonly buffer QBuf {
-    float q[];          // row-major: (batch * seq_len) x d_model
+    float q[];
 };
 
 layout(binding = 3, std430) writeonly buffer KBuf {
@@ -29,17 +64,25 @@ layout(binding = 4, std430) writeonly buffer VBuf {
 };
 
 void main() {
-    uint total_qkv = pc.batch * pc.seq_len * pc.d_model * 3u;
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= total_qkv) return;
-
-    uint buffer_type = idx / (pc.batch * pc.seq_len * pc.d_model);
-    uint remaining = idx % (pc.batch * pc.seq_len * pc.d_model);
-    uint token = remaining / pc.d_model;
-    uint out_idx = remaining % pc.d_model;
-
-    // Смещения в params
     uint d = pc.d_model;
+    uint per_buffer = pc.batch * pc.seq_len * d;
+    uint total = per_buffer * 3u;
+
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    // Определяем, для какого выхода (Q/K/V) работаем.
+    uint buffer_type = idx / per_buffer;
+    uint rem = idx % per_buffer;
+
+    // Восстанавливаем (r, t, j) из column-major индекса:
+    //   rem = (t * d + j) * batch + r
+    uint r   = rem % pc.batch;
+    uint tmp = rem / pc.batch;
+    uint j   = tmp % d;
+    uint t   = tmp / d;
+
+    // Смещения блоков параметров.
     uint wq_start = 0u;
     uint bq_start = wq_start + d * d;
     uint wk_start = bq_start + d;
@@ -60,20 +103,24 @@ void main() {
         b_start = bv_start;
     }
 
-    // Линейное преобразование
-    float sum = params[b_start + out_idx];
-    uint input_base = token * d;
-    for (uint j = 0u; j < d; ++j) {
-        sum += x[input_base + j] * params[w_start + out_idx * d + j];
+    // Линейное преобразование.
+    //   sum = b[j] + Σ_i x[r,t,i] * W[j,i]
+    float sum = params[b_start + j];
+    uint in_base = (t * d) * pc.batch + r;
+    uint w_base = j * d;
+    for (uint i = 0u; i < d; ++i) {
+        float x_val = x[in_base + i * pc.batch];
+        float w_val = params[w_start + w_base + i];
+        sum += x_val * w_val;
     }
 
-    // Запись результата в соответствующий буфер
-    uint out_pos = token * d + out_idx;
+    // Запись в соответствующий выходной буфер.
+    uint out_idx = (t * d + j) * pc.batch + r;
     if (buffer_type == 0u) {
-        q[out_pos] = sum;
+        q[out_idx] = sum;
     } else if (buffer_type == 1u) {
-        k[out_pos] = sum;
+        k[out_idx] = sum;
     } else {
-        v[out_pos] = sum;
+        v[out_idx] = sum;
     }
 }

@@ -4,18 +4,33 @@ use std::sync::Mutex;
 use crate::layers::UniversalLayer;
 
 /// Кэш промежуточных результатов прямого прохода для обратного распространения.
+///
+/// Все тензоры хранятся в column-major раскладке, согласованной с общей
+/// раскладкой проекта.
+///
+/// Раскладка тензоров формы `(batch, seq_len * d_model)`, column-major:
+///   элемент `(r, t, j)` лежит по адресу `(t * d_model + j) * batch + r`
+///
+/// Раскладка тензоров формы `(batch, seq_len * seq_len)`, column-major:
+///   элемент `(r, t, s)` лежит по адресу `(t * seq_len + s) * batch + r`
 pub(crate) struct RelativePositionAttentionCache {
-    /// Преобразованные запросы Q (batch * seq * d_model, row-major).
+    /// Преобразованные запросы Q.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub q: Vec<f32>,
-    /// Преобразованные ключи K (batch * seq * d_model, row-major).
+    /// Преобразованные ключи K.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub k: Vec<f32>,
-    /// Преобразованные значения V (batch * seq * d_model, row-major).
+    /// Преобразованные значения V.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub v: Vec<f32>,
-    /// Скоры до softmax (batch * seq * seq, row-major).
+    /// Скоры внимания до softmax.
+    /// Форма `(batch, seq_len * seq_len)`, column-major.
     pub scores: Vec<f32>,
-    /// Веса после softmax (batch * seq * seq, row-major).
+    /// Веса внимания после softmax.
+    /// Форма `(batch, seq_len * seq_len)`, column-major.
     pub attention_weights: Vec<f32>,
-    /// Результат внимания до выходного линейного слоя (batch * seq * d_model).
+    /// Результат внимания до выходного линейного слоя.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub attn_out: Vec<f32>,
     /// Размер батча.
     pub batch: usize,

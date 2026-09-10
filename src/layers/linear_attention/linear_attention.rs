@@ -4,18 +4,33 @@ use std::sync::Mutex;
 use crate::layers::UniversalLayer;
 
 /// Кэш промежуточных результатов прямого прохода для обратного распространения.
+///
+/// Все тензоры хранятся в column-major раскладке, согласованной с общей
+/// раскладкой проекта.
+///
+/// Раскладка тензоров `(batch, seq_len * d_model)`, column-major:
+///   элемент `(r, t, j)` лежит по адресу `(t * d_model + j) * batch + r`
+///
+/// Раскладка матрицы `(d_model, d_model)`, column-major:
+///   элемент `(i, j)` лежит по адресу `j * d_model + i`
 pub(crate) struct LinearAttentionCache {
-    /// Преобразованные запросы (после линейного слоя и phi).
+    /// Преобразованные запросы после применения φ.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub q: Vec<f32>,
-    /// Преобразованные ключи (после линейного слоя и phi).
+    /// Преобразованные ключи после применения φ.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub k: Vec<f32>,
-    /// Преобразованные значения (после линейного слоя, без phi).
+    /// Значения после линейного слоя, без φ.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub v: Vec<f32>,
-    /// Матрица K^T V (d_model x d_model, row-major).
+    /// Матрица K_phi^T V.
+    /// Форма `(d_model, d_model)`, column-major: `kv[j * d_model + i] = KV[i, j]`.
     pub kv: Vec<f32>,
-    /// Вектор K^T 1 (длина d_model).
+    /// Вектор K_phi^T 1.
+    /// Форма `(d_model,)`, линейный вектор.
     pub z: Vec<f32>,
-    /// Результат внимания до выходного линейного слоя (batch*seq*d_model).
+    /// Результат внимания до выходного линейного слоя.
+    /// Форма `(batch, seq_len * d_model)`, column-major.
     pub attn_out: Vec<f32>,
     /// Размер батча.
     pub batch: usize,

@@ -16,23 +16,14 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 }
 
 impl GpuCompute {
-    /// Прямой проход LinearAttention на GPU.
+    /// Прямой проход LinearAttention на GPU (column-major раскладка).
     ///
-    /// Параметры слоя (все матрицы и смещения) передаются как `params_view`.
-    /// Вход и выход — GPU-дескрипторы. Внутри выделяются временные буферы
-    /// для промежуточных вычислений, но итоговые промежуточные результаты
-    /// (q_raw, k_raw, v_raw, q_phi, k_phi, kv, z) сохраняются для обратного прохода.
+    /// Все промежуточные тензоры имеют форму `(batch, seq_len * d_model)` и
+    /// хранятся в column-major. Матрица KV имеет форму `(d_model, d_model)` в
+    /// column-major: `kv[i * d + l] = KV[l, i]`. Вектор Z имеет длину `d_model`.
     ///
-    /// # Аргументы
-    /// * `input` – вход `(batch, seq_len * d_model)` (column-major, GPU).
-    /// * `params` – view на полный блок параметров `4*(d_model² + d_model)`.
-    /// * `output` – выход `(batch, seq_len * d_model)`.
-    /// * `seq_len`, `d_model` – размеры последовательности и модели.
-    /// * `q_raw`, `k_raw`, `v_raw` – буферы для сохранения линейных преобразований
-    ///   (до применения φ). Размер каждого: `(batch*seq_len) x d_model`, row-major.
-    /// * `q_phi`, `k_phi` – буферы после применения φ (row-major).
-    /// * `kv`, `z` – буферы для сохранения матрицы KᵀV и вектора Kᵀ1.
-    ///   `kv` имеет размер `d_model x d_model`, `z` – `d_model`.
+    /// Параметры (Wq, bq, Wk, bk, Wv, bv, Wo, bo) передаются как единый view на
+    /// плоский блок в `params`. Веса — row-major, смещения — линейные векторы.
     pub fn run_linear_attention_forward_buffered_handle_with_dims(
         &self,
         input: &MatrixBufferHandle,
@@ -57,107 +48,96 @@ impl GpuCompute {
         assert_eq!(input.cols(), features, "Input cols mismatch");
         assert_eq!(output.rows(), batch);
         assert_eq!(output.cols(), features, "Output cols mismatch");
-        assert_eq!(params.len(), 4 * (d_model * d_model + d_model), "Params length mismatch");
+        assert_eq!(
+            params.len(),
+            4 * (d_model * d_model + d_model),
+            "Params length mismatch"
+        );
 
-        // Проверяем размеры промежуточных буферов
         let token_count = batch * seq_len;
+        let token_total = token_count * d_model;
+
         for buf in [q_raw, k_raw, v_raw, q_phi, k_phi] {
             assert_eq!(
                 buf.rows() * buf.cols(),
-                token_count * d_model,
+                token_total,
                 "Intermediate buffer size mismatch"
             );
         }
-        assert_eq!(kv.rows() * kv.cols(), d_model * d_model, "kv size mismatch");
+        assert_eq!(
+            kv.rows() * kv.cols(),
+            d_model * d_model,
+            "kv size mismatch"
+        );
         assert_eq!(z.rows() * z.cols(), d_model, "z size mismatch");
 
-        // Создаём views для всех параметров
         let d = d_model;
-        let wq_start = 0usize;
-        let bq_start = wq_start + d * d;
-        let wk_start = bq_start + d;
-        let bk_start = wk_start + d * d;
-        let wv_start = bk_start + d;
-        let bv_start = wv_start + d * d;
-        let wo_start = bv_start + d;
-        let bo_start = wo_start + d * d;
 
-        let wq_view = MatrixBufferView::with_shape(
-            params.parent_handle().clone(),
-            params.offset_elements() + wq_start,
-            d * d,
-            d,
-            d,
+        // Смещения параметров в плоском блоке:
+        //   Wq: [0, d²)
+        //   bq: [d², d² + d)
+        //   Wk: [d² + d, 2d² + d)
+        //   bk: [2d² + d, 2d² + 2d)
+        //   Wv: [2d² + 2d, 3d² + 2d)
+        //   bv: [3d² + 2d, 3d² + 3d)
+        //   Wo: [3d² + 3d, 4d² + 3d)
+        //   bo: [4d² + 3d, 4d² + 4d)
+        let wq_off = 0usize;
+        let bq_off = d * d;
+        let wk_off = bq_off + d;
+        let bk_off = wk_off + d * d;
+        let wv_off = bk_off + d;
+        let bv_off = wv_off + d * d;
+        let wo_off = bv_off + d;
+        let bo_off = wo_off + d * d;
+
+        let parent = params.parent_handle().clone();
+        let base = params.offset_elements();
+
+        let wq_view = MatrixBufferView::with_shape(parent.clone(), base + wq_off, d * d, d, d);
+        let bq_view = MatrixBufferView::new(parent.clone(), base + bq_off, d);
+        let wk_view = MatrixBufferView::with_shape(parent.clone(), base + wk_off, d * d, d, d);
+        let bk_view = MatrixBufferView::new(parent.clone(), base + bk_off, d);
+        let wv_view = MatrixBufferView::with_shape(parent.clone(), base + wv_off, d * d, d, d);
+        let bv_view = MatrixBufferView::new(parent.clone(), base + bv_off, d);
+        let wo_view = MatrixBufferView::with_shape(parent.clone(), base + wo_off, d * d, d, d);
+        let bo_view = MatrixBufferView::new(parent.clone(), base + bo_off, d);
+
+        // 1. Per-token линейные преобразования Q, K, V.
+        self.run_linear_per_token_forward_buffered_handle(
+            input, &wq_view, &bq_view, q_raw, seq_len,
         );
-        let bq_view = MatrixBufferView::new(
-            params.parent_handle().clone(),
-            params.offset_elements() + bq_start,
-            d,
+        self.run_linear_per_token_forward_buffered_handle(
+            input, &wk_view, &bk_view, k_raw, seq_len,
         );
-        let wk_view = MatrixBufferView::with_shape(
-            params.parent_handle().clone(),
-            params.offset_elements() + wk_start,
-            d * d,
-            d,
-            d,
-        );
-        let bk_view = MatrixBufferView::new(
-            params.parent_handle().clone(),
-            params.offset_elements() + bk_start,
-            d,
-        );
-        let wv_view = MatrixBufferView::with_shape(
-            params.parent_handle().clone(),
-            params.offset_elements() + wv_start,
-            d * d,
-            d,
-            d,
-        );
-        let bv_view = MatrixBufferView::new(
-            params.parent_handle().clone(),
-            params.offset_elements() + bv_start,
-            d,
-        );
-        let wo_view = MatrixBufferView::with_shape(
-            params.parent_handle().clone(),
-            params.offset_elements() + wo_start,
-            d * d,
-            d,
-            d,
-        );
-        let bo_view = MatrixBufferView::new(
-            params.parent_handle().clone(),
-            params.offset_elements() + bo_start,
-            d,
+        self.run_linear_per_token_forward_buffered_handle(
+            input, &wv_view, &bv_view, v_raw, seq_len,
         );
 
-        // 1. Линейные преобразования для Q, K, V
-        self.run_linear_forward_buffered_handle(input, &wq_view, &bq_view, q_raw);
-        self.run_linear_forward_buffered_handle(input, &wk_view, &bk_view, k_raw);
-        self.run_linear_forward_buffered_handle(input, &wv_view, &bv_view, v_raw);
-
-        // 2. Применяем φ(x) = ELU(x)+1 к q_raw и k_raw
+        // 2. φ на q_raw и k_raw.
         let phi_pipeline = &self.linear_attention_pipelines().phi;
-        let push_phi = [(token_count * d_model) as u32];
-        let q_raw_buf = self.get_gpu_subbuffer_from_handle(q_raw);
-        let k_raw_buf = self.get_gpu_subbuffer_from_handle(k_raw);
-        let q_phi_buf = self.get_gpu_subbuffer_from_handle(q_phi);
-        let k_phi_buf = self.get_gpu_subbuffer_from_handle(k_phi);
+        let push_phi = [token_total as u32];
 
         self.run_compute_shader(
             phi_pipeline,
-            &[(0, q_raw_buf), (1, q_phi_buf)],
+            &[
+                (0, self.get_gpu_subbuffer_from_handle(q_raw)),
+                (1, self.get_gpu_subbuffer_from_handle(q_phi)),
+            ],
             &push_phi,
-            token_count * d_model,
+            token_total,
         );
         self.run_compute_shader(
             phi_pipeline,
-            &[(0, k_raw_buf), (1, k_phi_buf)],
+            &[
+                (0, self.get_gpu_subbuffer_from_handle(k_raw)),
+                (1, self.get_gpu_subbuffer_from_handle(k_phi)),
+            ],
             &push_phi,
-            token_count * d_model,
+            token_total,
         );
 
-        // 3. Вычисляем KV и Z
+        // 3. Вычисление KV = K_phi^T · V и Z = K_phi^T · 1.
         let kvz_pipeline = &self.linear_attention_pipelines().compute_kvz;
         let push_kvz = [batch as u32, seq_len as u32, d_model as u32];
         self.run_compute_shader(
@@ -172,41 +152,28 @@ impl GpuCompute {
             d_model * d_model + d_model,
         );
 
-        // 4. Основной forward (выход Y = φ(Q)(KᵀV)/(φ(Q)Kᵀ1) W_o + b_o)
+        // 4. Основной forward: y = b_o + φ(Q) · KV · W_o^T / (φ(Q) · Z + eps).
         let fwd_pipeline = &self.linear_attention_pipelines().forward;
         let push_fwd = [batch as u32, seq_len as u32, d_model as u32];
-        let total_out = batch * seq_len * d_model;
         self.run_compute_shader(
             fwd_pipeline,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(q_phi)),
-                (1, self.get_gpu_subbuffer_from_handle(k_phi)), // не используется в этом шейдере
-                (2, self.get_gpu_subbuffer_from_handle(v_raw)), // не используется
-                (3, self.get_gpu_subbuffer_from_handle(kv)),
-                (4, self.get_gpu_subbuffer_from_handle(z)),
-                (5, subbuffer_from_view(self, &wo_view)),
-                (6, subbuffer_from_view(self, &bo_view)),
-                (7, self.get_gpu_subbuffer_from_handle(output)),
+                (1, self.get_gpu_subbuffer_from_handle(kv)),
+                (2, self.get_gpu_subbuffer_from_handle(z)),
+                (3, subbuffer_from_view(self, &wo_view)),
+                (4, subbuffer_from_view(self, &bo_view)),
+                (5, self.get_gpu_subbuffer_from_handle(output)),
             ],
             &push_fwd,
-            total_out,
+            token_total,
         );
     }
 
-    /// Обратный проход LinearAttention на GPU.
+    /// Обратный проход LinearAttention на GPU (column-major раскладка).
     ///
-    /// Принимает сохранённые промежуточные буферы с forward.
-    /// Градиенты по параметрам записываются в `grad_params` (view на полный блок).
-    /// Вход/выходные градиенты — GPU-дескрипторы.
-    ///
-    /// # Аргументы
-    /// * `input` – вход `(batch, seq_len * d_model)`.
-    /// * `grad_out` – градиент по выходу.
-    /// * `params` – view на параметры.
-    /// * `grad_input` – буфер для градиента по входу.
-    /// * `grad_params` – view на градиенты параметров.
-    /// * `seq_len`, `d_model` – размеры.
-    /// * Промежуточные буферы из forward: q_raw, k_raw, v_raw, q_phi, k_phi, kv, z.
+    /// Принимает сохранённые промежуточные буферы с forward. Градиенты по
+    /// параметрам записываются в `grad_params` через атомарное накопление.
     pub fn run_linear_attention_backward_buffered_handle_with_dims(
         &self,
         input: &MatrixBufferHandle,
@@ -237,13 +204,22 @@ impl GpuCompute {
         assert_eq!(grad_out.cols(), features, "grad_out cols mismatch");
         assert_eq!(grad_input.rows(), batch);
         assert_eq!(grad_input.cols(), features, "grad_input cols mismatch");
-        assert_eq!(params.len(), 4 * (d_model * d_model + d_model), "Params length mismatch");
-        assert_eq!(grad_params.len(), 4 * (d_model * d_model + d_model), "grad_params length mismatch");
+        assert_eq!(
+            params.len(),
+            4 * (d_model * d_model + d_model),
+            "Params length mismatch"
+        );
+        assert_eq!(
+            grad_params.len(),
+            4 * (d_model * d_model + d_model),
+            "grad_params length mismatch"
+        );
 
         let token_count = batch * seq_len;
+        let token_total = token_count * d_model;
         let d = d_model;
 
-        // Обнуляем градиенты параметров
+        // 1. Обнуление grad_params.
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -257,16 +233,16 @@ impl GpuCompute {
             grad_params.len(),
         );
 
-        // Выделяем временные буферы для обратного прохода
-        let (d_attn_out_buf, d_attn_out_raw) = self.acquire_temp_buffer(token_count * d);
-        let (d_q_phi_buf, d_q_phi_raw) = self.acquire_temp_buffer(token_count * d);
+        // 2. Временные буферы для обратного прохода.
+        let (d_attn_out_buf, d_attn_out_raw) = self.acquire_temp_buffer(token_total);
+        let (d_q_phi_buf, d_q_phi_raw) = self.acquire_temp_buffer(token_total);
         let (d_kv_buf, d_kv_raw) = self.acquire_temp_buffer(d * d);
         let (d_z_buf, d_z_raw) = self.acquire_temp_buffer(d);
 
-        // Обнуляем d_kv и d_z перед накоплением (atomic)
-        let zero_kvz = self.upload_vec_to_gpu_handle(&vec![0.0f32; d * d], d * d, 1);
+        // 3. Обнуляем d_kv и d_z (используются с атомарным накоплением).
+        let zero_kv = self.upload_vec_to_gpu_handle(&vec![0.0f32; d * d], d * d, 1);
         self.copy_buffer_sync(
-            self.get_gpu_subbuffer_from_handle(&zero_kvz),
+            self.get_gpu_subbuffer_from_handle(&zero_kv),
             d_kv_buf.clone(),
         );
         let zero_z = self.upload_vec_to_gpu_handle(&vec![0.0f32; d], d, 1);
@@ -275,19 +251,20 @@ impl GpuCompute {
             d_z_buf.clone(),
         );
 
-        // Получаем subbuffer'ы для параметров
+        // 4. Извлекаем view на W_o (для первого этапа backward).
+        let wo_off = 3 * d * d + 3 * d;
         let wo_view = MatrixBufferView::with_shape(
             params.parent_handle().clone(),
-            params.offset_elements() + (4 * (d * d + d) - d * d - d),
+            params.offset_elements() + wo_off,
             d * d,
             d,
             d,
         );
         let wo_buf = subbuffer_from_view(self, &wo_view);
 
-        // 1. Backward main: вычисляет d_attn_out, d_q_phi, d_kv, d_z
+        // 5. Первый этап: bwd_main — d_attn_out, d_q_phi, d_kv, d_z.
         let bwd_main_pipeline = &self.linear_attention_pipelines().backward_main;
-        let push_bwd_main = [batch as u32, seq_len as u32, d_model as u32];
+        let push_bwd = [batch as u32, seq_len as u32, d_model as u32];
         self.run_compute_shader(
             bwd_main_pipeline,
             &[
@@ -301,13 +278,12 @@ impl GpuCompute {
                 (7, d_kv_buf.clone()),
                 (8, d_z_buf.clone()),
             ],
-            &push_bwd_main,
+            &push_bwd,
             token_count,
         );
 
-        // 2. Backward params: вычисляет gi и градиенты по параметрам, включая W_o/b_o
+        // 6. Второй этап: bwd_params — gi и градиенты параметров.
         let bwd_params_pipeline = &self.linear_attention_pipelines().backward_params;
-        let push_bwd_params = [batch as u32, seq_len as u32, d_model as u32];
         self.run_compute_shader(
             bwd_params_pipeline,
             &[
@@ -319,23 +295,89 @@ impl GpuCompute {
                 (5, self.get_gpu_subbuffer_from_handle(v_raw)),
                 (6, self.get_gpu_subbuffer_from_handle(q_raw)),
                 (7, self.get_gpu_subbuffer_from_handle(k_raw)),
-                (8, d_q_phi_buf.clone()), // d_q_phi
-                (9, d_kv_buf.clone()),   // d_kv
-                (10, d_z_buf.clone()),   // d_z
-                (11, self.get_gpu_subbuffer_from_handle(grad_input)), // gi
-                (12, subbuffer_from_view(self, grad_params)),        // grad_params
-                // Дополнительные буферы kv и z для вычисления attn_out внутри шейдера
+                (8, d_q_phi_buf.clone()),
+                (9, d_kv_buf.clone()),
+                (10, d_z_buf.clone()),
+                (11, self.get_gpu_subbuffer_from_handle(grad_input)),
+                (12, subbuffer_from_view(self, grad_params)),
                 (13, self.get_gpu_subbuffer_from_handle(kv)),
                 (14, self.get_gpu_subbuffer_from_handle(z)),
             ],
-            &push_bwd_params,
-            batch * seq_len * d_model,
+            &push_bwd,
+            token_count,
         );
 
-        // Освобождаем временные буферы
+        // 7. Освобождение временных буферов.
         self.release_temp_buffer(d_attn_out_buf, d_attn_out_raw);
         self.release_temp_buffer(d_q_phi_buf, d_q_phi_raw);
         self.release_temp_buffer(d_kv_buf, d_kv_raw);
         self.release_temp_buffer(d_z_buf, d_z_raw);
+    }
+
+    /// Вспомогательный метод: per-token линейное преобразование.
+    ///
+    /// Применяет матрицу весов `(out_features, in_features)` row-major и смещение
+    /// `(out_features,)` к каждому токену входного тензора `(batch, seq_len * in_features)`
+    /// в column-major. Результат — `(batch, seq_len * out_features)` в column-major.
+    fn run_linear_per_token_forward_buffered_handle(
+        &self,
+        input: &MatrixBufferHandle,
+        weight: &MatrixBufferView,
+        bias: &MatrixBufferView,
+        output: &MatrixBufferHandle,
+        seq_len: usize,
+    ) {
+        assert!(input.is_gpu(), "Input handle must be GPU");
+        assert!(output.is_gpu(), "Output handle must be GPU");
+        assert!(weight.is_gpu(), "Weight view must point to GPU buffer");
+        assert!(bias.is_gpu(), "Bias view must point to GPU buffer");
+        assert!(seq_len > 0, "seq_len must be positive");
+
+        let batch = input.rows();
+        let in_features = weight.cols();
+        let out_features = weight.rows();
+
+        assert_eq!(
+            input.cols(),
+            seq_len * in_features,
+            "Input cols mismatch for per-token linear"
+        );
+        assert_eq!(
+            output.rows(),
+            batch,
+            "Output rows mismatch for per-token linear"
+        );
+        assert_eq!(
+            output.cols(),
+            seq_len * out_features,
+            "Output cols mismatch for per-token linear"
+        );
+        assert_eq!(bias.len(), out_features, "Bias length mismatch");
+
+        let in_buf = self.get_gpu_subbuffer_from_handle(input);
+        let w_buf = subbuffer_from_view(self, weight);
+        let b_buf = subbuffer_from_view(self, bias);
+        let out_buf = self.get_gpu_subbuffer_from_handle(output);
+
+        let pipeline = &self.linear_attention_pipelines().linear_per_token;
+        let push = [
+            batch as u32,
+            seq_len as u32,
+            in_features as u32,
+            out_features as u32,
+        ];
+        let total = batch * seq_len * out_features;
+
+        self.run_compute_shader(
+            pipeline,
+            &[
+                (0, in_buf),
+                (1, w_buf),
+                (2, b_buf),
+                (3, out_buf),
+            ],
+            &push,
+            total,
+        );
     }
 }

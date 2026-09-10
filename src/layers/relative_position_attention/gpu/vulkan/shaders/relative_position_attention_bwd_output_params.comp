@@ -1,3 +1,32 @@
+// src/layers/relative_position_attention/gpu/vulkan/shaders/relative_position_attention_bwd_output_params.comp
+//
+// Обратный проход через выходной линейный слой (W_o, b_o) для
+// слоя RelativePositionAttention.
+//
+// Раскладка данных — column-major (для активаций). Веса W_o хранятся
+// в row-major.
+//
+// Вход:
+//   go       (batch, seq_len * d_model), column-major:
+//     go[(t * d + j) * batch + r]
+//   attn_out (batch, seq_len * d_model), column-major:
+//     attn_out[(t * d + i) * batch + r]
+//   w_o      (d_model, d_model), row-major:
+//     w_o[j * d + i]
+//   b_o      (d_model,), линейный вектор (не используется в этом шейдере,
+//            оставлен для совместимости с интерфейсом)
+//
+// Выход:
+//   d_attn_out (batch, seq_len * d_model), column-major:
+//     d_attn_out[(t * d + i) * batch + r]
+//
+//   grad_params (атомарное накопление через CAS):
+//     grad_b_o[j]   += go[r,t,j]
+//     grad_W_o[j,i] += go[r,t,j] * attn_out[r,t,i]
+//
+// Push-константы: batch, seq_len, d_model.
+// Dispatch: batch * seq_len потоков (один поток на токен (r, t)).
+
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -8,39 +37,30 @@ layout(push_constant) uniform PushConsts {
     uint d_model;
 } pc;
 
-// Градиент по выходу (row-major, (batch*seq_len) x d_model)
 layout(binding = 0, std430) readonly buffer GoBuf {
     float go[];
 };
 
-// Результат внимания до выходного линейного слоя (row-major, (batch*seq_len) x d_model)
 layout(binding = 1, std430) readonly buffer AttnOutBuf {
     float attn_out[];
 };
 
-// Матрица выходного линейного слоя W_o (row-major, d_model x d_model)
 layout(binding = 2, std430) readonly buffer WoBuf {
-    float wo[];
+    float w_o[];
 };
 
-// Смещения выходного линейного слоя b_o (длина d_model)
 layout(binding = 3, std430) readonly buffer BoBuf {
-    float bo[];
+    float b_o[];
 };
 
-// Градиент по attn_out (row-major, (batch*seq_len) x d_model)
 layout(binding = 4, std430) writeonly buffer DAttnOutBuf {
     float d_attn_out[];
 };
 
-// Общий буфер градиентов параметров (uint для атомарного накопления)
 layout(binding = 5, std430) buffer GradParamsBuf {
     uint grad_params[];
 };
 
-// Атомарное сложение float через CAS.
-// Использование макроса гарантирует, что atomicCompSwap вызывается
-// непосредственно с l-value (элементом storage buffer).
 #define ATOMIC_ADD_FLOAT(target, value) \
 { \
     uint expected = target; \
@@ -60,34 +80,48 @@ void main() {
     if (token_idx >= total_tokens) return;
 
     uint d = pc.d_model;
-    uint base = token_idx * d;
 
-    // 1. Вычисляем d_attn_out[base..base+d] = go * W_o^T
+    uint r = token_idx / pc.seq_len;
+    uint t = token_idx % pc.seq_len;
+
+    // База для (r, t, 0) в column-major:
+    //   элемент (r, t, k) лежит по адресу (t*d + k) * batch + r,
+    //   значит шаг по k равен batch.
+    uint tok_base = (t * d) * pc.batch + r;
+
+    // Смещения блоков в grad_params. Раскладка:
+    //   W_q: [0, d²)
+    //   b_q: [d², d² + d)
+    //   W_k: [d² + d, 2d² + d)
+    //   b_k: [2d² + d, 2d² + 2d)
+    //   W_v: [2d² + 2d, 3d² + 2d)
+    //   b_v: [3d² + 2d, 3d² + 3d)
+    //   W_o: [3d² + 3d, 4d² + 3d)
+    //   b_o: [4d² + 3d, 4d² + 4d)
+    uint d2 = d * d;
+    uint wo_start = 3u * d2 + 3u * d;
+    uint bo_start = wo_start + d2;
+
+    // ===== 1. d_attn_out[r, t, i] = Σ_j go[r,t,j] * W_o[j, i] =====
     for (uint i = 0u; i < d; ++i) {
         float sum = 0.0;
         for (uint j = 0u; j < d; ++j) {
-            sum += go[base + j] * wo[j * d + i];
+            float go_j = go[tok_base + j * pc.batch];
+            sum += go_j * w_o[j * d + i];
         }
-        d_attn_out[base + i] = sum;
+        d_attn_out[tok_base + i * pc.batch] = sum;
     }
 
-    // Смещения в общем буфере параметров (согласовано с CPU/GPU layout)
-    uint d2 = d * d;
-    uint wq_start = 0u;
-    uint bq_start = wq_start + d2;
-    uint wk_start = bq_start + d;
-    uint bk_start = wk_start + d2;
-    uint wv_start = bk_start + d;
-    uint bv_start = wv_start + d2;
-    uint wo_start = bv_start + d;
-    uint bo_start = wo_start + d2;
-
-    // 2. Атомарно накапливаем градиенты W_o и b_o
+    // ===== 2. Накопление grad_W_o, grad_b_o =====
     for (uint j = 0u; j < d; ++j) {
-        float go_val = go[base + j];
-        ATOMIC_ADD_FLOAT(grad_params[bo_start + j], go_val);
+        float go_j = go[tok_base + j * pc.batch];
+        ATOMIC_ADD_FLOAT(grad_params[bo_start + j], go_j);
         for (uint i = 0u; i < d; ++i) {
-            ATOMIC_ADD_FLOAT(grad_params[wo_start + j * d + i], go_val * attn_out[base + i]);
+            float ao_i = attn_out[tok_base + i * pc.batch];
+            ATOMIC_ADD_FLOAT(
+                grad_params[wo_start + j * d + i],
+                go_j * ao_i
+            );
         }
     }
 }

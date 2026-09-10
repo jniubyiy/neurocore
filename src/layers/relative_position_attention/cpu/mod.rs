@@ -6,7 +6,9 @@ use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 
-use super::super::relative_position_attention::relative_position_attention::{RelativePositionAttention, RelativePositionAttentionCache};
+use super::super::relative_position_attention::relative_position_attention::{
+    RelativePositionAttention, RelativePositionAttentionCache,
+};
 
 impl UniversalLayerBuffered for RelativePositionAttention {
     fn forward_buffered(
@@ -19,141 +21,153 @@ impl UniversalLayerBuffered for RelativePositionAttention {
         let batch = input.rows();
         let seq = self.seq_len;
         let d = self.d_model;
-        let total_tokens = seq * d;
+        let features = seq * d;
+        let total = batch * features;
 
-        debug_assert_eq!(input.cols(), total_tokens);
+        debug_assert_eq!(input.cols(), features);
         debug_assert_eq!(output.rows(), batch);
-        debug_assert_eq!(output.cols(), total_tokens);
+        debug_assert_eq!(output.cols(), features);
         debug_assert!(slice.start + self.param_len() <= params.rows() * params.cols());
 
-        let ids = [input.id(), output.id(), params.id()];
-        input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
-            let (first, rest) = slices.split_at_mut(1);
-            let x: &[f32] = &*first[0];
-            let (second, rest) = rest.split_at_mut(1);
-            let y: &mut [f32] = &mut *second[0];
-            let p: &[f32] = &*rest[0];
+        let (q_vec, k_vec, v_vec, scores_vec, weights_vec, attn_out_vec) = {
+            let ids = [input.id(), output.id(), params.id()];
+            input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
+                let (first, rest) = slices.split_at_mut(1);
+                let x: &[f32] = &*first[0];
+                let (second, rest) = rest.split_at_mut(1);
+                let y: &mut [f32] = &mut *second[0];
+                let p: &[f32] = &*rest[0];
 
-            let base = slice.start;
-            let wq_start = base;
-            let bq_start = wq_start + d * d;
-            let wk_start = bq_start + d;
-            let bk_start = wk_start + d * d;
-            let wv_start = bk_start + d;
-            let bv_start = wv_start + d * d;
-            let wo_start = bv_start + d;
-            let bo_start = wo_start + d * d;
-            let bias_start = bo_start + d;
+                let base = slice.start;
+                let wq_start = base;
+                let bq_start = wq_start + d * d;
+                let wk_start = bq_start + d;
+                let bk_start = wk_start + d * d;
+                let wv_start = bk_start + d;
+                let bv_start = wv_start + d * d;
+                let wo_start = bv_start + d;
+                let bo_start = wo_start + d * d;
+                let rel_bias_start = bo_start + d;
 
-            let mut x_rows = vec![0.0f32; batch * total_tokens];
-            for r in 0..batch {
-                for t in 0..seq {
-                    for j in 0..d {
-                        let src_idx = (t * d + j) * batch + r;
-                        let dst_idx = r * total_tokens + t * d + j;
-                        x_rows[dst_idx] = x[src_idx];
-                    }
-                }
-            }
+                // ============ 1. QKV-проекции (column-major) ============
+                //   q[(t*d + j)*batch + r] = b_q[j] + Σ_i x[(t*d+i)*batch+r] * W_q[j*d+i]
+                let mut q = vec![0.0f32; total];
+                let mut k = vec![0.0f32; total];
+                let mut v = vec![0.0f32; total];
 
-            let mut q = vec![0.0f32; batch * total_tokens];
-            let mut k = vec![0.0f32; batch * total_tokens];
-            let mut v = vec![0.0f32; batch * total_tokens];
-            for r in 0..batch {
-                for t in 0..seq {
-                    let offset = r * total_tokens + t * d;
-                    for j in 0..d {
-                        let mut sum_q = p[bq_start + j];
-                        let mut sum_k = p[bk_start + j];
-                        let mut sum_v = p[bv_start + j];
-                        for i in 0..d {
-                            let x_val = x_rows[offset + i];
-                            sum_q += x_val * p[wq_start + j * d + i];
-                            sum_k += x_val * p[wk_start + j * d + i];
-                            sum_v += x_val * p[wv_start + j * d + i];
-                        }
-                        q[offset + j] = sum_q;
-                        k[offset + j] = sum_k;
-                        v[offset + j] = sum_v;
-                    }
-                }
-            }
-
-            let scale = 1.0f32 / (d as f32).sqrt();
-            let mut scores = vec![0.0f32; batch * seq * seq];
-            let mut attention_weights = vec![0.0f32; batch * seq * seq];
-
-            for r in 0..batch {
-                for t in 0..seq {
-                    let q_offset = r * total_tokens + t * d;
-                    let score_offset = r * seq * seq + t * seq;
-                    let mut max_score = f32::NEG_INFINITY;
-                    for s in 0..seq {
-                        let k_offset = r * total_tokens + s * d;
-                        let mut score = 0.0;
+                for r in 0..batch {
+                    for t in 0..seq {
+                        let tok_base = (t * d) * batch + r;
                         for j in 0..d {
-                            score += q[q_offset + j] * k[k_offset + j];
+                            let mut sq = p[bq_start + j];
+                            let mut sk = p[bk_start + j];
+                            let mut sv = p[bv_start + j];
+                            for i in 0..d {
+                                let xv = x[tok_base + i * batch];
+                                sq += xv * p[wq_start + j * d + i];
+                                sk += xv * p[wk_start + j * d + i];
+                                sv += xv * p[wv_start + j * d + i];
+                            }
+                            let idx = tok_base + j * batch;
+                            q[idx] = sq;
+                            k[idx] = sk;
+                            v[idx] = sv;
                         }
-                        score *= scale;
-                        let rel_idx = (s as isize - t as isize + (seq as isize - 1)) as usize;
-                        score += p[bias_start + rel_idx];
-                        scores[score_offset + s] = score;
-                        if score > max_score { max_score = score; }
-                    }
-                    let mut sum_exp = 0.0;
-                    let mut exps = vec![0.0f32; seq];
-                    for s in 0..seq {
-                        let e = (scores[score_offset + s] - max_score).exp();
-                        exps[s] = e;
-                        sum_exp += e;
-                    }
-                    for s in 0..seq {
-                        attention_weights[score_offset + s] = exps[s] / sum_exp;
                     }
                 }
-            }
 
-            let mut attn_out = vec![0.0f32; batch * total_tokens];
-            for r in 0..batch {
-                for t in 0..seq {
-                    let out_offset = r * total_tokens + t * d;
-                    let weight_offset = r * seq * seq + t * seq;
-                    for j in 0..d {
-                        let mut sum = 0.0;
+                // ============ 2. Scores и softmax (column-major) ============
+                //   scores[(t*seq + s)*batch + r] = scale * Σ_j q[r,t,j]*k[r,s,j]
+                //                                   + rel_bias[s - t + seq - 1]
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let scores_total = batch * seq * seq;
+
+                let mut scores = vec![0.0f32; scores_total];
+                let mut weights = vec![0.0f32; scores_total];
+
+                for r in 0..batch {
+                    for t in 0..seq {
+                        let q_base = (t * d) * batch + r;
+                        let s_base = (t * seq) * batch + r;
+
+                        let mut max_score = f32::NEG_INFINITY;
                         for s in 0..seq {
-                            let v_offset = r * total_tokens + s * d + j;
-                            sum += attention_weights[weight_offset + s] * v[v_offset];
+                            let k_base = (s * d) * batch + r;
+                            let mut dot = 0.0f32;
+                            for j in 0..d {
+                                dot += q[q_base + j * batch] * k[k_base + j * batch];
+                            }
+                            dot *= scale;
+
+                            let rel_idx =
+                                (s as isize - t as isize + (seq as isize - 1)) as usize;
+                            let score = dot + p[rel_bias_start + rel_idx];
+                            scores[s_base + s * batch] = score;
+                            if score > max_score {
+                                max_score = score;
+                            }
                         }
-                        attn_out[out_offset + j] = sum;
+
+                        let mut sum_exp = 0.0f32;
+                        for s in 0..seq {
+                            sum_exp += (scores[s_base + s * batch] - max_score).exp();
+                        }
+                        let inv_sum = 1.0 / sum_exp;
+                        for s in 0..seq {
+                            let e = (scores[s_base + s * batch] - max_score).exp();
+                            weights[s_base + s * batch] = e * inv_sum;
+                        }
                     }
                 }
-            }
 
-            for r in 0..batch {
-                for t in 0..seq {
-                    for j in 0..d {
-                        let mut sum = p[bo_start + j];
-                        let offset = r * total_tokens + t * d;
+                // ============ 3. attn_out (column-major) ============
+                //   attn_out[(t*d + i)*batch + r] = Σ_s weights[r,t,s] * v[r,s,i]
+                let mut attn_out = vec![0.0f32; total];
+
+                for r in 0..batch {
+                    for t in 0..seq {
+                        let w_base = (t * seq) * batch + r;
+                        let a_base = (t * d) * batch + r;
                         for i in 0..d {
-                            sum += attn_out[offset + i] * p[wo_start + j * d + i];
+                            let mut sum = 0.0f32;
+                            for s in 0..seq {
+                                let v_idx = (s * d + i) * batch + r;
+                                sum += weights[w_base + s * batch] * v[v_idx];
+                            }
+                            attn_out[a_base + i * batch] = sum;
                         }
-                        let out_idx = (t * d + j) * batch + r;
-                        y[out_idx] = sum;
                     }
                 }
-            }
 
-            self.store_cache(RelativePositionAttentionCache {
-                q,
-                k,
-                v,
-                scores,
-                attention_weights,
-                attn_out,
-                batch,
-                seq,
-                d_model: d,
-            });
+                // ============ 4. Выходной линейный слой (column-major) ============
+                //   y[(t*d + j)*batch + r] = b_o[j] + Σ_i attn_out[r,t,i] * W_o[j*d+i]
+                for r in 0..batch {
+                    for t in 0..seq {
+                        let a_base = (t * d) * batch + r;
+                        for j in 0..d {
+                            let mut sum = p[bo_start + j];
+                            for i in 0..d {
+                                sum += attn_out[a_base + i * batch] * p[wo_start + j * d + i];
+                            }
+                            y[a_base + j * batch] = sum;
+                        }
+                    }
+                }
+
+                (q, k, v, scores, weights, attn_out)
+            })
+        };
+
+        self.store_cache(RelativePositionAttentionCache {
+            q: q_vec,
+            k: k_vec,
+            v: v_vec,
+            scores: scores_vec,
+            attention_weights: weights_vec,
+            attn_out: attn_out_vec,
+            batch,
+            seq,
+            d_model: d,
         });
     }
 
@@ -179,11 +193,13 @@ impl UniversalLayerBuffered for RelativePositionAttention {
         let batch = grad_output.rows();
         let seq = self.seq_len;
         let d = self.d_model;
-        let total_tokens = seq * d;
+        let features = seq * d;
+        let total = batch * features;
+        let scores_total = batch * seq * seq;
 
-        debug_assert_eq!(grad_output.cols(), total_tokens);
+        debug_assert_eq!(grad_output.cols(), features);
         debug_assert_eq!(grad_input.rows(), batch);
-        debug_assert_eq!(grad_input.cols(), total_tokens);
+        debug_assert_eq!(grad_input.cols(), features);
         debug_assert_eq!(batch, cache.batch);
         debug_assert_eq!(seq, cache.seq);
         debug_assert_eq!(d, cache.d_model);
@@ -228,10 +244,14 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 let bv_start = wv_start + d * d;
                 let wo_start = bv_start + d;
                 let bo_start = wo_start + d * d;
-                let bias_start = bo_start + d;
+                let rel_bias_start = bo_start + d;
 
+                // Обнуление градиентов.
                 for i in 0..self.param_len() {
                     gp[base + i] = 0.0;
+                }
+                for i in 0..total {
+                    gi[i] = 0.0;
                 }
 
                 let mut grad_wq = vec![0.0f32; d * d];
@@ -244,140 +264,172 @@ impl UniversalLayerBuffered for RelativePositionAttention {
                 let mut grad_bo = vec![0.0f32; d];
                 let mut grad_rel_bias = vec![0.0f32; 2 * seq - 1];
 
-                for i in 0..(batch * total_tokens) {
-                    gi[i] = 0.0;
-                }
+                // ============ 1. grad_Wo, grad_bo, d_attn_out ============
+                //   grad_bo[j]        += go[r,t,j]
+                //   grad_Wo[j,i]      += go[r,t,j] * attn_out[r,t,i]
+                //   d_attn_out[r,t,i]  = Σ_j go[r,t,j] * W_o[j,i]
+                let mut d_attn_out = vec![0.0f32; total];
 
-                let mut x_rows = vec![0.0f32; batch * total_tokens];
-                let mut go_rows = vec![0.0f32; batch * total_tokens];
                 for r in 0..batch {
                     for t in 0..seq {
+                        let tok_base = (t * d) * batch + r;
+
                         for j in 0..d {
-                            let src_idx = (t * d + j) * batch + r;
-                            let dst_idx = r * total_tokens + t * d + j;
-                            x_rows[dst_idx] = x[src_idx];
-                            go_rows[dst_idx] = go[src_idx];
+                            let go_j = go[tok_base + j * batch];
+                            grad_bo[j] += go_j;
+                            for i in 0..d {
+                                grad_wo[j * d + i] +=
+                                    go_j * cache.attn_out[tok_base + i * batch];
+                            }
+                        }
+
+                        for i in 0..d {
+                            let mut sum_j = 0.0f32;
+                            for j in 0..d {
+                                sum_j +=
+                                    go[tok_base + j * batch] * p[wo_start + j * d + i];
+                            }
+                            d_attn_out[tok_base + i * batch] = sum_j;
                         }
                     }
                 }
 
-                let mut d_attn_out = vec![0.0f32; batch * total_tokens];
+                // ============ 2. d_weights, d_v ============
+                //   d_weights[r,t,s] = Σ_i d_attn_out[r,t,i] * v[r,s,i]
+                //   d_v[r,s,i]       = Σ_t d_attn_out[r,t,i] * weights[r,t,s]
+                let mut d_weights = vec![0.0f32; scores_total];
+                let mut d_v = vec![0.0f32; total];
+
                 for r in 0..batch {
                     for t in 0..seq {
-                        let idx = r * total_tokens + t * d;
-                        for i in 0..d {
-                            let mut grad_i = 0.0;
-                            for j in 0..d {
-                                let go_val = go_rows[idx + j];
-                                grad_i += go_val * p[wo_start + j * d + i];
-                                grad_wo[j * d + i] += go_val * cache.attn_out[idx + i];
-                                grad_bo[j] += go_val;
+                        let w_base = (t * seq) * batch + r;
+                        let a_base = (t * d) * batch + r;
+                        for s in 0..seq {
+                            let mut sum = 0.0f32;
+                            for i in 0..d {
+                                let v_idx = (s * d + i) * batch + r;
+                                sum += d_attn_out[a_base + i * batch] * cache.v[v_idx];
                             }
-                            d_attn_out[idx + i] = grad_i;
+                            d_weights[w_base + s * batch] = sum;
                         }
                     }
                 }
 
-                let mut d_v = vec![0.0f32; batch * total_tokens];
-                let mut d_weights = vec![0.0f32; batch * seq * seq];
                 for r in 0..batch {
                     for s in 0..seq {
+                        let v_base = (s * d) * batch + r;
                         for i in 0..d {
-                            let v_idx = r * total_tokens + s * d + i;
-                            let mut grad_v = 0.0;
+                            let mut sum = 0.0f32;
                             for t in 0..seq {
-                                let w = cache.attention_weights[r * seq * seq + t * seq + s];
-                                grad_v += w * d_attn_out[r * total_tokens + t * d + i];
-                                d_weights[r * seq * seq + t * seq + s] += d_attn_out[r * total_tokens + t * d + i] * cache.v[v_idx];
+                                let w_idx = (t * seq + s) * batch + r;
+                                let a_idx = (t * d + i) * batch + r;
+                                sum += d_attn_out[a_idx] * cache.attention_weights[w_idx];
                             }
-                            d_v[v_idx] = grad_v;
+                            d_v[v_base + i * batch] = sum;
                         }
                     }
                 }
 
-                let mut d_scores = vec![0.0f32; batch * seq * seq];
+                // ============ 3. d_scores (softmax backward) ============
+                //   dot                 = Σ_s weights[r,t,s] * d_weights[r,t,s]
+                //   d_scores[r,t,s]     = weights[r,t,s] * (d_weights[r,t,s] - dot)
+                let mut d_scores = vec![0.0f32; scores_total];
+
                 for r in 0..batch {
                     for t in 0..seq {
-                        let weight_offset = r * seq * seq + t * seq;
-                        let mut dot = 0.0;
+                        let s_base = (t * seq) * batch + r;
+                        let mut dot = 0.0f32;
                         for s in 0..seq {
-                            dot += cache.attention_weights[weight_offset + s] * d_weights[weight_offset + s];
+                            dot += cache.attention_weights[s_base + s * batch]
+                                * d_weights[s_base + s * batch];
                         }
                         for s in 0..seq {
-                            let w = cache.attention_weights[weight_offset + s];
-                            let dw = d_weights[weight_offset + s];
-                            d_scores[weight_offset + s] = w * (dw - dot);
+                            let w = cache.attention_weights[s_base + s * batch];
+                            let dw = d_weights[s_base + s * batch];
+                            d_scores[s_base + s * batch] = w * (dw - dot);
                         }
                     }
                 }
 
-                let mut d_q = vec![0.0f32; batch * total_tokens];
-                let mut d_k = vec![0.0f32; batch * total_tokens];
+                // ============ 4. d_q, d_k, grad_rel_bias ============
+                //   d_q[r,t,i] = scale * Σ_s d_scores[r,t,s] * k[r,s,i]
+                //   d_k[r,s,i] = scale * Σ_t d_scores[r,t,s] * q[r,t,i]
+                //   grad_rel_bias[s - t + seq - 1] += d_scores[r,t,s]
                 let scale = 1.0f32 / (d as f32).sqrt();
+                let mut d_q = vec![0.0f32; total];
+                let mut d_k = vec![0.0f32; total];
 
                 for r in 0..batch {
                     for t in 0..seq {
-                        let q_offset = r * total_tokens + t * d;
-                        let score_offset = r * seq * seq + t * seq;
+                        let q_base = (t * d) * batch + r;
+                        let ds_base = (t * seq) * batch + r;
                         for s in 0..seq {
-                            let ds = d_scores[score_offset + s];
-                            let k_offset = r * total_tokens + s * d;
-                            for j in 0..d {
-                                d_q[q_offset + j] += ds * cache.k[k_offset + j] * scale;
-                                d_k[k_offset + j] += ds * cache.q[q_offset + j] * scale;
+                            let ds = d_scores[ds_base + s * batch];
+                            let k_base = (s * d) * batch + r;
+
+                            for i in 0..d {
+                                d_q[q_base + i * batch] +=
+                                    ds * cache.k[k_base + i * batch] * scale;
+                                d_k[k_base + i * batch] +=
+                                    ds * cache.q[q_base + i * batch] * scale;
                             }
-                            let rel_idx = (s as isize - t as isize + (seq as isize - 1)) as usize;
+
+                            let rel_idx =
+                                (s as isize - t as isize + (seq as isize - 1)) as usize;
                             grad_rel_bias[rel_idx] += ds;
                         }
                     }
                 }
 
-                let d_q_raw = d_q;
-                let d_k_raw = d_k;
-                let d_v_raw = d_v;
-
+                // ============ 5. gi и градиенты параметров Q, K, V ============
+                //   gi[r,t,i]      += Σ_j ( d_q[r,t,j] * W_q[j,i]
+                //                         + d_k[r,t,j] * W_k[j,i]
+                //                         + d_v[r,t,j] * W_v[j,i] )
+                //   grad_W_q[j,i]  += d_q[r,t,j] * x[r,t,i]
+                //   grad_b_q[j]    += d_q[r,t,j]
                 for r in 0..batch {
                     for t in 0..seq {
-                        let idx = r * total_tokens + t * d;
-                        for i in 0..d {
-                            let dq = d_q_raw[idx + i];
-                            grad_bq[i] += dq;
-                            for j in 0..d {
-                                grad_wq[i * d + j] += dq * x_rows[idx + j];
-                                gi[(t * d + j) * batch + r] += dq * p[wq_start + i * d + j];
-                            }
+                        let tok_base = (t * d) * batch + r;
+                        for j in 0..d {
+                            let dq = d_q[tok_base + j * batch];
+                            let dk = d_k[tok_base + j * batch];
+                            let dv = d_v[tok_base + j * batch];
 
-                            let dk = d_k_raw[idx + i];
-                            grad_bk[i] += dk;
-                            for j in 0..d {
-                                grad_wk[i * d + j] += dk * x_rows[idx + j];
-                                gi[(t * d + j) * batch + r] += dk * p[wk_start + i * d + j];
-                            }
+                            grad_bq[j] += dq;
+                            grad_bk[j] += dk;
+                            grad_bv[j] += dv;
 
-                            let dv = d_v_raw[idx + i];
-                            grad_bv[i] += dv;
-                            for j in 0..d {
-                                grad_wv[i * d + j] += dv * x_rows[idx + j];
-                                gi[(t * d + j) * batch + r] += dv * p[wv_start + i * d + j];
+                            for i in 0..d {
+                                let xv = x[tok_base + i * batch];
+
+                                grad_wq[j * d + i] += dq * xv;
+                                grad_wk[j * d + i] += dk * xv;
+                                grad_wv[j * d + i] += dv * xv;
+
+                                gi[tok_base + i * batch] +=
+                                    dq * p[wq_start + j * d + i]
+                                    + dk * p[wk_start + j * d + i]
+                                    + dv * p[wv_start + j * d + i];
                             }
                         }
                     }
                 }
 
+                // ============ 6. Запись градиентов параметров ============
                 for i in 0..d {
                     gp[bq_start + i] = grad_bq[i];
                     gp[bk_start + i] = grad_bk[i];
                     gp[bv_start + i] = grad_bv[i];
                     gp[bo_start + i] = grad_bo[i];
                 }
-                for i in 0..d*d {
+                for i in 0..d * d {
                     gp[wq_start + i] = grad_wq[i];
                     gp[wk_start + i] = grad_wk[i];
                     gp[wv_start + i] = grad_wv[i];
                     gp[wo_start + i] = grad_wo[i];
                 }
-                for i in 0..(2*seq-1) {
-                    gp[bias_start + i] = grad_rel_bias[i];
+                for i in 0..(2 * seq - 1) {
+                    gp[rel_bias_start + i] = grad_rel_bias[i];
                 }
             });
     }

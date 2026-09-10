@@ -1,3 +1,31 @@
+// src/layers/linear_attention/gpu/vulkan/shaders/linear_attention_fwd.comp
+//
+// Прямой проход LinearAttention в column-major раскладке.
+//
+// Формула:
+//   denom[r, t]   = eps + Σ_l q_phi[r, t, l] * z[l]
+//   num[r, t, j]  = Σ_l q_phi[r, t, l] * ( Σ_i KV[l, i] * w_o[j, i] )
+//   y[r, t, j]    = b_o[j] + num[r, t, j] / denom[r, t]
+//
+// где KV[l, i] хранится как kv[i * d + l] (column-major).
+//
+// Раскладка всех тензоров — column-major.
+//
+// Bindings:
+//   0: q_phi — (batch, seq_len * d_model), column-major:
+//              q_phi[(t * d + l) * batch + r]
+//   1: kv    — (d_model, d_model), column-major:
+//              kv[i * d + l] = KV[l, i]
+//   2: z     — (d_model,), линейный вектор
+//   3: w_o   — (d_model, d_model), row-major:
+//              w_o[j * d + i]
+//   4: b_o   — (d_model,)
+//   5: y     — (batch, seq_len * d_model), column-major:
+//              y[(t * d + j) * batch + r]
+//
+// Push-константы: batch, seq_len, d_model
+// Dispatch: batch * seq_len * d_model потоков.
+
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -9,79 +37,67 @@ layout(push_constant) uniform PushConsts {
 } pc;
 
 layout(binding = 0, std430) readonly buffer QPhiBuf {
-    float q_phi[];   // row-major: (batch * seq_len) x d_model
+    float q_phi[];
 };
 
-layout(binding = 1, std430) readonly buffer KPhiBuf {
-    float k_phi[];   // row-major: (batch * seq_len) x d_model (не используется в forward)
+layout(binding = 1, std430) readonly buffer KVBuf {
+    float kv[];
 };
 
-layout(binding = 2, std430) readonly buffer VBuf {
-    float v[];       // row-major: (batch * seq_len) x d_model (не используется в forward)
+layout(binding = 2, std430) readonly buffer ZBuf {
+    float z[];
 };
 
-layout(binding = 3, std430) readonly buffer KVBuf {
-    float kv[];      // d_model x d_model (row-major)
+layout(binding = 3, std430) readonly buffer WoBuf {
+    float w_o[];
 };
 
-layout(binding = 4, std430) readonly buffer ZBuf {
-    float z[];       // d_model
+layout(binding = 4, std430) readonly buffer BoBuf {
+    float b_o[];
 };
 
-layout(binding = 5, std430) readonly buffer WoBuf {
-    float w_o[];     // d_model x d_model (row-major, индексация как w_o[j*d_model + i])
-};
-
-layout(binding = 6, std430) readonly buffer BoBuf {
-    float b_o[];     // d_model
-};
-
-layout(binding = 7, std430) writeonly buffer OutBuf {
-    float y[];       // row-major: (batch * seq_len) x d_model
+layout(binding = 5, std430) writeonly buffer OutBuf {
+    float y[];
 };
 
 void main() {
+    uint d = pc.d_model;
+    uint total = pc.batch * pc.seq_len * d;
     uint idx = gl_GlobalInvocationID.x;
-    uint total = pc.batch * pc.seq_len * pc.d_model;
     if (idx >= total) return;
 
-    uint d = pc.d_model;
-    uint seq_total = pc.seq_len;
-    uint batch_total = pc.batch;
-    uint tokens_per_batch = seq_total; // количество токенов в одном примере
+    // Восстанавливаем (r, t, j) из column-major индекса:
+    // idx = (t * d + j) * batch + r
+    uint r   = idx % pc.batch;
+    uint tmp = idx / pc.batch;
+    uint j   = tmp % d;
+    uint t   = tmp / d;
 
-    // Определяем индекс токена (глобальный по всем батчам) и j
-    uint token_idx = idx / d;         // индекс токена среди всех batch*seq_len токенов
-    uint j = idx % d;                 // номер выходного признака
+    uint q_base = (t * d) * pc.batch + r; // база для q_phi[r, t, 0]
 
-    // Вычисляем denom для данного токена: sum_i q_phi[token_idx*d + i] * z[i] + eps
+    // 1. Вычисляем denom = eps + Σ_l q_phi[r, t, l] * z[l]
     float eps = 1e-6;
     float denom = eps;
-    // базовый указатель на q_phi для этого токена
-    uint q_base = token_idx * d;
-    for (uint i = 0; i < d; ++i) {
-        denom += q_phi[q_base + i] * z[i];
+    for (uint l = 0u; l < d; ++l) {
+        float q_l = q_phi[q_base + l * pc.batch];
+        denom += q_l * z[l];
     }
+    float inv_denom = 1.0 / denom;
 
-    // Вычисляем attn_out[token_idx, i] для всех i? Но нам нужно только для текущего j.
-    // Однако attn_out зависит от KV и Q. Для y[token_idx, j] нужно:
-    // attn_out[token_idx, i] для всех i, так как y = sum_i attn_out[token_idx, i] * w_o[j, i] + b_o[j]
-    // Но attn_out[token_idx, i] = sum_l q_phi[token_idx, l] * kv[l, i] / denom
-    // Подставим: y[token_idx, j] = sum_i (sum_l q_phi[token_idx, l] * kv[l, i] / denom) * w_o[j, i] + b_o[j]
-    // = (1/denom) * sum_l q_phi[token_idx, l] * (sum_i kv[l, i] * w_o[j, i]) + b_o[j]
-
-    // Можно вычислить эффективнее, если заранее посчитать матрицу temp[l,j] = sum_i kv[l,i]*w_o[j,i],
-    // но для простоты сделаем двойной цикл внутри одного потока (неэффективно, но работает).
-    float y_val = b_o[j];
-    for (uint l = 0; l < d; ++l) {
-        float q_l = q_phi[q_base + l];
-        // Для каждого l суммируем по i: kv[l*d + i] * w_o[j*d + i]
-        float sum_i = 0.0;
-        for (uint i = 0; i < d; ++i) {
-            sum_i += kv[l * d + i] * w_o[j * d + i];
+    // 2. Вычисляем числитель:
+    // num = Σ_l q_phi[r, t, l] * ( Σ_i KV[l, i] * w_o[j, i] )
+    //     = Σ_l q_phi[r, t, l] * ( Σ_i kv[i * d + l] * w_o[j * d + i] )
+    float num = 0.0;
+    uint w_row_base = j * d;
+    for (uint l = 0u; l < d; ++l) {
+        float q_l = q_phi[q_base + l * pc.batch];
+        float inner = 0.0;
+        for (uint i = 0u; i < d; ++i) {
+            inner += kv[i * d + l] * w_o[w_row_base + i];
         }
-        y_val += q_l * sum_i / denom;
+        num += q_l * inner;
     }
 
-    y[idx] = y_val;
+    // 3. Записываем результат.
+    y[idx] = b_o[j] + num * inv_denom;
 }

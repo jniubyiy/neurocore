@@ -16,48 +16,53 @@ impl UniversalLayerBuffered for Memory {
         _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
     ) {
-        // ВАЖНО: вычисляем размеры ДО блокировки MemoryExecutor
+        // ВАЖНО: вычисляем размеры и берём копии скаляров ДО блокировки MemoryExecutor.
         let rows = input.rows();
         let features = self.features;
+        let alpha = self.alpha;
         let ids = [input.id(), output.id()];
 
-        let mut cells_guard = self.cells.lock().unwrap();
-        let cells = &mut *cells_guard;
+        let mut state_guard = self.state.lock().unwrap();
+        let state = &mut *state_guard;
 
         input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
             let x: &[f32] = &*first[0];
             let y: &mut [f32] = &mut *rest[0];
 
+            // ============ Инициализация якорей ============
+            // Выполняется один раз при первом прямом проходе, по образцу r = 0 батча.
+            if !state.initialized {
+                for c in 0..features {
+                    let v = x[c * rows];
+                    state.min_cells[c] = v;
+                    state.max_cells[c] = v;
+                }
+                state.initialized = true;
+            }
+
+            // ============ Основной проход ============
             for r in 0..rows {
                 for c in 0..features {
                     let idx = c * rows + r;
                     let x_val = x[idx];
-                    let min_idx = c;
-                    let max_idx = features + c;
-
-                    // Инициализация якорей первым значением
-                    if cells[min_idx].is_none() {
-                        cells[min_idx] = Some(x_val);
-                        cells[max_idx] = Some(x_val);
-                    }
-
-                    let min_val = cells[min_idx].unwrap();
-                    let max_val = cells[max_idx].unwrap();
+                    let min_val = state.min_cells[c];
+                    let max_val = state.max_cells[c];
 
                     let d_min = (x_val - min_val).abs();
                     let d_max = (x_val - max_val).abs();
                     let closest = if d_min <= d_max { min_val } else { max_val };
-                    y[idx] = x_val + self.alpha * (closest - x_val);
 
-                    // Обновление якорей
+                    y[idx] = x_val + alpha * (closest - x_val);
+
+                    // Обновление якорей в зависимости от положения x_val.
                     if x_val > max_val {
-                        cells[max_idx] = Some(max_val + self.alpha * (x_val - max_val));
+                        state.max_cells[c] = max_val + alpha * (x_val - max_val);
                     } else if x_val < min_val {
-                        cells[min_idx] = Some(min_val + self.alpha * (x_val - min_val));
+                        state.min_cells[c] = min_val + alpha * (x_val - min_val);
                     } else {
-                        cells[min_idx] = Some(min_val + self.alpha * (x_val - min_val));
-                        cells[max_idx] = Some(max_val + self.alpha * (x_val - max_val));
+                        state.min_cells[c] = min_val + alpha * (x_val - min_val);
+                        state.max_cells[c] = max_val + alpha * (x_val - max_val);
                     }
                 }
             }

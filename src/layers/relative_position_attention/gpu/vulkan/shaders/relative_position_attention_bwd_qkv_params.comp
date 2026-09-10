@@ -1,3 +1,36 @@
+// src/layers/relative_position_attention/gpu/vulkan/shaders/relative_position_attention_bwd_qkv_params.comp
+//
+// Обратный проход через Q, K и relative position bias для слоя
+// RelativePositionAttention.
+//
+// Раскладка данных — column-major.
+//
+// Вход:
+//   q        (batch, seq_len * d_model), column-major:
+//     q[(t * d + i) * batch + r]
+//   k        (batch, seq_len * d_model), column-major:
+//     k[(s * d + i) * batch + r]
+//   d_scores (batch, seq_len * seq_len), column-major:
+//     d_scores[(t * seq_len + s) * batch + r]
+//
+// Выход:
+//   d_q (batch, seq_len * d_model), column-major:
+//     d_q[(t * d + i) * batch + r] = scale * Σ_s d_scores[r,t,s] * k[r,s,i]
+//
+//   d_k (batch, seq_len * d_model), column-major:
+//     d_k[(s * d + i) * batch + r] = scale * Σ_t d_scores[r,t,s] * q[r,t,i]
+//
+//   grad_rel_bias (длина 2 * seq_len - 1), атомарное накопление:
+//     grad_rel_bias[s - t + (seq_len - 1)] += d_scores[r,t,s]
+//
+// Push-константы: batch, seq_len, d_model.
+// Dispatch: 2 * batch * seq_len * d_model + batch * seq_len * seq_len потоков.
+//
+// Секции:
+//   [0, Nq)          → d_q,        где Nq = batch * seq_len * d_model
+//   [Nq, Nq + Nk)    → d_k,        где Nk = batch * seq_len * d_model
+//   [Nq + Nk, ...)   → grad_rel_bias, где всего batch * seq_len * seq_len потоков
+
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -9,31 +42,29 @@ layout(push_constant) uniform PushConsts {
 } pc;
 
 layout(binding = 0, std430) readonly buffer QBuf {
-    float q[];          // (batch * seq_len) x d_model, row-major
+    float q[];
 };
 
 layout(binding = 1, std430) readonly buffer KBuf {
-    float k[];          // (batch * seq_len) x d_model, row-major
+    float k[];
 };
 
 layout(binding = 2, std430) readonly buffer DScoresBuf {
-    float d_scores[];   // (batch * seq_len) x seq_len, row-major
+    float d_scores[];
 };
 
 layout(binding = 3, std430) writeonly buffer DQBuf {
-    float d_q[];        // (batch * seq_len) x d_model, row-major
+    float d_q[];
 };
 
 layout(binding = 4, std430) writeonly buffer DKBuf {
-    float d_k[];        // (batch * seq_len) x d_model, row-major
+    float d_k[];
 };
 
 layout(binding = 5, std430) buffer GradRelBiasBuf {
-    uint grad_rel_bias[]; // битовое представление float, длина 2*seq_len - 1
+    uint grad_rel_bias[];
 };
 
-// Макрос атомарного сложения float, использующий atomicCompSwap напрямую.
-// Целевой аргумент (target) должен быть l-value элементом из storage buffer.
 #define ATOMIC_ADD_FLOAT(target, value) \
 { \
     uint expected = target; \
@@ -48,59 +79,70 @@ layout(binding = 5, std430) buffer GradRelBiasBuf {
 }
 
 void main() {
+    uint d = pc.d_model;
+    uint seq = pc.seq_len;
+
+    uint n_q = pc.batch * seq * d;
+    uint n_k = pc.batch * seq * d;
+    uint n_scores = pc.batch * seq * seq;
+
     uint idx = gl_GlobalInvocationID.x;
-    uint total_dq = pc.batch * pc.seq_len * pc.d_model;
-    uint total_dk = total_dq;
+    uint total = n_q + n_k + n_scores;
+    if (idx >= total) return;
 
-    // Секция 1: вычисление d_q
-    if (idx < total_dq) {
-        uint token = idx / pc.d_model;    // глобальный индекс токена (batch*t)
-        uint i = idx % pc.d_model;        // признак
+    float scale = inversesqrt(float(d));
 
-        uint r = token / pc.seq_len;
-        uint t = token % pc.seq_len;
-        uint seq = pc.seq_len;
-        float scale = inversesqrt(float(pc.d_model));
+    if (idx < n_q) {
+        // ============ Секция 1: d_q ============
+        // idx = (t * d + i) * batch + r
+        uint r   = idx % pc.batch;
+        uint tmp = idx / pc.batch;
+        uint i   = tmp % d;
+        uint t   = tmp / d;
+
+        // База для d_scores[r, t, 0]: элемент (r, t, s) лежит
+        // по адресу (t * seq + s) * batch + r, шаг по s = batch.
+        uint ds_base = (t * seq) * pc.batch + r;
 
         float sum = 0.0;
         for (uint s = 0u; s < seq; ++s) {
-            uint k_idx = (r * seq + s) * pc.d_model + i;
-            sum += d_scores[token * seq + s] * k[k_idx] * scale;
+            // k[r, s, i] в column-major: (s * d + i) * batch + r
+            uint k_idx = (s * d + i) * pc.batch + r;
+            float ds = d_scores[ds_base + s * pc.batch];
+            sum += ds * k[k_idx];
         }
-        d_q[idx] = sum;
-    }
-    // Секция 2: вычисление d_k
-    else if (idx < total_dq + total_dk) {
-        uint local_idx = idx - total_dq;
-        uint token_s = local_idx / pc.d_model; // здесь token_s относится к индексу s (номер токена в последовательности)
-        uint i = local_idx % pc.d_model;
-
-        uint r = token_s / pc.seq_len;
-        uint s = token_s % pc.seq_len; // в d_k индексация по s (ключ)
-        uint seq = pc.seq_len;
-        float scale = inversesqrt(float(pc.d_model));
+        d_q[idx] = sum * scale;
+    } else if (idx < n_q + n_k) {
+        // ============ Секция 2: d_k ============
+        uint local = idx - n_q;
+        // local = (s * d + i) * batch + r
+        uint r   = local % pc.batch;
+        uint tmp = local / pc.batch;
+        uint i   = tmp % d;
+        uint s   = tmp / d;
 
         float sum = 0.0;
         for (uint t = 0u; t < seq; ++t) {
-            uint q_idx = (r * seq + t) * pc.d_model + i;
-            uint d_score_idx = (r * seq + t) * seq + s;
-            sum += d_scores[d_score_idx] * q[q_idx] * scale;
+            // d_scores[r, t, s] в column-major: (t * seq + s) * batch + r
+            uint ds_idx = (t * seq + s) * pc.batch + r;
+            // q[r, t, i] в column-major: (t * d + i) * batch + r
+            uint q_idx = (t * d + i) * pc.batch + r;
+            sum += d_scores[ds_idx] * q[q_idx];
         }
-        d_k[local_idx] = sum;
-    }
-    // Секция 3: накопление градиента по rel_bias
-    else {
-        uint total_scores = pc.batch * pc.seq_len * pc.seq_len;
-        uint score_idx = idx - total_dq - total_dk;
-        if (score_idx < total_scores) {
-            uint token = score_idx / pc.seq_len;
-            uint s_pos = score_idx % pc.seq_len;
+        d_k[local] = sum * scale;
+    } else {
+        // ============ Секция 3: grad_rel_bias ============
+        uint local = idx - n_q - n_k;
+        // local = (t * seq + s) * batch + r
+        uint r   = local % pc.batch;
+        uint tmp = local / pc.batch;
+        uint s   = tmp % seq;
+        uint t   = tmp / seq;
 
-            uint r = token / pc.seq_len;
-            uint t = token % pc.seq_len;
+        int rel_idx = int(s) - int(t) + int(seq - 1u);
 
-            int rel_idx = int(s_pos) - int(t) + int(pc.seq_len - 1u);
-            ATOMIC_ADD_FLOAT(grad_rel_bias[uint(rel_idx)], d_scores[score_idx]);
-        }
+        // d_scores[r, t, s] в column-major: (t * seq + s) * batch + r = local
+        float ds = d_scores[local];
+        ATOMIC_ADD_FLOAT(grad_rel_bias[uint(rel_idx)], ds);
     }
 }

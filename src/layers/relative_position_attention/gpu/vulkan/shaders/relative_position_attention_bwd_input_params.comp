@@ -1,3 +1,43 @@
+// src/layers/relative_position_attention/gpu/vulkan/shaders/relative_position_attention_bwd_input_params.comp
+//
+// Завершающий обратный шейдер RelativePositionAttention: вычисляет
+// градиент по входу и градиенты по W_q, b_q, W_k, b_k, W_v, b_v.
+//
+// Раскладка активаций — column-major. Веса параметров — row-major
+// (W[i,j] лежит по адресу i*d + j).
+//
+// Вход:
+//   x     (batch, seq_len * d_model), column-major:
+//     x[(t * d + i) * batch + r]
+//   d_q   (batch, seq_len * d_model), column-major:
+//     d_q[(t * d + i) * batch + r]
+//   d_k   — аналогично
+//   d_v   — аналогично
+//   params — плоский блок параметров:
+//     W_q: [0, d²)             row-major
+//     b_q: [d², d² + d)
+//     W_k: [d² + d, 2d² + d)   row-major
+//     b_k: [2d² + d, 2d² + 2d)
+//     W_v: [2d² + 2d, 3d² + 2d) row-major
+//     b_v: [3d² + 2d, 3d² + 3d)
+//
+// Выход:
+//   gi           (batch, seq_len * d_model), column-major
+//   grad_params  (атомарное накопление через CAS)
+//
+// Математика:
+//   gi[r,t,j] = Σ_i ( d_q[r,t,i] * W_q[i,j]
+//                  + d_k[r,t,i] * W_k[i,j]
+//                  + d_v[r,t,i] * W_v[i,j] )
+//
+//   grad_W_q[i,j] += d_q[r,t,i] * x[r,t,j]
+//   grad_b_q[i]   += d_q[r,t,i]
+//   (аналогично для K, V)
+//
+// Push-константы: batch, seq_len, d_model.
+// Dispatch: batch * seq_len * d_model потоков (один поток на (r, t, j)).
+// grad_params должен быть предварительно обнулён на хосте.
+
 #version 450
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -8,42 +48,34 @@ layout(push_constant) uniform PushConsts {
     uint d_model;
 } pc;
 
-// Входной тензор (row-major: (batch*seq_len) x d_model)
 layout(binding = 0, std430) readonly buffer InputBuf {
     float x[];
 };
 
-// Градиенты по Q (row-major)
 layout(binding = 1, std430) readonly buffer DQBuf {
     float d_q[];
 };
 
-// Градиенты по K (row-major)
 layout(binding = 2, std430) readonly buffer DKBuf {
     float d_k[];
 };
 
-// Градиенты по V (row-major)
 layout(binding = 3, std430) readonly buffer DVBuf {
     float d_v[];
 };
 
-// Параметры слоя (полный блок: Wq,bq,Wk,bk,Wv,bv,Wo,bo,rel_bias)
 layout(binding = 4, std430) readonly buffer ParamsBuf {
     float params[];
 };
 
-// Выходной градиент по входу (row-major)
 layout(binding = 5, std430) writeonly buffer GradInBuf {
     float gi[];
 };
 
-// Буфер градиентов параметров (uint для атомарного накопления)
 layout(binding = 6, std430) buffer GradParamsBuf {
     uint grad_params[];
 };
 
-// Макрос атомарного сложения float
 #define ATOMIC_ADD_FLOAT(target, value) \
 { \
     uint expected = target; \
@@ -58,17 +90,23 @@ layout(binding = 6, std430) buffer GradParamsBuf {
 }
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    uint total_tokens = pc.batch * pc.seq_len;
-    uint total_elements = total_tokens * pc.d_model;
-    if (idx >= total_elements) return;
-
-    uint token_idx = idx / pc.d_model;
-    uint j = idx % pc.d_model;
-
     uint d = pc.d_model;
+    uint total = pc.batch * pc.seq_len * d;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
 
-    // Смещения параметров (согласовано с CPU/GPU forward)
+    // Восстанавливаем (r, t, j) из column-major индекса:
+    //   idx = (t * d + j) * batch + r
+    uint r   = idx % pc.batch;
+    uint tmp = idx / pc.batch;
+    uint j   = tmp % d;
+    uint t   = tmp / d;
+
+    // База для (r, t, 0): элемент (r, t, k) лежит по адресу (t*d + k)*batch + r,
+    // значит шаг по k равен batch.
+    uint tok_base = (t * d) * pc.batch + r;
+
+    // Смещения блоков параметров.
     uint wq_start = 0u;
     uint bq_start = wq_start + d * d;
     uint wk_start = bq_start + d;
@@ -76,36 +114,43 @@ void main() {
     uint wv_start = bk_start + d;
     uint bv_start = wv_start + d * d;
 
-    // 1. Вычисляем градиент по входу для текущего j
+    // ===== 1. grad по входу: gi[r,t,j] = Σ_i ( d_q[i]*W_q[i,j] + d_k[i]*W_k[i,j] + d_v[i]*W_v[i,j] ) =====
     float gi_val = 0.0;
     for (uint i = 0u; i < d; ++i) {
-        gi_val += d_q[token_idx * d + i] * params[wq_start + i * d + j];
-        gi_val += d_k[token_idx * d + i] * params[wk_start + i * d + j];
-        gi_val += d_v[token_idx * d + i] * params[wv_start + i * d + j];
+        float dq_i = d_q[tok_base + i * pc.batch];
+        float dk_i = d_k[tok_base + i * pc.batch];
+        float dv_i = d_v[tok_base + i * pc.batch];
+        gi_val += dq_i * params[wq_start + i * d + j]
+                + dk_i * params[wk_start + i * d + j]
+                + dv_i * params[wv_start + i * d + j];
     }
-    gi[token_idx * d + j] = gi_val;
+    gi[idx] = gi_val;
 
-    // 2. Атомарное накопление градиентов по параметрам Q, K, V.
-    float x_val = x[token_idx * d + j];
-
-    // W_q[i,j] += d_q[i] * x_val, b_q[i] += d_q[i]
+    // ===== 2. Накопление градиентов по W_q, W_k, W_v =====
+    // Каждый поток (r,t,j) добавляет в столбец j: d_q[i]*x[j] для всех i.
+    float x_j = x[tok_base + j * pc.batch];
     for (uint i = 0u; i < d; ++i) {
-        float dq = d_q[token_idx * d + i];
-        ATOMIC_ADD_FLOAT(grad_params[bq_start + i], dq);
-        ATOMIC_ADD_FLOAT(grad_params[wq_start + i * d + j], dq * x_val);
+        float dq_i = d_q[tok_base + i * pc.batch];
+        float dk_i = d_k[tok_base + i * pc.batch];
+        float dv_i = d_v[tok_base + i * pc.batch];
+
+        ATOMIC_ADD_FLOAT(grad_params[wq_start + i * d + j], dq_i * x_j);
+        ATOMIC_ADD_FLOAT(grad_params[wk_start + i * d + j], dk_i * x_j);
+        ATOMIC_ADD_FLOAT(grad_params[wv_start + i * d + j], dv_i * x_j);
     }
 
-    // W_k[i,j] += d_k[i] * x_val, b_k[i] += d_k[i]
-    for (uint i = 0u; i < d; ++i) {
-        float dk = d_k[token_idx * d + i];
-        ATOMIC_ADD_FLOAT(grad_params[bk_start + i], dk);
-        ATOMIC_ADD_FLOAT(grad_params[wk_start + i * d + j], dk * x_val);
-    }
+    // ===== 3. Накопление градиентов по bias =====
+    // Только один поток на (r,t) — например j == 0 — добавляет вклад по bias,
+    // чтобы избежать избыточного накопления при обходе по j.
+    if (j == 0u) {
+        for (uint i = 0u; i < d; ++i) {
+            float dq_i = d_q[tok_base + i * pc.batch];
+            float dk_i = d_k[tok_base + i * pc.batch];
+            float dv_i = d_v[tok_base + i * pc.batch];
 
-    // W_v[i,j] += d_v[i] * x_val, b_v[i] += d_v[i]
-    for (uint i = 0u; i < d; ++i) {
-        float dv = d_v[token_idx * d + i];
-        ATOMIC_ADD_FLOAT(grad_params[bv_start + i], dv);
-        ATOMIC_ADD_FLOAT(grad_params[wv_start + i * d + j], dv * x_val);
+            ATOMIC_ADD_FLOAT(grad_params[bq_start + i], dq_i);
+            ATOMIC_ADD_FLOAT(grad_params[bk_start + i], dk_i);
+            ATOMIC_ADD_FLOAT(grad_params[bv_start + i], dv_i);
+        }
     }
 }

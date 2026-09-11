@@ -20,24 +20,45 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
     unsafe { std::slice::from_raw_parts(ptr, bytes.len() / 4) }
 }
 
+/// Пайплайны AdaptiveNormalization, разбитые на этапы.
+///
+/// Прямой проход:
+///   row_stats → col_stats → forward
+///
+/// Обратный проход:
+///   row_stats → col_stats → bwd_weights → bwd_row_sums → bwd_col_sums
+///   → bwd_input , bwd_params
 pub struct AdaptiveNormalizationPipelines {
     pub forward: Arc<ComputePipeline>,
-    pub backward: Arc<ComputePipeline>,
+    pub backward: Arc<ComputePipeline>, // оставлено для обратной совместимости полей
     pub row_stats: Arc<ComputePipeline>,
     pub col_stats: Arc<ComputePipeline>,
+    pub bwd_weights: Arc<ComputePipeline>,
+    pub bwd_row_sums: Arc<ComputePipeline>,
+    pub bwd_col_sums: Arc<ComputePipeline>,
+    pub bwd_input: Arc<ComputePipeline>,
+    pub bwd_params: Arc<ComputePipeline>,
 }
 
 impl AdaptiveNormalizationPipelines {
     pub fn new(device: Arc<Device>) -> Self {
         let fwd_bytes = include_bytes!("vulkan/shaders/adaptive_norm_fwd.spv");
-        let bwd_bytes = include_bytes!("vulkan/shaders/adaptive_norm_bwd.spv");
         let row_stats_bytes = include_bytes!("vulkan/shaders/adaptive_norm_row_stats.spv");
         let col_stats_bytes = include_bytes!("vulkan/shaders/adaptive_norm_col_stats.spv");
+        let bwd_weights_bytes = include_bytes!("vulkan/shaders/adaptive_norm_bwd_weights.spv");
+        let bwd_row_sums_bytes = include_bytes!("vulkan/shaders/adaptive_norm_bwd_row_sums.spv");
+        let bwd_col_sums_bytes = include_bytes!("vulkan/shaders/adaptive_norm_bwd_col_sums.spv");
+        let bwd_input_bytes = include_bytes!("vulkan/shaders/adaptive_norm_bwd_input.spv");
+        let bwd_params_bytes = include_bytes!("vulkan/shaders/adaptive_norm_bwd_params.spv");
 
-        let fwd_spv = as_u32_slice(fwd_bytes);
-        let bwd_spv = as_u32_slice(bwd_bytes);
-        let row_stats_spv = as_u32_slice(row_stats_bytes);
-        let col_stats_spv = as_u32_slice(col_stats_bytes);
+        let fwd_spv         = as_u32_slice(fwd_bytes);
+        let row_stats_spv   = as_u32_slice(row_stats_bytes);
+        let col_stats_spv   = as_u32_slice(col_stats_bytes);
+        let bwd_weights_spv = as_u32_slice(bwd_weights_bytes);
+        let bwd_row_sums_spv = as_u32_slice(bwd_row_sums_bytes);
+        let bwd_col_sums_spv = as_u32_slice(bwd_col_sums_bytes);
+        let bwd_input_spv   = as_u32_slice(bwd_input_bytes);
+        let bwd_params_spv  = as_u32_slice(bwd_params_bytes);
 
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
             let mut bindings = std::collections::BTreeMap::new();
@@ -64,130 +85,81 @@ impl AdaptiveNormalizationPipelines {
             .expect("Failed to create descriptor set layout for AdaptiveNormalization")
         }
 
-        // ==================== Forward ====================
-        let fwd_layout = create_ds_layout(device.clone(), 8);
-        let fwd_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(fwd_spv))
-                .expect("Failed to create AdaptiveNormalization forward shader module")
-        };
-        let fwd_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 8, // batch, features
-        };
-        let fwd_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![fwd_layout],
-                push_constant_ranges: vec![fwd_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create AdaptiveNormalization forward pipeline layout");
-        let fwd_entry = fwd_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("AdaptiveNormalization forward entry point not found");
-        let fwd_stage = PipelineShaderStageCreateInfo::new(fwd_entry);
-        let forward = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(fwd_stage, fwd_pipeline_layout),
-        )
-        .expect("Failed to create AdaptiveNormalization forward pipeline");
+        fn build(
+            device: Arc<Device>,
+            spv: &[u32],
+            ds_n: u32,
+            push_size: u32,
+            name: &str,
+        ) -> Arc<ComputePipeline> {
+            let layout = create_ds_layout(device.clone(), ds_n);
+            let module = unsafe {
+                ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(spv))
+                    .unwrap_or_else(|_| panic!("Failed to create {} shader module", name))
+            };
+            let push = PushConstantRange {
+                stages: ShaderStages::COMPUTE,
+                offset: 0,
+                size: push_size,
+            };
+            let pipeline_layout = PipelineLayout::new(
+                device.clone(),
+                PipelineLayoutCreateInfo {
+                    set_layouts: vec![layout],
+                    push_constant_ranges: vec![push],
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|_| panic!("Failed to create {} pipeline layout", name));
+            let entry = module
+                .entry_point_with_execution("main", ExecutionModel::GLCompute)
+                .unwrap_or_else(|| panic!("{} entry point not found", name));
+            let stage = PipelineShaderStageCreateInfo::new(entry);
+            ComputePipeline::new(
+                device,
+                None,
+                ComputePipelineCreateInfo::stage_layout(stage, pipeline_layout),
+            )
+            .unwrap_or_else(|_| panic!("Failed to create {} pipeline", name))
+        }
 
-        // ==================== Backward ====================
-        let bwd_layout = create_ds_layout(device.clone(), 10);
-        let bwd_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_spv))
-                .expect("Failed to create AdaptiveNormalization backward shader module")
-        };
-        let bwd_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 8, // batch, features
-        };
-        let bwd_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_layout],
-                push_constant_ranges: vec![bwd_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create AdaptiveNormalization backward pipeline layout");
-        let bwd_entry = bwd_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("AdaptiveNormalization backward entry point not found");
-        let bwd_stage = PipelineShaderStageCreateInfo::new(bwd_entry);
-        let backward = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_stage, bwd_pipeline_layout),
-        )
-        .expect("Failed to create AdaptiveNormalization backward pipeline");
+        // row_stats: 4 буфера, push = [batch, features] (8 байт).
+        let row_stats = build(device.clone(), row_stats_spv, 4, 8, "AdaptiveNorm row_stats");
 
-        // ==================== Row Statistics ====================
-        let row_stats_layout = create_ds_layout(device.clone(), 4);
-        let row_stats_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(row_stats_spv))
-                .expect("Failed to create AdaptiveNormalization row stats shader module")
-        };
-        let row_stats_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 8, // batch, features
-        };
-        let row_stats_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![row_stats_layout],
-                push_constant_ranges: vec![row_stats_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create AdaptiveNormalization row stats pipeline layout");
-        let row_stats_entry = row_stats_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("AdaptiveNormalization row stats entry point not found");
-        let row_stats_stage = PipelineShaderStageCreateInfo::new(row_stats_entry);
-        let row_stats = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(row_stats_stage, row_stats_pipeline_layout),
-        )
-        .expect("Failed to create AdaptiveNormalization row stats pipeline");
+        // col_stats: 3 буфера, push = [batch, features] (8 байт).
+        let col_stats = build(device.clone(), col_stats_spv, 3, 8, "AdaptiveNorm col_stats");
 
-        // ==================== Column Statistics ====================
-        let col_stats_layout = create_ds_layout(device.clone(), 3);
-        let col_stats_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(col_stats_spv))
-                .expect("Failed to create AdaptiveNormalization col stats shader module")
-        };
-        let col_stats_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 8, // batch, features
-        };
-        let col_stats_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![col_stats_layout],
-                push_constant_ranges: vec![col_stats_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create AdaptiveNormalization col stats pipeline layout");
-        let col_stats_entry = col_stats_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("AdaptiveNormalization col stats entry point not found");
-        let col_stats_stage = PipelineShaderStageCreateInfo::new(col_stats_entry);
-        let col_stats = ComputePipeline::new(
-            device,
-            None,
-            ComputePipelineCreateInfo::stage_layout(col_stats_stage, col_stats_pipeline_layout),
-        )
-        .expect("Failed to create AdaptiveNormalization col stats pipeline");
+        // forward: 8 буферов, push = [batch, features] (8 байт).
+        let forward = build(device.clone(), fwd_spv, 8, 8, "AdaptiveNorm forward");
 
-        Self { forward, backward, row_stats, col_stats }
+        // bwd_weights: 4 буфера, push = [features] (4 байта).
+        let bwd_weights = build(device.clone(), bwd_weights_spv, 4, 4, "AdaptiveNorm bwd_weights");
+
+        // bwd_row_sums: 8 буферов, push = [batch, features] (8 байт).
+        let bwd_row_sums = build(device.clone(), bwd_row_sums_spv, 8, 8, "AdaptiveNorm bwd_row_sums");
+
+        // bwd_col_sums: 6 буферов, push = [batch, features] (8 байт).
+        let bwd_col_sums = build(device.clone(), bwd_col_sums_spv, 6, 8, "AdaptiveNorm bwd_col_sums");
+
+        // bwd_input: 17 буферов, push = [batch, features] (8 байт).
+        let bwd_input = build(device.clone(), bwd_input_spv, 17, 8, "AdaptiveNorm bwd_input");
+
+        // bwd_params: 12 буферов, push = [batch, features] (8 байт).
+        let bwd_params = build(device.clone(), bwd_params_spv, 12, 8, "AdaptiveNorm bwd_params");
+
+        // Поле backward оставлено для совместимости полей. Дублируем указатель на bwd_input.
+        let backward = bwd_input.clone();
+
+        Self {
+            forward,
+            backward,
+            row_stats,
+            col_stats,
+            bwd_weights,
+            bwd_row_sums,
+            bwd_col_sums,
+            bwd_input,
+            bwd_params,
+        }
     }
 }

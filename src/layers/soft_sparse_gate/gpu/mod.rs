@@ -17,7 +17,7 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 }
 
 impl GpuCompute {
-    /// Прямой проход SoftSparseGate на GPU.
+    /// Прямой проход SoftSparseGate на GPU (column-major).
     ///
     /// Пороги передаются как `MatrixBufferView`, ссылающийся на часть
     /// общего GPU-буфера параметров сегмента. Вход и выход — GPU-дескрипторы.
@@ -44,7 +44,8 @@ impl GpuCompute {
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
         let pipeline = &self.soft_sparse_gate_pipelines().forward;
-        let push = [total as u32, temperature.to_bits(), features as u32];
+        // push = [batch, features, temperature_bits] — 12 байт.
+        let push = [batch as u32, features as u32, temperature.to_bits()];
         self.run_compute_shader(
             pipeline,
             &[(0, in_buf), (1, thresh_buf), (2, out_buf)],
@@ -53,7 +54,7 @@ impl GpuCompute {
         );
     }
 
-    /// Обратный проход SoftSparseGate на GPU.
+    /// Обратный проход SoftSparseGate на GPU (column-major).
     ///
     /// Градиенты порогов записываются непосредственно в `grad_thresh`
     /// (часть общего GPU-буфера градиентов). Вход/выходные градиенты — GPU-дескрипторы.
@@ -89,7 +90,8 @@ impl GpuCompute {
         let gthresh_buf = subbuffer_from_view(self, grad_thresh);
 
         let pipeline = &self.soft_sparse_gate_pipelines().backward;
-        let push = [total as u32, temperature.to_bits(), features as u32];
+        // push = [batch, features, temperature_bits] — 12 байт.
+        let push = [batch as u32, features as u32, temperature.to_bits()];
         self.run_compute_shader(
             pipeline,
             &[

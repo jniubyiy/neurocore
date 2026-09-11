@@ -20,38 +20,67 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
     unsafe { std::slice::from_raw_parts(ptr, bytes.len() / 4) }
 }
 
+/// Пайплайны RelativePositionAttention, разбитые на этапы.
+///
+/// Forward:
+///   prepare_qkv → scores_softmax → output
+///
+/// Backward:
+///   backward_output_params → backward_dv, backward_dweights
+///                          → backward_scores_softmax
+///                          → backward_dq, backward_dk, backward_rel_bias
+///                          → backward_input_params
 pub struct RelativePositionAttentionPipelines {
+    // Forward
     pub prepare_qkv: Arc<ComputePipeline>,
     pub scores_softmax: Arc<ComputePipeline>,
     pub output: Arc<ComputePipeline>,
-    pub backward_scores_softmax: Arc<ComputePipeline>,
-    pub backward_qkv_params: Arc<ComputePipeline>,
+
+    // Backward — выходной линейный слой
     pub backward_output_params: Arc<ComputePipeline>,
-    pub backward_values_weights: Arc<ComputePipeline>,
+
+    // Backward — V и weights
+    pub backward_dv: Arc<ComputePipeline>,
+    pub backward_dweights: Arc<ComputePipeline>,
+
+    // Backward — softmax скоров
+    pub backward_scores_softmax: Arc<ComputePipeline>,
+
+    // Backward — Q, K, rel_bias
+    pub backward_dq: Arc<ComputePipeline>,
+    pub backward_dk: Arc<ComputePipeline>,
+    pub backward_rel_bias: Arc<ComputePipeline>,
+
+    // Backward — вход и QKV-параметры
     pub backward_input_params: Arc<ComputePipeline>,
 }
 
 impl RelativePositionAttentionPipelines {
     pub fn new(device: Arc<Device>) -> Self {
-        let prepare_bytes = include_bytes!("vulkan/shaders/relative_position_attention_fwd_prepare_qkv.spv");
-        let scores_bytes = include_bytes!("vulkan/shaders/relative_position_attention_fwd_scores_softmax.spv");
-        let output_bytes = include_bytes!("vulkan/shaders/relative_position_attention_fwd_output.spv");
-        let bwd_scores_bytes = include_bytes!("vulkan/shaders/relative_position_attention_bwd_scores_softmax.spv");
-        let bwd_qkv_bytes = include_bytes!("vulkan/shaders/relative_position_attention_bwd_qkv_params.spv");
+        let prepare_bytes      = include_bytes!("vulkan/shaders/relative_position_attention_fwd_prepare_qkv.spv");
+        let scores_bytes       = include_bytes!("vulkan/shaders/relative_position_attention_fwd_scores_softmax.spv");
+        let output_bytes       = include_bytes!("vulkan/shaders/relative_position_attention_fwd_output.spv");
+        let bwd_scores_bytes   = include_bytes!("vulkan/shaders/relative_position_attention_bwd_scores_softmax.spv");
+        let bwd_dq_bytes       = include_bytes!("vulkan/shaders/relative_position_attention_bwd_dq.spv");
+        let bwd_dk_bytes       = include_bytes!("vulkan/shaders/relative_position_attention_bwd_dk.spv");
+        let bwd_rel_bias_bytes = include_bytes!("vulkan/shaders/relative_position_attention_bwd_rel_bias.spv");
+        let bwd_dv_bytes       = include_bytes!("vulkan/shaders/relative_position_attention_bwd_dv.spv");
+        let bwd_dweights_bytes = include_bytes!("vulkan/shaders/relative_position_attention_bwd_dweights.spv");
         let bwd_output_params_bytes = include_bytes!("vulkan/shaders/relative_position_attention_bwd_output_params.spv");
-        let bwd_values_weights_bytes = include_bytes!("vulkan/shaders/relative_position_attention_bwd_values_weights.spv");
-        let bwd_input_params_bytes = include_bytes!("vulkan/shaders/relative_position_attention_bwd_input_params.spv");
+        let bwd_input_params_bytes  = include_bytes!("vulkan/shaders/relative_position_attention_bwd_input_params.spv");
 
-        let prepare_spv = as_u32_slice(prepare_bytes);
-        let scores_spv = as_u32_slice(scores_bytes);
-        let output_spv = as_u32_slice(output_bytes);
-        let bwd_scores_spv = as_u32_slice(bwd_scores_bytes);
-        let bwd_qkv_spv = as_u32_slice(bwd_qkv_bytes);
+        let prepare_spv         = as_u32_slice(prepare_bytes);
+        let scores_spv          = as_u32_slice(scores_bytes);
+        let output_spv          = as_u32_slice(output_bytes);
+        let bwd_scores_spv      = as_u32_slice(bwd_scores_bytes);
+        let bwd_dq_spv          = as_u32_slice(bwd_dq_bytes);
+        let bwd_dk_spv          = as_u32_slice(bwd_dk_bytes);
+        let bwd_rel_bias_spv    = as_u32_slice(bwd_rel_bias_bytes);
+        let bwd_dv_spv          = as_u32_slice(bwd_dv_bytes);
+        let bwd_dweights_spv    = as_u32_slice(bwd_dweights_bytes);
         let bwd_output_params_spv = as_u32_slice(bwd_output_params_bytes);
-        let bwd_values_weights_spv = as_u32_slice(bwd_values_weights_bytes);
-        let bwd_input_params_spv = as_u32_slice(bwd_input_params_bytes);
+        let bwd_input_params_spv  = as_u32_slice(bwd_input_params_bytes);
 
-        // Вспомогательная функция создания layout с N storage-буферами
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
             let mut bindings = std::collections::BTreeMap::new();
             for binding in 0..n {
@@ -77,229 +106,92 @@ impl RelativePositionAttentionPipelines {
             .expect("Failed to create descriptor set layout for RelativePositionAttention")
         }
 
-        // Push constant для всех пайплайнов: batch, seq_len, d_model (12 байт)
-        let push_range = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 12,
-        };
+        fn build(
+            device: Arc<Device>,
+            spv: &[u32],
+            ds_n: u32,
+            push_size: u32,
+            name: &str,
+        ) -> Arc<ComputePipeline> {
+            let layout = create_ds_layout(device.clone(), ds_n);
+            let module = unsafe {
+                ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(spv))
+                    .unwrap_or_else(|_| panic!("Failed to create {} shader module", name))
+            };
+            let push = PushConstantRange {
+                stages: ShaderStages::COMPUTE,
+                offset: 0,
+                size: push_size,
+            };
+            let pipeline_layout = PipelineLayout::new(
+                device.clone(),
+                PipelineLayoutCreateInfo {
+                    set_layouts: vec![layout],
+                    push_constant_ranges: vec![push],
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|_| panic!("Failed to create {} pipeline layout", name));
+            let entry = module
+                .entry_point_with_execution("main", ExecutionModel::GLCompute)
+                .unwrap_or_else(|| panic!("{} entry point not found", name));
+            let stage = PipelineShaderStageCreateInfo::new(entry);
+            ComputePipeline::new(
+                device,
+                None,
+                ComputePipelineCreateInfo::stage_layout(stage, pipeline_layout),
+            )
+            .unwrap_or_else(|_| panic!("Failed to create {} pipeline", name))
+        }
 
-        // ==================== Prepare QKV ====================
-        let prepare_layout = create_ds_layout(device.clone(), 5);
-        let prepare_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(prepare_spv))
-                .expect("Failed to create prepare QKV shader module")
-        };
-        let prepare_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![prepare_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create prepare QKV pipeline layout");
-        let prepare_entry = prepare_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("prepare QKV entry point not found");
-        let prepare_stage = PipelineShaderStageCreateInfo::new(prepare_entry);
-        let prepare_qkv = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(prepare_stage, prepare_pipeline_layout),
-        )
-        .expect("Failed to create prepare QKV pipeline");
+        // Все шейдеры RelativePositionAttention используют push = [batch, seq_len, d_model] (12 байт).
+        const PUSH: u32 = 12;
 
-        // ==================== Scores & Softmax ====================
-        let scores_layout = create_ds_layout(device.clone(), 5);
-        let scores_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(scores_spv))
-                .expect("Failed to create scores/softmax shader module")
-        };
-        let scores_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![scores_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create scores/softmax pipeline layout");
-        let scores_entry = scores_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("scores/softmax entry point not found");
-        let scores_stage = PipelineShaderStageCreateInfo::new(scores_entry);
-        let scores_softmax = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(scores_stage, scores_pipeline_layout),
-        )
-        .expect("Failed to create scores/softmax pipeline");
+        // Forward
+        let prepare_qkv =
+            build(device.clone(), prepare_spv, 5, PUSH, "RPA prepare_qkv");
+        let scores_softmax =
+            build(device.clone(), scores_spv, 5, PUSH, "RPA scores_softmax");
+        let output =
+            build(device.clone(), output_spv, 5, PUSH, "RPA output");
 
-        // ==================== Output ====================
-        let output_layout = create_ds_layout(device.clone(), 5);
-        let output_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(output_spv))
-                .expect("Failed to create output shader module")
-        };
-        let output_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![output_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create output pipeline layout");
-        let output_entry = output_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("output entry point not found");
-        let output_stage = PipelineShaderStageCreateInfo::new(output_entry);
-        let output = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(output_stage, output_pipeline_layout),
-        )
-        .expect("Failed to create output pipeline");
+        // Backward — выходной линейный слой
+        let backward_output_params =
+            build(device.clone(), bwd_output_params_spv, 6, PUSH, "RPA bwd_output_params");
 
-        // ==================== Backward Scores & Softmax ====================
-        let bwd_scores_layout = create_ds_layout(device.clone(), 3);
-        let bwd_scores_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_scores_spv))
-                .expect("Failed to create backward scores shader module")
-        };
-        let bwd_scores_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_scores_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create backward scores pipeline layout");
-        let bwd_scores_entry = bwd_scores_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("backward scores entry point not found");
-        let bwd_scores_stage = PipelineShaderStageCreateInfo::new(bwd_scores_entry);
-        let backward_scores_softmax = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_scores_stage, bwd_scores_pipeline_layout),
-        )
-        .expect("Failed to create backward scores pipeline");
+        // Backward — V и weights
+        let backward_dv =
+            build(device.clone(), bwd_dv_spv, 3, PUSH, "RPA bwd_dv");
+        let backward_dweights =
+            build(device.clone(), bwd_dweights_spv, 3, PUSH, "RPA bwd_dweights");
 
-        // ==================== Backward QKV Params ====================
-        let bwd_qkv_layout = create_ds_layout(device.clone(), 6);
-        let bwd_qkv_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_qkv_spv))
-                .expect("Failed to create backward QKV params shader module")
-        };
-        let bwd_qkv_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_qkv_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create backward QKV params pipeline layout");
-        let bwd_qkv_entry = bwd_qkv_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("backward QKV params entry point not found");
-        let bwd_qkv_stage = PipelineShaderStageCreateInfo::new(bwd_qkv_entry);
-        let backward_qkv_params = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_qkv_stage, bwd_qkv_pipeline_layout),
-        )
-        .expect("Failed to create backward QKV params pipeline");
+        // Backward — softmax скоров
+        let backward_scores_softmax =
+            build(device.clone(), bwd_scores_spv, 3, PUSH, "RPA bwd_scores_softmax");
 
-        // ==================== Backward Output Params (новый) ====================
-        let bwd_output_params_layout = create_ds_layout(device.clone(), 6);
-        let bwd_output_params_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_output_params_spv))
-                .expect("Failed to create backward output params shader module")
-        };
-        let bwd_output_params_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_output_params_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create backward output params pipeline layout");
-        let bwd_output_params_entry = bwd_output_params_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("backward output params entry point not found");
-        let bwd_output_params_stage = PipelineShaderStageCreateInfo::new(bwd_output_params_entry);
-        let backward_output_params = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_output_params_stage, bwd_output_params_pipeline_layout),
-        )
-        .expect("Failed to create backward output params pipeline");
+        // Backward — Q, K, rel_bias
+        let backward_dq =
+            build(device.clone(), bwd_dq_spv, 3, PUSH, "RPA bwd_dq");
+        let backward_dk =
+            build(device.clone(), bwd_dk_spv, 3, PUSH, "RPA bwd_dk");
+        let backward_rel_bias =
+            build(device.clone(), bwd_rel_bias_spv, 2, PUSH, "RPA bwd_rel_bias");
 
-        // ==================== Backward Values & Weights (новый) ====================
-        let bwd_values_weights_layout = create_ds_layout(device.clone(), 5);
-        let bwd_values_weights_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_values_weights_spv))
-                .expect("Failed to create backward values/weights shader module")
-        };
-        let bwd_values_weights_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_values_weights_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create backward values/weights pipeline layout");
-        let bwd_values_weights_entry = bwd_values_weights_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("backward values/weights entry point not found");
-        let bwd_values_weights_stage = PipelineShaderStageCreateInfo::new(bwd_values_weights_entry);
-        let backward_values_weights = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_values_weights_stage, bwd_values_weights_pipeline_layout),
-        )
-        .expect("Failed to create backward values/weights pipeline");
-
-        // ==================== Backward Input Params (новый) ====================
-        let bwd_input_params_layout = create_ds_layout(device.clone(), 7);
-        let bwd_input_params_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_input_params_spv))
-                .expect("Failed to create backward input params shader module")
-        };
-        let bwd_input_params_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_input_params_layout],
-                push_constant_ranges: vec![push_range],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create backward input params pipeline layout");
-        let bwd_input_params_entry = bwd_input_params_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("backward input params entry point not found");
-        let bwd_input_params_stage = PipelineShaderStageCreateInfo::new(bwd_input_params_entry);
-        let backward_input_params = ComputePipeline::new(
-            device,
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_input_params_stage, bwd_input_params_pipeline_layout),
-        )
-        .expect("Failed to create backward input params pipeline");
+        // Backward — вход и QKV-параметры
+        let backward_input_params =
+            build(device.clone(), bwd_input_params_spv, 7, PUSH, "RPA bwd_input_params");
 
         Self {
             prepare_qkv,
             scores_softmax,
             output,
-            backward_scores_softmax,
-            backward_qkv_params,
             backward_output_params,
-            backward_values_weights,
+            backward_dv,
+            backward_dweights,
+            backward_scores_softmax,
+            backward_dq,
+            backward_dk,
+            backward_rel_bias,
             backward_input_params,
         }
     }

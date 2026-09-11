@@ -1,11 +1,15 @@
 // src/layers/combiner/gpu/mod.rs
 
-pub mod pipeline;   // <-- новый модуль
+pub mod pipeline;
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 impl GpuCompute {
+    /// Прямой проход Combiner на GPU (column-major).
+    ///
+    /// Один поток на выходной элемент (r, j), j ∈ [0, m).
+    /// Dispatch = batch · m.
     pub fn run_combiner_forward_buffered_handle(
         &self,
         a: &MatrixBufferHandle,
@@ -38,10 +42,10 @@ impl GpuCompute {
 
         let (bias_buf, bias_raw) = self.upload_to_temp_buffer(bias);
 
-        // Используем новый пайплайн из собственной структуры Combiner
         let pipeline = &self.combiner_pipelines().forward;
         let push = [batch as u32, n as u32, m as u32];
-        self.run_compute_shader_with_dispatch(
+        let total = batch * m;
+        self.run_compute_shader(
             pipeline,
             &[
                 (0, a_buf),
@@ -53,12 +57,18 @@ impl GpuCompute {
                 (6, pre_buf),
             ],
             &push,
-            [((batch + 255) / 256) as u32, 1, 1],
+            total,
         );
 
         self.release_temp_buffer(bias_buf, bias_raw);
     }
 
+    /// Обратный проход Combiner на GPU (column-major).
+    ///
+    /// Два этапа:
+    ///   1. bwd_dx      — градиенты по входам a и b. Dispatch = batch · n.
+    ///   2. bwd_params  — градиенты wa, wb, bias.
+    ///                    Dispatch = 2·m·n + m.
     pub fn run_combiner_backward_buffered_handle(
         &self,
         a: &MatrixBufferHandle,
@@ -73,10 +83,15 @@ impl GpuCompute {
         d_wb: &MatrixBufferHandle,
         d_bias: &MatrixBufferHandle,
     ) -> Vec<f32> {
-        assert!(a.is_gpu() && b.is_gpu() && d_out.is_gpu() && pre.is_gpu() && wa.is_gpu() && wb.is_gpu(),
-            "Input handles must be GPU");
-        assert!(da.is_gpu() && db.is_gpu() && d_wa.is_gpu() && d_wb.is_gpu() && d_bias.is_gpu(),
-            "Output handles must be GPU");
+        assert!(
+            a.is_gpu() && b.is_gpu() && d_out.is_gpu() && pre.is_gpu()
+                && wa.is_gpu() && wb.is_gpu(),
+            "Input handles must be GPU"
+        );
+        assert!(
+            da.is_gpu() && db.is_gpu() && d_wa.is_gpu() && d_wb.is_gpu() && d_bias.is_gpu(),
+            "Output handles must be GPU"
+        );
 
         let batch = a.rows();
         let n = a.cols();
@@ -110,30 +125,40 @@ impl GpuCompute {
         let d_wb_buf = self.get_gpu_subbuffer_from_handle(d_wb);
         let d_bias_buf = self.get_gpu_subbuffer_from_handle(d_bias);
 
-        self.fill_gpu_handle(d_wa, 0.0);
-        self.fill_gpu_handle(d_wb, 0.0);
-        self.fill_gpu_handle(d_bias, 0.0);
-
-        // Используем новый пайплайн из собственной структуры Combiner
-        let pipeline = &self.combiner_pipelines().backward;
+        let pipelines = self.combiner_pipelines();
         let push = [batch as u32, n as u32, m as u32];
-        self.run_compute_shader_with_dispatch(
-            pipeline,
+
+        // 1. bwd_dx: градиенты по входам.
+        let total_dx = batch * n;
+        self.run_compute_shader(
+            &pipelines.backward_dx,
             &[
-                (0, d_out_buf),
-                (1, pre_buf),
-                (2, a_buf),
-                (3, b_buf),
-                (4, wa_buf),
-                (5, wb_buf),
-                (6, da_buf),
-                (7, db_buf),
-                (8, d_wa_buf),
-                (9, d_wb_buf),
-                (10, d_bias_buf),
+                (0, d_out_buf.clone()),
+                (1, pre_buf.clone()),
+                (2, wa_buf.clone()),
+                (3, wb_buf.clone()),
+                (4, da_buf.clone()),
+                (5, db_buf.clone()),
             ],
             &push,
-            [((batch + 255) / 256) as u32, 1, 1],
+            total_dx,
+        );
+
+        // 2. bwd_params: градиенты весов и смещений.
+        let total_params = 2 * m * n + m;
+        self.run_compute_shader(
+            &pipelines.backward_params,
+            &[
+                (0, a_buf),
+                (1, b_buf),
+                (2, d_out_buf),
+                (3, pre_buf),
+                (4, d_wa_buf),
+                (5, d_wb_buf),
+                (6, d_bias_buf),
+            ],
+            &push,
+            total_params,
         );
 
         let mut grad = Vec::with_capacity(2 * m * n + m);

@@ -17,11 +17,8 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 impl GpuCompute {
     /// Прямой проход AdaptiveNormalization на GPU.
     ///
-    /// Параметры (все 7*features элементов) передаются как `MatrixBufferView`,
-    /// ссылающийся на часть общего GPU-буфера параметров сегмента.
-    /// Вход и выход — GPU-дескрипторы.
-    /// Внутри вычисляются статистики по строкам и столбцам через отдельные
-    /// редукционные шейдеры, после чего вызывается основной forward-шейдер.
+    /// Этапы:
+    ///   row_stats → col_stats → forward
     pub fn run_adaptive_norm_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -39,27 +36,22 @@ impl GpuCompute {
         assert_eq!(output.cols(), features);
         assert_eq!(params.len(), 7 * features, "Params length must be 7*features");
 
-        // Выделяем временные буферы для статистик
-        let (row_mean_buf, row_mean_raw) = self.acquire_temp_buffer(batch);
-        let (row_var_buf, row_var_raw) = self.acquire_temp_buffer(batch);
+        // Временные буферы под статистики.
+        let (row_mean_buf,   row_mean_raw)   = self.acquire_temp_buffer(batch);
+        let (row_var_buf,    row_var_raw)    = self.acquire_temp_buffer(batch);
         let (row_rms_sq_buf, row_rms_sq_raw) = self.acquire_temp_buffer(batch);
-        let (col_mean_buf, col_mean_raw) = self.acquire_temp_buffer(features);
-        let (col_var_buf, col_var_raw) = self.acquire_temp_buffer(features);
+        let (col_mean_buf,   col_mean_raw)   = self.acquire_temp_buffer(features);
+        let (col_var_buf,    col_var_raw)    = self.acquire_temp_buffer(features);
 
-        // Получаем Subbuffer для входного тензора
-        let in_buf = self.get_gpu_subbuffer_from_handle(input);
-        // Subbuffer для параметров
+        let in_buf     = self.get_gpu_subbuffer_from_handle(input);
         let params_buf = subbuffer_from_view(self, params);
-
-        // Запускаем редукционные шейдеры
-        let row_stats_pipeline = &self.adaptive_normalization_pipelines().row_stats;
-        let col_stats_pipeline = &self.adaptive_normalization_pipelines().col_stats;
+        let out_buf    = self.get_gpu_subbuffer_from_handle(output);
 
         let push_stats = [batch as u32, features as u32];
 
-        // row stats: вход -> row_mean, row_var, row_rms_sq
+        // 1. Статистики по строкам.
         self.run_compute_shader(
-            row_stats_pipeline,
+            &self.adaptive_normalization_pipelines().row_stats,
             &[
                 (0, in_buf.clone()),
                 (1, row_mean_buf.clone()),
@@ -70,9 +62,9 @@ impl GpuCompute {
             batch,
         );
 
-        // col stats: вход -> col_mean, col_var
+        // 2. Статистики по столбцам.
         self.run_compute_shader(
-            col_stats_pipeline,
+            &self.adaptive_normalization_pipelines().col_stats,
             &[
                 (0, in_buf.clone()),
                 (1, col_mean_buf.clone()),
@@ -82,14 +74,9 @@ impl GpuCompute {
             features,
         );
 
-        // Получаем выходной Subbuffer
-        let out_buf = self.get_gpu_subbuffer_from_handle(output);
-
-        // Запускаем основной forward-шейдер
-        let forward_pipeline = &self.adaptive_normalization_pipelines().forward;
-        let push_fwd = [batch as u32, features as u32];
+        // 3. Основной forward.
         self.run_compute_shader(
-            forward_pipeline,
+            &self.adaptive_normalization_pipelines().forward,
             &[
                 (0, in_buf.clone()),
                 (1, out_buf),
@@ -100,11 +87,10 @@ impl GpuCompute {
                 (6, col_mean_buf.clone()),
                 (7, col_var_buf.clone()),
             ],
-            &push_fwd,
+            &push_stats,
             total,
         );
 
-        // Освобождаем временные буферы
         self.release_temp_buffer(row_mean_buf, row_mean_raw);
         self.release_temp_buffer(row_var_buf, row_var_raw);
         self.release_temp_buffer(row_rms_sq_buf, row_rms_sq_raw);
@@ -114,10 +100,10 @@ impl GpuCompute {
 
     /// Обратный проход AdaptiveNormalization на GPU.
     ///
-    /// Градиенты по параметрам записываются в `grad_params` (часть общего GPU-буфера
-    /// градиентов). Вход/выходные градиенты — GPU-дескрипторы.
-    /// Перед вызовом область `grad_params` обнуляется, так как шейдер использует
-    /// атомарное накопление. Статистики пересчитываются заново.
+    /// Этапы:
+    ///   row_stats → col_stats → bwd_weights
+    ///   → bwd_row_sums → bwd_col_sums
+    ///   → bwd_input , bwd_params
     pub fn run_adaptive_norm_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -142,42 +128,36 @@ impl GpuCompute {
         assert_eq!(params.len(), 7 * features, "Params length mismatch");
         assert_eq!(grad_params.len(), 7 * features, "grad_params length mismatch");
 
-        // Обнуляем область grad_params перед накоплением
-        let zero_handle = self.upload_vec_to_gpu_handle(
-            &vec![0.0f32; grad_params.len()],
-            grad_params.len(),
-            1,
-        );
-        self.copy_gpu_handle_region(
-            &zero_handle,
-            grad_params.parent_handle(),
-            0,
-            grad_params.offset_elements(),
-            grad_params.len(),
-        );
-        // zero_handle выйдет из области видимости и будет освобождён
-
-        // Выделяем временные буферы для статистик
-        let (row_mean_buf, row_mean_raw) = self.acquire_temp_buffer(batch);
-        let (row_var_buf, row_var_raw) = self.acquire_temp_buffer(batch);
+        // Временные буферы.
+        let (row_mean_buf,   row_mean_raw)   = self.acquire_temp_buffer(batch);
+        let (row_var_buf,    row_var_raw)    = self.acquire_temp_buffer(batch);
         let (row_rms_sq_buf, row_rms_sq_raw) = self.acquire_temp_buffer(batch);
-        let (col_mean_buf, col_mean_raw) = self.acquire_temp_buffer(features);
-        let (col_var_buf, col_var_raw) = self.acquire_temp_buffer(features);
+        let (col_mean_buf,   col_mean_raw)   = self.acquire_temp_buffer(features);
+        let (col_var_buf,    col_var_raw)    = self.acquire_temp_buffer(features);
 
-        // Получаем нужные Subbuffer'ы
-        let in_buf = self.get_gpu_subbuffer_from_handle(input);
-        let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
-        let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
+        let (w_ln_buf,  w_ln_raw)  = self.acquire_temp_buffer(features);
+        let (w_rms_buf, w_rms_raw) = self.acquire_temp_buffer(features);
+        let (w_bn_buf,  w_bn_raw)  = self.acquire_temp_buffer(features);
+
+        let (sum_dln_buf,    sum_dln_raw)    = self.acquire_temp_buffer(batch);
+        let (sum_dln_x_buf,  sum_dln_x_raw)  = self.acquire_temp_buffer(batch);
+        let (sum_drms_x_buf, sum_drms_x_raw) = self.acquire_temp_buffer(batch);
+
+        let (sum_dbn_buf,   sum_dbn_raw)   = self.acquire_temp_buffer(features);
+        let (sum_dbn_x_buf, sum_dbn_x_raw) = self.acquire_temp_buffer(features);
+
+        let in_buf     = self.get_gpu_subbuffer_from_handle(input);
+        let go_buf     = self.get_gpu_subbuffer_from_handle(grad_out);
+        let gi_buf     = self.get_gpu_subbuffer_from_handle(grad_input);
         let params_buf = subbuffer_from_view(self, params);
         let grad_params_buf = subbuffer_from_view(self, grad_params);
 
-        // Пересчитываем статистики
-        let row_stats_pipeline = &self.adaptive_normalization_pipelines().row_stats;
-        let col_stats_pipeline = &self.adaptive_normalization_pipelines().col_stats;
         let push_stats = [batch as u32, features as u32];
+        let push_feat  = [features as u32];
 
+        // 1. Пересчёт статистик.
         self.run_compute_shader(
-            row_stats_pipeline,
+            &self.adaptive_normalization_pipelines().row_stats,
             &[
                 (0, in_buf.clone()),
                 (1, row_mean_buf.clone()),
@@ -189,7 +169,7 @@ impl GpuCompute {
         );
 
         self.run_compute_shader(
-            col_stats_pipeline,
+            &self.adaptive_normalization_pipelines().col_stats,
             &[
                 (0, in_buf.clone()),
                 (1, col_mean_buf.clone()),
@@ -199,32 +179,114 @@ impl GpuCompute {
             features,
         );
 
-        // Запускаем основной backward-шейдер
-        let backward_pipeline = &self.adaptive_normalization_pipelines().backward;
-        let push_bwd = [batch as u32, features as u32];
+        // 2. Веса softmax на признак.
         self.run_compute_shader(
-            backward_pipeline,
+            &self.adaptive_normalization_pipelines().bwd_weights,
+            &[
+                (0, params_buf.clone()),
+                (1, w_ln_buf.clone()),
+                (2, w_rms_buf.clone()),
+                (3, w_bn_buf.clone()),
+            ],
+            &push_feat,
+            features,
+        );
+
+        // 3. Суммы по строкам.
+        self.run_compute_shader(
+            &self.adaptive_normalization_pipelines().bwd_row_sums,
             &[
                 (0, in_buf.clone()),
-                (1, go_buf),
-                (2, params_buf),
-                (3, gi_buf),
-                (4, grad_params_buf),
-                (5, row_mean_buf.clone()),
-                (6, row_var_buf.clone()),
-                (7, row_rms_sq_buf.clone()),
-                (8, col_mean_buf.clone()),
-                (9, col_var_buf.clone()),
+                (1, go_buf.clone()),
+                (2, w_ln_buf.clone()),
+                (3, w_rms_buf.clone()),
+                (4, row_mean_buf.clone()),
+                (5, sum_dln_buf.clone()),
+                (6, sum_dln_x_buf.clone()),
+                (7, sum_drms_x_buf.clone()),
             ],
-            &push_bwd,
+            &push_stats,
+            batch,
+        );
+
+        // 4. Суммы по столбцам.
+        self.run_compute_shader(
+            &self.adaptive_normalization_pipelines().bwd_col_sums,
+            &[
+                (0, in_buf.clone()),
+                (1, go_buf.clone()),
+                (2, w_bn_buf.clone()),
+                (3, col_mean_buf.clone()),
+                (4, sum_dbn_buf.clone()),
+                (5, sum_dbn_x_buf.clone()),
+            ],
+            &push_stats,
+            features,
+        );
+
+        // 5. Градиент по входу.
+        self.run_compute_shader(
+            &self.adaptive_normalization_pipelines().bwd_input,
+            &[
+                (0,  in_buf.clone()),
+                (1,  go_buf.clone()),
+                (2,  params_buf.clone()),
+                (3,  row_mean_buf.clone()),
+                (4,  row_var_buf.clone()),
+                (5,  row_rms_sq_buf.clone()),
+                (6,  col_mean_buf.clone()),
+                (7,  col_var_buf.clone()),
+                (8,  w_ln_buf.clone()),
+                (9,  w_rms_buf.clone()),
+                (10, w_bn_buf.clone()),
+                (11, sum_dln_buf.clone()),
+                (12, sum_dln_x_buf.clone()),
+                (13, sum_drms_x_buf.clone()),
+                (14, sum_dbn_buf.clone()),
+                (15, sum_dbn_x_buf.clone()),
+                (16, gi_buf),
+            ],
+            &push_stats,
             total,
         );
 
-        // Освобождаем временные буферы
+        // 6. Градиенты по параметрам.
+        self.run_compute_shader(
+            &self.adaptive_normalization_pipelines().bwd_params,
+            &[
+                (0,  in_buf.clone()),
+                (1,  go_buf.clone()),
+                (2,  params_buf),
+                (3,  row_mean_buf.clone()),
+                (4,  row_var_buf.clone()),
+                (5,  row_rms_sq_buf.clone()),
+                (6,  col_mean_buf.clone()),
+                (7,  col_var_buf.clone()),
+                (8,  w_ln_buf.clone()),
+                (9,  w_rms_buf.clone()),
+                (10, w_bn_buf.clone()),
+                (11, grad_params_buf),
+            ],
+            &push_stats,
+            features,
+        );
+
+        // Освобождение временных буферов.
         self.release_temp_buffer(row_mean_buf, row_mean_raw);
         self.release_temp_buffer(row_var_buf, row_var_raw);
         self.release_temp_buffer(row_rms_sq_buf, row_rms_sq_raw);
         self.release_temp_buffer(col_mean_buf, col_mean_raw);
         self.release_temp_buffer(col_var_buf, col_var_raw);
+
+        self.release_temp_buffer(w_ln_buf, w_ln_raw);
+        self.release_temp_buffer(w_rms_buf, w_rms_raw);
+        self.release_temp_buffer(w_bn_buf, w_bn_raw);
+
+        self.release_temp_buffer(sum_dln_buf, sum_dln_raw);
+        self.release_temp_buffer(sum_dln_x_buf, sum_dln_x_raw);
+        self.release_temp_buffer(sum_drms_x_buf, sum_drms_x_raw);
+
+        self.release_temp_buffer(sum_dbn_buf, sum_dbn_raw);
+        self.release_temp_buffer(sum_dbn_x_buf, sum_dbn_x_raw);
     }
 }

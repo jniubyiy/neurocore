@@ -7,7 +7,6 @@ use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use vulkano::buffer::Subbuffer;
 
-/// Вспомогательная функция: получает `Subbuffer<[f32]>` из `MatrixBufferView`.
 fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[f32]> {
     let parent_sub = gpu.get_gpu_subbuffer_from_handle(view.parent_handle());
     let start = view.offset_elements() as u64;
@@ -15,21 +14,14 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
     parent_sub.slice(start..end)
 }
 
+const POWER_EPS: f32 = 1e-12;
+
 impl GpuCompute {
     /// Прямой проход SpectrallyNormalizedLinear на GPU.
     ///
-    /// Выполняет степенной метод для обновления `u`, `v` и вычисления `sigma`,
-    /// затем применяет линейное преобразование с эффективным масштабом `scale / sigma`.
-    ///
-    /// # Аргументы
-    /// * `input` – вход `(batch, in_features)`, column-major.
-    /// * `params` – view на полный блок параметров `[W; b; scale]` размером
-    ///   `out_features * in_features + out_features + 1`.
-    /// * `scale` – обучаемый масштаб (скаляр, известен вызывающему коду).
-    /// * `output` – выход `(batch, out_features)`, column-major.
-    /// * `u_state`, `v_state`, `sigma_state` – GPU-буферы, содержащие состояние
-    ///   степенного метода (`u` – in_features, `v` – out_features, `sigma` – 1).
-    ///   Они обновляются и должны сохраняться между вызовами.
+    /// Power iteration (поэтапно, без локальных массивов, без MAX_DIM):
+    ///   matvec_v → normalize(v) → matvec_u → normalize(u) → sigma
+    /// Затем основной forward с эффективным масштабом scale / sigma.
     pub fn run_spectral_norm_linear_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -56,23 +48,11 @@ impl GpuCompute {
             out_feat * in_feat + out_feat + 1,
             "Params length mismatch"
         );
-        assert_eq!(
-            u_state.rows() * u_state.cols(),
-            in_feat,
-            "u_state size mismatch"
-        );
-        assert_eq!(
-            v_state.rows() * v_state.cols(),
-            out_feat,
-            "v_state size mismatch"
-        );
-        assert_eq!(
-            sigma_state.rows() * sigma_state.cols(),
-            1,
-            "sigma_state size mismatch"
-        );
+        assert_eq!(u_state.rows() * u_state.cols(), in_feat, "u_state size mismatch");
+        assert_eq!(v_state.rows() * v_state.cols(), out_feat, "v_state size mismatch");
+        assert_eq!(sigma_state.rows() * sigma_state.cols(), 1, "sigma_state size mismatch");
 
-        // Создаём view для W и bias
+        // View на W (row-major) и bias.
         let w_view = MatrixBufferView::with_shape(
             params.parent_handle().clone(),
             params.offset_elements(),
@@ -87,7 +67,6 @@ impl GpuCompute {
             out_feat,
         );
 
-        // Subbuffer'ы
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
         let w_buf = subbuffer_from_view(self, &w_view);
@@ -96,29 +75,72 @@ impl GpuCompute {
         let v_buf = self.get_gpu_subbuffer_from_handle(v_state);
         let sigma_buf = self.get_gpu_subbuffer_from_handle(sigma_state);
 
-        // Запускаем степенной метод
-        let power_pipeline = &self.spectral_norm_linear_pipelines().power_iteration;
-        let push_power = [in_feat as u32, out_feat as u32, 1e-12f32.to_bits()];
+        let pipelines = self.spectral_norm_linear_pipelines();
+
+        let push_io = [in_feat as u32, out_feat as u32];
+
+        // 1. v = W · u.
         self.run_compute_shader(
-            power_pipeline,
+            &pipelines.matvec_v,
+            &[
+                (0, w_buf.clone()),
+                (1, u_buf.clone()),
+                (2, v_buf.clone()),
+            ],
+            &push_io,
+            out_feat,
+        );
+
+        // 2. Нормализация v.
+        let push_norm_v = [out_feat as u32, POWER_EPS.to_bits()];
+        self.run_compute_shader_with_dispatch(
+            &pipelines.normalize,
+            &[(0, v_buf.clone())],
+            &push_norm_v,
+            [1, 1, 1],
+        );
+
+        // 3. u = Wᵀ · v.
+        self.run_compute_shader(
+            &pipelines.matvec_u,
+            &[
+                (0, w_buf.clone()),
+                (1, v_buf.clone()),
+                (2, u_buf.clone()),
+            ],
+            &push_io,
+            in_feat,
+        );
+
+        // 4. Нормализация u.
+        let push_norm_u = [in_feat as u32, POWER_EPS.to_bits()];
+        self.run_compute_shader_with_dispatch(
+            &pipelines.normalize,
+            &[(0, u_buf.clone())],
+            &push_norm_u,
+            [1, 1, 1],
+        );
+
+        // 5. sigma = uᵀ W v.
+        self.run_compute_shader_with_dispatch(
+            &pipelines.sigma,
             &[
                 (0, w_buf.clone()),
                 (1, u_buf.clone()),
                 (2, v_buf.clone()),
                 (3, sigma_buf.clone()),
             ],
-            &push_power,
-            1, // один поток
+            &push_io,
+            [1, 1, 1],
         );
 
-        // Получаем значение sigma для push-константы forward
+        // 6. Скачиваем sigma для push-константы forward.
         let sigma = {
             let sigma_vec = self.download_gpu_handle_to_vec(sigma_state);
             sigma_vec[0]
         };
 
-        // Запускаем forward
-        let forward_pipeline = &self.spectral_norm_linear_pipelines().forward;
+        // 7. Основной forward.
         let push_fwd = [
             batch as u32,
             in_feat as u32,
@@ -127,12 +149,12 @@ impl GpuCompute {
             sigma.to_bits(),
         ];
         self.run_compute_shader(
-            forward_pipeline,
+            &pipelines.forward,
             &[
-                (0, in_buf.clone()),
-                (1, w_buf.clone()),
-                (2, b_buf.clone()),
-                (3, out_buf.clone()),
+                (0, in_buf),
+                (1, w_buf),
+                (2, b_buf),
+                (3, out_buf),
             ],
             &push_fwd,
             batch * out_feat,
@@ -141,17 +163,7 @@ impl GpuCompute {
 
     /// Обратный проход SpectrallyNormalizedLinear на GPU.
     ///
-    /// Вычисляет градиенты по входу, весам, смещениям и масштабу.
-    /// Градиенты параметров атомарно накапливаются в `grad_params`.
-    ///
-    /// # Аргументы
-    /// * `input` – вход `(batch, in_features)`.
-    /// * `grad_out` – градиент по выходу `(batch, out_features)`.
-    /// * `params` – view на параметры `[W; b; scale]`.
-    /// * `grad_input` – GPU-буфер для градиента по входу (будет заполнен).
-    /// * `grad_params` – view на градиенты параметров (той же длины, что и параметры).
-    /// * `scale` – обучаемый масштаб (скаляр).
-    /// * `sigma` – сохранённое значение из forward (можно получить из `sigma_state`).
+    /// Не менялся: единый шейдер с phase 0/1.
     pub fn run_spectral_norm_linear_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -165,10 +177,7 @@ impl GpuCompute {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(grad_out.is_gpu(), "grad_out handle must be GPU");
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
-        assert!(
-            grad_params.is_gpu(),
-            "grad_params view must point to GPU buffer"
-        );
+        assert!(grad_params.is_gpu(), "grad_params view must point to GPU buffer");
         assert!(params.is_gpu(), "Params view must point to GPU buffer");
 
         let batch = input.rows();
@@ -188,7 +197,7 @@ impl GpuCompute {
             "Grad params length mismatch"
         );
 
-        // Обнуляем градиенты параметров
+        // Обнуляем grad_params.
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -202,7 +211,6 @@ impl GpuCompute {
             grad_params.len(),
         );
 
-        // Создаём view для W, bias, scale и их градиентов
         let w_start = 0;
         let b_start = out_feat * in_feat;
         let scale_idx = b_start + out_feat;
@@ -214,12 +222,6 @@ impl GpuCompute {
             out_feat,
             in_feat,
         );
-        let b_view = MatrixBufferView::new(
-            params.parent_handle().clone(),
-            params.offset_elements() + b_start,
-            out_feat,
-        );
-
         let gw_view = MatrixBufferView::with_shape(
             grad_params.parent_handle().clone(),
             grad_params.offset_elements() + w_start,
@@ -238,7 +240,6 @@ impl GpuCompute {
             1,
         );
 
-        // Subbuffer'ы
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
         let w_buf = subbuffer_from_view(self, &w_view);
@@ -247,9 +248,9 @@ impl GpuCompute {
         let gscale_buf = subbuffer_from_view(self, &gscale_view);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        let backward_pipeline = &self.spectral_norm_linear_pipelines().backward;
+        let pipeline = &self.spectral_norm_linear_pipelines().backward;
 
-        // Фаза 0: градиенты параметров
+        // Фаза 0: градиенты параметров.
         let push_bwd_params = [
             batch as u32,
             in_feat as u32,
@@ -259,7 +260,7 @@ impl GpuCompute {
             0u32,
         ];
         self.run_compute_shader(
-            backward_pipeline,
+            pipeline,
             &[
                 (0, in_buf.clone()),
                 (1, go_buf.clone()),
@@ -267,13 +268,13 @@ impl GpuCompute {
                 (3, gw_buf.clone()),
                 (4, gb_buf.clone()),
                 (5, gscale_buf.clone()),
-                (6, gi_buf.clone()), // не используется в этой фазе
+                (6, gi_buf.clone()),
             ],
             &push_bwd_params,
             batch * out_feat,
         );
 
-        // Фаза 1: градиент по входу
+        // Фаза 1: градиент по входу.
         let push_bwd_input = [
             batch as u32,
             in_feat as u32,
@@ -283,14 +284,14 @@ impl GpuCompute {
             1u32,
         ];
         self.run_compute_shader(
-            backward_pipeline,
+            pipeline,
             &[
                 (0, in_buf.clone()),
                 (1, go_buf.clone()),
                 (2, w_buf.clone()),
-                (3, gw_buf.clone()), // не используется
-                (4, gb_buf.clone()), // не используется
-                (5, gscale_buf.clone()), // не используется
+                (3, gw_buf.clone()),
+                (4, gb_buf.clone()),
+                (5, gscale_buf.clone()),
                 (6, gi_buf.clone()),
             ],
             &push_bwd_input,

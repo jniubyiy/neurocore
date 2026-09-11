@@ -17,11 +17,11 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 }
 
 impl GpuCompute {
-    /// Прямой проход DualAnchor на GPU.
+    /// Прямой проход DualAnchor на GPU (column-major).
     ///
     /// Параметры `min_vals`, `max_vals`, `alpha` передаются как три отдельных
     /// `MatrixBufferView`, ссылающихся на смещения `[0, features)`,
-    /// `[features, 2*features)` и `[2*features, 2*features+1)` внутри общего
+    /// `[features, 2·features)` и `[2·features, 2·features+1)` внутри общего
     /// блока параметров. Вход и выход — GPU-дескрипторы.
     pub fn run_dualanchor_forward_buffered_handle(
         &self,
@@ -51,7 +51,7 @@ impl GpuCompute {
         let max_buf = subbuffer_from_view(self, max_vals);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        // Читаем alpha на CPU, так как шейдер ожидает float push constant.
+        // Читаем alpha на CPU — шейдер ожидает float push constant.
         let alpha_val = {
             let cpu_handle = self.download_gpu_handle_to_cpu_handle(alpha.parent_handle());
             let guard = cpu_handle.read();
@@ -60,9 +60,10 @@ impl GpuCompute {
         };
 
         let pipeline = &self.dual_anchor_pipelines().forward;
-        let push = [total as u32, features as u32, alpha_val.to_bits()];
+        // push = [batch, features, alpha_bits] — 12 байт.
+        let push = [batch as u32, features as u32, alpha_val.to_bits()];
 
-        self.run_compute_shader_with_dispatch(
+        self.run_compute_shader(
             pipeline,
             &[
                 (0, in_buf),
@@ -71,26 +72,15 @@ impl GpuCompute {
                 (3, out_buf),
             ],
             &push,
-            [((batch + 255) / 256) as u32, 1, 1],
+            total,
         );
     }
 
-    /// Обратный проход DualAnchor на GPU.
+    /// Обратный проход DualAnchor на GPU (column-major).
     ///
-    /// Градиенты по параметрам записываются в единый `grad_params` — тот же
-    /// блок, что и параметры слоя, но в буфере градиентов. Внутри метода
-    /// создаются три отдельных `Subbuffer` на смещениях `[0, features)`,
-    /// `[features, 2*features)` и `[2*features, 2*features+1)`, которые
-    /// передаются в шейдер как три отдельных binding.
-    ///
-    /// # Аргументы
-    /// * `input` — вход слоя (GPU, column-major).
-    /// * `grad_out` — градиент по выходу (GPU).
-    /// * `min_vals`, `max_vals`, `alpha` — представления параметров слоя
-    ///   (части общего блока параметров).
-    /// * `grad_input` — буфер для градиента по входу (GPU).
-    /// * `grad_params` — единый view на блок градиентов параметров
-    ///   длиной `2*features + 1` (min, max, alpha).
+    /// Градиенты параметров записываются в `grad_params` — блок длиной
+    /// `2·features + 1` (grad_min, grad_max, grad_alpha). Внутри метода
+    /// создаются три отдельных Subbuffer на соответствующих смещениях.
     pub fn run_dualanchor_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -117,12 +107,11 @@ impl GpuCompute {
         assert_eq!(grad_input.rows(), batch);
         assert_eq!(grad_input.cols(), features);
 
-        // Единый буфер градиентов параметров должен содержать
-        // [grad_min (features), grad_max (features), grad_alpha (1)].
+        // Единый буфер градиентов параметров: [grad_min (features), grad_max (features), grad_alpha (1)].
         assert_eq!(
             grad_params.len(),
             2 * features + 1,
-            "grad_params length must be 2*features + 1"
+            "grad_params length must be 2·features + 1"
         );
 
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
@@ -131,8 +120,7 @@ impl GpuCompute {
         let max_buf = subbuffer_from_view(self, max_vals);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
 
-        // Разбиваем единый grad_params на три Subbuffer, соответствующих
-        // трём логическим блокам: grad_min, grad_max, grad_alpha.
+        // Разбиваем grad_params на три Subbuffer.
         let grad_params_parent = grad_params.parent_handle().clone();
         let grad_params_offset = grad_params.offset_elements();
 
@@ -165,9 +153,10 @@ impl GpuCompute {
         };
 
         let pipeline = &self.dual_anchor_pipelines().backward;
-        let push = [total as u32, features as u32, alpha_val.to_bits()];
+        // push = [batch, features, alpha_bits] — 12 байт.
+        let push = [batch as u32, features as u32, alpha_val.to_bits()];
 
-        self.run_compute_shader_with_dispatch(
+        self.run_compute_shader(
             pipeline,
             &[
                 (0, in_buf),
@@ -180,7 +169,7 @@ impl GpuCompute {
                 (7, galpha_buf),
             ],
             &push,
-            [((batch + 255) / 256) as u32, 1, 1],
+            total,
         );
     }
 }

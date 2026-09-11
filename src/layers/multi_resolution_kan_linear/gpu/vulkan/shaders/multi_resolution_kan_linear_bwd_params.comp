@@ -1,0 +1,112 @@
+// src/layers/multi_resolution_kan_linear/gpu/vulkan/shaders/multi_resolution_kan_linear_bwd_params.comp
+//
+// Фаза 0 обратного прохода MultiResolutionKANLinear:
+// накопление градиентов по параметрам (coarse, fine, bias).
+//
+// Раскладка column-major для активаций, row-major для весов.
+// Один поток на элемент (r, j). Внутри — цикл по i, O(in) на поток.
+// Локальных массивов нет, ограничений нет.
+//
+// Push: batch, in_features, out_features.
+// Dispatch: batch · out_features потоков.
+
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint in_features;
+    uint out_features;
+} pc;
+
+layout(binding = 0, std430) readonly buffer InputBuf      { float x[]; };
+layout(binding = 1, std430) readonly buffer GradOutBuf    { float go[]; };
+layout(binding = 2, std430) readonly buffer ParamsBuf     { float params[]; };
+layout(binding = 3, std430) buffer         GradParamsBuf  { uint grad_params[]; };
+
+#define COARSE_GRID 4u
+#define FINE_GRID   8u
+
+#define ATOMIC_ADD_FLOAT(target, value) \
+{ \
+    uint expected = target; \
+    uint desired; \
+    do { \
+        float cur = uintBitsToFloat(expected); \
+        desired = floatBitsToUint(cur + (value)); \
+        uint old = atomicCompSwap(target, expected, desired); \
+        if (old == expected) break; \
+        expected = old; \
+    } while (true); \
+}
+
+// Линейная интерполяция с возвратом значения, производной и индексов/весов.
+void linear_interpolate_deriv(
+    float x_val,
+    uint  grid_size,
+    uint  coeff_base,
+    out float val,
+    out float deriv,
+    out uint  idx0,
+    out uint  idx1,
+    out float w0,
+    out float w1
+) {
+    float t = (clamp(x_val, -1.0, 1.0) + 1.0) * 0.5;
+    float scaled = t * float(grid_size - 1u);
+    idx0 = uint(floor(scaled));
+    idx1 = min(idx0 + 1u, grid_size - 1u);
+    float frac = scaled - float(idx0);
+    w0 = 1.0 - frac;
+    w1 = frac;
+    val  = w0 * params[coeff_base + idx0] + w1 * params[coeff_base + idx1];
+    deriv = (params[coeff_base + idx1] - params[coeff_base + idx0])
+          * float(grid_size - 1u) * 0.5;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.batch * pc.out_features;
+    if (idx >= total) return;
+
+    uint r = idx % pc.batch;
+    uint j = idx / pc.batch;
+
+    uint in_feat  = pc.in_features;
+    uint out_feat = pc.out_features;
+
+    uint coarse_offset = 0u;
+    uint fine_offset   = coarse_offset + in_feat * out_feat * COARSE_GRID;
+    uint bias_offset   = fine_offset   + in_feat * out_feat * FINE_GRID;
+
+    float gout = go[j * pc.batch + r];
+
+    ATOMIC_ADD_FLOAT(grad_params[bias_offset + j], gout);
+
+    for (uint i = 0u; i < in_feat; ++i) {
+        float x_val = x[i * pc.batch + r];
+
+        float c_val, c_deriv, f_val, f_deriv;
+        uint  c_idx0, c_idx1, f_idx0, f_idx1;
+        float c_w0, c_w1, f_w0, f_w1;
+
+        linear_interpolate_deriv(
+            x_val, COARSE_GRID,
+            coarse_offset + (j * in_feat + i) * COARSE_GRID,
+            c_val, c_deriv, c_idx0, c_idx1, c_w0, c_w1
+        );
+        linear_interpolate_deriv(
+            x_val, FINE_GRID,
+            fine_offset + (j * in_feat + i) * FINE_GRID,
+            f_val, f_deriv, f_idx0, f_idx1, f_w0, f_w1
+        );
+
+        uint base_coarse = coarse_offset + (j * in_feat + i) * COARSE_GRID;
+        ATOMIC_ADD_FLOAT(grad_params[base_coarse + c_idx0], gout * c_w0);
+        ATOMIC_ADD_FLOAT(grad_params[base_coarse + c_idx1], gout * c_w1);
+
+        uint base_fine = fine_offset + (j * in_feat + i) * FINE_GRID;
+        ATOMIC_ADD_FLOAT(grad_params[base_fine + f_idx0], gout * f_w0);
+        ATOMIC_ADD_FLOAT(grad_params[base_fine + f_idx1], gout * f_w1);
+    }
+}

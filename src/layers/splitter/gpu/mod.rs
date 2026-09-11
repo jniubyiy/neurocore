@@ -1,11 +1,15 @@
 // src/layers/splitter/gpu/mod.rs
 
-pub mod pipeline;   // <-- новый модуль
+pub mod pipeline;
 
 use crate::compute_manager::gpu::compute::GpuCompute;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 
 impl GpuCompute {
+    /// Прямой проход Splitter на GPU (column-major).
+    ///
+    /// Один поток на выходной элемент (r, j), j ∈ [0, p+q).
+    /// Dispatch = batch · (p + q).
     pub fn run_splitter_forward_buffered_handle(
         &self,
         x: &MatrixBufferHandle,
@@ -19,7 +23,10 @@ impl GpuCompute {
         pre_b: &MatrixBufferHandle,
     ) {
         assert!(x.is_gpu() && wa.is_gpu() && wb.is_gpu(), "Input handles must be GPU");
-        assert!(out_a.is_gpu() && pre_a.is_gpu() && out_b.is_gpu() && pre_b.is_gpu(), "Output handles must be GPU");
+        assert!(
+            out_a.is_gpu() && pre_a.is_gpu() && out_b.is_gpu() && pre_b.is_gpu(),
+            "Output handles must be GPU"
+        );
 
         let batch = x.rows();
         let n = x.cols();
@@ -45,10 +52,10 @@ impl GpuCompute {
         let (bias_a_buf, bias_a_raw) = self.upload_to_temp_buffer(bias_a);
         let (bias_b_buf, bias_b_raw) = self.upload_to_temp_buffer(bias_b);
 
-        // Используем новый пайплайн из собственной структуры Splitter
         let pipeline = &self.splitter_pipelines().forward;
         let push = [batch as u32, n as u32, p as u32, q as u32];
-        self.run_compute_shader_with_dispatch(
+        let total = batch * (p + q);
+        self.run_compute_shader(
             pipeline,
             &[
                 (0, in_buf),
@@ -62,13 +69,19 @@ impl GpuCompute {
                 (8, pre_b_buf),
             ],
             &push,
-            [((batch + 255) / 256) as u32, 1, 1],
+            total,
         );
 
         self.release_temp_buffer(bias_a_buf, bias_a_raw);
         self.release_temp_buffer(bias_b_buf, bias_b_raw);
     }
 
+    /// Обратный проход Splitter на GPU (column-major).
+    ///
+    /// Два этапа:
+    ///   1. bwd_dx      — градиент по входу x. Dispatch = batch · n.
+    ///   2. bwd_params  — градиенты wa, wb, bias_a, bias_b.
+    ///                    Dispatch = p·n + q·n + p + q.
     pub fn run_splitter_backward_buffered_handle(
         &self,
         x: &MatrixBufferHandle,
@@ -84,10 +97,16 @@ impl GpuCompute {
         d_wb: &MatrixBufferHandle,
         d_bias_b: &MatrixBufferHandle,
     ) -> Vec<f32> {
-        assert!(x.is_gpu() && da.is_gpu() && db.is_gpu() && pre_a.is_gpu() && pre_b.is_gpu() && wa.is_gpu() && wb.is_gpu(),
-            "Input handles must be GPU");
-        assert!(dx.is_gpu() && d_wa.is_gpu() && d_bias_a.is_gpu() && d_wb.is_gpu() && d_bias_b.is_gpu(),
-            "Output handles must be GPU");
+        assert!(
+            x.is_gpu() && da.is_gpu() && db.is_gpu()
+                && pre_a.is_gpu() && pre_b.is_gpu() && wa.is_gpu() && wb.is_gpu(),
+            "Input handles must be GPU"
+        );
+        assert!(
+            dx.is_gpu() && d_wa.is_gpu() && d_bias_a.is_gpu()
+                && d_wb.is_gpu() && d_bias_b.is_gpu(),
+            "Output handles must be GPU"
+        );
 
         let batch = x.rows();
         let n = x.cols();
@@ -118,32 +137,43 @@ impl GpuCompute {
         let d_wb_buf = self.get_gpu_subbuffer_from_handle(d_wb);
         let d_bias_b_buf = self.get_gpu_subbuffer_from_handle(d_bias_b);
 
-        self.fill_gpu_handle(d_wa, 0.0);
-        self.fill_gpu_handle(d_wb, 0.0);
-        self.fill_gpu_handle(d_bias_a, 0.0);
-        self.fill_gpu_handle(d_bias_b, 0.0);
-
-        // Используем новый пайплайн из собственной структуры Splitter
-        let pipeline = &self.splitter_pipelines().backward;
+        let pipelines = self.splitter_pipelines();
         let push = [batch as u32, n as u32, p as u32, q as u32];
-        self.run_compute_shader_with_dispatch(
-            pipeline,
+
+        // 1. bwd_dx: градиент по входу.
+        let total_dx = batch * n;
+        self.run_compute_shader(
+            &pipelines.backward_dx,
+            &[
+                (0, da_buf.clone()),
+                (1, db_buf.clone()),
+                (2, pre_a_buf.clone()),
+                (3, pre_b_buf.clone()),
+                (4, wa_buf.clone()),
+                (5, wb_buf.clone()),
+                (6, dx_buf.clone()),
+            ],
+            &push,
+            total_dx,
+        );
+
+        // 2. bwd_params: градиенты весов и смещений.
+        let total_params = p * n + q * n + p + q;
+        self.run_compute_shader(
+            &pipelines.backward_params,
             &[
                 (0, x_buf),
                 (1, da_buf),
                 (2, db_buf),
                 (3, pre_a_buf),
                 (4, pre_b_buf),
-                (5, wa_buf),
-                (6, wb_buf),
-                (7, dx_buf),
-                (8, d_wa_buf),
-                (9, d_bias_a_buf),
-                (10, d_wb_buf),
-                (11, d_bias_b_buf),
+                (5, d_wa_buf),
+                (6, d_bias_a_buf),
+                (7, d_wb_buf),
+                (8, d_bias_b_buf),
             ],
             &push,
-            [((batch + 255) / 256) as u32, 1, 1],
+            total_params,
         );
 
         let mut grad = Vec::with_capacity(p * n + q * n + p + q);

@@ -21,15 +21,6 @@ impl GpuCompute {
     /// Все промежуточные тензоры хранятся в column-major:
     ///  - q, k, v:        (batch, seq_len * d_model)
     ///  - scores, weights: (batch, seq_len * seq_len)
-    ///
-    /// Параметры (Wq, bq, Wk, bk, Wv, bv, Wo, bo, rel_bias) передаются
-    /// через плоский `params`. Веса — row-major, смещения и rel_bias — линейные.
-    ///
-    /// Промежуточные буферы (q_buf, k_buf, v_buf, scores_buf, weights_buf)
-    /// передаются вызывающим кодом и сохраняются в
-    /// `BufferedContext::RelativePositionAttention` для последующего
-    /// обратного прохода — состояние слоя (RwLock<...State>) в GPU-пути
-    /// не используется.
     pub fn run_relative_position_attention_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -105,10 +96,9 @@ impl GpuCompute {
 
         let push = [batch as u32, seq_len as u32, d_model as u32];
 
-        // 1. Подготовка Q, K, V: три линейных преобразования за один dispatch.
-        let prepare_pipeline = &self.relative_position_attention_pipelines().prepare_qkv;
+        // 1. Подготовка Q, K, V.
         self.run_compute_shader(
-            prepare_pipeline,
+            &self.relative_position_attention_pipelines().prepare_qkv,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(input)),
                 (1, subbuffer_from_view(self, params)),
@@ -121,9 +111,8 @@ impl GpuCompute {
         );
 
         // 2. Scores и softmax.
-        let scores_pipeline = &self.relative_position_attention_pipelines().scores_softmax;
         self.run_compute_shader(
-            scores_pipeline,
+            &self.relative_position_attention_pipelines().scores_softmax,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(q_buf)),
                 (1, self.get_gpu_subbuffer_from_handle(k_buf)),
@@ -136,9 +125,8 @@ impl GpuCompute {
         );
 
         // 3. Выход: y = b_o + weights · V · W_o^T.
-        let output_pipeline = &self.relative_position_attention_pipelines().output;
         self.run_compute_shader(
-            output_pipeline,
+            &self.relative_position_attention_pipelines().output,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(weights_buf)),
                 (1, self.get_gpu_subbuffer_from_handle(v_buf)),
@@ -153,10 +141,15 @@ impl GpuCompute {
 
     /// Обратный проход RelativePositionAttention на GPU (column-major).
     ///
-    /// Принимает сохранённые промежуточные буферы с forward. Градиенты по
-    /// параметрам записываются в `grad_params` через атомарное накопление.
-    /// Состояние слоя (RwLock<RelativePositionAttentionState>) в GPU-пути
-    /// не используется — все промежуточные тензоры приходят через аргументы.
+    /// Разбит на этапы:
+    ///   1. backward_output_params    → grad_Wo, grad_bo, d_attn_out
+    ///   2. backward_dv               → d_v
+    ///   3. backward_dweights         → d_weights
+    ///   4. backward_scores_softmax   → d_scores
+    ///   5. backward_dq               → d_q
+    ///   6. backward_dk               → d_k
+    ///   7. backward_rel_bias         → grad_rel_bias
+    ///   8. backward_input_params     → grad_Wq/bq/Wk/bk/Wv/bv + gi
     pub fn run_relative_position_attention_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -209,7 +202,7 @@ impl GpuCompute {
             grad_params.len(),
         );
 
-        // 2. Смещения параметров в плоском буфере.
+        // 2. Смещения параметров.
         let wq_off = 0usize;
         let bq_off = wq_off + d * d;
         let wk_off = bq_off + d;
@@ -251,11 +244,9 @@ impl GpuCompute {
         let (d_v_buf, d_v_raw) = self.acquire_temp_buffer(token_total);
 
         let push = [batch as u32, seq_len as u32, d_model as u32];
+        let pipelines = self.relative_position_attention_pipelines();
 
-        // 4. Вычисление attn_out = weights · V через shader `output`
-        //    с единичной матрицей W_o и нулевым b_o.
-        //    Так как y = b_o + Σ_s weights[r,t,s] · (Σ_i v[r,s,i]·W_o[j,i]),
-        //    при W_o = I, b_o = 0 получаем y = Σ_s weights[r,t,s] · v[r,s,j] = attn_out.
+        // 4. attn_out = weights · V (W_o = I, b_o = 0).
         let mut identity = vec![0.0f32; d * d];
         for i in 0..d {
             identity[i * d + i] = 1.0;
@@ -263,9 +254,8 @@ impl GpuCompute {
         let identity_handle = self.upload_vec_to_gpu_handle(&identity, d, d);
         let zero_b_o_handle = self.upload_vec_to_gpu_handle(&vec![0.0f32; d], d, 1);
 
-        let output_pipeline = &self.relative_position_attention_pipelines().output;
         self.run_compute_shader(
-            output_pipeline,
+            &pipelines.output,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(weights_buf)),
                 (1, self.get_gpu_subbuffer_from_handle(v_buf)),
@@ -277,12 +267,9 @@ impl GpuCompute {
             token_total,
         );
 
-        // 5. Обратный проход через выходной линейный слой:
-        //    d_attn_out = go · W_o, grad_Wo, grad_bo.
-        let bwd_out_pipeline =
-            &self.relative_position_attention_pipelines().backward_output_params;
+        // 5. backward_output_params → d_attn_out, grad_Wo, grad_bo.
         self.run_compute_shader(
-            bwd_out_pipeline,
+            &pipelines.backward_output_params,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(grad_out)),
                 (1, attn_out_buf.clone()),
@@ -295,27 +282,33 @@ impl GpuCompute {
             token_count,
         );
 
-        // 6. Обратный проход через V и weights: d_v, d_weights.
-        let bwd_vw_pipeline =
-            &self.relative_position_attention_pipelines().backward_values_weights;
+        // 6. backward_dv → d_v.
         self.run_compute_shader(
-            bwd_vw_pipeline,
+            &pipelines.backward_dv,
             &[
                 (0, d_attn_out_buf.clone()),
                 (1, self.get_gpu_subbuffer_from_handle(weights_buf)),
-                (2, self.get_gpu_subbuffer_from_handle(v_buf)),
-                (3, d_v_buf.clone()),
-                (4, d_weights_buf.clone()),
+                (2, d_v_buf.clone()),
             ],
             &push,
-            token_total + scores_total,
+            token_total,
         );
 
-        // 7. Обратный проход через softmax: d_scores.
-        let bwd_ss_pipeline =
-            &self.relative_position_attention_pipelines().backward_scores_softmax;
+        // 7. backward_dweights → d_weights.
         self.run_compute_shader(
-            bwd_ss_pipeline,
+            &pipelines.backward_dweights,
+            &[
+                (0, d_attn_out_buf.clone()),
+                (1, self.get_gpu_subbuffer_from_handle(v_buf)),
+                (2, d_weights_buf.clone()),
+            ],
+            &push,
+            scores_total,
+        );
+
+        // 8. backward_scores_softmax → d_scores.
+        self.run_compute_shader(
+            &pipelines.backward_scores_softmax,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(weights_buf)),
                 (1, d_weights_buf.clone()),
@@ -325,28 +318,44 @@ impl GpuCompute {
             token_count,
         );
 
-        // 8. Обратный проход через Q, K и rel_bias: d_q, d_k, grad_rel_bias.
-        let bwd_qkv_pipeline =
-            &self.relative_position_attention_pipelines().backward_qkv_params;
+        // 9. backward_dq → d_q.
         self.run_compute_shader(
-            bwd_qkv_pipeline,
+            &pipelines.backward_dq,
             &[
-                (0, self.get_gpu_subbuffer_from_handle(q_buf)),
+                (0, d_scores_buf.clone()),
                 (1, self.get_gpu_subbuffer_from_handle(k_buf)),
-                (2, d_scores_buf.clone()),
-                (3, d_q_buf.clone()),
-                (4, d_k_buf.clone()),
-                (5, subbuffer_from_view(self, &grad_rel_bias_view)),
+                (2, d_q_buf.clone()),
             ],
             &push,
-            token_total * 2 + scores_total,
+            token_total,
         );
 
-        // 9. Обратный проход через QKV-проекции к входу и к их параметрам.
-        let bwd_in_pipeline =
-            &self.relative_position_attention_pipelines().backward_input_params;
+        // 10. backward_dk → d_k.
         self.run_compute_shader(
-            bwd_in_pipeline,
+            &pipelines.backward_dk,
+            &[
+                (0, d_scores_buf.clone()),
+                (1, self.get_gpu_subbuffer_from_handle(q_buf)),
+                (2, d_k_buf.clone()),
+            ],
+            &push,
+            token_total,
+        );
+
+        // 11. backward_rel_bias → grad_rel_bias.
+        self.run_compute_shader(
+            &pipelines.backward_rel_bias,
+            &[
+                (0, d_scores_buf.clone()),
+                (1, subbuffer_from_view(self, &grad_rel_bias_view)),
+            ],
+            &push,
+            scores_total,
+        );
+
+        // 12. backward_input_params → gi + grad_Wq/bq/Wk/bk/Wv/bv.
+        self.run_compute_shader(
+            &pipelines.backward_input_params,
             &[
                 (0, self.get_gpu_subbuffer_from_handle(input)),
                 (1, d_q_buf.clone()),
@@ -360,7 +369,7 @@ impl GpuCompute {
             token_total,
         );
 
-        // 10. Освобождение временных буферов.
+        // 13. Освобождение временных буферов.
         self.release_temp_buffer(attn_out_buf, attn_out_raw);
         self.release_temp_buffer(d_attn_out_buf, d_attn_out_raw);
         self.release_temp_buffer(d_weights_buf, d_weights_raw);

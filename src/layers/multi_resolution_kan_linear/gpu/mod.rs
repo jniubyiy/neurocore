@@ -7,7 +7,6 @@ use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use vulkano::buffer::Subbuffer;
 
-/// Вспомогательная функция: получает `Subbuffer<[f32]>` из `MatrixBufferView`.
 fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[f32]> {
     let parent_sub = gpu.get_gpu_subbuffer_from_handle(view.parent_handle());
     let start = view.offset_elements() as u64;
@@ -17,12 +16,6 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
 
 impl GpuCompute {
     /// Прямой проход MultiResolutionKANLinear на GPU.
-    ///
-    /// Параметры (coarse, fine, bias) передаются как `MatrixBufferView`,
-    /// ссылающийся на часть общего GPU-буфера параметров сегмента.
-    /// Вход и выход — GPU-дескрипторы.
-    /// Внутри используется один compute-шейдер, который вычисляет
-    /// взвешенную сумму грубой и точной интерполяций.
     pub fn run_multi_resolution_kan_linear_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -38,7 +31,6 @@ impl GpuCompute {
         let out_features = output.cols();
         assert_eq!(output.rows(), batch, "Output rows mismatch");
 
-        // Проверка длины параметров: in*out*(4+8) + out
         let expected_param_len = in_features * out_features * 12 + out_features;
         assert_eq!(params.len(), expected_param_len, "Params length mismatch");
 
@@ -59,12 +51,12 @@ impl GpuCompute {
 
     /// Обратный проход MultiResolutionKANLinear на GPU.
     ///
-    /// Градиенты по параметрам записываются в `grad_params` (часть общего GPU-буфера
-    /// градиентов). Вход/выходные градиенты — GPU-дескрипторы.
-    /// Перед вызовом область `grad_params` обнуляется, так как шейдер использует
-    /// атомарное накопление. Затем запускаются две фазы:
-    /// фаза 0 — накопление градиентов параметров,
-    /// фаза 1 — вычисление градиента по входу.
+    /// Два независимых этапа без `phase`-ветвления:
+    ///   bwd_params → grad_params (coarse, fine, bias);
+    ///   bwd_input  → grad_input.
+    ///
+    /// Промежуточный grad_input не обнуляется: единственный shader bwd_input
+    /// пишет каждую ячейку ровно один раз.
     pub fn run_multi_resolution_kan_linear_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -90,7 +82,7 @@ impl GpuCompute {
         assert_eq!(params.len(), expected_param_len, "Params length mismatch");
         assert_eq!(grad_params.len(), expected_param_len, "grad_params length mismatch");
 
-        // Обнуляем градиенты параметров
+        // Обнуление градиентов параметров.
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -110,50 +102,33 @@ impl GpuCompute {
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
         let grad_params_buf = subbuffer_from_view(self, grad_params);
 
-        let pipeline = &self.multi_resolution_kan_linear_pipelines().backward;
+        let push = [batch as u32, in_features as u32, out_features as u32];
+        let pipelines = self.multi_resolution_kan_linear_pipelines();
 
-        // Фаза 0: градиенты параметров
-        {
-            let push = [
-                batch as u32,
-                in_features as u32,
-                out_features as u32,
-                0u32, // phase = 0
-            ];
-            self.run_compute_shader(
-                pipeline,
-                &[
-                    (0, in_buf.clone()),
-                    (1, go_buf.clone()),
-                    (2, params_buf.clone()),
-                    (3, grad_params_buf.clone()),
-                    (4, gi_buf.clone()),
-                ],
-                &push,
-                batch * out_features,
-            );
-        }
+        // Фаза 0: градиенты параметров.
+        self.run_compute_shader(
+            &pipelines.bwd_params,
+            &[
+                (0, in_buf.clone()),
+                (1, go_buf.clone()),
+                (2, params_buf.clone()),
+                (3, grad_params_buf.clone()),
+            ],
+            &push,
+            batch * out_features,
+        );
 
-        // Фаза 1: градиент по входу
-        {
-            let push = [
-                batch as u32,
-                in_features as u32,
-                out_features as u32,
-                1u32, // phase = 1
-            ];
-            self.run_compute_shader(
-                pipeline,
-                &[
-                    (0, in_buf.clone()),
-                    (1, go_buf.clone()),
-                    (2, params_buf.clone()),
-                    (3, grad_params_buf.clone()),
-                    (4, gi_buf.clone()),
-                ],
-                &push,
-                batch * in_features,
-            );
-        }
+        // Фаза 1: градиент по входу.
+        self.run_compute_shader(
+            &pipelines.bwd_input,
+            &[
+                (0, in_buf),
+                (1, go_buf),
+                (2, params_buf),
+                (3, gi_buf),
+            ],
+            &push,
+            batch * in_features,
+        );
     }
 }

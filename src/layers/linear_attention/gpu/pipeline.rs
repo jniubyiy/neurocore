@@ -20,33 +20,60 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
     unsafe { std::slice::from_raw_parts(ptr, bytes.len() / 4) }
 }
 
+/// Пайплайны LinearAttention, разбитые на этапы.
+///
+/// Forward:
+///   linear_per_token (×3)  →  phi (×2)  →  compute_kvz  →  forward
+///
+/// Backward:
+///   bwd_prepare → bwd_dq_phi_dkv → bwd_dk_phi → bwd_dv
+///               → bwd_grad_wo  → bwd_gi_params
 pub struct LinearAttentionPipelines {
+    // Forward
     pub compute_kvz: Arc<ComputePipeline>,
     pub forward: Arc<ComputePipeline>,
-    pub backward_main: Arc<ComputePipeline>,
-    pub backward_params: Arc<ComputePipeline>,
     pub phi: Arc<ComputePipeline>,
     pub linear_per_token: Arc<ComputePipeline>,
+
+    // Backward
+    pub bwd_prepare: Arc<ComputePipeline>,
+    pub bwd_dq_phi_dkv: Arc<ComputePipeline>,
+    pub bwd_dk_phi: Arc<ComputePipeline>,
+    pub bwd_dv: Arc<ComputePipeline>,
+    pub bwd_grad_wo: Arc<ComputePipeline>,
+    pub bwd_gi_params: Arc<ComputePipeline>,
 }
 
 impl LinearAttentionPipelines {
     pub fn new(device: Arc<Device>) -> Self {
-        // Загрузка SPIR‑V
         let kvz_bytes = include_bytes!("vulkan/shaders/linear_attention_compute_kvz.spv");
         let fwd_bytes = include_bytes!("vulkan/shaders/linear_attention_fwd.spv");
-        let bwd_main_bytes = include_bytes!("vulkan/shaders/linear_attention_bwd_main.spv");
-        let bwd_params_bytes = include_bytes!("vulkan/shaders/linear_attention_bwd_params.spv");
         let phi_bytes = include_bytes!("vulkan/shaders/linear_attention_phi.spv");
-        let per_token_bytes = include_bytes!("vulkan/shaders/linear_attention_linear_per_token.spv");
+        let per_token_bytes =
+            include_bytes!("vulkan/shaders/linear_attention_linear_per_token.spv");
+        let bwd_prepare_bytes =
+            include_bytes!("vulkan/shaders/linear_attention_bwd_prepare.spv");
+        let bwd_dq_phi_dkv_bytes =
+            include_bytes!("vulkan/shaders/linear_attention_bwd_dq_phi_dkv.spv");
+        let bwd_dk_phi_bytes =
+            include_bytes!("vulkan/shaders/linear_attention_bwd_dk_phi.spv");
+        let bwd_dv_bytes = include_bytes!("vulkan/shaders/linear_attention_bwd_dv.spv");
+        let bwd_grad_wo_bytes =
+            include_bytes!("vulkan/shaders/linear_attention_bwd_grad_wo.spv");
+        let bwd_gi_params_bytes =
+            include_bytes!("vulkan/shaders/linear_attention_bwd_gi_params.spv");
 
         let kvz_spv = as_u32_slice(kvz_bytes);
         let fwd_spv = as_u32_slice(fwd_bytes);
-        let bwd_main_spv = as_u32_slice(bwd_main_bytes);
-        let bwd_params_spv = as_u32_slice(bwd_params_bytes);
         let phi_spv = as_u32_slice(phi_bytes);
         let per_token_spv = as_u32_slice(per_token_bytes);
+        let bwd_prepare_spv = as_u32_slice(bwd_prepare_bytes);
+        let bwd_dq_phi_dkv_spv = as_u32_slice(bwd_dq_phi_dkv_bytes);
+        let bwd_dk_phi_spv = as_u32_slice(bwd_dk_phi_bytes);
+        let bwd_dv_spv = as_u32_slice(bwd_dv_bytes);
+        let bwd_grad_wo_spv = as_u32_slice(bwd_grad_wo_bytes);
+        let bwd_gi_params_spv = as_u32_slice(bwd_gi_params_bytes);
 
-        // Вспомогательная функция создания layout с N storage-буферами.
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
             let mut bindings = std::collections::BTreeMap::new();
             for binding in 0..n {
@@ -72,205 +99,86 @@ impl LinearAttentionPipelines {
             .expect("Failed to create descriptor set layout for LinearAttention")
         }
 
-        // ==================== Compute KVZ ====================
-        let kvz_layout = create_ds_layout(device.clone(), 4);
-        let kvz_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(kvz_spv))
-                .expect("Failed to create LinearAttention compute_kvz shader module")
-        };
-        let kvz_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 12, // batch, seq_len, d_model
-        };
-        let kvz_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![kvz_layout],
-                push_constant_ranges: vec![kvz_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create LinearAttention compute_kvz pipeline layout");
-        let kvz_entry = kvz_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("LinearAttention compute_kvz entry point not found");
-        let kvz_stage = PipelineShaderStageCreateInfo::new(kvz_entry);
-        let compute_kvz = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(kvz_stage, kvz_pipeline_layout),
-        )
-        .expect("Failed to create LinearAttention compute_kvz pipeline");
+        fn build(
+            device: Arc<Device>,
+            spv: &[u32],
+            ds_n: u32,
+            push_size: u32,
+            name: &str,
+        ) -> Arc<ComputePipeline> {
+            let layout = create_ds_layout(device.clone(), ds_n);
+            let module = unsafe {
+                ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(spv))
+                    .unwrap_or_else(|_| panic!("Failed to create {} shader module", name))
+            };
+            let push = PushConstantRange {
+                stages: ShaderStages::COMPUTE,
+                offset: 0,
+                size: push_size,
+            };
+            let pipeline_layout = PipelineLayout::new(
+                device.clone(),
+                PipelineLayoutCreateInfo {
+                    set_layouts: vec![layout],
+                    push_constant_ranges: vec![push],
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|_| panic!("Failed to create {} pipeline layout", name));
+            let entry = module
+                .entry_point_with_execution("main", ExecutionModel::GLCompute)
+                .unwrap_or_else(|| panic!("{} entry point not found", name));
+            let stage = PipelineShaderStageCreateInfo::new(entry);
+            ComputePipeline::new(
+                device,
+                None,
+                ComputePipelineCreateInfo::stage_layout(stage, pipeline_layout),
+            )
+            .unwrap_or_else(|_| panic!("Failed to create {} pipeline", name))
+        }
 
-        // ==================== Forward ====================
-        // 6 bindings: q_phi, kv, z, w_o, b_o, y
-        let fwd_layout = create_ds_layout(device.clone(), 6);
-        let fwd_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(fwd_spv))
-                .expect("Failed to create LinearAttention forward shader module")
-        };
-        let fwd_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 12, // batch, seq_len, d_model
-        };
-        let fwd_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![fwd_layout],
-                push_constant_ranges: vec![fwd_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create LinearAttention forward pipeline layout");
-        let fwd_entry = fwd_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("LinearAttention forward entry point not found");
-        let fwd_stage = PipelineShaderStageCreateInfo::new(fwd_entry);
-        let forward = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(fwd_stage, fwd_pipeline_layout),
-        )
-        .expect("Failed to create LinearAttention forward pipeline");
+        // Forward
+        let compute_kvz = build(device.clone(), kvz_spv, 4, 12, "LinearAttention compute_kvz");
+        let forward = build(device.clone(), fwd_spv, 6, 12, "LinearAttention forward");
+        let phi = build(device.clone(), phi_spv, 2, 4, "LinearAttention phi");
+        let linear_per_token =
+            build(device.clone(), per_token_spv, 4, 16, "LinearAttention per_token");
 
-        // ==================== Backward Main ====================
-        // 9 bindings: go, w_o, q_phi, kv, z, d_attn_out, d_q_phi, d_kv, d_z
-        let bwd_main_layout = create_ds_layout(device.clone(), 9);
-        let bwd_main_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_main_spv))
-                .expect("Failed to create LinearAttention backward main shader module")
-        };
-        let bwd_main_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 12,
-        };
-        let bwd_main_pipeline_layout = PipelineLayout::new(
+        // Backward
+        let bwd_prepare =
+            build(device.clone(), bwd_prepare_spv, 9, 12, "LinearAttention bwd_prepare");
+        let bwd_dq_phi_dkv = build(
             device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_main_layout],
-                push_constant_ranges: vec![bwd_main_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create LinearAttention backward main pipeline layout");
-        let bwd_main_entry = bwd_main_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("LinearAttention backward main entry point not found");
-        let bwd_main_stage = PipelineShaderStageCreateInfo::new(bwd_main_entry);
-        let backward_main = ComputePipeline::new(
+            bwd_dq_phi_dkv_spv,
+            10,
+            12,
+            "LinearAttention bwd_dq_phi_dkv",
+        );
+        let bwd_dk_phi =
+            build(device.clone(), bwd_dk_phi_spv, 4, 12, "LinearAttention bwd_dk_phi");
+        let bwd_dv =
+            build(device.clone(), bwd_dv_spv, 3, 12, "LinearAttention bwd_dv");
+        let bwd_grad_wo =
+            build(device.clone(), bwd_grad_wo_spv, 3, 12, "LinearAttention bwd_grad_wo");
+        let bwd_gi_params = build(
             device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_main_stage, bwd_main_pipeline_layout),
-        )
-        .expect("Failed to create LinearAttention backward main pipeline");
-
-        // ==================== Backward Params ====================
-        // 15 bindings: x, go, params, q_phi, k_phi, v, q_raw, k_raw,
-        //              d_q_phi, d_kv, d_z, gi, grad_params, kv, z
-        let bwd_params_layout = create_ds_layout(device.clone(), 15);
-        let bwd_params_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_params_spv))
-                .expect("Failed to create LinearAttention backward params shader module")
-        };
-        let bwd_params_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 12,
-        };
-        let bwd_params_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![bwd_params_layout],
-                push_constant_ranges: vec![bwd_params_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create LinearAttention backward params pipeline layout");
-        let bwd_params_entry = bwd_params_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("LinearAttention backward params entry point not found");
-        let bwd_params_stage = PipelineShaderStageCreateInfo::new(bwd_params_entry);
-        let backward_params = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(bwd_params_stage, bwd_params_pipeline_layout),
-        )
-        .expect("Failed to create LinearAttention backward params pipeline");
-
-        // ==================== Phi ====================
-        // 2 bindings: x, y
-        let phi_layout = create_ds_layout(device.clone(), 2);
-        let phi_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(phi_spv))
-                .expect("Failed to create LinearAttention phi shader module")
-        };
-        let phi_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 4, // total
-        };
-        let phi_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![phi_layout],
-                push_constant_ranges: vec![phi_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create LinearAttention phi pipeline layout");
-        let phi_entry = phi_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("LinearAttention phi entry point not found");
-        let phi_stage = PipelineShaderStageCreateInfo::new(phi_entry);
-        let phi = ComputePipeline::new(
-            device.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(phi_stage, phi_pipeline_layout),
-        )
-        .expect("Failed to create LinearAttention phi pipeline");
-
-        // ==================== Per-Token Linear ====================
-        // 4 bindings: x, w, b, y
-        let per_token_layout = create_ds_layout(device.clone(), 4);
-        let per_token_module = unsafe {
-            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(per_token_spv))
-                .expect("Failed to create LinearAttention per-token linear shader module")
-        };
-        let per_token_push = PushConstantRange {
-            stages: ShaderStages::COMPUTE,
-            offset: 0,
-            size: 16, // batch, seq_len, in_features, out_features
-        };
-        let per_token_pipeline_layout = PipelineLayout::new(
-            device.clone(),
-            PipelineLayoutCreateInfo {
-                set_layouts: vec![per_token_layout],
-                push_constant_ranges: vec![per_token_push],
-                ..Default::default()
-            },
-        )
-        .expect("Failed to create LinearAttention per-token linear pipeline layout");
-        let per_token_entry = per_token_module
-            .entry_point_with_execution("main", ExecutionModel::GLCompute)
-            .expect("LinearAttention per-token linear entry point not found");
-        let per_token_stage = PipelineShaderStageCreateInfo::new(per_token_entry);
-        let linear_per_token = ComputePipeline::new(
-            device,
-            None,
-            ComputePipelineCreateInfo::stage_layout(per_token_stage, per_token_pipeline_layout),
-        )
-        .expect("Failed to create LinearAttention per-token linear pipeline");
+            bwd_gi_params_spv,
+            9,
+            12,
+            "LinearAttention bwd_gi_params",
+        );
 
         Self {
             compute_kvz,
             forward,
-            backward_main,
-            backward_params,
             phi,
             linear_per_token,
+            bwd_prepare,
+            bwd_dq_phi_dkv,
+            bwd_dk_phi,
+            bwd_dv,
+            bwd_grad_wo,
+            bwd_gi_params,
         }
     }
 }

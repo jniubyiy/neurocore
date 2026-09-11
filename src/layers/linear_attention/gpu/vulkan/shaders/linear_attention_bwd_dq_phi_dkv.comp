@@ -1,0 +1,89 @@
+// src/layers/linear_attention/gpu/vulkan/shaders/linear_attention_bwd_dq_phi_dkv.comp
+//
+// Второй этап обратного прохода LinearAttention.
+//
+// Один поток на (токен, l).
+//
+// Вычисляет:
+//   d_q_phi[tok,l] = inv_denom · Σ_i d_attn_out[tok,i] · kv[i,l]
+//                  - z[l] · inv_denom² · dot_da_ao[tok]
+//
+// Атомарно накапливает:
+//   d_kv[i,l] += d_attn_out[tok,i] · q_phi[tok,l] · inv_denom   (для всех i)
+//   d_z[l]    += -q_phi[tok,l] · inv_denom · dot_da_ao[tok]
+//
+// Push: batch, seq_len, d_model.
+// Dispatch: (batch · seq_len) · d_model потоков.
+
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint seq_len;
+    uint d_model;
+} pc;
+
+layout(binding = 0, std430) readonly buffer QPhiBuf     { float q_phi[]; };
+layout(binding = 1, std430) readonly buffer AttnOutBuf  { float attn_out[]; };
+layout(binding = 2, std430) readonly buffer DAttnOutBuf { float d_attn_out[]; };
+layout(binding = 3, std430) readonly buffer KVBuf       { float kv[]; };
+layout(binding = 4, std430) readonly buffer ZBuf        { float z[]; };
+layout(binding = 5, std430) readonly buffer DenomBuf    { float denom[]; };
+layout(binding = 6, std430) readonly buffer DotDaAoBuf  { float dot_da_ao[]; };
+layout(binding = 7, std430) writeonly buffer DQPhiBuf   { float d_q_phi[]; };
+layout(binding = 8, std430) buffer DKVBuf               { uint d_kv[]; };
+layout(binding = 9, std430) buffer DZBuf                { uint d_z[]; };
+
+#define ATOMIC_ADD_FLOAT(target, value) \
+{ \
+    uint expected = target; \
+    uint desired; \
+    do { \
+        float cur = uintBitsToFloat(expected); \
+        desired = floatBitsToUint(cur + (value)); \
+        uint old = atomicCompSwap(target, expected, desired); \
+        if (old == expected) break; \
+        expected = old; \
+    } while (true); \
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint d = pc.d_model;
+    uint token_count = pc.batch * pc.seq_len;
+    uint total = token_count * d;
+    if (gid >= total) return;
+
+    uint tok = gid / d;
+    uint l = gid % d;
+
+    uint r = tok % pc.batch;
+    uint t = tok / pc.batch;
+    uint tok_base = (t * d) * pc.batch + r;
+
+    float inv_denom = 1.0 / denom[tok];
+    float inv_denom_sq = inv_denom * inv_denom;
+    float dot = dot_da_ao[tok];
+    float zl = z[l];
+
+    // d_q_phi[l] = inv_denom · Σ_i d_attn_out[i] · kv[i,l] - z[l] · inv_denom² · dot
+    float sum_da_kv = 0.0;
+    for (uint i = 0u; i < d; ++i) {
+        float da = d_attn_out[tok_base + i * pc.batch];
+        sum_da_kv += da * kv[i * d + l];
+    }
+    float dq_l = sum_da_kv * inv_denom - zl * dot * inv_denom_sq;
+    d_q_phi[tok_base + l * pc.batch] = dq_l;
+
+    float q_l = q_phi[tok_base + l * pc.batch];
+
+    // d_z[l] += -q_l · inv_denom · dot
+    ATOMIC_ADD_FLOAT(d_z[l], -q_l * inv_denom * dot);
+
+    // d_kv[i,l] += d_attn_out[i] · q_l · inv_denom   (для каждого i)
+    for (uint i = 0u; i < d; ++i) {
+        float da = d_attn_out[tok_base + i * pc.batch];
+        ATOMIC_ADD_FLOAT(d_kv[i * d + l], da * q_l * inv_denom);
+    }
+}

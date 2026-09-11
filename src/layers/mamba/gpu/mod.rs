@@ -7,7 +7,6 @@ use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use vulkano::buffer::Subbuffer;
 
-/// Вспомогательная функция: получает `Subbuffer<[f32]>` из `MatrixBufferView`.
 fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[f32]> {
     let parent_sub = gpu.get_gpu_subbuffer_from_handle(view.parent_handle());
     let start = view.offset_elements() as u64;
@@ -15,14 +14,12 @@ fn subbuffer_from_view(gpu: &GpuCompute, view: &MatrixBufferView) -> Subbuffer<[
     parent_sub.slice(start..end)
 }
 
+/// Количество членов ряда Тейлора для exp(Δ·A), исключая единичный член.
+/// Полная сумма содержит T_0 + T_1 + ... + T_TAYLOR_STEPS = exp(Δ·A) приближённо.
+const TAYLOR_STEPS: usize = 10;
+
 impl GpuCompute {
     /// Прямой проход Mamba на GPU.
-    ///
-    /// Параметры (A, B, C, D, delta) передаются как `MatrixBufferView` на полный
-    /// блок. Вход/выход — GPU-дескрипторы (column-major).
-    ///
-    /// Скрытые состояния `h_all` хранятся в row-major: `(r * seq_len + t) * state_dim + i`
-    /// и передаются как GPU-дескриптор из контекста слоя.
     pub fn run_mamba_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -53,7 +50,7 @@ impl GpuCompute {
         let param_len = n * n + n * d + d * n + 2;
         assert_eq!(params.len(), param_len, "Params length mismatch");
 
-        // Создаём view для параметров.
+        // Смещения параметров.
         let a_start = 0usize;
         let b_start = a_start + n * n;
         let c_start = b_start + n * d;
@@ -92,45 +89,36 @@ impl GpuCompute {
             1,
         );
 
-        // Скачиваем delta для push-константы дискретизации.
+        // Читаем delta.
         let delta_val = {
-            let handle =
-                self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
+            let handle = self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
             let guard = handle.read();
             let slice = guard.as_slice().unwrap();
             slice[delta_view.offset_elements()]
         };
 
-        // Выделяем временные буферы A_bar и B_bar.
+        // Временные буферы для A_bar и B_bar.
         let (a_bar_buf, a_bar_raw) = self.acquire_temp_buffer(n * n);
         let (b_bar_buf, b_bar_raw) = self.acquire_temp_buffer(n * d);
 
-        // Subbuffer'ы.
-        let in_buf = self.get_gpu_subbuffer_from_handle(input);
-        let out_buf = self.get_gpu_subbuffer_from_handle(output);
-        let h_buf = self.get_gpu_subbuffer_from_handle(h_all);
-        let a_buf = subbuffer_from_view(self, &a_view);
-        let b_buf = subbuffer_from_view(self, &b_view);
-        let c_buf = subbuffer_from_view(self, &c_view);
-        let d_buf = subbuffer_from_view(self, &d_view);
-
-        // Запускаем дискретизацию: A_bar = exp(Δ A), B_bar = Δ B.
-        let discretize_pipeline = &self.mamba_pipelines().discretize;
-        let push_disc = [n as u32, d as u32, delta_val.to_bits(), 0u32];
-        let total_disc = n * n + n * d;
-        self.run_compute_shader(
-            discretize_pipeline,
-            &[
-                (0, a_buf.clone()),
-                (1, b_buf.clone()),
-                (2, a_bar_buf.clone()),
-                (3, b_bar_buf.clone()),
-            ],
-            &push_disc,
-            total_disc,
+        // Discretize через ряд Тейлора (см. TAYLOR_STEPS).
+        self.run_mamba_discretize(
+            &a_view,
+            &b_view,
+            delta_val,
+            n,
+            d,
+            &a_bar_buf,
+            &b_bar_buf,
         );
 
-        // Последовательные шаги forward.
+        // Subbuffer'ы для forward.
+        let in_buf  = self.get_gpu_subbuffer_from_handle(input);
+        let out_buf = self.get_gpu_subbuffer_from_handle(output);
+        let h_buf   = self.get_gpu_subbuffer_from_handle(h_all);
+        let c_buf   = subbuffer_from_view(self, &c_view);
+        let d_buf   = subbuffer_from_view(self, &d_view);
+
         let fwd_pipeline = &self.mamba_pipelines().forward_step;
 
         for t in 0..seq_len {
@@ -183,16 +171,11 @@ impl GpuCompute {
             );
         }
 
-        // Освобождаем временные буферы.
         self.release_temp_buffer(a_bar_buf, a_bar_raw);
         self.release_temp_buffer(b_bar_buf, b_bar_raw);
     }
 
     /// Обратный проход Mamba на GPU.
-    ///
-    /// Градиенты по параметрам записываются в `grad_params` атомарно.
-    /// Вход/выходные градиенты — GPU-дескрипторы (column-major).
-    /// Скрытые состояния `h_all` приходят из контекста слоя.
     pub fn run_mamba_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -208,10 +191,7 @@ impl GpuCompute {
         assert!(input.is_gpu(), "Input handle must be GPU");
         assert!(grad_out.is_gpu(), "grad_out handle must be GPU");
         assert!(grad_input.is_gpu(), "grad_input handle must be GPU");
-        assert!(
-            grad_params.is_gpu(),
-            "grad_params view must point to GPU buffer"
-        );
+        assert!(grad_params.is_gpu(), "grad_params view must point to GPU buffer");
         assert!(params.is_gpu(), "Params view must point to GPU buffer");
         assert!(h_all.is_gpu(), "h_all handle must be GPU");
 
@@ -233,7 +213,7 @@ impl GpuCompute {
             "h_all size mismatch"
         );
 
-        // Обнуляем градиенты по параметрам и входу.
+        // Обнуление градиентов параметров и входа.
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -248,7 +228,7 @@ impl GpuCompute {
         );
         self.fill_gpu_handle(grad_input, 0.0);
 
-        // Создаём view для параметров и их градиентов.
+        // Смещения параметров и градиентов.
         let a_start = 0usize;
         let b_start = a_start + n * n;
         let c_start = b_start + n * d;
@@ -319,10 +299,9 @@ impl GpuCompute {
             1,
         );
 
-        // Скачиваем delta для push-константы дискретизации.
+        // Читаем delta.
         let delta_val = {
-            let handle =
-                self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
+            let handle = self.download_gpu_handle_to_cpu_handle(delta_view.parent_handle());
             let guard = handle.read();
             let slice = guard.as_slice().unwrap();
             slice[delta_view.offset_elements()]
@@ -336,7 +315,7 @@ impl GpuCompute {
         let (delta_next_a_buf, delta_next_a_raw) = self.acquire_temp_buffer(batch * n);
         let (delta_next_b_buf, delta_next_b_raw) = self.acquire_temp_buffer(batch * n);
 
-        // Обнуляем grad_A_bar, grad_B_bar и delta_next_a.
+        // Обнуление grad_A_bar, grad_B_bar и delta_next_a.
         let zero_grad_a_bar = self.upload_to_temp_buffer(&vec![0.0f32; n * n]);
         let zero_grad_b_bar = self.upload_to_temp_buffer(&vec![0.0f32; n * d]);
         let zero_delta_next = self.upload_to_temp_buffer(&vec![0.0f32; batch * n]);
@@ -345,38 +324,33 @@ impl GpuCompute {
         self.copy_buffer_sync(zero_grad_b_bar.0.clone(), grad_b_bar_buf.clone());
         self.copy_buffer_sync(zero_delta_next.0.clone(), delta_next_a_buf.clone());
 
-        // Освобождаем zero-буферы.
         self.release_temp_buffer(zero_grad_a_bar.0, zero_grad_a_bar.1);
         self.release_temp_buffer(zero_grad_b_bar.0, zero_grad_b_bar.1);
         self.release_temp_buffer(zero_delta_next.0, zero_delta_next.1);
 
-        // Запускаем дискретизацию.
-        let discretize_pipeline = &self.mamba_pipelines().discretize;
-        let push_disc = [n as u32, d as u32, delta_val.to_bits(), 0u32];
-        self.run_compute_shader(
-            discretize_pipeline,
-            &[
-                (0, subbuffer_from_view(self, &a_view)),
-                (1, subbuffer_from_view(self, &b_view)),
-                (2, a_bar_buf.clone()),
-                (3, b_bar_buf.clone()),
-            ],
-            &push_disc,
-            n * n + n * d,
+        // Discretize.
+        self.run_mamba_discretize(
+            &a_view,
+            &b_view,
+            delta_val,
+            n,
+            d,
+            &a_bar_buf,
+            &b_bar_buf,
         );
 
         // Subbuffer'ы.
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
         let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
-        let h_buf = self.get_gpu_subbuffer_from_handle(h_all);
+        let h_buf  = self.get_gpu_subbuffer_from_handle(h_all);
         let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
-        let c_buf = subbuffer_from_view(self, &c_view);
+        let c_buf  = subbuffer_from_view(self, &c_view);
         let gc_buf = subbuffer_from_view(self, &gc_view);
         let gd_buf = subbuffer_from_view(self, &gd_view);
-        let d_buf = subbuffer_from_view(self, &d_view);
+        let d_buf  = subbuffer_from_view(self, &d_view);
 
-        // Цикл обратных шагов по t.
-        let bwd_pipeline = &self.mamba_pipelines().backward_step;
+        let pipelines = self.mamba_pipelines();
+
         let mut current_delta_in = delta_next_a_buf.clone();
         let mut current_delta_out = delta_next_b_buf.clone();
 
@@ -388,37 +362,97 @@ impl GpuCompute {
                 seq_len as u32,
                 t as u32,
             ];
+
+            // 1. dh_t.
             self.run_compute_shader(
-                bwd_pipeline,
+                &pipelines.bwd_dh_t,
                 &[
-                    (0, in_buf.clone()),
-                    (1, go_buf.clone()),
-                    (2, h_buf.clone()),
-                    (3, a_bar_buf.clone()),
-                    (4, b_bar_buf.clone()),
-                    (5, c_buf.clone()),
-                    (6, d_buf.clone()),
-                    (7, current_delta_in.clone()),
-                    (8, grad_a_bar_buf.clone()),
-                    (9, grad_b_bar_buf.clone()),
-                    (10, gc_buf.clone()),
-                    (11, gd_buf.clone()),
-                    (12, gi_buf.clone()),
-                    (13, current_delta_out.clone()),
+                    (0, go_buf.clone()),
+                    (1, c_buf.clone()),
+                    (2, a_bar_buf.clone()),
+                    (3, current_delta_in.clone()),
+                    (4, current_delta_out.clone()),
                 ],
                 &push,
-                batch,
+                batch * n,
             );
+
+            // 2. grad_A_bar (только t > 0).
+            if t > 0 {
+                self.run_compute_shader(
+                    &pipelines.bwd_grad_A_bar,
+                    &[
+                        (0, current_delta_out.clone()),
+                        (1, h_buf.clone()),
+                        (2, grad_a_bar_buf.clone()),
+                    ],
+                    &push,
+                    batch * n * n,
+                );
+            }
+
+            // 3. grad_B_bar.
+            self.run_compute_shader(
+                &pipelines.bwd_grad_B_bar,
+                &[
+                    (0, current_delta_out.clone()),
+                    (1, in_buf.clone()),
+                    (2, grad_b_bar_buf.clone()),
+                ],
+                &push,
+                batch * n * d,
+            );
+
+            // 4. grad_C.
+            self.run_compute_shader(
+                &pipelines.bwd_grad_C,
+                &[
+                    (0, go_buf.clone()),
+                    (1, h_buf.clone()),
+                    (2, gc_buf.clone()),
+                ],
+                &push,
+                batch * d * n,
+            );
+
+            // 5. grad_D.
+            self.run_compute_shader(
+                &pipelines.bwd_grad_D,
+                &[
+                    (0, go_buf.clone()),
+                    (1, in_buf.clone()),
+                    (2, gd_buf.clone()),
+                ],
+                &push,
+                batch * d,
+            );
+
+            // 6. grad_input.
+            self.run_compute_shader(
+                &pipelines.bwd_grad_input,
+                &[
+                    (0, current_delta_out.clone()),
+                    (1, go_buf.clone()),
+                    (2, b_bar_buf.clone()),
+                    (3, d_buf.clone()),
+                    (4, gi_buf.clone()),
+                ],
+                &push,
+                batch * d,
+            );
+
+            // Ping-pong.
             std::mem::swap(&mut current_delta_in, &mut current_delta_out);
         }
 
-        // Преобразование градиентов A_bar, B_bar в градиенты A, B, delta.
-        let convert_pipeline = &self.mamba_pipelines().convert_grads;
+        // Convert: A_bar, B_bar → A, B, Δ.
         let ga_buf = subbuffer_from_view(self, &ga_view);
         let gb_buf = subbuffer_from_view(self, &gb_view);
         let gdelta_buf = subbuffer_from_view(self, &gdelta_view);
+
+        let push_disc = [n as u32, d as u32, delta_val.to_bits(), 0u32];
         self.run_compute_shader(
-            convert_pipeline,
+            &pipelines.convert_grads,
             &[
                 (0, subbuffer_from_view(self, &a_view)),
                 (1, subbuffer_from_view(self, &b_view)),
@@ -432,12 +466,109 @@ impl GpuCompute {
             n * n + n * d,
         );
 
-        // Освобождаем временные буферы.
         self.release_temp_buffer(a_bar_buf, a_bar_raw);
         self.release_temp_buffer(b_bar_buf, b_bar_raw);
         self.release_temp_buffer(grad_a_bar_buf, grad_a_bar_raw);
         self.release_temp_buffer(grad_b_bar_buf, grad_b_bar_raw);
         self.release_temp_buffer(delta_next_a_buf, delta_next_a_raw);
         self.release_temp_buffer(delta_next_b_buf, delta_next_b_raw);
+    }
+
+    // ===================================================================
+    // Внутренние хелперы
+    // ===================================================================
+
+    /// Дискретизация A_bar = exp(Δ·A), B_bar = Δ·B через ряд Тейлора.
+    ///
+    /// Выполняет TAYLOR_STEPS шагов ряда; каждый шаг — отдельный dispatch
+    /// (accum + step). T-матрицы ping-pong'аются между двумя временными
+    /// буферами.
+    fn run_mamba_discretize(
+        &self,
+        a_view: &MatrixBufferView,
+        b_view: &MatrixBufferView,
+        delta_val: f32,
+        n: usize,
+        d: usize,
+        a_bar_buf: &Subbuffer<[f32]>,
+        b_bar_buf: &Subbuffer<[f32]>,
+    ) {
+        let pipelines = self.mamba_pipelines();
+
+        // Два временных буфера для T и T_next.
+        let (mut t_a_buf, t_a_raw) = self.acquire_temp_buffer(n * n);
+        let (mut t_b_buf, t_b_raw) = self.acquire_temp_buffer(n * n);
+
+        let a_buf = subbuffer_from_view(self, a_view);
+        let b_buf = subbuffer_from_view(self, b_view);
+
+        // 1. Init: T := I, A_bar := 0.
+        let push_n = [n as u32];
+        self.run_compute_shader(
+            &pipelines.discretize_init,
+            &[
+                (0, t_a_buf.clone()),
+                (1, a_bar_buf.clone()),
+            ],
+            &push_n,
+            n * n,
+        );
+
+        // 2. Ряд Тейлора.
+        for k in 1..=TAYLOR_STEPS {
+            // A_bar += T.
+            self.run_compute_shader(
+                &pipelines.discretize_accum,
+                &[
+                    (0, t_a_buf.clone()),
+                    (1, a_bar_buf.clone()),
+                ],
+                &push_n,
+                n * n,
+            );
+
+            // T_next = (Δ/k) · T · A.
+            let push_step = [n as u32, k as u32, delta_val.to_bits()];
+            self.run_compute_shader(
+                &pipelines.discretize_step,
+                &[
+                    (0, t_a_buf.clone()),
+                    (1, a_buf.clone()),
+                    (2, t_b_buf.clone()),
+                ],
+                &push_step,
+                n * n,
+            );
+
+            // Ping-pong.
+            std::mem::swap(&mut t_a_buf, &mut t_b_buf);
+        }
+
+        // 3. Финальный accumulate для последнего T.
+        self.run_compute_shader(
+            &pipelines.discretize_accum,
+            &[
+                (0, t_a_buf.clone()),
+                (1, a_bar_buf.clone()),
+            ],
+            &push_n,
+            n * n,
+        );
+
+        // 4. B_bar = Δ · B.
+        let push_scale_b = [n as u32, d as u32, delta_val.to_bits()];
+        self.run_compute_shader(
+            &pipelines.discretize_scale_b,
+            &[
+                (0, b_buf),
+                (1, b_bar_buf.clone()),
+            ],
+            &push_scale_b,
+            n * d,
+        );
+
+        // 5. Освобождение временных T-буферов.
+        self.release_temp_buffer(t_a_buf, t_a_raw);
+        self.release_temp_buffer(t_b_buf, t_b_raw);
     }
 }

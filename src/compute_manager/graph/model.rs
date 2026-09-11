@@ -57,6 +57,14 @@ impl ParamGradients {
     }
 }
 
+/// Раскладка чанков, зафиксированная в момент forward.
+///
+/// Вектор `(start, end)` соответствует глобальному порядку чанков, в котором
+/// были сохранены контексты слоёв. Используется backward'ом, чтобы гарантировать
+/// соответствие между `contexts[i]` и диапазоном батча, для которого этот
+/// контекст был построен.
+pub type SavedChunkLayout = Vec<(usize, usize, usize)>;
+
 pub struct MixedModel {
     pub(crate) models: Arc<Vec<Model>>,
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
@@ -71,7 +79,13 @@ pub struct MixedModel {
     pub(crate) output_shapes: Vec<Vec<usize>>,
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
     pub(crate) optimizer_exprs: HashMap<usize, OptimizerExpr>,
-    pub(crate) last_forward_contexts: HashMap<usize, ChunkedContexts>,
+    /// Для каждой модели — пара (контексты слоёв, раскладка чанков).
+    ///
+    /// Раскладка сохраняется в момент forward и переиспользуется в backward,
+    /// чтобы forward и backward работали с одинаковым разбиением батча
+    /// (см. `parallel::forward_universal_parallel` /
+    /// `parallel::backward_universal_parallel`).
+    pub(crate) last_forward_contexts: HashMap<usize, (ChunkedContexts, SavedChunkLayout)>,
 }
 
 impl MixedModel {

@@ -31,7 +31,7 @@ fn get_proc_output_features(
             || layer.as_soft_keep_gate().is_some()
             || layer.as_dual_anchor().is_some()
         {
-            // Размерность не меняется
+            // Размерность не меняется.
         }
     }
     current_cols
@@ -66,10 +66,10 @@ impl MixedModel {
         let mut stream_buffers: Vec<MatrixBufferHandle> = inputs;
         let mut all_ctxs: ChunkedContexts = Vec::new();
 
-        // Получаем пул из self
+        // Получаем пул из self.
         let pool = self.temp_matrix_pool.clone();
 
-        // Клонируем Arc, а не весь вектор моделей
+        // Клонируем Arc, а не весь вектор моделей.
         let models = Arc::clone(&self.models);
 
         for (model_index, model) in models.iter().enumerate() {
@@ -81,19 +81,29 @@ impl MixedModel {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
                         let mut pool_guard = pool.lock().unwrap();
-                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(&mut pool_guard, buf, target_dims));
+                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(
+                            &mut pool_guard,
+                            buf,
+                            target_dims,
+                        ));
                     }
                     stream_buffers = new_stream;
-                    self.last_forward_contexts.insert(model_index, Vec::new());
+                    self.last_forward_contexts
+                        .insert(model_index, (Vec::new(), Vec::new()));
                 }
                 Model::ReduceMean(target_dims) => {
                     let mut new_stream = Vec::with_capacity(stream_buffers.len());
                     for buf in stream_buffers {
                         let mut pool_guard = pool.lock().unwrap();
-                        new_stream.push(dim_change::reduce_mat_buffered_handle(&mut pool_guard, buf, target_dims));
+                        new_stream.push(dim_change::reduce_mat_buffered_handle(
+                            &mut pool_guard,
+                            buf,
+                            target_dims,
+                        ));
                     }
                     stream_buffers = new_stream;
-                    self.last_forward_contexts.insert(model_index, Vec::new());
+                    self.last_forward_contexts
+                        .insert(model_index, (Vec::new(), Vec::new()));
                 }
                 Model::UniversalProcessor(proc, slices, stream_indices) => {
                     let active_indices: Vec<usize> = match stream_indices {
@@ -112,7 +122,9 @@ impl MixedModel {
                         let input_buf = stream_buffers[stream_idx].clone();
 
                         if let ComputeDevice::Gpu { .. } = device {
-                            let gpu = self.compute_executor.gpu_compute()
+                            let gpu = self
+                                .compute_executor
+                                .gpu_compute()
                                 .expect("GPU requested but not available");
 
                             let input_gpu = if input_buf.is_gpu() {
@@ -126,7 +138,6 @@ impl MixedModel {
                                 gpu_buf
                             };
 
-                            // Передаём срезы
                             let (out_gpu, layer_ctxs) = process_forward_gpu_buffered(
                                 gpu.as_ref(),
                                 proc.as_ref().as_slice(),
@@ -137,7 +148,7 @@ impl MixedModel {
 
                             stream_buffers[stream_idx] = out_gpu;
                             self.last_forward_contexts
-                                .insert(model_index, vec![layer_ctxs.clone()]);
+                                .insert(model_index, (vec![layer_ctxs.clone()], Vec::new()));
                             all_ctxs.push(layer_ctxs);
                         } else {
                             let can_parallel = can_parallelize(proc.as_ref().as_slice())
@@ -145,17 +156,17 @@ impl MixedModel {
                                 && self.executor.num_workers() > 1;
 
                             if can_parallel {
-                                let out_features = get_proc_output_features(proc.as_ref().as_slice(), &input_buf);
+                                let out_features =
+                                    get_proc_output_features(proc.as_ref().as_slice(), &input_buf);
                                 let out_handle = {
                                     let mut pool_guard = pool.lock().unwrap();
                                     pool_guard.acquire(input_buf.rows(), out_features)
                                 };
 
-                                // Для параллельной ветки нужны владеющие копии
                                 let proc_arc = Arc::clone(proc);
                                 let slices_vec = slices.clone();
 
-                                let chunk_ctxs = forward_universal_parallel(
+                                let (chunk_ctxs, chunk_layout) = forward_universal_parallel(
                                     self.executor.as_ref(),
                                     pool.clone(),
                                     proc_arc,
@@ -167,14 +178,14 @@ impl MixedModel {
 
                                 stream_buffers[stream_idx] = out_handle;
                                 self.last_forward_contexts
-                                    .insert(model_index, chunk_ctxs.clone());
+                                    .insert(model_index, (chunk_ctxs.clone(), chunk_layout));
                                 all_ctxs.extend(chunk_ctxs);
                             } else {
                                 let ctxs = {
                                     let mut pool_guard = pool.lock().unwrap();
                                     self.process_universal_processor_forward_buffered(
                                         &mut pool_guard,
-                                        proc,  // передаём &Arc<Vec<...>> как ожидает метод
+                                        proc,
                                         slices.as_slice(),
                                         model_index,
                                         &params_handle,
@@ -182,8 +193,10 @@ impl MixedModel {
                                         stream_indices,
                                     )
                                 };
+                                // Последовательный путь: один чанк = весь батч.
+                                let layout = vec![(0usize, batch_size, batch_size)];
                                 self.last_forward_contexts
-                                    .insert(model_index, vec![ctxs.clone()]);
+                                    .insert(model_index, (vec![ctxs.clone()], layout));
                                 all_ctxs.push(ctxs);
                             }
                         }
@@ -200,7 +213,8 @@ impl MixedModel {
                         &mut all_ctxs,
                         model_index,
                     );
-                    self.last_forward_contexts.insert(model_index, Vec::new());
+                    self.last_forward_contexts
+                        .insert(model_index, (Vec::new(), Vec::new()));
                 }
                 Model::CombinerConnector { input_dims, .. } => {
                     let mut pool_guard = pool.lock().unwrap();
@@ -212,9 +226,14 @@ impl MixedModel {
                         &mut all_ctxs,
                         model_index,
                     );
-                    self.last_forward_contexts.insert(model_index, Vec::new());
+                    self.last_forward_contexts
+                        .insert(model_index, (Vec::new(), Vec::new()));
                 }
-                Model::Splitter { input_dim, output_dims, slice } => {
+                Model::Splitter {
+                    input_dim,
+                    output_dims,
+                    slice,
+                } => {
                     let mut pool_guard = pool.lock().unwrap();
                     self.process_splitter_forward_buffered(
                         &mut pool_guard,
@@ -226,14 +245,20 @@ impl MixedModel {
                         &mut all_ctxs,
                         model_index,
                     );
+                    let layout = vec![(0usize, batch_size, batch_size)];
                     if let Some(ctx) = all_ctxs.last().and_then(|chunk| chunk.last()) {
                         self.last_forward_contexts
-                            .insert(model_index, vec![vec![ctx.clone()]]);
+                            .insert(model_index, (vec![vec![ctx.clone()]], layout));
                     } else {
-                        self.last_forward_contexts.insert(model_index, Vec::new());
+                        self.last_forward_contexts
+                            .insert(model_index, (Vec::new(), layout));
                     }
                 }
-                Model::Combiner { input_dim, output_dim, slice } => {
+                Model::Combiner {
+                    input_dim,
+                    output_dim,
+                    slice,
+                } => {
                     let mut pool_guard = pool.lock().unwrap();
                     self.process_combiner_forward_buffered(
                         &mut pool_guard,
@@ -245,11 +270,13 @@ impl MixedModel {
                         &mut all_ctxs,
                         model_index,
                     );
+                    let layout = vec![(0usize, batch_size, batch_size)];
                     if let Some(ctx) = all_ctxs.last().and_then(|chunk| chunk.last()) {
                         self.last_forward_contexts
-                            .insert(model_index, vec![vec![ctx.clone()]]);
+                            .insert(model_index, (vec![vec![ctx.clone()]], layout));
                     } else {
-                        self.last_forward_contexts.insert(model_index, Vec::new());
+                        self.last_forward_contexts
+                            .insert(model_index, (Vec::new(), layout));
                     }
                 }
             }

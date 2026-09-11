@@ -1,10 +1,16 @@
 // src/compute_manager/cpu/parallel.rs
 
-use std::sync::{Arc, Barrier, Mutex};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use crate::compute_manager::cpu::WorkerPool;
 use crate::compute_manager::executor::Executor;
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext};
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::{
     UniversalLayer, UniversalLayerBuffered,
@@ -17,7 +23,313 @@ use crate::layers::{
 };
 use crate::model_plan::param_store::ParamSlice;
 
-/// Общая структура данных для одной задачи прямого прохода.
+// ============================================================================
+//  Наблюдение за состоянием чанков (ChunkTracker + watchdog)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkStatus {
+    Pending,
+    Assigned,
+    InProgress,
+    Done,
+}
+
+struct ChunkState {
+    chunk_id: usize,
+    start: usize,
+    end: usize,
+    status: ChunkStatus,
+    assigned_worker: Option<usize>,
+    physical_worker: Option<usize>,
+    started_at: Option<Instant>,
+    finished_at: Option<Instant>,
+    duration_ns: u64,
+}
+
+struct ChunkTracker {
+    chunks: Vec<ChunkState>,
+    created_at: Instant,
+    last_change: Instant,
+    total_changes: usize,
+}
+
+impl ChunkTracker {
+    fn new(chunks: &[(usize, usize, usize)]) -> Self {
+        let now = Instant::now();
+        let entries = chunks
+            .iter()
+            .enumerate()
+            .map(|(chunk_id, &(start, _size, end))| ChunkState {
+                chunk_id,
+                start,
+                end,
+                status: ChunkStatus::Pending,
+                assigned_worker: None,
+                physical_worker: None,
+                started_at: None,
+                finished_at: None,
+                duration_ns: 0,
+            })
+            .collect();
+        Self {
+            chunks: entries,
+            created_at: now,
+            last_change: now,
+            total_changes: 0,
+        }
+    }
+
+    fn mark_assigned(&mut self, chunk_id: usize, logical_worker_id: usize) {
+        if let Some(c) = self.chunks.get_mut(chunk_id) {
+            c.status = ChunkStatus::Assigned;
+            c.assigned_worker = Some(logical_worker_id);
+            self.last_change = Instant::now();
+            self.total_changes += 1;
+        }
+    }
+
+    fn mark_in_progress(&mut self, chunk_id: usize, physical_worker_id: usize) {
+        if let Some(c) = self.chunks.get_mut(chunk_id) {
+            c.status = ChunkStatus::InProgress;
+            c.physical_worker = Some(physical_worker_id);
+            c.started_at = Some(Instant::now());
+            self.last_change = Instant::now();
+            self.total_changes += 1;
+        }
+    }
+
+    fn mark_done(&mut self, chunk_id: usize, duration_ns: u64) {
+        if let Some(c) = self.chunks.get_mut(chunk_id) {
+            c.status = ChunkStatus::Done;
+            c.finished_at = Some(Instant::now());
+            c.duration_ns = duration_ns;
+            self.last_change = Instant::now();
+            self.total_changes += 1;
+        }
+    }
+
+    fn total_changes(&self) -> usize {
+        self.total_changes
+    }
+
+    fn dump(&self) -> String {
+        let elapsed = self.created_at.elapsed();
+        let mut s = String::new();
+
+        let n_total = self.chunks.len();
+        let n_done = self.chunks.iter().filter(|c| c.status == ChunkStatus::Done).count();
+        let n_in_progress = self
+            .chunks
+            .iter()
+            .filter(|c| c.status == ChunkStatus::InProgress)
+            .count();
+        let n_assigned = self
+            .chunks
+            .iter()
+            .filter(|c| c.status == ChunkStatus::Assigned)
+            .count();
+        let n_pending = self
+            .chunks
+            .iter()
+            .filter(|c| c.status == ChunkStatus::Pending)
+            .count();
+
+        let _ = writeln!(s, "=== ChunkTracker dump @ T+{:.3}s ===", elapsed.as_secs_f64());
+        let _ = writeln!(
+            s,
+            "total={} | done={} | in_progress={} | assigned={} | pending={}",
+            n_total, n_done, n_in_progress, n_assigned, n_pending
+        );
+        let _ = writeln!(
+            s,
+            "last_change: T+{:.3}s ({} changes total)",
+            self.last_change.duration_since(self.created_at).as_secs_f64(),
+            self.total_changes
+        );
+
+        let _ = writeln!(s, "--- done ---");
+        let mut any = false;
+        for c in self.chunks.iter().filter(|c| c.status == ChunkStatus::Done) {
+            any = true;
+            let _ = writeln!(
+                s,
+                "  chunk {:>3}  range [{:>3}..{:<3})  assigned={:?}  physical={:?}  dur={:.3}us",
+                c.chunk_id,
+                c.start,
+                c.end,
+                c.assigned_worker,
+                c.physical_worker,
+                c.duration_ns as f64 / 1000.0
+            );
+        }
+        if !any {
+            let _ = writeln!(s, "  (none)");
+        }
+
+        let _ = writeln!(s, "--- in_progress ---");
+        any = false;
+        for c in self.chunks.iter().filter(|c| c.status == ChunkStatus::InProgress) {
+            any = true;
+            let running = c
+                .started_at
+                .map(|a| format!("{:.3}s", a.elapsed().as_secs_f64()))
+                .unwrap_or_else(|| "?".into());
+            let _ = writeln!(
+                s,
+                "  chunk {:>3}  range [{:>3}..{:<3})  assigned={:?}  physical={:?}  running={}",
+                c.chunk_id, c.start, c.end, c.assigned_worker, c.physical_worker, running
+            );
+        }
+        if !any {
+            let _ = writeln!(s, "  (none)");
+        }
+
+        let _ = writeln!(s, "--- assigned (not started) ---");
+        any = false;
+        for c in self.chunks.iter().filter(|c| c.status == ChunkStatus::Assigned) {
+            any = true;
+            let _ = writeln!(
+                s,
+                "  chunk {:>3}  range [{:>3}..{:<3})  assigned_worker={:?}",
+                c.chunk_id, c.start, c.end, c.assigned_worker
+            );
+        }
+        if !any {
+            let _ = writeln!(s, "  (none)");
+        }
+
+        let _ = writeln!(s, "--- pending ---");
+        any = false;
+        for c in self.chunks.iter().filter(|c| c.status == ChunkStatus::Pending) {
+            any = true;
+            let _ = writeln!(s, "  chunk {:>3}  range [{:>3}..{:<3})", c.chunk_id, c.start, c.end);
+        }
+        if !any {
+            let _ = writeln!(s, "  (none)");
+        }
+
+        let _ = writeln!(s, "--- logical worker stats ---");
+        let mut lmap: BTreeMap<usize, (usize, usize, usize, Vec<usize>)> = BTreeMap::new();
+        for c in &self.chunks {
+            if let Some(w) = c.assigned_worker {
+                let e = lmap.entry(w).or_insert((0, 0, 0, Vec::new()));
+                match c.status {
+                    ChunkStatus::Done => e.0 += 1,
+                    ChunkStatus::InProgress => e.1 += 1,
+                    ChunkStatus::Assigned => e.2 += 1,
+                    ChunkStatus::Pending => {}
+                }
+                e.3.push(c.chunk_id);
+            }
+        }
+        if lmap.is_empty() {
+            let _ = writeln!(s, "  (none)");
+        } else {
+            for (w, (d, ip, a, ids)) in lmap {
+                let _ = writeln!(
+                    s,
+                    "  logical worker {}: done={}, in_progress={}, assigned={}, chunks={:?}",
+                    w, d, ip, a, ids
+                );
+            }
+        }
+
+        let _ = writeln!(s, "--- physical worker stats ---");
+        let mut pmap: BTreeMap<usize, (usize, usize, Vec<usize>)> = BTreeMap::new();
+        for c in &self.chunks {
+            if let Some(w) = c.physical_worker {
+                let e = pmap.entry(w).or_insert((0, 0, Vec::new()));
+                match c.status {
+                    ChunkStatus::Done => e.0 += 1,
+                    ChunkStatus::InProgress => e.1 += 1,
+                    _ => {}
+                }
+                e.2.push(c.chunk_id);
+            }
+        }
+        if pmap.is_empty() {
+            let _ = writeln!(s, "  (no physical worker has touched any chunk)");
+        } else {
+            for (w, (d, ip, ids)) in pmap {
+                let _ = writeln!(
+                    s,
+                    "  physical worker {}: done={}, in_progress={}, chunks={:?}",
+                    w, d, ip, ids
+                );
+            }
+        }
+
+        s
+    }
+}
+
+/// Секунд без прогресса, после которых watchdog печатает дамп трекера.
+/// Это страховка от реальных зависаний в пользовательских слоях.
+const CHUNK_WATCHDOG_STUCK_SECS: u64 = 15;
+
+fn start_chunk_watchdog(
+    tracker: Arc<Mutex<ChunkTracker>>,
+    done_flag: Arc<AtomicBool>,
+    stuck_secs: u64,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("chunk-watchdog".into())
+        .spawn(move || {
+            const MAX_DUMPS: u32 = 3;
+            let tick = Duration::from_millis(500);
+            let stuck_threshold = Duration::from_secs(stuck_secs);
+
+            let mut last_total_changes = 0usize;
+            let mut last_progress_at = Instant::now();
+            let mut dumps_emitted = 0u32;
+
+            loop {
+                thread::sleep(tick);
+                if done_flag.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let current = {
+                    let g = tracker.lock().unwrap();
+                    g.total_changes()
+                };
+
+                if current != last_total_changes {
+                    last_total_changes = current;
+                    last_progress_at = Instant::now();
+                    dumps_emitted = 0;
+                    continue;
+                }
+
+                if last_progress_at.elapsed() >= stuck_threshold {
+                    if dumps_emitted < MAX_DUMPS {
+                        let dump = {
+                            let g = tracker.lock().unwrap();
+                            g.dump()
+                        };
+                        eprintln!(
+                            "[chunk-watchdog] NO PROGRESS for {}s, dump #{}/{}:",
+                            stuck_secs,
+                            dumps_emitted + 1,
+                            MAX_DUMPS
+                        );
+                        for line in dump.lines() {
+                            eprintln!("[chunk-watchdog] {}", line);
+                        }
+                        dumps_emitted += 1;
+                    }
+                    last_progress_at = Instant::now();
+                }
+            }
+        })
+        .expect("Failed to spawn chunk watchdog")
+}
+
+// ============================================================================
+//  Общие структуры задач
+// ============================================================================
+
 struct ForwardTaskShared {
     input: MatrixBufferHandle,
     output: MatrixBufferHandle,
@@ -27,7 +339,6 @@ struct ForwardTaskShared {
     pool: Arc<Mutex<TempMatrixPool>>,
 }
 
-/// Общая структура данных для одной задачи обратного прохода.
 struct BackwardTaskShared {
     grad_output: MatrixBufferHandle,
     grad_input: MatrixBufferHandle,
@@ -38,6 +349,10 @@ struct BackwardTaskShared {
     contexts: ChunkedContexts,
     pool: Arc<Mutex<TempMatrixPool>>,
 }
+
+// ============================================================================
+//  Вспомогательные функции работы с чанками
+// ============================================================================
 
 pub(crate) fn extract_chunk(
     input: &MatrixBufferHandle,
@@ -88,6 +403,10 @@ pub(crate) fn write_chunk(
     }
 }
 
+// ============================================================================
+//  Размерности слоёв
+// ============================================================================
+
 fn get_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
     if let Some(l) = layer.as_linear() {
         <Linear as UniversalLayerBuffered>::output_features(l)
@@ -98,7 +417,6 @@ fn get_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHand
     } else if let Some(l) = layer.as_spectral_norm_linear() {
         <SpectrallyNormalizedLinear as UniversalLayerBuffered>::output_features(l)
     } else {
-        // Все остальные слои сохраняют размерность
         input.cols()
     }
 }
@@ -116,6 +434,10 @@ fn get_input_features(layer: &Box<dyn UniversalLayer>, grad_output: &MatrixBuffe
         grad_output.cols()
     }
 }
+
+// ============================================================================
+//  Диспетчеризация слоёв
+// ============================================================================
 
 fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
@@ -286,8 +608,6 @@ fn build_buffered_context(
     } else if layer.as_rms_norm_learnable_eps().is_some() {
         BufferedContext::RMSNormWithLearnableEpsilon { input: input.clone() }
     } else if layer.as_adaptive_dropout().is_some() {
-        // CPU-ветка: mask и arg не нужны в контексте, но требуются для типа.
-        // Создаём пустые handle.
         let empty_mask = pool_guard.acquire(0, 0);
         let empty_arg = pool_guard.acquire(0, 0);
         BufferedContext::AdaptiveDropout {
@@ -308,7 +628,7 @@ fn build_buffered_context(
             input: input.clone(),
             mean: Vec::new(),
             var: Vec::new(),
-            use_batch_stats: true, // можно уточнить, но для CPU backward статистики берутся из слоя? В текущей реализации batch_renorm backward использует mean/var из ctx, но forward их не сохраняет. Временное решение: оставляем пустые. Лучше исправить сам слой, но пока так.
+            use_batch_stats: true,
         }
     } else if layer.as_concrete_dropout().is_some() {
         let empty_arg = pool_guard.acquire(0, 0);
@@ -336,8 +656,6 @@ fn build_buffered_context(
 }
 
 pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
-    // Запрещаем параллелизм для слоёв с внутренним состоянием,
-    // которое общее для всех чанков батча.
     !layers.iter().any(|l| {
         l.as_memory().is_some()
             || l.as_ind_rnn().is_some()
@@ -348,6 +666,31 @@ pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
     })
 }
 
+// ============================================================================
+//  Параллельный forward
+// ============================================================================
+
+/// Один чанк вместе с его глобальным ID.
+#[derive(Clone, Copy)]
+struct ChunkMeta {
+    chunk_id: usize,
+    start: usize,
+    size: usize,
+    end: usize,
+}
+
+/// Параллельный прямой проход.
+///
+/// Возвращает `(контексты, раскладка)`:
+/// * `контексты` — `ctx_storage[i]` содержит контексты слоёв для чанка с глобальным
+///   `chunk_id = i`.
+/// * `раскладка` — `Vec<(start, size, end)>` в том же глобальном порядке
+///   (`раскладка[i]` соответствует `контексты[i]`).
+///
+/// Эту пару обязательно нужно сохранить между forward и backward: scheduler
+/// может изменить `plan_chunks_assignment` между вызовами (после обучения
+/// mini-model), поэтому backward не должен перезапрашивать раскладку — он
+/// получает её как аргумент.
 pub(crate) fn forward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -356,14 +699,63 @@ pub(crate) fn forward_universal_parallel(
     params: MatrixBufferHandle,
     input: MatrixBufferHandle,
     output: MatrixBufferHandle,
-) -> ChunkedContexts {
+) -> (ChunkedContexts, Vec<(usize, usize, usize)>) {
     let batch_size = input.rows();
-    let chunks = executor.plan_chunks_assignment(batch_size);
-    let all_chunks: Vec<(usize, usize, usize)> = chunks.into_iter().flatten().collect();
-    let num_chunks = all_chunks.len();
-    if num_chunks == 0 {
-        return Vec::new();
+    let num_workers = executor.num_workers();
+
+    assert!(
+        num_workers >= 1,
+        "forward_universal_parallel: worker pool has no workers (num_workers = {})",
+        num_workers
+    );
+
+    let assignments = executor.plan_chunks_assignment(batch_size);
+
+    assert_eq!(
+        assignments.len(),
+        num_workers,
+        "forward_universal_parallel: scheduler returned {} worker assignments, \
+         but pool has {} workers",
+        assignments.len(),
+        num_workers
+    );
+
+    // Нумеруем чанки глобально в том порядке, в каком они пришли.
+    let mut global_chunks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut per_worker_chunks: Vec<Vec<ChunkMeta>> = Vec::with_capacity(num_workers);
+
+    for worker_chunks in assignments {
+        let mut metas = Vec::with_capacity(worker_chunks.len());
+        for (start, size, end) in worker_chunks {
+            let cid = global_chunks.len();
+            global_chunks.push((start, size, end));
+            metas.push(ChunkMeta { chunk_id: cid, start, size, end });
+        }
+        per_worker_chunks.push(metas);
     }
+
+    let total_chunks = global_chunks.len();
+    if total_chunks == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Tracker + watchdog.
+    let tracker = Arc::new(Mutex::new(ChunkTracker::new(&global_chunks)));
+    {
+        let mut t = tracker.lock().unwrap();
+        for (logical_worker_id, metas) in per_worker_chunks.iter().enumerate() {
+            for m in metas {
+                t.mark_assigned(m.chunk_id, logical_worker_id);
+            }
+        }
+    }
+
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let watchdog = start_chunk_watchdog(
+        tracker.clone(),
+        done_flag.clone(),
+        CHUNK_WATCHDOG_STUCK_SECS,
+    );
 
     let slices_arc = Arc::new(slices);
     let shared = Arc::new(ForwardTaskShared {
@@ -375,64 +767,163 @@ pub(crate) fn forward_universal_parallel(
         pool,
     });
 
-    let ctx_storage = Arc::new(Mutex::new(vec![Vec::new(); num_chunks]));
-    let barrier = Arc::new(Barrier::new(num_chunks + 1));
+    let ctx_storage: Arc<Mutex<Vec<Vec<DynamicContext>>>> =
+        Arc::new(Mutex::new(vec![Vec::new(); total_chunks]));
 
-    for (chunk_id, (start, _size, end)) in all_chunks.into_iter().enumerate() {
+    // Владеющий `'static`-хэндл для воркеров.
+    let executor_arc: Arc<dyn Executor> = Arc::from(executor.clone_executor());
+
+    for (logical_worker_id, metas) in per_worker_chunks.into_iter().enumerate() {
         let shared = shared.clone();
-        let barrier = barrier.clone();
+        let tracker = tracker.clone();
         let ctx_storage = ctx_storage.clone();
+        let executor_for_worker = Arc::clone(&executor_arc);
 
-        executor.execute_dyn(Box::new(move || {
-            {
-                let mut pool_guard = shared.pool.lock().unwrap();
-                let input_chunk = extract_chunk(&shared.input, start, end, &mut *pool_guard);
+        let task = Box::new(move || {
+            let physical_worker_id = WorkerPool::current_worker_index();
+
+            let mut pool_guard = shared.pool.lock().unwrap();
+
+            for m in metas {
+                tracker
+                    .lock()
+                    .unwrap()
+                    .mark_in_progress(m.chunk_id, physical_worker_id);
+
+                let t0 = Instant::now();
+
+                let input_chunk =
+                    extract_chunk(&shared.input, m.start, m.end, &mut *pool_guard);
                 let mut current = input_chunk;
                 let mut chunk_ctxs = Vec::with_capacity(shared.layers.len());
 
                 for (layer, slice) in shared.layers.iter().zip(shared.slices.iter()) {
                     let out_cols = get_output_features(layer, &current);
                     let out = pool_guard.acquire(current.rows(), out_cols);
-                    let buffered_ctx = build_buffered_context(layer, &current, &out, &mut *pool_guard);
+                    let buffered_ctx =
+                        build_buffered_context(layer, &current, &out, &mut *pool_guard);
                     call_forward_buffered(layer, &current, &out, &shared.params, slice);
                     chunk_ctxs.push(DynamicContext::Buffered(buffered_ctx));
                     current = out;
                 }
 
-                write_chunk(&shared.output, &current, start);
+                write_chunk(&shared.output, &current, m.start);
 
                 {
                     let mut storage = ctx_storage.lock().unwrap();
-                    storage[chunk_id] = chunk_ctxs;
+                    storage[m.chunk_id] = chunk_ctxs;
                 }
+
+                let duration_ns = t0.elapsed().as_nanos() as u64;
+
+                tracker
+                    .lock()
+                    .unwrap()
+                    .mark_done(m.chunk_id, duration_ns);
+
+                // Обратная связь scheduler'у — обучение mini-model.
+                executor_for_worker.report_execution_time(
+                    logical_worker_id,
+                    m.size,
+                    duration_ns as f64,
+                );
             }
-            barrier.wait();
-        }));
+        });
+
+        executor.execute_dyn(task);
     }
 
-    barrier.wait();
+    executor.wait_all();
+
+    done_flag.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+
     let storage = ctx_storage.lock().unwrap();
-    storage.clone()
+    (storage.clone(), global_chunks)
 }
 
+// ============================================================================
+//  Параллельный backward
+// ============================================================================
+
+/// Параллельный обратный проход.
+///
+/// Раскладку чанков **не запрашивает заново** у scheduler'а — она приходит
+/// аргументом `saved_chunks` из forward-прохода. Это гарантирует, что
+/// `contexts[i]` (сохранённый forward-контекст) соответствует `saved_chunks[i]`
+/// (диапазон батча).
+///
+/// Чанки распределяются по воркерам простым round-robin: воркер `k`
+/// обрабатывает чанки `k, k + num_workers, k + 2·num_workers, …`.
+/// Если `saved_chunks.len() < num_workers` — часть воркеров получит пустой
+/// набор задач и ничего не будет делать (это корректно).
 pub(crate) fn backward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
     layers: Arc<Vec<Box<dyn UniversalLayer>>>,
     slices: Vec<ParamSlice>,
     contexts: ChunkedContexts,
+    saved_chunks: &[(usize, usize, usize)],
     grad_output: MatrixBufferHandle,
     grad_input: MatrixBufferHandle,
     params: MatrixBufferHandle,
     grad_params: MatrixBufferHandle,
 ) {
     let batch_size = grad_output.rows();
-    let chunks = executor.plan_chunks_assignment(batch_size);
-    let all_chunks: Vec<(usize, usize, usize)> = chunks.into_iter().flatten().collect();
-    let num_chunks = all_chunks.len();
-    if num_chunks == 0 || num_chunks != contexts.len() {
-        panic!("backward_universal_parallel: number of chunks does not match contexts");
+    let num_workers = executor.num_workers();
+
+    assert!(
+        num_workers >= 1,
+        "backward_universal_parallel: worker pool has no workers (num_workers = {})",
+        num_workers
+    );
+
+    let total_chunks = saved_chunks.len();
+    if total_chunks == 0 {
+        return;
     }
+
+    assert_eq!(
+        total_chunks,
+        contexts.len(),
+        "backward_universal_parallel: number of saved chunks ({}) does not match contexts ({})",
+        total_chunks,
+        contexts.len()
+    );
+
+    // Round-robin по воркерам. Воркер k получает чанки k, k+nw, k+2·nw, ...
+    let mut per_worker_chunks: Vec<Vec<ChunkMeta>> =
+        (0..num_workers).map(|_| Vec::new()).collect();
+
+    for (chunk_id, &(start, size, end)) in saved_chunks.iter().enumerate() {
+        let logical_worker_id = chunk_id % num_workers;
+        per_worker_chunks[logical_worker_id].push(ChunkMeta {
+            chunk_id,
+            start,
+            size,
+            end,
+        });
+    }
+
+    let _ = batch_size; // сохраняем для отладки при необходимости
+
+    // Tracker + watchdog (та же раскладка, что и в forward).
+    let tracker = Arc::new(Mutex::new(ChunkTracker::new(saved_chunks)));
+    {
+        let mut t = tracker.lock().unwrap();
+        for (logical_worker_id, metas) in per_worker_chunks.iter().enumerate() {
+            for m in metas {
+                t.mark_assigned(m.chunk_id, logical_worker_id);
+            }
+        }
+    }
+
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let watchdog = start_chunk_watchdog(
+        tracker.clone(),
+        done_flag.clone(),
+        CHUNK_WATCHDOG_STUCK_SECS,
+    );
 
     let slices_arc = Arc::new(slices);
     let shared = Arc::new(BackwardTaskShared {
@@ -446,39 +937,52 @@ pub(crate) fn backward_universal_parallel(
         pool,
     });
 
+    // Временные буферы градиентов — по одному на чанк.
     let param_len = shared.grad_params.rows();
-    let mut temp_grads = Vec::with_capacity(num_chunks);
-    for _ in 0..num_chunks {
-        temp_grads.push(
-            shared
-                .pool
-                .lock()
-                .unwrap()
-                .acquire(param_len, 1),
-        );
+    let mut temp_grads: Vec<MatrixBufferHandle> = Vec::with_capacity(total_chunks);
+    for _ in 0..total_chunks {
+        let h = shared.pool.lock().unwrap().acquire(param_len, 1);
+        temp_grads.push(h);
     }
+    let temp_grads = Arc::new(temp_grads);
 
-    let barrier = Arc::new(Barrier::new(num_chunks + 1));
+    for metas in per_worker_chunks.into_iter() {
+        if metas.is_empty() {
+            continue;
+        }
 
-    for (chunk_id, (start, _size, end)) in all_chunks.into_iter().enumerate() {
         let shared = shared.clone();
-        let barrier = barrier.clone();
-        let temp_grad = temp_grads[chunk_id].clone();
+        let tracker = tracker.clone();
+        let temp_grads = temp_grads.clone();
 
-        executor.execute_dyn(Box::new(move || {
-            {
-                let mut pool_guard = shared.pool.lock().unwrap();
-                let grad_output_chunk = extract_chunk(&shared.grad_output, start, end, &mut *pool_guard);
+        let task = Box::new(move || {
+            let physical_worker_id = WorkerPool::current_worker_index();
+
+            let mut pool_guard = shared.pool.lock().unwrap();
+
+            for m in metas {
+                tracker
+                    .lock()
+                    .unwrap()
+                    .mark_in_progress(m.chunk_id, physical_worker_id);
+
+                let t0 = Instant::now();
+
+                let grad_output_chunk =
+                    extract_chunk(&shared.grad_output, m.start, m.end, &mut *pool_guard);
                 let mut current_grad = grad_output_chunk;
 
-                let contexts_chunk = &shared.contexts[chunk_id];
+                let contexts_chunk = &shared.contexts[m.chunk_id];
+                let temp_grad = &temp_grads[m.chunk_id];
+
                 for i in (0..shared.layers.len()).rev() {
                     let layer = &shared.layers[i];
                     let slice = &shared.slices[i];
                     let ctx = &contexts_chunk[i];
 
                     let in_features = get_input_features(layer, &current_grad);
-                    let grad_input_chunk = pool_guard.acquire(current_grad.rows(), in_features);
+                    let grad_input_chunk =
+                        pool_guard.acquire(current_grad.rows(), in_features);
 
                     call_backward_buffered(
                         layer,
@@ -487,22 +991,34 @@ pub(crate) fn backward_universal_parallel(
                         &grad_input_chunk,
                         &shared.params,
                         slice,
-                        &temp_grad,
+                        temp_grad,
                     );
 
                     pool_guard.release(current_grad);
                     current_grad = grad_input_chunk;
                 }
 
-                write_chunk(&shared.grad_input, &current_grad, start);
+                write_chunk(&shared.grad_input, &current_grad, m.start);
                 pool_guard.release(current_grad);
+
+                let duration_ns = t0.elapsed().as_nanos() as u64;
+
+                tracker
+                    .lock()
+                    .unwrap()
+                    .mark_done(m.chunk_id, duration_ns);
             }
-            barrier.wait();
-        }));
+        });
+
+        executor.execute_dyn(task);
     }
 
-    barrier.wait();
+    executor.wait_all();
 
+    done_flag.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+
+    // Финальная редукция: суммируем temp_grads в grad_params.
     let mut pool_guard = shared.pool.lock().unwrap();
     {
         let mut grad_guard = shared.grad_params.write();
@@ -511,7 +1027,7 @@ pub(crate) fn backward_universal_parallel(
             *v = 0.0;
         }
     }
-    for temp in temp_grads {
+    for temp in temp_grads.iter() {
         let temp_guard = temp.read();
         let temp_slice = temp_guard.as_slice().expect("CPU buffer");
         let mut grad_guard = shared.grad_params.write();
@@ -519,6 +1035,8 @@ pub(crate) fn backward_universal_parallel(
         for i in 0..grad_slice.len() {
             grad_slice[i] += temp_slice[i];
         }
-        pool_guard.release(temp);
+    }
+    for temp in temp_grads.iter() {
+        pool_guard.release(temp.clone());
     }
 }

@@ -31,47 +31,26 @@ pub struct TrainingResult {
 }
 
 pub fn execute(plan: &TrainingPlan, device_plan: &DevicePlan) -> Result<TrainingResult, String> {
-    eprintln!("[exec] enter: cloning plan + device_plan");
     let plan = plan.clone();
     let device_plan = device_plan.clone();
 
-    eprintln!("[exec] spawning training thread");
     let handle = thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
-            eprintln!("[exec] thread: start");
             let model_desc = (plan.model_fn)();
-            eprintln!("[exec] thread: model_fn returned {} layer descs", model_desc.len());
-
             let _ = Plan::from_layer_descs(model_desc.clone())?;
-            eprintln!("[exec] thread: plan validated");
-
-            eprintln!("[exec] thread: building MixedModel (device_plan build_memory_executor + ComputeExecutor)");
             let mut model = MixedModel::from_plan_with_device_plan(
                 model_desc,
                 device_plan.clone(),
             )?;
-            eprintln!(
-                "[exec] thread: MixedModel built ({} models, {} input streams, {} output streams)",
-                model.models().len(),
-                model.input_stream_count(),
-                model.output_stream_count(),
-            );
-
-            eprintln!("[exec] thread: entering execute_inner");
-            let r = execute_inner(&plan, &device_plan, &mut model);
-            eprintln!("[exec] thread: execute_inner returned {:?}", r.as_ref().map(|_| "Ok").map_err(|e| e.clone()));
-            r
+            execute_inner(&plan, &device_plan, &mut model)
         })
         .map_err(|e| format!("Failed to spawn training thread: {}", e))?;
 
-    eprintln!("[exec] waiting for thread to join");
-    let result = match handle.join() {
+    match handle.join() {
         Ok(inner_result) => inner_result,
         Err(_) => Err("Training thread panicked".to_string()),
-    };
-    eprintln!("[exec] thread joined");
-    result
+    }
 }
 
 fn execute_inner(
@@ -79,7 +58,6 @@ fn execute_inner(
     _device_plan: &DevicePlan,
     model: &mut MixedModel,
 ) -> Result<TrainingResult, String> {
-    eprintln!("[exec_inner] enter");
     let start_time = Instant::now();
 
     if plan.train_data_streams.is_some() || plan.target_data_streams.is_some() ||
@@ -92,11 +70,9 @@ fn execute_inner(
         );
     }
 
-    eprintln!("[exec_inner] initializing params");
     {
         let mut ps = model.param_store().lock().unwrap();
         let len = ps.total_params();
-        eprintln!("[exec_inner] total params = {}", len);
         match &plan.initializer {
             Initializer::Zeros => ps.set_all_params(&vec![0.0f32; len]),
             Initializer::Ones => ps.set_all_params(&vec![1.0f32; len]),
@@ -114,9 +90,7 @@ fn execute_inner(
             }
         }
     }
-    eprintln!("[exec_inner] params initialized");
 
-    eprintln!("[exec_inner] building opt chain");
     let opt_chain = plan.optimizer_desc.build_chain();
 
     let learning_rate = opt_chain
@@ -128,9 +102,7 @@ fn execute_inner(
                 .map(|sg| sg.factor)
         })
         .unwrap_or(0.01);
-    eprintln!("[exec_inner] learning_rate = {}", learning_rate);
 
-    eprintln!("[exec_inner] setting up monitor");
     let mut monitor = if plan.monitoring {
         let dump_dir = PathBuf::from("nan_dumps");
         let _ = std::fs::create_dir_all(&dump_dir);
@@ -142,9 +114,7 @@ fn execute_inner(
     } else {
         None
     };
-    eprintln!("[exec_inner] monitor set up (enabled={})", plan.monitoring);
 
-    eprintln!("[exec_inner] reading train/target data");
     let train_data = match &plan.train_data {
         Some(data) => data.clone(),
         None => return Err("Training data not provided".into()),
@@ -161,10 +131,6 @@ fn execute_inner(
 
     let num_samples = train_data.num_samples();
     let batch_size = plan.batch_size.max(1);
-    eprintln!(
-        "[exec_inner] num_samples={}, batch_size={}, epochs={}",
-        num_samples, batch_size, plan.epochs
-    );
 
     let mut profiler = if plan.profile != ProfileMode::None {
         Some(Profiler::new(plan.profile))
@@ -176,16 +142,9 @@ fn execute_inner(
     let mut best_epoch = 0usize;
     let mut zero_loss_epoch: Option<usize> = None;
 
-    eprintln!("[exec_inner] starting epochs loop");
     for epoch in 0..plan.epochs {
-        if epoch < 3 || epoch % 50 == 0 {
-            eprintln!("[exec_inner] epoch {}/{}: redistribute", epoch, plan.epochs);
-        }
         model.compute_executor().redistribute(model.models(), plan.batch_size, true);
         let placement = model.compute_executor().get_placement();
-        if epoch < 3 {
-            eprintln!("[exec_inner] epoch {}: migrate_parameters ({} placements)", epoch, placement.len());
-        }
         model.migrate_parameters(&placement)?;
 
         let mut epoch_loss = 0.0f32;
@@ -214,7 +173,7 @@ fn execute_inner(
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
             let t3 = Instant::now();
-            // Градиенты уже находятся внутри ParamStore, поэтому передаём пустой срез
+            // Градиенты уже находятся внутри ParamStore, поэтому передаём пустой срез.
             model.update_params_buffered(plan.optimizer_desc.clone(), &[]);
             let update_dt = t3.elapsed().as_nanos() as u64;
 
@@ -301,7 +260,6 @@ fn execute_inner(
             }
         }
     }
-    eprintln!("[exec_inner] epochs loop completed");
 
     let elapsed = start_time.elapsed().as_secs_f64();
 
@@ -317,7 +275,6 @@ fn execute_inner(
     };
 
     if let Some(test_input) = &plan.test_data {
-        eprintln!("[exec_inner] running final test evaluation");
         let test_input_dynamic = test_input.to_dynamic_tensor();
         let (pred, _) = model.forward(test_input_dynamic.clone());
 
@@ -371,6 +328,5 @@ fn execute_inner(
         result.monitor_summary = Some(summary);
     }
 
-    eprintln!("[exec_inner] returning Ok");
     Ok(result)
 }

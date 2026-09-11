@@ -36,9 +36,7 @@ pub struct Scheduler {
     cost: CostModel,
     training_data: Vec<Vec<(usize, f64)>>,
     training_threshold: usize,
-    /// Наличие GPU в плане устройств. Может использоваться для
-    /// корректировки стратегии планирования (например, уменьшения
-    /// числа CPU-чанков, если часть работы перекладывается на GPU).
+    /// Наличие GPU в плане устройств.
     has_gpu: bool,
 }
 
@@ -85,6 +83,33 @@ fn get_data_dir() -> PathBuf {
         return std::env::temp_dir().join("neurocore_data");
     }
     fallback
+}
+
+/// Возвращает вектор скоростей длиной ровно `num_workers`.
+///
+/// * Если `speeds` короче — дополняет значениями `1.0`.
+/// * Если `speeds` длиннее — обрезает до `num_workers`.
+///
+/// Это устраняет рассинхрон между `core_relative_speeds`
+/// (длиной `logical_cores`) и фактическим числом воркеров пула
+/// (`num_workers`), из-за которого `greedy_assign` мог вернуть
+/// раскладку с количеством записей, не равным числу воркеров.
+fn normalize_speeds(speeds: &[f64], num_workers: usize) -> Vec<f64> {
+    if num_workers == 0 {
+        return Vec::new();
+    }
+    if speeds.len() == num_workers {
+        return speeds.to_vec();
+    }
+    if speeds.len() > num_workers {
+        return speeds[..num_workers].to_vec();
+    }
+    let mut out = Vec::with_capacity(num_workers);
+    out.extend_from_slice(speeds);
+    while out.len() < num_workers {
+        out.push(1.0);
+    }
+    out
 }
 
 impl Scheduler {
@@ -143,7 +168,17 @@ impl Scheduler {
         self.num_workers
     }
 
-    pub fn report_execution_time(&mut self, cpu_idx: usize, task_size: usize, duration_ns: f64) {
+    /// Обратная связь: воркер сообщает время выполнения задачи.
+    ///
+    /// Данные накапливаются в `training_data[worker_id]`. По достижении
+    /// порога `training_threshold` обучается `ForwardTimePredictor`
+    /// для этого воркера, и модель сохраняется на диск.
+    pub fn report_execution_time(
+        &mut self,
+        cpu_idx: usize,
+        task_size: usize,
+        duration_ns: f64,
+    ) {
         if cpu_idx >= self.training_data.len() {
             return;
         }
@@ -151,11 +186,10 @@ impl Scheduler {
         self.training_data[cpu_idx].push((task_size, duration_ns));
 
         if self.training_data[cpu_idx].len() >= self.training_threshold {
-            // Забираем данные для этого CPU
+            // Забираем данные для этого CPU.
             let data = std::mem::take(&mut self.training_data[cpu_idx]);
 
-            // Строим признаки для каждого элемента заранее, чтобы не держать mutable borrow на predictor
-            // во время вызова self.build_time_features (который заимствует self неизменно)
+            // Строим признаки заранее.
             let mut features_list = Vec::with_capacity(data.len());
             let mut targets = Vec::with_capacity(data.len());
             for (size, time) in &data {
@@ -165,13 +199,11 @@ impl Scheduler {
                 targets.push(target);
             }
 
-            // Теперь mutable borrow на predictor
             let predictor = &mut self.predictors[cpu_idx];
             for (features, target) in features_list.into_iter().zip(targets) {
                 predictor.train(&features, target, 0.001);
             }
 
-            // Сохраняем модель
             if cpu_idx < self.predictors_paths.len() {
                 predictor.save(&self.predictors_paths[cpu_idx]);
             }
@@ -196,10 +228,6 @@ impl Scheduler {
             return vec![Vec::new(); self.num_workers];
         }
 
-        // Если есть GPU, можно уменьшить максимальное количество чанков,
-        // так как часть работы уже выполняется на GPU, и CPU‑потоки не должны
-        // создавать излишнюю конкуренцию. Для простоты ограничим максимальное
-        // число чанков половиной от обычного.
         let max_chunks_per_worker = if self.has_gpu {
             MAX_CHUNKS_PER_WORKER / 2
         } else {
@@ -208,7 +236,11 @@ impl Scheduler {
 
         let max_chunks = total_tasks.min(self.num_workers * max_chunks_per_worker);
 
-        let speeds = self.profile.core_relative_speeds.clone();
+        // НОРМАЛИЗАЦИЯ: приводим длины к num_workers. Ключевой фикс —
+        // `core_relative_speeds` может быть длиной logical_cores (напр. 20),
+        // а нам нужны скорости ровно для num_workers воркеров (напр. 2).
+        let speeds = normalize_speeds(&self.profile.core_relative_speeds, self.num_workers);
+        debug_assert_eq!(speeds.len(), self.num_workers);
 
         let has_trained_model = self.predictors.iter().enumerate().any(|(idx, _)| {
             !self.training_data[idx].is_empty()
@@ -308,12 +340,19 @@ impl Scheduler {
         max_chunks: usize,
         speeds: &[f64],
     ) -> Vec<Vec<(usize, usize, usize)>> {
+        debug_assert_eq!(speeds.len(), self.num_workers);
+
         let mut best_penalty = f32::MAX;
         let mut best_assignment = vec![Vec::new(); self.num_workers];
 
         for c in 1..=max_chunks {
             let chunks = split_into_chunks(total_tasks, c);
             let assignment = greedy_assign(&chunks, speeds);
+
+            // Страховка: greedy_assign строит раскладку на основе `speeds.len()`,
+            // но после нормализации speeds это ровно `num_workers`.
+            debug_assert_eq!(assignment.len(), self.num_workers);
+
             let loads: Vec<f64> = assignment
                 .iter()
                 .map(|assigned| assigned.iter().map(|(_, size, _)| *size as f64).sum())

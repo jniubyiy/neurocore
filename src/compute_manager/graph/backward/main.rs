@@ -3,26 +3,27 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::compute_manager::cpu::parallel::{can_parallelize, backward_universal_parallel};
+use crate::compute_manager::cpu::parallel::{backward_universal_parallel, can_parallelize};
 use crate::compute_manager::dim_change;
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::graph::model::MixedModel;
-use crate::compute_manager::graph::types::{DynamicContext, Model};
+use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext, Model};
 use crate::compute_manager::gpu::processor::process_backward_gpu_buffered;
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::device_plan::ComputeDevice;
 use crate::layers::{UniversalLayer, UniversalLayerBuffered};
-use crate::model_plan::param_store::ParamSlice;
-
-use super::segments::{processors::*, connectors::*};
 
 impl MixedModel {
     pub fn backward_mat_multi_buffered(
         &mut self,
         deltas: Vec<MatrixBufferHandle>,
     ) -> Vec<MatrixBufferHandle> {
-        assert_eq!(deltas.len(), self.output_stream_count,
+        assert_eq!(
+            deltas.len(),
+            self.output_stream_count,
             "backward_mat_multi_buffered: expected {} deltas, got {}",
-            self.output_stream_count, deltas.len());
+            self.output_stream_count,
+            deltas.len()
+        );
 
         let mut stream_gradients = deltas;
         let models = Arc::clone(&self.models);
@@ -46,7 +47,14 @@ impl MixedModel {
                     pool_guard.acquire(0, 0)
                 });
 
-            let chunked_ctxs = self
+            // Раскладка чанков, зафиксированная в forward.
+            // Для моделей без параллельной обработки (коннекторы, dim-операции
+            // и т.п.) — второй элемент пустой или состоит из одного чанка на
+            // весь батч, что соответствует последовательной ветке forward.
+            let (chunked_ctxs, saved_chunks): (
+                ChunkedContexts,
+                Vec<(usize, usize, usize)>,
+            ) = self
                 .last_forward_contexts
                 .get(&model_index)
                 .cloned()
@@ -57,7 +65,11 @@ impl MixedModel {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
                         let mut pool_guard = pool.lock().unwrap();
-                        new_stream.push(dim_change::reduce_mat_buffered_handle(&mut pool_guard, buf, target_dims));
+                        new_stream.push(dim_change::reduce_mat_buffered_handle(
+                            &mut pool_guard,
+                            buf,
+                            target_dims,
+                        ));
                     }
                     stream_gradients = new_stream;
                 }
@@ -65,7 +77,11 @@ impl MixedModel {
                     let mut new_stream = Vec::with_capacity(stream_gradients.len());
                     for buf in stream_gradients {
                         let mut pool_guard = pool.lock().unwrap();
-                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(&mut pool_guard, buf, target_dims));
+                        new_stream.push(dim_change::unsqueeze_mat_buffered_handle(
+                            &mut pool_guard,
+                            buf,
+                            target_dims,
+                        ));
                     }
                     stream_gradients = new_stream;
                 }
@@ -89,11 +105,12 @@ impl MixedModel {
 
                         if can_parallel {
                             let batch = delta_handle.rows();
-                            let input_features = if let Some(linear) = proc.first().and_then(|l| l.as_linear()) {
-                                <dyn UniversalLayerBuffered>::input_features(linear)
-                            } else {
-                                delta_handle.cols()
-                            };
+                            let input_features =
+                                if let Some(linear) = proc.first().and_then(|l| l.as_linear()) {
+                                    <dyn UniversalLayerBuffered>::input_features(linear)
+                                } else {
+                                    delta_handle.cols()
+                                };
 
                             let grad_input_handle = {
                                 let mut pool_guard = pool.lock().unwrap();
@@ -110,6 +127,7 @@ impl MixedModel {
                                 proc_arc,
                                 slices_vec,
                                 ctx_chunk,
+                                &saved_chunks,
                                 delta_handle,
                                 grad_input_handle.clone(),
                                 params_handle.clone(),
@@ -118,7 +136,9 @@ impl MixedModel {
 
                             new_gradients[stream_idx] = Some(grad_input_handle);
                         } else if let ComputeDevice::Gpu { .. } = device {
-                            let gpu = self.compute_executor.gpu_compute()
+                            let gpu = self
+                                .compute_executor
+                                .gpu_compute()
                                 .expect("GPU requested but not available");
 
                             let delta_gpu_handle = if delta_handle.is_gpu() {
@@ -152,7 +172,8 @@ impl MixedModel {
 
                             let cpu_handle = {
                                 let mut pool_guard = pool.lock().unwrap();
-                                let handle = pool_guard.acquire(out_gpu.rows(), out_gpu.cols());
+                                let handle =
+                                    pool_guard.acquire(out_gpu.rows(), out_gpu.cols());
                                 gpu.copy_gpu_to_cpu_handle(&out_gpu, &handle);
                                 handle
                             };
@@ -199,9 +220,13 @@ impl MixedModel {
                     );
                 }
                 Model::CombinerConnector { .. } => {
-                    // Ничего не делаем, градиенты остаются без изменений
+                    // Ничего не делаем, градиенты остаются без изменений.
                 }
-                Model::Splitter { input_dim, output_dims, slice } => {
+                Model::Splitter {
+                    input_dim,
+                    output_dims,
+                    slice,
+                } => {
                     let mut pool_guard = pool.lock().unwrap();
                     stream_gradients = self.process_splitter_backward_buffered(
                         &mut pool_guard,
@@ -214,7 +239,11 @@ impl MixedModel {
                         stream_gradients,
                     );
                 }
-                Model::Combiner { input_dim, output_dim, slice } => {
+                Model::Combiner {
+                    input_dim,
+                    output_dim,
+                    slice,
+                } => {
                     let mut pool_guard = pool.lock().unwrap();
                     stream_gradients = self.process_combiner_backward_buffered(
                         &mut pool_guard,
@@ -230,7 +259,8 @@ impl MixedModel {
             }
 
             let duration = start.elapsed().as_nanos() as f64;
-            self.compute_executor.record_model_time(model_index, &device, duration);
+            self.compute_executor
+                .record_model_time(model_index, &device, duration);
         }
 
         assert_eq!(stream_gradients.len(), self.input_stream_count);

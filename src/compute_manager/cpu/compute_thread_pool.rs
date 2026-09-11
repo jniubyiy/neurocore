@@ -1,19 +1,27 @@
 // src/compute_manager/cpu/compute_thread_pool.rs
 
+//! Пул вычислительных потоков.
+//!
+//! Предназначен для выполнения ресурсоёмких операций (прямой и обратный
+//! проходы, вычисление потерь, шаги оптимизатора) на CPU. Пул тесно связан
+//! с планировщиком [`Scheduler`], который распределяет батчи между потоками
+//! с учётом их производительности.
+//!
+//! Реализует [`Executor`] для унификации интерфейса. Ключевые отличия от
+//! `ControlThreadPool`:
+//! * собственный пул воркеров с обычным размером стека (2 МБ);
+//! * доступ к [`Scheduler`] через `Arc<Mutex<_>>`, используется для
+//!   `plan_chunks_assignment` и `report_execution_time`;
+//! * переопределяет [`Executor::report_execution_time`], направляя данные
+//!   обратной связи в scheduler для обучения mini-модели.
+
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::cpu::scheduler::Scheduler;
 use crate::compute_manager::cpu::worker_pool::WorkerPool;
-use crate::compute_manager::executor::Executor;
+use crate::compute_manager::executor::{ChunkAssignment, Executor};
 
 /// Пул вычислительных потоков.
-///
-/// Предназначен для выполнения ресурсоёмких операций (прямой и обратный
-/// проходы, вычисление потерь, шаги оптимизатора) на CPU. Пул тесно связан
-/// с планировщиком [`Scheduler`], который распределяет батчи между потоками
-/// с учётом их производительности.
-///
-/// Реализует [`Executor`] для унификации интерфейса.
 pub struct ComputeThreadPool {
     pool: Arc<WorkerPool>,
     scheduler: Arc<Mutex<Scheduler>>,
@@ -25,7 +33,7 @@ impl ComputeThreadPool {
     /// # Аргументы
     /// * `num_threads` – количество потоков в пуле.
     /// * `scheduler` – планировщик задач, который будет использоваться
-    ///   для распределения работы.
+    ///   для распределения работы и обучения mini-модели.
     ///
     /// # Паника
     /// Паникует, если `num_threads` равно нулю.
@@ -87,8 +95,31 @@ impl Executor for ComputeThreadPool {
         self.pool.num_workers()
     }
 
-    fn plan_chunks_assignment(&self, total_tasks: usize) -> Vec<Vec<(usize, usize, usize)>> {
-        self.scheduler.lock().unwrap().plan_chunks_assignment(total_tasks)
+    fn plan_chunks_assignment(&self, total_tasks: usize) -> ChunkAssignment {
+        self.scheduler
+            .lock()
+            .unwrap()
+            .plan_chunks_assignment(total_tasks)
+    }
+
+    /// Обратная связь: воркер сообщает время выполнения чанка.
+    ///
+    /// Проброс в [`Scheduler::report_execution_time`], который накапливает
+    /// данные для обучения mini-модели (`ForwardTimePredictor`). При
+    /// достижении порога (50 измерений на воркер) scheduler обучает
+    /// mini-модель, и последующие вызовы `plan_chunks_assignment`
+    /// автоматически переключаются с равномерного распределения на
+    /// распределение с предсказанием времени.
+    fn report_execution_time(
+        &self,
+        worker_id: usize,
+        task_size: usize,
+        duration_ns: f64,
+    ) {
+        self.scheduler
+            .lock()
+            .unwrap()
+            .report_execution_time(worker_id, task_size, duration_ns);
     }
 
     fn clone_executor(&self) -> Box<dyn Executor> {

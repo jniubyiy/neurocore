@@ -147,6 +147,9 @@ fn print_result(label: &str, r: &neurocore::training_plan::execution::TrainingRe
         "{}  time={:.3}s | best_loss={:.6} @ epoch {} | zero_loss_epoch={:?}",
         label, r.training_time_secs, r.best_loss, r.best_epoch, r.zero_loss_epoch
     );
+    if let Some(ref profile) = r.profile {
+        println!("{}", profile.report());
+    }
 }
 
 fn main() {

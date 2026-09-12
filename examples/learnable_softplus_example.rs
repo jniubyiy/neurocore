@@ -132,13 +132,13 @@ macro_rules! device_plan_v {
     };
 }
 
-device_plan_v!(device_plan_v1, 1, 8192, false, 0, false);
+device_plan_v!(device_plan_v1, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v2, 4, 8192, false, 0, false);
 device_plan_v!(device_plan_v3, 2, 8192, true, 4096, false);
-device_plan_v!(device_plan_v4_cpu, 1, 8192, false, 0, false);
+device_plan_v!(device_plan_v4_cpu, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v4_gpu, 2, 8192, true, 4096, false);
 device_plan_v!(device_plan_v5_gpu, 2, 8192, true, 4096, false);
-device_plan_v!(device_plan_v5_cpu, 1, 8192, false, 0, false);
+device_plan_v!(device_plan_v5_cpu, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v6, 4, 8192, false, 0, true);
 device_plan_v!(device_plan_v7, 4, 8192, true, 4096, false);
 
@@ -147,9 +147,6 @@ fn print_result(label: &str, r: &neurocore::training_plan::execution::TrainingRe
         "{}  time={:.3}s | best_loss={:.6} @ epoch {} | zero_loss_epoch={:?}",
         label, r.training_time_secs, r.best_loss, r.best_epoch, r.zero_loss_epoch
     );
-    if let Some(ref profile) = r.profile {
-        println!("{}", profile.report());
-    }
 }
 
 fn main() {
@@ -157,7 +154,7 @@ fn main() {
         base_training,
         device = device_plan_v1::plan
     );
-    print_result("V1 CPU1", &r1);
+    print_result("V1 CPU2", &r1);
 
     let r2 = neurocore::run_training!(
         base_training,
@@ -175,7 +172,7 @@ fn main() {
         base_training,
         device = device_plan_v4_cpu::plan
     );
-    print_result("V4a CPU", &r4a);
+    print_result("V4a CPU2", &r4a);
 
     let r4b = neurocore::run_training!(
         base_training,
@@ -193,7 +190,7 @@ fn main() {
         base_training,
         device = device_plan_v5_cpu::plan
     );
-    print_result("V5b CPU", &r5b);
+    print_result("V5b CPU2", &r5b);
 
     let r6 = neurocore::run_training!(
         base_training,

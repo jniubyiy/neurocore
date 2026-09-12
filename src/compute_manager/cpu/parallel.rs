@@ -2,10 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::compute_manager::cpu::WorkerPool;
 use crate::compute_manager::executor::Executor;
@@ -24,7 +22,7 @@ use crate::layers::{
 use crate::model_plan::param_store::ParamSlice;
 
 // ============================================================================
-//  Наблюдение за состоянием чанков (ChunkTracker + watchdog)
+//  Отслеживание состояния чанков
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +45,20 @@ struct ChunkState {
     duration_ns: u64,
 }
 
+/// Событийный трекер чанков.
+///
+/// Работает без таймеров и фоновых потоков: переходы состояний
+/// (`Pending → Assigned → InProgress → Done`) фиксируются воркерами
+/// непосредственно в моменты, когда эти переходы происходят.
+///
+/// Назначение:
+/// * накопление статистики выполнения (длительности, распределение по воркерам);
+/// * возможность по запросу сформировать дамп текущего состояния
+///   (`dump()`), например, при разборе инцидентов или по запросу пользователя.
+///
+/// Трекер сам по себе не отслеживает «зависания» — понятие застоя требует
+/// сравнения с ходом времени, а внутренние таймеры в ядре не используются.
+#[allow(dead_code)]
 struct ChunkTracker {
     chunks: Vec<ChunkState>,
     created_at: Instant,
@@ -109,10 +121,17 @@ impl ChunkTracker {
         }
     }
 
+    #[allow(dead_code)]
     fn total_changes(&self) -> usize {
         self.total_changes
     }
 
+    /// Формирует текстовый дамп текущего состояния трекера.
+    ///
+    /// Метод чисто диагностический, не запускает никаких таймеров
+    /// и не порождает потоков. Его может вызвать внешний код в любой
+    /// момент, если ему нужно понять, что происходит с чанками.
+    #[allow(dead_code)]
     fn dump(&self) -> String {
         let elapsed = self.created_at.elapsed();
         let mut s = String::new();
@@ -262,68 +281,6 @@ impl ChunkTracker {
 
         s
     }
-}
-
-/// Секунд без прогресса, после которых watchdog печатает дамп трекера.
-/// Это страховка от реальных зависаний в пользовательских слоях.
-const CHUNK_WATCHDOG_STUCK_SECS: u64 = 15;
-
-fn start_chunk_watchdog(
-    tracker: Arc<Mutex<ChunkTracker>>,
-    done_flag: Arc<AtomicBool>,
-    stuck_secs: u64,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name("chunk-watchdog".into())
-        .spawn(move || {
-            const MAX_DUMPS: u32 = 3;
-            let tick = Duration::from_millis(500);
-            let stuck_threshold = Duration::from_secs(stuck_secs);
-
-            let mut last_total_changes = 0usize;
-            let mut last_progress_at = Instant::now();
-            let mut dumps_emitted = 0u32;
-
-            loop {
-                thread::sleep(tick);
-                if done_flag.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                let current = {
-                    let g = tracker.lock().unwrap();
-                    g.total_changes()
-                };
-
-                if current != last_total_changes {
-                    last_total_changes = current;
-                    last_progress_at = Instant::now();
-                    dumps_emitted = 0;
-                    continue;
-                }
-
-                if last_progress_at.elapsed() >= stuck_threshold {
-                    if dumps_emitted < MAX_DUMPS {
-                        let dump = {
-                            let g = tracker.lock().unwrap();
-                            g.dump()
-                        };
-                        eprintln!(
-                            "[chunk-watchdog] NO PROGRESS for {}s, dump #{}/{}:",
-                            stuck_secs,
-                            dumps_emitted + 1,
-                            MAX_DUMPS
-                        );
-                        for line in dump.lines() {
-                            eprintln!("[chunk-watchdog] {}", line);
-                        }
-                        dumps_emitted += 1;
-                    }
-                    last_progress_at = Instant::now();
-                }
-            }
-        })
-        .expect("Failed to spawn chunk watchdog")
 }
 
 // ============================================================================
@@ -691,6 +648,10 @@ struct ChunkMeta {
 /// может изменить `plan_chunks_assignment` между вызовами (после обучения
 /// mini-model), поэтому backward не должен перезапрашивать раскладку — он
 /// получает её как аргумент.
+///
+/// Состояние чанков отслеживается событийно: воркеры фиксируют переходы
+/// `Assigned → InProgress → Done` в `ChunkTracker` в моменты самих переходов.
+/// Никаких фоновых таймеров и сторожевых потоков не создаётся.
 pub(crate) fn forward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -739,7 +700,7 @@ pub(crate) fn forward_universal_parallel(
         return (Vec::new(), Vec::new());
     }
 
-    // Tracker + watchdog.
+    // Трекер заполняется событийно. Никаких потоков, никаких таймеров.
     let tracker = Arc::new(Mutex::new(ChunkTracker::new(&global_chunks)));
     {
         let mut t = tracker.lock().unwrap();
@@ -749,13 +710,6 @@ pub(crate) fn forward_universal_parallel(
             }
         }
     }
-
-    let done_flag = Arc::new(AtomicBool::new(false));
-    let watchdog = start_chunk_watchdog(
-        tracker.clone(),
-        done_flag.clone(),
-        CHUNK_WATCHDOG_STUCK_SECS,
-    );
 
     let slices_arc = Arc::new(slices);
     let shared = Arc::new(ForwardTaskShared {
@@ -835,9 +789,6 @@ pub(crate) fn forward_universal_parallel(
 
     executor.wait_all();
 
-    done_flag.store(true, Ordering::Relaxed);
-    let _ = watchdog.join();
-
     let storage = ctx_storage.lock().unwrap();
     (storage.clone(), global_chunks)
 }
@@ -857,6 +808,8 @@ pub(crate) fn forward_universal_parallel(
 /// обрабатывает чанки `k, k + num_workers, k + 2·num_workers, …`.
 /// Если `saved_chunks.len() < num_workers` — часть воркеров получит пустой
 /// набор задач и ничего не будет делать (это корректно).
+///
+/// Как и в forward, состояние чанков отслеживается событийно, без таймеров.
 pub(crate) fn backward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -907,7 +860,7 @@ pub(crate) fn backward_universal_parallel(
 
     let _ = batch_size; // сохраняем для отладки при необходимости
 
-    // Tracker + watchdog (та же раскладка, что и в forward).
+    // Трекер заполняется событийно.
     let tracker = Arc::new(Mutex::new(ChunkTracker::new(saved_chunks)));
     {
         let mut t = tracker.lock().unwrap();
@@ -917,13 +870,6 @@ pub(crate) fn backward_universal_parallel(
             }
         }
     }
-
-    let done_flag = Arc::new(AtomicBool::new(false));
-    let watchdog = start_chunk_watchdog(
-        tracker.clone(),
-        done_flag.clone(),
-        CHUNK_WATCHDOG_STUCK_SECS,
-    );
 
     let slices_arc = Arc::new(slices);
     let shared = Arc::new(BackwardTaskShared {
@@ -1014,9 +960,6 @@ pub(crate) fn backward_universal_parallel(
     }
 
     executor.wait_all();
-
-    done_flag.store(true, Ordering::Relaxed);
-    let _ = watchdog.join();
 
     // Финальная редукция: суммируем temp_grads в grad_params.
     let mut pool_guard = shared.pool.lock().unwrap();

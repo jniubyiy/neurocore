@@ -5,6 +5,22 @@
 // Модель учится восстанавливать входные данные с экспоненциальным распределением.
 // Демонстрирует несколько вариантов запуска: CPU с разным числом потоков,
 // GPU, SSD, а также профилирование.
+//
+// Переменная окружения NEUROCORE_VARIANT (необязательная):
+//   v1  — только V1 CPU2
+//   v2  — только V2 CPU4
+//   v3  — только V3 GPU
+//   v4a — только V4a CPU2
+//   v4b — только V4b GPU
+//   v5a — только V5a GPU
+//   v5b — только V5b CPU2
+//   v6  — только V6 SSD
+//   v7  — только V7 Prof
+//   all (или не задано) — все варианты последовательно.
+//
+// Изоляция одного варианта позволяет исключить накопление глобального
+// состояния между прогонами (счётчики, scheduler, модели mini-model) и
+// понять, воспроизводится ли проблема в конкретном варианте изолированно.
 
 use neurocore::tensor::Tensor2D;
 use neurocore::training_plan::ProfileMode;
@@ -153,58 +169,61 @@ fn print_result(label: &str, r: &neurocore::training_plan::execution::TrainingRe
     );
 }
 
+fn run_variant(variant: &str) {
+    match variant {
+        "v1" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v1::plan);
+            print_result("V1 CPU2", &r);
+        }
+        "v2" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v2::plan);
+            print_result("V2 CPU4", &r);
+        }
+        "v3" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v3::plan);
+            print_result("V3 GPU ", &r);
+        }
+        "v4a" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v4_cpu::plan);
+            print_result("V4a CPU2", &r);
+        }
+        "v4b" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v4_gpu::plan);
+            print_result("V4b GPU", &r);
+        }
+        "v5a" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v5_gpu::plan);
+            print_result("V5a GPU", &r);
+        }
+        "v5b" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v5_cpu::plan);
+            print_result("V5b CPU2", &r);
+        }
+        "v6" => {
+            let r = neurocore::run_training!(base_training, device = device_plan_v6::plan);
+            print_result("V6 SSD", &r);
+        }
+        "v7" => {
+            let r = neurocore::run_training!(profiled_training, device = device_plan_v7::plan);
+            print_result("V7 Prof", &r);
+        }
+        other => panic!(
+            "Unknown NEUROCORE_VARIANT = {:?}. \
+             Use one of: v1, v2, v3, v4a, v4b, v5a, v5b, v6, v7, all",
+            other
+        ),
+    }
+}
+
 fn main() {
-    let r1 = neurocore::run_training!(
-        base_training,
-        device = device_plan_v1::plan
-    );
-    print_result("V1 CPU2", &r1);
+    let variant = std::env::var("NEUROCORE_VARIANT")
+        .unwrap_or_else(|_| "all".to_string());
 
-    let r2 = neurocore::run_training!(
-        base_training,
-        device = device_plan_v2::plan
-    );
-    print_result("V2 CPU4", &r2);
-
-    let r3 = neurocore::run_training!(
-        base_training,
-        device = device_plan_v3::plan
-    );
-    print_result("V3 GPU ", &r3);
-
-    let r4a = neurocore::run_training!(
-        base_training,
-        device = device_plan_v4_cpu::plan
-    );
-    print_result("V4a CPU2", &r4a);
-
-    let r4b = neurocore::run_training!(
-        base_training,
-        device = device_plan_v4_gpu::plan
-    );
-    print_result("V4b GPU", &r4b);
-
-    let r5a = neurocore::run_training!(
-        base_training,
-        device = device_plan_v5_gpu::plan
-    );
-    print_result("V5a GPU", &r5a);
-
-    let r5b = neurocore::run_training!(
-        base_training,
-        device = device_plan_v5_cpu::plan
-    );
-    print_result("V5b CPU2", &r5b);
-
-    let r6 = neurocore::run_training!(
-        base_training,
-        device = device_plan_v6::plan
-    );
-    print_result("V6 SSD", &r6);
-
-    let r7 = neurocore::run_training!(
-        profiled_training,
-        device = device_plan_v7::plan
-    );
-    print_result("V7 Prof", &r7);
+    if variant == "all" {
+        for v in ["v1", "v2", "v3", "v4a", "v4b", "v5a", "v5b", "v6", "v7"] {
+            run_variant(v);
+        }
+    } else {
+        run_variant(&variant);
+    }
 }

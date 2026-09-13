@@ -19,6 +19,9 @@ use super::super::apply_update::ApplyUpdate;
 //
 // Печатает норму градиента ||g|| и норму параметров ||p|| до/после апдейта
 // на первых APPLY_LOG_LIMIT вызовах, а также любые вызовы с NaN/Inf.
+//
+// При обнаружении аномалии печатаются ПОЛНЫЕ срезы g и p (все 92 элемента),
+// чтобы можно было точно локализовать источник (индексы, значения).
 // ============================================================================
 
 static APPLY_DEBUG: Lazy<bool> =
@@ -54,7 +57,7 @@ impl OptimizerCube for ApplyUpdate {
             "ApplyUpdate: params and grads must be CPU"
         );
 
-        // Решаем, логировать ли текущий вызов
+        // Решаем, логировать ли текущий вызов.
         let (log_this, call_id) = if *APPLY_DEBUG {
             let n = APPLY_CALLS.fetch_add(1, Ordering::Relaxed);
             (n < APPLY_LOG_LIMIT, n)
@@ -73,21 +76,38 @@ impl OptimizerCube for ApplyUpdate {
 
         debug_assert_eq!(p_slice.len(), g_slice.len());
 
-        if *APPLY_DEBUG {
-            let has_anom = g_slice.iter().any(|v| !v.is_finite())
-                || p_slice.iter().any(|v| !v.is_finite());
-            if log_this || has_anom {
-                if has_anom && !log_this {
-                    println!("[APPLY #{}] ANOMALY DETECTED (non-finite in p or g)", call_id);
-                }
+        // Проверяем аномалии ДО update.
+        let has_anom_before = p_slice.iter().any(|v| !v.is_finite())
+            || g_slice.iter().any(|v| !v.is_finite());
+
+        if *APPLY_DEBUG && (log_this || has_anom_before) {
+            if has_anom_before && !log_this {
                 println!(
-                    "[APPLY #{}] len={}, ||g||={:.6}, ||p||_before={:.6}",
-                    call_id,
-                    p_slice.len(),
-                    apply_dbg_l2(g_slice),
-                    apply_dbg_l2(p_slice),
+                    "[APPLY #{}] ANOMALY DETECTED (non-finite in p or g BEFORE update)",
+                    call_id
                 );
-                // Показать первые 5 значений градиента (всегда — важно для динамики)
+            }
+            println!(
+                "[APPLY #{}] len={}, ||g||={:.6}, ||p||_before={:.6}",
+                call_id,
+                p_slice.len(),
+                apply_dbg_l2(g_slice),
+                apply_dbg_l2(p_slice),
+            );
+            if has_anom_before {
+                // Полный срез: сколько элементов, все значения.
+                // Печатаем по частям (по 16 значений), чтобы строки были читаемы.
+                println!("    FULL g (len={}):", g_slice.len());
+                for (chunk_idx, chunk) in g_slice.chunks(16).enumerate() {
+                    println!("      g[{:>3}..{:>3}] = {:?}", chunk_idx * 16,
+                             chunk_idx * 16 + chunk.len(), chunk);
+                }
+                println!("    FULL p_before (len={}):", p_slice.len());
+                for (chunk_idx, chunk) in p_slice.chunks(16).enumerate() {
+                    println!("      p[{:>3}..{:>3}] = {:?}", chunk_idx * 16,
+                             chunk_idx * 16 + chunk.len(), chunk);
+                }
+            } else {
                 let show = p_slice.len().min(5);
                 println!("    first g[:{}] = {:?}", show, &g_slice[..show]);
                 println!("    first p[:{}] (before) = {:?}", show, &p_slice[..show]);
@@ -98,14 +118,21 @@ impl OptimizerCube for ApplyUpdate {
             p_slice[i] -= g_slice[i];
         }
 
-        if *APPLY_DEBUG {
-            let has_anom = p_slice.iter().any(|v| !v.is_finite());
-            if log_this || has_anom {
-                println!(
-                    "    ||p||_after = {:.6}{}",
-                    apply_dbg_l2(p_slice),
-                    if has_anom { "  <-- NaN/Inf in p after update" } else { "" }
-                );
+        let has_anom_after = p_slice.iter().any(|v| !v.is_finite());
+
+        if *APPLY_DEBUG && (log_this || has_anom_after) {
+            println!(
+                "    ||p||_after = {:.6}{}",
+                apply_dbg_l2(p_slice),
+                if has_anom_after { "  <-- NaN/Inf in p after update" } else { "" }
+            );
+            if has_anom_after {
+                println!("    FULL p_after (len={}):", p_slice.len());
+                for (chunk_idx, chunk) in p_slice.chunks(16).enumerate() {
+                    println!("      p[{:>3}..{:>3}] = {:?}", chunk_idx * 16,
+                             chunk_idx * 16 + chunk.len(), chunk);
+                }
+            } else {
                 let show = p_slice.len().min(5);
                 println!("    first p[:{}] (after)  = {:?}", show, &p_slice[..show]);
             }

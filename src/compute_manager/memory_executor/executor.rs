@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -43,7 +43,21 @@ pub struct MemoryExecutor {
     temp_pool: TempBufferPool,
     matrix_entries: HashMap<MatrixBufferId, MatrixEntry>,
     next_matrix_id: AtomicUsize,
-    memory_arc: Option<Arc<RwLock<MemoryExecutor>>>,
+
+    /// Слабая ссылка на владельца `MemoryExecutor`.
+    ///
+    /// Используется при создании новых [`MatrixBufferHandle`]: каждый handle
+    /// получает **сильный** `Arc` на владельца, чтобы гарантировать, что
+    /// `MemoryExecutor` живёт, пока жив хоть один handle. Сама же структура
+    /// держит на себя только `Weak`, что исключает цикл сильных ссылок
+    /// и позволяет `MemoryExecutor` корректно дропаться после завершения
+    /// обучения.
+    ///
+    /// Раньше здесь был `Option<Arc<RwLock<MemoryExecutor>>>`, что создавало
+    /// цикл `Arc → MemoryExecutor → Arc` и не давало освободить ресурсы
+    /// после завершения сессии. Это приводило к загрязнению глобального
+    /// состояния между последовательными тренировками (V1 → V2).
+    memory_arc: Option<Weak<RwLock<MemoryExecutor>>>,
 }
 
 impl MemoryExecutor {
@@ -61,8 +75,13 @@ impl MemoryExecutor {
         }
     }
 
+    /// Устанавливает слабую ссылку на владельца.
+    ///
+    /// Вызывается один раз при создании `MemoryExecutor` (в
+    /// `DevicePlan::build_memory_executor`). Ссылка слабая, поэтому она
+    /// не мешает дропу владельца.
     pub fn set_self_arc(&mut self, arc: Arc<RwLock<MemoryExecutor>>) {
-        self.memory_arc = Some(arc);
+        self.memory_arc = Some(Arc::downgrade(&arc));
     }
 
     /// Проверяет, можно ли выделить `elements` элементов в указанном пуле памяти.
@@ -252,7 +271,21 @@ impl MemoryExecutor {
         let entry = MatrixEntry::new(rows, cols, storage, priority);
         self.matrix_entries.insert(id, entry);
 
-        let arc = self.memory_arc.clone().expect("MemoryExecutor::set_self_arc not called");
+        // Получаем сильный Arc на владельца через слабую ссылку.
+        //
+        // Если upgrade() вернул None, это означает, что все внешние сильные
+        // ссылки на MemoryExecutor уже дропнуты, и мы пытаемся выделить
+        // буфер внутри умирающего executor'а. Это логическая ошибка в коде
+        // вызывающей стороны (нельзя вызывать acquire после дропа владельца).
+        let arc = self
+            .memory_arc
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .expect(
+                "MemoryExecutor::acquire_matrix_handle: owner Arc is gone. \
+                 This means the MemoryExecutor was dropped while still in use. \
+                 Check that the caller holds a strong Arc during acquire.",
+            );
         Ok(MatrixBufferHandle::new(id, arc))
     }
 

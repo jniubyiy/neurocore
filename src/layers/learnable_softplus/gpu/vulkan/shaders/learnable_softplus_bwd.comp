@@ -1,84 +1,92 @@
+// src/layers/learnable_softplus/gpu/vulkan/shaders/learnable_softplus_bwd.comp
+//
+// Обратный проход LearnableSoftplus на GPU.
+//
+// Раскладка активаций — column-major: x[c * batch + r].
+// Для элемента с индексом idx:
+//   c = idx / batch,  r = idx % batch,  batch = total / features.
+//
+// β = exp(β_raw)
+// y = softplus(β·(x − θ)) / β
+//
+// ∂y/∂x     = σ(β·(x − θ))
+// ∂y/∂θ     = −σ(β·(x − θ))
+// ∂y/∂β_raw = (x − θ)·σ(β·(x − θ)) − y
+//
+// Push: total, features.
+// Dispatch: total потоков.
+
 #version 450
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConsts {
-    uint total;      // batch * features
-    uint features;   // количество признаков
+    uint total;
+    uint features;
 } pc;
 
-layout(binding = 0, std430) readonly buffer InputBuf {
-    float x[];
-};
+layout(binding = 0, std430) readonly buffer InputBuf    { float x[]; };
+layout(binding = 1, std430) readonly buffer GradOutBuf  { float go[]; };
+layout(binding = 2, std430) readonly buffer BetaBuf     { float beta_raw[]; };
+layout(binding = 3, std430) readonly buffer ThetaBuf    { float theta[]; };
+layout(binding = 4, std430) writeonly buffer GradInBuf  { float gi[]; };
+layout(binding = 5, std430) buffer GradBetaBuf          { uint grad_beta_raw[]; };
+layout(binding = 6, std430) buffer GradThetaBuf         { uint grad_theta[]; };
 
-layout(binding = 1, std430) readonly buffer GradOutBuf {
-    float go[];
-};
+float softplus(float z) {
+    return max(z, 0.0) + log(1.0 + exp(-abs(z)));
+}
 
-layout(binding = 2, std430) readonly buffer BetaBuf {
-    float beta[];
-};
+float sigmoid_stable(float z) {
+    if (z >= 0.0) {
+        return 1.0 / (1.0 + exp(-z));
+    } else {
+        float e = exp(z);
+        return e / (1.0 + e);
+    }
+}
 
-layout(binding = 3, std430) readonly buffer ThetaBuf {
-    float theta[];
-};
-
-layout(binding = 4, std430) writeonly buffer GradInBuf {
-    float gi[];
-};
-
-layout(binding = 5, std430) buffer GradBetaBuf {
-    uint grad_beta[];  // битовое представление float
-};
-
-layout(binding = 6, std430) buffer GradThetaBuf {
-    uint grad_theta[]; // битовое представление float
-};
+// Канонический макрос атомарного сложения float через CAS.
+#define ATOMIC_ADD_FLOAT(target, value) \
+{ \
+    uint expected = target; \
+    uint desired; \
+    do { \
+        float cur = uintBitsToFloat(expected); \
+        desired = floatBitsToUint(cur + (value)); \
+        uint old = atomicCompSwap(target, expected, desired); \
+        if (old == expected) break; \
+        expected = old; \
+    } while (true); \
+}
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.total) return;
 
-    uint c = idx % pc.features;
+    // Column-major: c = idx / batch.
+    uint batch = pc.total / pc.features;
+    uint c = idx / batch;
+
     float x_val = x[idx];
-    float gout = go[idx];
-    float b = beta[c];
-    float t = theta[c];
-    float shifted = b * (x_val - t);
-    float sigmoid = 1.0 / (1.0 + exp(-shifted));
-    float y_val = (1.0 / b) * log(1.0 + exp(shifted));
+    float gout  = go[idx];
 
-    // Градиент по входу
-    gi[idx] = gout * sigmoid;
+    float beta_raw = beta_raw[c];
+    float b        = exp(beta_raw);
+    float inv_b    = 1.0 / b;
+    float t        = theta[c];
+    float shifted  = b * (x_val - t);
+    float sig      = sigmoid_stable(shifted);
+    float y_val    = softplus(shifted) * inv_b;
 
-    // Градиент по beta: (x - theta)*sigmoid - y/b
-    float d_beta = (x_val - t) * sigmoid - y_val / b;
-    // Атомарное накопление в grad_beta[c]
-    {
-        float inc = gout * d_beta;
-        uint expected = grad_beta[c];
-        uint desired;
-        do {
-            float cur = uintBitsToFloat(expected);
-            desired = floatBitsToUint(cur + inc);
-            uint old = atomicCompSwap(grad_beta[c], expected, desired);
-            if (old == expected) break;
-            expected = old;
-        } while (true);
-    }
+    // ∂y/∂x
+    gi[idx] = gout * sig;
 
-    // Градиент по theta: -sigmoid
-    float d_theta = -sigmoid;
-    // Атомарное накопление в grad_theta[c]
-    {
-        float inc = gout * d_theta;
-        uint expected = grad_theta[c];
-        uint desired;
-        do {
-            float cur = uintBitsToFloat(expected);
-            desired = floatBitsToUint(cur + inc);
-            uint old = atomicCompSwap(grad_theta[c], expected, desired);
-            if (old == expected) break;
-            expected = old;
-        } while (true);
-    }
+    // ∂y/∂β_raw = (x − θ)·σ(shifted) − y
+    float d_beta_raw = (x_val - t) * sig - y_val;
+
+    // ∂y/∂θ = −σ(shifted)
+    float d_theta = -sig;
+
+    ATOMIC_ADD_FLOAT(grad_beta_raw[c], gout * d_beta_raw);
+    ATOMIC_ADD_FLOAT(grad_theta[c],    gout * d_theta);
 }

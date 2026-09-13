@@ -35,10 +35,26 @@ use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 //   * эволюция β и θ слоя LearnableSoftplus из ParamStore
 //     (первые LOG_LSF_EVO_FIRST эпох, затем раз в LOG_LSF_EVO_EVERY эпох);
 //   * раз в LOG_NORM_EVERY эпох — ||params||_2.
+//
+// NEUROCORE_DEBUG_LAYERS=1 — точечная диагностика для сравнения CPU и GPU:
+//   * после forward — checksum prediction (sum/l2/min/max);
+//   * после backward — checksum первого gradient-буфера (sum/l2/min/max);
+//   * после update (для последнего батча первых эпох) — ||params||_2.
+//   Печатается для каждого батча всех эпох. Логи одинакового формата
+//   для CPU и GPU, что позволяет построчное сравнение.
+//
+// ВАЖНО: чтение параметров для checksum выполняется через
+// `ParamGradients::to_flat_vec` (для градиентов) и через
+// `Tensor`-безопасный путь (для prediction). Для параметров используется
+// `param_store_read_all_safe`, который корректно обрабатывает GPU-буферы:
+// скачивает их во временный CPU-хэндл и читает оттуда.
 // ============================================================================
 
 static TRAIN_DEBUG: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_TRAIN").is_ok());
+
+static LAYER_DEBUG: Lazy<bool> =
+    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_LAYERS").is_ok());
 
 const LOG_FIRST_EPOCHS: usize = 3;
 const LOG_NORM_EVERY: usize = 10;
@@ -93,6 +109,58 @@ fn train_dbg_print_vec(label: &str, data: &[f32]) {
     println!("    [TRAIN] {} (len={}): {:?}", label, data.len(), data);
 }
 
+/// Краткая однострочная сводка по срезу для сравнения CPU/GPU.
+fn train_dbg_summary(data: &[f32]) -> String {
+    if data.is_empty() {
+        return "len=0".to_string();
+    }
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut nan_cnt = 0usize;
+    let mut inf_cnt = 0usize;
+    for &v in data {
+        if v.is_nan() { nan_cnt += 1; continue; }
+        if v.is_infinite() { inf_cnt += 1; continue; }
+        if v < mn { mn = v; }
+        if v > mx { mx = v; }
+        sum += v as f64;
+    }
+    let l2 = train_dbg_l2(data);
+    format!(
+        "len={} sum={:.6e} l2={:.6e} min={:.6e} max={:.6e} nan={} inf={}",
+        data.len(), sum, l2, mn, mx, nan_cnt, inf_cnt
+    )
+}
+
+/// Безопасное чтение всех параметров модели.
+///
+/// В отличие от `ParamStore::get_all_params`, корректно обрабатывает
+/// GPU-буферы: скачивает их во временный CPU-хэндл и читает оттуда.
+/// Работает только при наличии активного GpuCompute — который есть у
+/// `MixedModel` через `compute_executor`.
+fn read_all_params_safe(model: &MixedModel) -> Option<Vec<f32>> {
+    let ps = model.param_store().lock().unwrap();
+    if ps.is_empty() {
+        return Some(Vec::new());
+    }
+    let gpu_opt = model.compute_executor().gpu_compute();
+    let mut result = Vec::with_capacity(ps.total_params());
+    for buffer_idx in 0..ps.num_buffers() {
+        let buf = ps.get_param_buffer_by_idx(buffer_idx);
+        if buf.params.is_gpu() {
+            let gpu = gpu_opt.as_ref()?;
+            let data = gpu.download_gpu_handle_to_vec(&buf.params);
+            result.extend_from_slice(&data);
+        } else {
+            let guard = buf.params.read();
+            let slice = guard.as_slice()?;
+            result.extend_from_slice(slice);
+        }
+    }
+    Some(result)
+}
+
 fn per_sample_mse(pred_flat: &[f32], target_flat: &[f32]) -> f32 {
     assert_eq!(pred_flat.len(), target_flat.len());
     let n = pred_flat.len();
@@ -120,7 +188,8 @@ struct LsfEvoSnap {
 }
 
 /// Собирает снимок raw_beta/theta и их градиентов для всех LearnableSoftplus
-/// в модели. Возвращает Vec снимков.
+/// в модели. Работает только на CPU-параметрах (этот путь активируется
+/// через TRAIN_DEBUG и рассчитан на отладку CPU-сценариев).
 fn collect_lsf_evo(model: &MixedModel) -> Vec<LsfEvoSnap> {
     let ps_guard = model.param_store().lock().unwrap();
     let mut out = Vec::new();
@@ -132,6 +201,11 @@ fn collect_lsf_evo(model: &MixedModel) -> Vec<LsfEvoSnap> {
                     let slice = &slices[l_idx];
                     let params_h = ps_guard.params_handle(slice);
                     let grads_h = ps_guard.grads_handle(slice);
+                    if params_h.is_gpu() || grads_h.is_gpu() {
+                        // Пропускаем GPU-параметры: этот диагностический путь
+                        // рассчитан на CPU.
+                        continue;
+                    }
                     let raw_betas = params_h.read_range(slice.start, f);
                     let thetas = params_h.read_range(slice.start + f, f);
                     let grad_raw_betas = grads_h.read_range(slice.start, f);
@@ -155,11 +229,10 @@ fn collect_lsf_evo(model: &MixedModel) -> Vec<LsfEvoSnap> {
 /// Печатает эволюцию β/θ для текущей эпохи.
 fn print_lsf_evo(epoch: usize, snaps: &[LsfEvoSnap]) {
     if snaps.is_empty() {
-        println!("  [LSF-EVOLUTION ep{}] (no LearnableSoftplus found)", epoch);
+        println!("  [LSF-EVOLUTION ep{}] (no LearnableSoftplus on CPU found)", epoch);
         return;
     }
     for s in snaps {
-        // β = 1 + raw_β (с учётом clamp 1e-3). Печатаем β и |β−1|.
         let mut beta_min = f32::INFINITY;
         let mut beta_max = f32::NEG_INFINITY;
         let mut beta_sum = 0.0f32;
@@ -368,23 +441,43 @@ fn execute_inner(
         None
     };
 
-    if *TRAIN_DEBUG {
+    // Проверяем, являются ли параметры CPU (для TRAIN_DEBUG-путей, которые
+    // читают параметры как CPU).
+    let params_are_cpu_initially = {
+        let ps = model.param_store().lock().unwrap();
+        ps.is_empty() || {
+            let buf = ps.get_param_buffer_by_idx(0);
+            !buf.params.is_gpu()
+        }
+    };
+
+    if *TRAIN_DEBUG && params_are_cpu_initially {
         println!("=== [TRAIN DEBUG] execution_inner ===");
         println!("  num_samples = {}", num_samples);
         println!("  batch_size  = {}", batch_size);
         println!("  epochs      = {}", plan.epochs);
         println!("  lr (from ScaleGradient) = {:.6}", learning_rate);
         println!("  num mini-batches/epoch  = {}", num_batches_per_epoch);
-        {
-            let ps = model.param_store().lock().unwrap();
-            let total = ps.total_params();
-            let flat = ps.get_all_params();
-            println!("  total params = {}", total);
+        if let Some(flat) = read_all_params_safe(model) {
+            println!("  total params = {}", flat.len());
             train_dbg_print_stats("init params", &flat);
         }
-        // Стартовый снимок β/θ
         let snaps = collect_lsf_evo(model);
         print_lsf_evo(0, &snaps);
+        println!();
+    }
+
+    if *LAYER_DEBUG {
+        println!("=== [LAYERS DEBUG] per-batch checksums ===");
+        println!(
+            "  num_samples={} batch_size={} num_batches/epoch={}",
+            num_samples, batch_size, num_batches_per_epoch
+        );
+        if let Some(flat) = read_all_params_safe(model) {
+            println!("  init_params: {}", train_dbg_summary(&flat));
+        } else {
+            println!("  init_params: (safe read returned None)");
+        }
         println!();
     }
 
@@ -406,7 +499,7 @@ fn execute_inner(
 
         let mut epoch_batches: Vec<BatchInfo> = Vec::with_capacity(num_batches_per_epoch);
 
-        for start in (0..num_samples).step_by(batch_size) {
+        for (batch_idx, start) in (0..num_samples).step_by(batch_size).enumerate() {
             let end = (start + batch_size).min(num_samples);
             let batch_size_actual = end - start;
 
@@ -448,6 +541,15 @@ fn execute_inner(
             let (pred, _ctxs) = model.forward(batch_tensor.clone());
             let forward_dt = t0.elapsed().as_nanos() as u64;
 
+            // === Точечная диагностика: checksum prediction ===
+            if *LAYER_DEBUG {
+                let pred_flat = pred.to_flat();
+                println!(
+                    "[DBG-PRED] epoch={:>3} batch={:>2} [{}..{}) {}",
+                    epoch, batch_idx, start, end, train_dbg_summary(&pred_flat)
+                );
+            }
+
             let t1 = Instant::now();
             let (loss, delta) = model.compute_loss(
                 plan.loss_desc.clone(),
@@ -462,6 +564,14 @@ fn execute_inner(
 
             let grads_flat = grads.to_flat_vec();
             let grad_l2 = train_dbg_l2(&grads_flat);
+
+            // === Точечная диагностика: checksum градиентов ===
+            if *LAYER_DEBUG {
+                println!(
+                    "[DBG-GRAD] epoch={:>3} batch={:>2} [{}..{}) {}",
+                    epoch, batch_idx, start, end, train_dbg_summary(&grads_flat)
+                );
+            }
 
             epoch_batches.push(BatchInfo {
                 start,
@@ -484,6 +594,23 @@ fn execute_inner(
             let t3 = Instant::now();
             model.update_params_buffered(plan.optimizer_desc.clone(), &[]);
             let update_dt = t3.elapsed().as_nanos() as u64;
+
+            // === Точечная диагностика: checksum параметров после update ===
+            // Для первых эпох, после последнего батча. Безопасно читает
+            // параметры как на CPU, так и на GPU (через временный CPU-хэндл).
+            if *LAYER_DEBUG && batch_idx == num_batches_per_epoch - 1 && epoch < LOG_FIRST_EPOCHS {
+                if let Some(flat) = read_all_params_safe(model) {
+                    println!(
+                        "[DBG-PARAMS-AFTER-EPOCH] epoch={:>3} {}",
+                        epoch, train_dbg_summary(&flat)
+                    );
+                } else {
+                    println!(
+                        "[DBG-PARAMS-AFTER-EPOCH] epoch={:>3} (safe read returned None)",
+                        epoch
+                    );
+                }
+            }
 
             epoch_loss += loss * batch_size_actual as f32;
 
@@ -631,9 +758,9 @@ fn execute_inner(
             );
 
             if epoch < LOG_FIRST_EPOCHS || epoch % LOG_NORM_EVERY == 0 {
-                let ps = model.param_store().lock().unwrap();
-                let flat = ps.get_all_params();
-                train_dbg_print_stats(&format!("params @ epoch {}", epoch), &flat);
+                if let Some(flat) = read_all_params_safe(model) {
+                    train_dbg_print_stats(&format!("params @ epoch {}", epoch), &flat);
+                }
             }
         }
 

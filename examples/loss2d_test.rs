@@ -5,7 +5,7 @@
 // GPU-тесты запускаются в отдельном потоке с увеличенным стеком,
 // чтобы избежать переполнения стека (как в основном training loop).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 use faer::Mat;
@@ -14,10 +14,6 @@ use neurocore::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPo
 use neurocore::compute_manager::memory_executor::MemoryExecutor;
 use neurocore::device_plan::DevicePlan;
 use neurocore::compute_manager::gpu::GpuCompute;
-use neurocore::loss_plan::{
-    Aggregation, Abs, AbsDiff, AddScalar, CrossEntropyWithLogits, ElementChain, Log1p, LossDesc,
-    Square, Sub, SumColumns,
-};
 
 mod losses {
     use neurocore::loss_plan::{
@@ -91,11 +87,11 @@ fn handle_to_mat(handle: &MatrixBufferHandle) -> Mat<f32> {
 
 fn main() {
     // Создаём MemoryExecutor и TempMatrixPool для CPU
-    let mem = Arc::new(Mutex::new(MemoryExecutor::new()));
-    mem.lock()
+    let mem = Arc::new(RwLock::new(MemoryExecutor::new()));
+    mem.write()
         .unwrap()
         .register_compute_device(DeviceSpec::cpu(0, 1024, 1), None);
-    mem.lock().unwrap().set_self_arc(mem.clone());
+    mem.write().unwrap().set_self_arc(mem.clone());
 
     let mut pool = TempMatrixPool::new(mem);
 
@@ -261,7 +257,7 @@ fn main() {
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             let device_plan = DevicePlan::empty()
-                .cpu(0, 1)
+                .cpu(0, 2)
                 .ram(0, 1024)
                 .gpu(0)
                 .vram(0, 0, 1024);

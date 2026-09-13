@@ -5,6 +5,8 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use once_cell::sync::Lazy;
+
 use crate::compute_manager::cpu::WorkerPool;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext};
@@ -20,6 +22,20 @@ use crate::layers::{
     SpectrallyNormalizedLinear,
 };
 use crate::model_plan::param_store::ParamSlice;
+
+// ============================================================================
+//  Отладочные переключатели
+// ============================================================================
+//
+// NEUROCORE_DEBUG_PARALLEL=1 — включает подробную диагностику по каждому
+// слою в параллельном forward и backward: тип слоя, размеры входа и выхода,
+// состояние буферов перед write_chunk.
+//
+// Несовпадение размеров в write_chunk печатается ВСЕГДА, независимо от
+// флага — это критическая ошибка, ведущая к панике.
+
+static PARALLEL_DEBUG: Lazy<bool> =
+    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_PARALLEL").is_ok());
 
 // ============================================================================
 //  Отслеживание состояния чанков
@@ -50,14 +66,6 @@ struct ChunkState {
 /// Работает без таймеров и фоновых потоков: переходы состояний
 /// (`Pending → Assigned → InProgress → Done`) фиксируются воркерами
 /// непосредственно в моменты, когда эти переходы происходят.
-///
-/// Назначение:
-/// * накопление статистики выполнения (длительности, распределение по воркерам);
-/// * возможность по запросу сформировать дамп текущего состояния
-///   (`dump()`), например, при разборе инцидентов или по запросу пользователя.
-///
-/// Трекер сам по себе не отслеживает «зависания» — понятие застоя требует
-/// сравнения с ходом времени, а внутренние таймеры в ядре не используются.
 #[allow(dead_code)]
 struct ChunkTracker {
     chunks: Vec<ChunkState>,
@@ -126,11 +134,6 @@ impl ChunkTracker {
         self.total_changes
     }
 
-    /// Формирует текстовый дамп текущего состояния трекера.
-    ///
-    /// Метод чисто диагностический, не запускает никаких таймеров
-    /// и не порождает потоков. Его может вызвать внешний код в любой
-    /// момент, если ему нужно понять, что происходит с чанками.
     #[allow(dead_code)]
     fn dump(&self) -> String {
         let elapsed = self.created_at.elapsed();
@@ -174,24 +177,17 @@ impl ChunkTracker {
             let _ = writeln!(
                 s,
                 "  chunk {:>3}  range [{:>3}..{:<3})  assigned={:?}  physical={:?}  dur={:.3}us",
-                c.chunk_id,
-                c.start,
-                c.end,
-                c.assigned_worker,
-                c.physical_worker,
+                c.chunk_id, c.start, c.end, c.assigned_worker, c.physical_worker,
                 c.duration_ns as f64 / 1000.0
             );
         }
-        if !any {
-            let _ = writeln!(s, "  (none)");
-        }
+        if !any { let _ = writeln!(s, "  (none)"); }
 
         let _ = writeln!(s, "--- in_progress ---");
         any = false;
         for c in self.chunks.iter().filter(|c| c.status == ChunkStatus::InProgress) {
             any = true;
-            let running = c
-                .started_at
+            let running = c.started_at
                 .map(|a| format!("{:.3}s", a.elapsed().as_secs_f64()))
                 .unwrap_or_else(|| "?".into());
             let _ = writeln!(
@@ -200,9 +196,7 @@ impl ChunkTracker {
                 c.chunk_id, c.start, c.end, c.assigned_worker, c.physical_worker, running
             );
         }
-        if !any {
-            let _ = writeln!(s, "  (none)");
-        }
+        if !any { let _ = writeln!(s, "  (none)"); }
 
         let _ = writeln!(s, "--- assigned (not started) ---");
         any = false;
@@ -214,9 +208,7 @@ impl ChunkTracker {
                 c.chunk_id, c.start, c.end, c.assigned_worker
             );
         }
-        if !any {
-            let _ = writeln!(s, "  (none)");
-        }
+        if !any { let _ = writeln!(s, "  (none)"); }
 
         let _ = writeln!(s, "--- pending ---");
         any = false;
@@ -224,9 +216,7 @@ impl ChunkTracker {
             any = true;
             let _ = writeln!(s, "  chunk {:>3}  range [{:>3}..{:<3})", c.chunk_id, c.start, c.end);
         }
-        if !any {
-            let _ = writeln!(s, "  (none)");
-        }
+        if !any { let _ = writeln!(s, "  (none)"); }
 
         let _ = writeln!(s, "--- logical worker stats ---");
         let mut lmap: BTreeMap<usize, (usize, usize, usize, Vec<usize>)> = BTreeMap::new();
@@ -345,6 +335,15 @@ pub(crate) fn write_chunk(
     let out_rows = output.rows();
     let cols = output.cols();
     let chunk_rows = chunk.rows();
+
+    if cols != chunk.cols() {
+        eprintln!(
+            "[WRITE-CHUNK-MISMATCH] output={}x{} chunk={}x{} start={} \
+             (cols mismatch: output.cols()={} chunk.cols()={})",
+            out_rows, cols, chunk_rows, chunk.cols(), start, cols, chunk.cols(),
+        );
+    }
+
     assert_eq!(cols, chunk.cols());
     assert!(start + chunk_rows <= out_rows);
 
@@ -363,33 +362,20 @@ pub(crate) fn write_chunk(
 // ============================================================================
 //  Размерности слоёв
 // ============================================================================
+//
+// Обе функции — тонкие обёртки над методами трейта UniversalLayer.
+// Вся логика определения размерностей живёт в самом трейте, эти обёртки
+// лишь подставляют форму буфера как fallback для слоёв, сохраняющих
+// размерность.
 
+#[inline]
 fn get_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
-    if let Some(l) = layer.as_linear() {
-        <Linear as UniversalLayerBuffered>::output_features(l)
-    } else if let Some(l) = layer.as_feature_fusion() {
-        <FeatureFusion as UniversalLayerBuffered>::output_features(l)
-    } else if let Some(l) = layer.as_multi_resolution_kan_linear() {
-        <MultiResolutionKANLinear as UniversalLayerBuffered>::output_features(l)
-    } else if let Some(l) = layer.as_spectral_norm_linear() {
-        <SpectrallyNormalizedLinear as UniversalLayerBuffered>::output_features(l)
-    } else {
-        input.cols()
-    }
+    layer.output_features_for(input.cols())
 }
 
+#[inline]
 fn get_input_features(layer: &Box<dyn UniversalLayer>, grad_output: &MatrixBufferHandle) -> usize {
-    if let Some(l) = layer.as_linear() {
-        <Linear as UniversalLayerBuffered>::input_features(l)
-    } else if let Some(l) = layer.as_feature_fusion() {
-        <FeatureFusion as UniversalLayerBuffered>::input_features(l)
-    } else if let Some(l) = layer.as_multi_resolution_kan_linear() {
-        <MultiResolutionKANLinear as UniversalLayerBuffered>::input_features(l)
-    } else if let Some(l) = layer.as_spectral_norm_linear() {
-        <SpectrallyNormalizedLinear as UniversalLayerBuffered>::input_features(l)
-    } else {
-        grad_output.cols()
-    }
+    layer.input_features_for(grad_output.cols())
 }
 
 // ============================================================================
@@ -627,7 +613,6 @@ pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
 //  Параллельный forward
 // ============================================================================
 
-/// Один чанк вместе с его глобальным ID.
 #[derive(Clone, Copy)]
 struct ChunkMeta {
     chunk_id: usize,
@@ -636,22 +621,6 @@ struct ChunkMeta {
     end: usize,
 }
 
-/// Параллельный прямой проход.
-///
-/// Возвращает `(контексты, раскладка)`:
-/// * `контексты` — `ctx_storage[i]` содержит контексты слоёв для чанка с глобальным
-///   `chunk_id = i`.
-/// * `раскладка` — `Vec<(start, size, end)>` в том же глобальном порядке
-///   (`раскладка[i]` соответствует `контексты[i]`).
-///
-/// Эту пару обязательно нужно сохранить между forward и backward: scheduler
-/// может изменить `plan_chunks_assignment` между вызовами (после обучения
-/// mini-model), поэтому backward не должен перезапрашивать раскладку — он
-/// получает её как аргумент.
-///
-/// Состояние чанков отслеживается событийно: воркеры фиксируют переходы
-/// `Assigned → InProgress → Done` в `ChunkTracker` в моменты самих переходов.
-/// Никаких фоновых таймеров и сторожевых потоков не создаётся.
 pub(crate) fn forward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -681,7 +650,6 @@ pub(crate) fn forward_universal_parallel(
         num_workers
     );
 
-    // Нумеруем чанки глобально в том порядке, в каком они пришли.
     let mut global_chunks: Vec<(usize, usize, usize)> = Vec::new();
     let mut per_worker_chunks: Vec<Vec<ChunkMeta>> = Vec::with_capacity(num_workers);
 
@@ -700,7 +668,17 @@ pub(crate) fn forward_universal_parallel(
         return (Vec::new(), Vec::new());
     }
 
-    // Трекер заполняется событийно. Никаких потоков, никаких таймеров.
+    if *PARALLEL_DEBUG {
+        eprintln!(
+            "[FWD-PARALLEL-START] batch_size={} num_workers={} total_chunks={} \
+             input=({}x{}) output=({}x{}) layers={}",
+            batch_size, num_workers, total_chunks,
+            input.rows(), input.cols(),
+            output.rows(), output.cols(),
+            layers.len(),
+        );
+    }
+
     let tracker = Arc::new(Mutex::new(ChunkTracker::new(&global_chunks)));
     {
         let mut t = tracker.lock().unwrap();
@@ -724,7 +702,6 @@ pub(crate) fn forward_universal_parallel(
     let ctx_storage: Arc<Mutex<Vec<Vec<DynamicContext>>>> =
         Arc::new(Mutex::new(vec![Vec::new(); total_chunks]));
 
-    // Владеющий `'static`-хэндл для воркеров.
     let executor_arc: Arc<dyn Executor> = Arc::from(executor.clone_executor());
 
     for (logical_worker_id, metas) in per_worker_chunks.into_iter().enumerate() {
@@ -754,11 +731,49 @@ pub(crate) fn forward_universal_parallel(
                 for (layer, slice) in shared.layers.iter().zip(shared.slices.iter()) {
                     let out_cols = get_output_features(layer, &current);
                     let out = pool_guard.acquire(current.rows(), out_cols);
+
+                    if *PARALLEL_DEBUG {
+                        eprintln!(
+                            "[FWD-PARALLEL] worker={} chunk={} layer={} in=({}x{}) out_cols={}",
+                            physical_worker_id,
+                            m.chunk_id,
+                            std::any::type_name_of_val(layer.as_ref()),
+                            current.rows(),
+                            current.cols(),
+                            out_cols,
+                        );
+                    }
+
                     let buffered_ctx =
                         build_buffered_context(layer, &current, &out, &mut *pool_guard);
                     call_forward_buffered(layer, &current, &out, &shared.params, slice);
+
+                    if *PARALLEL_DEBUG {
+                        eprintln!(
+                            "[FWD-PARALLEL]   after forward: out=({}x{})",
+                            out.rows(),
+                            out.cols(),
+                        );
+                    }
+
                     chunk_ctxs.push(DynamicContext::Buffered(buffered_ctx));
                     current = out;
+                }
+
+                let needs_warn = shared.output.cols() != current.cols();
+                if *PARALLEL_DEBUG || needs_warn {
+                    eprintln!(
+                        "[FWD-PARALLEL] worker={} chunk={} BEFORE write_chunk: \
+                         output=({}x{}) current=({}x{}) start={} end={}",
+                        physical_worker_id,
+                        m.chunk_id,
+                        shared.output.rows(),
+                        shared.output.cols(),
+                        current.rows(),
+                        current.cols(),
+                        m.start,
+                        m.end,
+                    );
                 }
 
                 write_chunk(&shared.output, &current, m.start);
@@ -775,7 +790,6 @@ pub(crate) fn forward_universal_parallel(
                     .unwrap()
                     .mark_done(m.chunk_id, duration_ns);
 
-                // Обратная связь scheduler'у — обучение mini-model.
                 executor_for_worker.report_execution_time(
                     logical_worker_id,
                     m.size,
@@ -797,19 +811,6 @@ pub(crate) fn forward_universal_parallel(
 //  Параллельный backward
 // ============================================================================
 
-/// Параллельный обратный проход.
-///
-/// Раскладку чанков **не запрашивает заново** у scheduler'а — она приходит
-/// аргументом `saved_chunks` из forward-прохода. Это гарантирует, что
-/// `contexts[i]` (сохранённый forward-контекст) соответствует `saved_chunks[i]`
-/// (диапазон батча).
-///
-/// Чанки распределяются по воркерам простым round-robin: воркер `k`
-/// обрабатывает чанки `k, k + num_workers, k + 2·num_workers, …`.
-/// Если `saved_chunks.len() < num_workers` — часть воркеров получит пустой
-/// набор задач и ничего не будет делать (это корректно).
-///
-/// Как и в forward, состояние чанков отслеживается событийно, без таймеров.
 pub(crate) fn backward_universal_parallel(
     executor: &dyn Executor,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -844,7 +845,6 @@ pub(crate) fn backward_universal_parallel(
         contexts.len()
     );
 
-    // Round-robin по воркерам. Воркер k получает чанки k, k+nw, k+2·nw, ...
     let mut per_worker_chunks: Vec<Vec<ChunkMeta>> =
         (0..num_workers).map(|_| Vec::new()).collect();
 
@@ -858,9 +858,19 @@ pub(crate) fn backward_universal_parallel(
         });
     }
 
-    let _ = batch_size; // сохраняем для отладки при необходимости
+    let _ = batch_size;
 
-    // Трекер заполняется событийно.
+    if *PARALLEL_DEBUG {
+        eprintln!(
+            "[BWD-PARALLEL-START] batch_size={} num_workers={} total_chunks={} \
+             grad_output=({}x{}) grad_input=({}x{}) layers={}",
+            batch_size, num_workers, total_chunks,
+            grad_output.rows(), grad_output.cols(),
+            grad_input.rows(), grad_input.cols(),
+            layers.len(),
+        );
+    }
+
     let tracker = Arc::new(Mutex::new(ChunkTracker::new(saved_chunks)));
     {
         let mut t = tracker.lock().unwrap();
@@ -883,7 +893,6 @@ pub(crate) fn backward_universal_parallel(
         pool,
     });
 
-    // Временные буферы градиентов — по одному на чанк.
     let param_len = shared.grad_params.rows();
     let mut temp_grads: Vec<MatrixBufferHandle> = Vec::with_capacity(total_chunks);
     for _ in 0..total_chunks {
@@ -930,6 +939,20 @@ pub(crate) fn backward_universal_parallel(
                     let grad_input_chunk =
                         pool_guard.acquire(current_grad.rows(), in_features);
 
+                    if *PARALLEL_DEBUG {
+                        eprintln!(
+                            "[BWD-PARALLEL] worker={} chunk={} layer={} \
+                             grad_in=({}x{}) grad_out=({}x{})",
+                            physical_worker_id,
+                            m.chunk_id,
+                            std::any::type_name_of_val(layer.as_ref()),
+                            current_grad.rows(),
+                            in_features,
+                            current_grad.rows(),
+                            current_grad.cols(),
+                        );
+                    }
+
                     call_backward_buffered(
                         layer,
                         ctx,
@@ -942,6 +965,21 @@ pub(crate) fn backward_universal_parallel(
 
                     pool_guard.release(current_grad);
                     current_grad = grad_input_chunk;
+                }
+
+                if *PARALLEL_DEBUG || shared.grad_input.cols() != current_grad.cols() {
+                    eprintln!(
+                        "[BWD-PARALLEL] worker={} chunk={} BEFORE write_chunk: \
+                         grad_input=({}x{}) current=({}x{}) start={} end={}",
+                        physical_worker_id,
+                        m.chunk_id,
+                        shared.grad_input.rows(),
+                        shared.grad_input.cols(),
+                        current_grad.rows(),
+                        current_grad.cols(),
+                        m.start,
+                        m.end,
+                    );
                 }
 
                 write_chunk(&shared.grad_input, &current_grad, m.start);

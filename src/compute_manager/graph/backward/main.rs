@@ -10,7 +10,26 @@ use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext, Mode
 use crate::compute_manager::gpu::processor::process_backward_gpu_buffered;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::device_plan::ComputeDevice;
-use crate::layers::{UniversalLayer, UniversalLayerBuffered};
+use crate::layers::UniversalLayer;
+
+/// Возвращает число входных признаков для первого слоя цепочки.
+///
+/// Единственное место, где это вычисляется для backward. Использует
+/// `UniversalLayer::input_features_for`, который сам знает про слои,
+/// меняющие размерность, и про слои, сохраняющие её.
+///
+/// `fallback` — число столбцов входящего градиента. Обычно используется,
+/// когда слой сохраняет размерность и не имеет фиксированного
+/// `input_features()`.
+fn first_layer_input_features(
+    layers: &[Box<dyn UniversalLayer>],
+    fallback: usize,
+) -> usize {
+    match layers.first() {
+        Some(first) => first.input_features_for(fallback),
+        None => fallback,
+    }
+}
 
 impl MixedModel {
     pub fn backward_mat_multi_buffered(
@@ -105,12 +124,10 @@ impl MixedModel {
 
                         if can_parallel {
                             let batch = delta_handle.rows();
-                            let input_features =
-                                if let Some(linear) = proc.first().and_then(|l| l.as_linear()) {
-                                    <dyn UniversalLayerBuffered>::input_features(linear)
-                                } else {
-                                    delta_handle.cols()
-                                };
+                            let input_features = first_layer_input_features(
+                                proc.as_ref().as_slice(),
+                                delta_handle.cols(),
+                            );
 
                             let grad_input_handle = {
                                 let mut pool_guard = pool.lock().unwrap();

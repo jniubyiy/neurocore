@@ -32,20 +32,11 @@ impl crate::compute_manager::graph::model::MixedModel {
             let slice = &slices[i];
             let ctx = ctxs[i];
 
-            // Определяем входную размерность слоя.
-            // Для слоёв, изменяющих размерность, берём input_features из трейта.
-            // Для всех остальных (сохраняющих размерность) входная размерность равна текущему числу столбцов градиента.
-            let in_features = if let Some(l) = layer.as_linear() {
-                <Linear as UniversalLayerBuffered>::input_features(l)
-            } else if let Some(l) = layer.as_feature_fusion() {
-                <FeatureFusion as UniversalLayerBuffered>::input_features(l)
-            } else if let Some(l) = layer.as_multi_resolution_kan_linear() {
-                <MultiResolutionKANLinear as UniversalLayerBuffered>::input_features(l)
-            } else if let Some(l) = layer.as_spectral_norm_linear() {
-                <SpectrallyNormalizedLinear as UniversalLayerBuffered>::input_features(l)
-            } else {
-                current_grad.cols()
-            };
+            // Входная размерность слоя. Вся логика определения — в трейте:
+            // слои с фиксированным input_features() возвращают его,
+            // слои, сохраняющие размерность, — число столбцов текущего
+            // буфера градиента.
+            let in_features = layer.input_features_for(current_grad.cols());
 
             let batch = current_grad.rows();
             let mut grad_input = pool.acquire(batch, in_features);

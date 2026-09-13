@@ -77,47 +77,14 @@ impl MixedModel {
     }
 }
 
-fn get_buffered_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
-    if let Some(l) = layer.as_linear() {
-        return <Linear as UniversalLayerBuffered>::output_features(l);
-    }
-    if let Some(l) = layer.as_feature_fusion() {
-        return <FeatureFusion as UniversalLayerBuffered>::output_features(l);
-    }
-    if let Some(l) = layer.as_multi_resolution_kan_linear() {
-        return <MultiResolutionKANLinear as UniversalLayerBuffered>::output_features(l);
-    }
-    if let Some(l) = layer.as_spectral_norm_linear() {
-        return <SpectrallyNormalizedLinear as UniversalLayerBuffered>::output_features(l);
-    }
-
-    if layer.as_relu().is_some()
-        || layer.as_sigmoid().is_some()
-        || layer.as_tanh().is_some()
-        || layer.as_leaky_relu().is_some()
-        || layer.as_identity().is_some()
-        || layer.as_softmax().is_some()
-        || layer.as_memory().is_some()
-        || layer.as_soft_sparse_gate().is_some()
-        || layer.as_soft_keep_gate().is_some()
-        || layer.as_dual_anchor().is_some()
-        || layer.as_adaptive_activation().is_some()
-        || layer.as_dual_slope_relu().is_some()
-        || layer.as_learnable_mish().is_some()
-        || layer.as_learnable_softplus().is_some()
-        || layer.as_rms_norm_learnable_eps().is_some()
-        || layer.as_adaptive_dropout().is_some()
-        || layer.as_sparse_feature_selection_gate().is_some()
-        || layer.as_adaptive_normalization().is_some()
-        || layer.as_batch_renorm().is_some()
-        || layer.as_concrete_dropout().is_some()
-        || layer.as_ind_rnn().is_some()
-        || layer.as_mamba().is_some()
-    {
-        return input.cols();
-    }
-
-    input.cols()
+/// Тонкая обёртка над методом трейта UniversalLayer.
+/// Вся логика определения выходной размерности живёт в самом трейте.
+#[inline]
+fn get_buffered_output_features(
+    layer: &Box<dyn UniversalLayer>,
+    input: &MatrixBufferHandle,
+) -> usize {
+    layer.output_features_for(input.cols())
 }
 
 fn call_forward_buffered(
@@ -226,7 +193,6 @@ fn build_buffered_context(
     } else if layer.as_rms_norm_learnable_eps().is_some() {
         BufferedContext::RMSNormWithLearnableEpsilon { input: input.clone() }
     } else if layer.as_adaptive_dropout().is_some() {
-        // Для CPU-ветки mask и arg не нужны, создаём пустые handle
         let empty_mask = pool.acquire(0, 0);
         let empty_arg = pool.acquire(0, 0);
         BufferedContext::AdaptiveDropout {
@@ -247,7 +213,7 @@ fn build_buffered_context(
             input: input.clone(),
             mean: Vec::new(),
             var: Vec::new(),
-            use_batch_stats: true, // заменить на слой если нужно
+            use_batch_stats: true,
         }
     } else if layer.as_concrete_dropout().is_some() {
         let empty_arg = pool.acquire(0, 0);

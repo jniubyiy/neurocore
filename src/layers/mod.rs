@@ -81,10 +81,60 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_multi_resolution_kan_linear(&self) -> Option<&MultiResolutionKANLinear> { None }
 
     // Общая информация о слое, используемая планировщиком.
-    // По умолчанию возвращает 0. Конкретные слои переопределяют.
+    //
+    // Соглашение о размерностях:
+    //   * `param_len() > 0`   — у слоя есть обучаемые параметры;
+    //   * `input_features() > 0`  — у слоя фиксированное число входных признаков;
+    //   * `output_features() > 0` — у слоя фиксированное число выходных признаков;
+    //   * `0` для `input_features()`/`output_features()` означает, что слой
+    //     сохраняет соответствующую размерность. Такое соглашение позволяет
+    //     покрыть активации, нормализации и гейты, которые не меняют
+    //     размерность, без необходимости заводить для них отдельные поля.
     fn param_len(&self) -> usize { 0 }
     fn input_features(&self) -> usize { 0 }
     fn output_features(&self) -> usize { 0 }
+
+    /// Число выходных признаков слоя при заданном числе входных.
+    ///
+    /// Единый источник истины для определения выходной размерности слоя
+    /// во всех местах проекта (forward, backward, параллельные пути,
+    /// сегментные процессоры).
+    ///
+    /// * Если `output_features() > 0` — слой имеет фиксированное число
+    ///   выходных признаков, независимое от входа. Возвращается оно.
+    /// * Если `output_features() == 0` — слой сохраняет размерность входа.
+    ///   Возвращается `in_cols`.
+    ///
+    /// # Примеры
+    /// * `Linear(8→1).output_features_for(8)`   → 1
+    /// * `FeatureFusion(8→8).output_features_for(8)` → 8
+    /// * `SoftSparseGate(8).output_features_for(8)` → 8
+    /// * `ReLU.output_features_for(8)`          → 8
+    #[inline]
+    fn output_features_for(&self, in_cols: usize) -> usize {
+        let of = self.output_features();
+        if of == 0 { in_cols } else { of }
+    }
+
+    /// Число входных признаков слоя при неизвестном `fallback`.
+    ///
+    /// Единый источник истины для определения входной размерности слоя.
+    ///
+    /// * Если `input_features() > 0` — слой имеет фиксированное число
+    ///   входных признаков. Возвращается оно.
+    /// * Если `input_features() == 0` — слой сохраняет размерность,
+    ///   и возвращается `fallback`. Обычно `fallback` — это число столбцов
+    ///   буфера градиента на входе в слой.
+    ///
+    /// # Примеры
+    /// * `Linear(8→1).input_features_for(1)`      → 8
+    /// * `SoftSparseGate(8).input_features_for(1)` → 8
+    /// * `ReLU.input_features_for(8)`              → 8
+    #[inline]
+    fn input_features_for(&self, fallback: usize) -> usize {
+        let inf = self.input_features();
+        if inf == 0 { fallback } else { inf }
+    }
 }
 
 // ---------------------------------------------------------------------------

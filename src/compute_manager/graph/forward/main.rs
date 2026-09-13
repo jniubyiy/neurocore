@@ -5,36 +5,27 @@ use std::time::Instant;
 
 use crate::compute_manager::cpu::parallel::{can_parallelize, forward_universal_parallel};
 use crate::compute_manager::dim_change;
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::compute_manager::graph::model::MixedModel;
 use crate::compute_manager::graph::types::{ChunkedContexts, Model};
 use crate::compute_manager::gpu::processor::process_forward_gpu_buffered;
 use crate::device_plan::ComputeDevice;
-use crate::layers::{UniversalLayer, UniversalLayerBuffered};
+use crate::layers::UniversalLayer;
 
+/// Возвращает число выходных признаков для цепочки слоёв UniversalProcessor.
+///
+/// Единственное место, где это вычисляется для forward. Использует
+/// `UniversalLayer::output_features_for`, который сам знает про слои,
+/// меняющие размерность, и про слои, сохраняющие её.
 fn get_proc_output_features(
     layers: &[Box<dyn UniversalLayer>],
     input: &MatrixBufferHandle,
 ) -> usize {
-    let mut current_cols = input.cols();
+    let mut cols = input.cols();
     for layer in layers {
-        if let Some(linear) = layer.as_linear() {
-            current_cols = <crate::layers::Linear as UniversalLayerBuffered>::output_features(linear);
-        } else if layer.as_relu().is_some()
-            || layer.as_sigmoid().is_some()
-            || layer.as_tanh().is_some()
-            || layer.as_leaky_relu().is_some()
-            || layer.as_identity().is_some()
-            || layer.as_softmax().is_some()
-            || layer.as_memory().is_some()
-            || layer.as_soft_sparse_gate().is_some()
-            || layer.as_soft_keep_gate().is_some()
-            || layer.as_dual_anchor().is_some()
-        {
-            // Размерность не меняется.
-        }
+        cols = layer.output_features_for(cols);
     }
-    current_cols
+    cols
 }
 
 impl MixedModel {

@@ -131,6 +131,8 @@ macro_rules! device_plan_v {
     };
 }
 
+// ВНИМАНИЕ: минимальное число CPU-потоков — 2 (см. DevicePlan::cpu).
+// Один поток уходит под управление, второй — на вычисления.
 device_plan_v!(device_plan_v1, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v2, 4, 8192, false, 0, false);
 device_plan_v!(device_plan_v3, 2, 8192, true, 4096, false);
@@ -141,14 +143,15 @@ device_plan_v!(device_plan_v5_cpu, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v6, 4, 8192, false, 0, true);
 device_plan_v!(device_plan_v7, 4, 8192, true, 4096, false);
 
+/// Печатает только краткую итоговую строку результата.
+/// Подробный отчёт профиля (`ProfileResult::report()`) намеренно не выводится,
+/// чтобы не засорять консоль. При необходимости отчёт доступен через
+/// `r.profile.as_ref().map(|p| p.report())`.
 fn print_result(label: &str, r: &neurocore::training_plan::execution::TrainingResult) {
     println!(
         "{}  time={:.3}s | best_loss={:.6} @ epoch {} | zero_loss_epoch={:?}",
         label, r.training_time_secs, r.best_loss, r.best_epoch, r.zero_loss_epoch
     );
-    if let Some(ref profile) = r.profile {
-        println!("{}", profile.report());
-    }
 }
 
 fn main() {

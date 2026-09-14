@@ -1,25 +1,33 @@
 // src/layers/feature_fusion/gpu/vulkan/shaders/feature_fusion_grad_params.comp
 //
-// Градиенты по параметрам FeatureFusion.
+// Градиент по логитам FeatureFusion.
 //
-// Для логитов:  grad_logits[j, i] = Σ_r go[j, r] * x[i, r] * w[j, i] * (1 - w[j, i])
-//               где w = softmax(логиты) для выхода j.
-// Для смещений: grad_bias[j]     = Σ_r go[j, r].
+// Один поток на (j, i). Внутри — цикл по r; для каждого r внутри
+// цикла по l вычисляется u[j,r] = Σ_l w[j,l] · x[l,r] (пересчёт
+// «на лету» вместо temp буфера — допустимо, так как fin обычно мало).
 //
-// Каждый индекс (j, i) и (j) пишется ровно один раз — атомика не нужна.
-// Локальных массивов нет.
+// Формула (см. вывод в CPU-реализации):
+//
+//   dz[j, k]      = Σ_r go[j,r] · w[j,k] · ( x[k,r] − u[j,r] )
+//   ∂L/∂L[j,k]    = dz[j, k] / T_eff[j]
+//   ∂L/∂T_raw[j]  = −sign(T_raw[j]) · (1/T_eff[j]²) · Σ_k L[j,k] · dz[j,k]
+//
+// Логиты пишутся в grad_params по смещению logits_base + i.
+// Вклад в «dot_ldz[j]» (Σ_k L[j,k] · dz[j,k]) накапливается через
+// канонический макрос ATOMIC_ADD_FLOAT над uint-буфером. Шейдер
+// feature_fusion_grad_T затем финализирует grad_params[temp_idx].
 //
 // Раскладка:
-//   x           — column-major, x[i * batch + r].
-//   go          — column-major, go[j * batch + r].
-//   weights     — row-major, weights[j * in_features + i] (выход softmax).
-//   grad_logits — row-major, grad_logits[j * in_features + i].
-//   grad_bias   — линейный, grad_bias[j].
+//   x       — column-major, x[i * batch + r].
+//   go      — column-major, go[j * batch + r].
+//   params  — плоский блок [logits, T_raw], row-major по j.
+//   weights — row-major, weights[j * in_features + i].
+//   grad_params — плоский блок [grad_logits, grad_T_raw], row-major по j.
+//   dot_ldz — вектор длины out_features; промежуточный накопитель,
+//             должен быть обнулён на хосте перед dispatch.
 //
 // Push-константы: batch, in_features, out_features.
-// Dispatch: out_features * in_features + out_features потоков.
-//   [0, out*in)        → grad_logits для (j, i)
-//   [out*in, out*in+out) → grad_bias для j
+// Dispatch: out_features * in_features потоков.
 
 #version 450
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -30,36 +38,82 @@ layout(push_constant) uniform PushConsts {
     uint out_features;
 } pc;
 
-layout(binding = 0, std430) readonly buffer InputBuf      { float x[]; };
-layout(binding = 1, std430) readonly buffer GradOutBuf    { float go[]; };
-layout(binding = 2, std430) readonly buffer WeightsBuf    { float weights[]; };
-layout(binding = 3, std430) writeonly buffer GradLogitsBuf { float grad_logits[]; };
-layout(binding = 4, std430) writeonly buffer GradBiasBuf   { float grad_bias[]; };
+layout(binding = 0, std430) readonly buffer InputBuf {
+    float x[];
+};
+
+layout(binding = 1, std430) readonly buffer GradOutBuf {
+    float go[];
+};
+
+layout(binding = 2, std430) readonly buffer ParamsBuf {
+    float params[];
+};
+
+layout(binding = 3, std430) readonly buffer WeightsBuf {
+    float weights[];
+};
+
+layout(binding = 4, std430) writeonly buffer GradParamsBuf {
+    float grad_params[];
+};
+
+layout(binding = 5, std430) buffer DotLdzBuf {
+    uint dot_ldz[];
+};
+
+#define ATOMIC_ADD_FLOAT(target, value) \
+{ \
+    uint expected = target; \
+    uint desired; \
+    do { \
+        float cur = uintBitsToFloat(expected); \
+        desired = floatBitsToUint(cur + (value)); \
+        uint old = atomicCompSwap(target, expected, desired); \
+        if (old == expected) break; \
+        expected = old; \
+    } while (true); \
+}
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    uint n_logits = pc.out_features * pc.in_features;
-    uint total = n_logits + pc.out_features;
+    uint total = pc.out_features * pc.in_features;
     if (idx >= total) return;
 
-    if (idx < n_logits) {
-        // Ветвь 1: grad_logits[j, i]
-        uint j = idx / pc.in_features;
-        uint i = idx % pc.in_features;
+    uint i = idx % pc.in_features;
+    uint j = idx / pc.in_features;
 
-        float w = weights[idx];
-        float acc = 0.0;
-        for (uint r = 0u; r < pc.batch; ++r) {
-            acc += go[j * pc.batch + r] * x[i * pc.batch + r];
+    uint fin = pc.in_features;
+    uint fout = pc.out_features;
+    uint batch = pc.batch;
+
+    uint logits_base = j * fin;
+    uint temp_idx = fout * fin + j;
+
+    float t_raw = params[temp_idx];
+    float t_eff = abs(t_raw) + 1e-6;
+    float inv_t = 1.0 / t_eff;
+
+    float w_ji = weights[logits_base + i];
+
+    // dz[j, i] = Σ_r go[j,r] · w[j,i] · ( x[i,r] − u[j,r] )
+    // u[j,r] = Σ_l w[j,l] · x[l,r] — пересчитываем локально.
+    float dz = 0.0;
+    for (uint r = 0u; r < batch; ++r) {
+        float u_r = 0.0;
+        for (uint l = 0u; l < fin; ++l) {
+            u_r += weights[logits_base + l] * x[l * batch + r];
         }
-        grad_logits[idx] = acc * w * (1.0 - w);
-    } else {
-        // Ветвь 2: grad_bias[j]
-        uint j = idx - n_logits;
-        float acc = 0.0;
-        for (uint r = 0u; r < pc.batch; ++r) {
-            acc += go[j * pc.batch + r];
-        }
-        grad_bias[j] = acc;
+        float x_ir = x[i * batch + r];
+        float go_jr = go[j * batch + r];
+        dz += go_jr * w_ji * (x_ir - u_r);
     }
+
+    // ∂L/∂L[j,i] = dz / T_eff.
+    grad_params[logits_base + i] = dz * inv_t;
+
+    // Накопление dot_ldz[j] += L[j,i] · dz.
+    float l_ji = params[logits_base + i];
+    float contrib = l_ji * dz;
+    ATOMIC_ADD_FLOAT(dot_ldz[j], contrib);
 }

@@ -1,20 +1,21 @@
 // examples/feature_fusion_example.rs
+// Пример обучения модели с использованием слоя FeatureFusion.
 //
-// Пример обучения модели с использованием слоя FeatureFusion в паре
-// с SoftSparseGate и финальным линейным слоем.
-//
-// Архитектура: SoftSparseGate(8→8) → FeatureFusion(8→8) → Linear(8→1).
+// Архитектура: FeatureFusion(8→8) → Linear(8→1).
 //
 // Роли слоёв:
-//   * SoftSparseGate — обучаемые пороги по каждому признаку. Мягко зануляет
-//     слабые по амплитуде признаки, пропускает сильные. Работает как
-//     «отсечка шума».
-//   * FeatureFusion — softmax-attention над признаками. Каждый выход — своя
-//     голова внимания, обучаемые нормированные веса важности признаков.
-//     Работает как «взвешивание по важности».
-//   * Linear — финальная проекция в скаляр со свободными коэффициентами
+//   * FeatureFusion — softmax-attention над признаками с обучаемой температурой.
+//     Каждая из 8 голов внимания может сфокусироваться на одном входном
+//     признаке (в пределе one-hot маска). Работает как «взвешивание по
+//     важности» и одновременно как нелинейный селектор признаков.
+//   * Linear — финальная проекция 8 → 1 со свободными коэффициентами
 //     любого знака. Именно этот слой выучивает числовую зависимость
 //     целевой переменной от входов.
+//
+// Композиция FF + Linear математически эквивалентна линейной функции
+// y = Σ c_i · x_i, где c_i = Σ_j W_j · w_{j,i}, w_{j,:} = softmax(L_j / T_j).
+// Коэффициенты c_i могут быть любого знака (за счёт W_j), что позволяет
+// решать задачи вида y = 2x₀ − 3x₁ без ограничений.
 //
 // Задача: y = 2·x₀ − 3·x₁ + шум. Признаки x₀, x₁ — полезные (амплитуда 0..1),
 // признаки x₂..x₇ — шум (амплитуда 0..0.3). Модель должна научиться
@@ -32,19 +33,14 @@ mod models {
 
     pub fn feature_fusion_model() -> Vec<LayerDesc> {
         vec![
-            // 1. Отсечка слабого шума по амплитуде.
-            //    extra = [temperature] = 0.5.
-            LayerDesc::new(LayerKind::SoftSparseGate)
-                .input(shape!(batch, A[8]))
-                .output(shape!(batch, A[8]))
-                .extra(vec![0.5]),
-
-            // 2. Softmax-attention: перевзвешивание оставшихся признаков.
+            // Softmax-attention над признаками с обучаемой температурой.
+            // Вход 8 признаков, выход 8 признаков (по одной голове внимания
+            // на каждый выходной признак).
             LayerDesc::new(LayerKind::FeatureFusion)
                 .input(shape!(batch, A[8]))
                 .output(shape!(batch, A[8])),
 
-            // 3. Финальная проекция 8 → 1 со свободными коэффициентами.
+            // Финальная проекция 8 → 1 со свободными коэффициентами.
             LayerDesc::new(LayerKind::Linear)
                 .input(shape!(batch, A[8]))
                 .output(shape!(batch, A[1])),
@@ -81,10 +77,10 @@ mod optimizers {
 ///   target = 2.0·x₀ − 3.0·x₁ + небольшой шум.
 ///
 /// x₀, x₁ — сильный сигнал, равномерно в [-1, 1].
-/// x₂..x₇ — слабый шум, равномерно в [-0.3, 0.3].
+/// x₂..x₇ — шум, равномерно в [-0.3, 0.3].
 ///
-/// Разделение по амплитуде даёт SoftSparseGate шанс реально выполнить
-/// свою функцию: занулить шум и пропустить полезный сигнал.
+/// Разделение по амплитуде позволяет модели различать полезные и шумовые
+/// признаки через масштаб входных значений.
 fn generate_data(num_samples: usize, seed: u64) -> (Tensor2D, Tensor2D) {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -119,7 +115,7 @@ fn generate_data(num_samples: usize, seed: u64) -> (Tensor2D, Tensor2D) {
 fn base_training() -> neurocore::training_plan::TrainingPlan {
     use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
 
-    let num_samples = 200;
+    let num_samples = 100;
     let batch_size = 20;
     let (train_x, train_y) = generate_data(num_samples, 42);
 
@@ -131,12 +127,9 @@ fn base_training() -> neurocore::training_plan::TrainingPlan {
         .batch_size(batch_size)
         .train_data(DataSource::from_tensor2d(train_x))
         .target_data(DataSource::from_tensor2d(train_y))
-        // Логиты SoftSparseGate и FeatureFusion инициализируются около 1.0
-        // для стабильного старта: пороги внутри рабочего диапазона |x|,
-        // softmax-веса близки к равномерным.
         .init_weights(Initializer::RandomUniform {
-            min: 0.5,
-            max: 1.5,
+            min: -0.1,
+            max: 0.1,
         })
         .seed(42)
         .output_tensors(vec!["prediction".to_string()])

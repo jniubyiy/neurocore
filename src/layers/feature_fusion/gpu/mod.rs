@@ -19,8 +19,8 @@ impl GpuCompute {
     /// Прямой проход FeatureFusion на GPU.
     ///
     /// Разбит на два этапа:
-    ///   1. softmax логитов → временный буфер `weights` (row-major, out × in);
-    ///   2. y = W_softmax · x + b.
+    ///   1. softmax логитов (с обучаемой температурой) → временный буфер `weights`;
+    ///   2. y = weights · x  (без bias).
     ///
     /// Временный буфер выделяется через `acquire_temp_buffer` и освобождается
     /// в конце. Локальных массивов в шейдерах нет, ограничений на размерности нет.
@@ -52,7 +52,7 @@ impl GpuCompute {
         let params_buf = subbuffer_from_view(self, params);
         let out_buf = self.get_gpu_subbuffer_from_handle(output);
 
-        // 2. Softmax логитов.
+        // 2. Softmax логитов (с T).
         let softmax_pipeline = &self.feature_fusion_pipelines().softmax;
         let push_softmax = [out_features as u32, in_features as u32];
         self.run_compute_shader(
@@ -62,16 +62,15 @@ impl GpuCompute {
             out_features,
         );
 
-        // 3. Основной forward: matmul с softmax-весами + bias.
+        // 3. Основной forward: y = weights · x (без bias).
         let output_pipeline = &self.feature_fusion_pipelines().output;
         let push_output = [batch as u32, in_features as u32, out_features as u32];
         self.run_compute_shader(
             output_pipeline,
             &[
                 (0, in_buf),
-                (1, params_buf),
-                (2, weights_buf.clone()),
-                (3, out_buf),
+                (1, weights_buf.clone()),
+                (2, out_buf),
             ],
             &push_output,
             batch * out_features,
@@ -83,12 +82,14 @@ impl GpuCompute {
 
     /// Обратный проход FeatureFusion на GPU.
     ///
-    /// Разбит на три этапа:
+    /// Разбит на четыре этапа:
     ///   1. softmax логитов (тот же шейдер, что и в forward);
-    ///   2. gi = go · W_softmax;
-    ///   3. grad_logits и grad_bias.
+    ///   2. gi = go · weights;
+    ///   3. grad_logits и накопление dot_ldz (атомарное);
+    ///   4. финализация grad_T_raw через dot_ldz.
     ///
-    /// Временный буфер под softmax-веса освобождается в конце.
+    /// `dot_ldz` — временный буфер длины `out_features`, обнуляется
+    /// перед запуском.
     pub fn run_feature_fusion_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -120,79 +121,85 @@ impl GpuCompute {
             "grad_params length mismatch"
         );
 
-        // 1. Временный буфер под softmax-веса.
         let weights_elems = out_features * in_features;
         let (weights_buf, weights_raw) = self.acquire_temp_buffer(weights_elems);
+        let (dot_ldz_buf, dot_ldz_raw) = self.acquire_temp_buffer(out_features);
 
-        let in_buf = self.get_gpu_subbuffer_from_handle(input);
-        let go_buf = self.get_gpu_subbuffer_from_handle(grad_out);
-        let gi_buf = self.get_gpu_subbuffer_from_handle(grad_input);
+        // Обнуляем dot_ldz (uint-буфер, но в Rust это f32 Subbuffer).
+        {
+            let zero_handle = self.upload_vec_to_gpu_handle(
+                &vec![0.0f32; out_features],
+                out_features,
+                1,
+            );
+            self.copy_buffer_sync(
+                self.get_gpu_subbuffer_from_handle(&zero_handle),
+                dot_ldz_buf.clone(),
+            );
+        }
+
+        let in_buf     = self.get_gpu_subbuffer_from_handle(input);
+        let go_buf     = self.get_gpu_subbuffer_from_handle(grad_out);
+        let gi_buf     = self.get_gpu_subbuffer_from_handle(grad_input);
         let params_buf = subbuffer_from_view(self, params);
         let grad_params_buf = subbuffer_from_view(self, grad_params);
 
-        // 2. Softmax логитов (тот же шейдер).
+        // 1. Softmax логитов (тот же шейдер).
         let softmax_pipeline = &self.feature_fusion_pipelines().softmax;
         let push_softmax = [out_features as u32, in_features as u32];
         self.run_compute_shader(
             softmax_pipeline,
-            &[(0, params_buf), (1, weights_buf.clone())],
+            &[(0, params_buf.clone()), (1, weights_buf.clone())],
             &push_softmax,
             out_features,
         );
 
-        // 3. Градиент по входу.
+        // 2. Градиент по входу: gi = go · weights.
         let grad_in_pipeline = &self.feature_fusion_pipelines().grad_input;
         let push_dims = [batch as u32, in_features as u32, out_features as u32];
         self.run_compute_shader(
             grad_in_pipeline,
-            &[(0, go_buf.clone()), (1, weights_buf.clone()), (2, gi_buf)],
+            &[
+                (0, go_buf.clone()),
+                (1, weights_buf.clone()),
+                (2, gi_buf),
+            ],
             &push_dims,
             batch * in_features,
         );
 
-        // 4. Градиенты по параметрам.
-        //
-        // Разбиваем grad_params на два диапазона:
-        //   [0, out*in)          → grad_logits (row-major)
-        //   [out*in, out*in+out) → grad_bias
-        //
-        // Так как внутри grad_params лежат [logits; bias], эти два view
-        // покрывают его без пересечения.
-        let grad_logits_view = MatrixBufferView::new(
-            grad_params.parent_handle().clone(),
-            grad_params.offset_elements(),
-            weights_elems,
-        );
-        let grad_bias_view = MatrixBufferView::new(
-            grad_params.parent_handle().clone(),
-            grad_params.offset_elements() + weights_elems,
-            out_features,
-        );
-
-        let grad_logits_buf = subbuffer_from_view(self, &grad_logits_view);
-        let grad_bias_buf = subbuffer_from_view(self, &grad_bias_view);
-
+        // 3. grad_params (логиты) + накопление dot_ldz.
         let grad_params_pipeline = &self.feature_fusion_pipelines().grad_params;
-        let total_params = weights_elems + out_features;
         self.run_compute_shader(
             grad_params_pipeline,
             &[
                 (0, in_buf),
                 (1, go_buf),
-                (2, weights_buf.clone()),
-                (3, grad_logits_buf),
-                (4, grad_bias_buf),
+                (2, params_buf.clone()),
+                (3, weights_buf.clone()),
+                (4, grad_params_buf.clone()),
+                (5, dot_ldz_buf.clone()),
             ],
             &push_dims,
-            total_params,
+            out_features * in_features,
         );
 
-        // Освобождаем временный буфер.
-        self.release_temp_buffer(weights_buf, weights_raw);
+        // 4. Финализация grad_T_raw через dot_ldz.
+        let grad_T_pipeline = &self.feature_fusion_pipelines().grad_T;
+        let push_T = [out_features as u32, in_features as u32];
+        self.run_compute_shader(
+            grad_T_pipeline,
+            &[
+                (0, params_buf),
+                (1, dot_ldz_buf.clone()),
+                (2, grad_params_buf),
+            ],
+            &push_T,
+            out_features,
+        );
 
-        // grad_params_buf не используется напрямую — он покрыт через два view,
-        // но чтобы избежать предупреждения о неиспользуемой переменной,
-        // оставим явную ссылку (компилятор её уберёт).
-        let _ = grad_params_buf;
+        // 5. Освобождаем временные буферы.
+        self.release_temp_buffer(weights_buf, weights_raw);
+        self.release_temp_buffer(dot_ldz_buf, dot_ldz_raw);
     }
 }

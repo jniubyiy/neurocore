@@ -1,5 +1,15 @@
 // examples/linear_test.rs
-// Демонстрация семи вариантов обучения автоэнкодера 4 -> 4 через run_training!.
+//
+// Диагностический прогон автоэнкодера 4 → 4 с разными learning rate.
+//
+// Цель: выяснить, зависит ли фактический шаг оптимизатора от заданного lr.
+//
+// Если lr реально линейный — каждая строка ниже даст различный loss, и
+// чем больше lr, тем меньше loss (до определённого предела, потом NaN).
+//
+// Если lr используется как "boolean" (0 = выкл, всё остальное = вкл с
+// фиксированным коэффициентом) — все непустые значения дадут одинаковый
+// финальный loss, а 0.0 — константу.
 
 use neurocore::tensor::Tensor2D;
 
@@ -16,6 +26,7 @@ mod models {
 
 mod losses {
     use neurocore::loss_plan::{Aggregation, ElementChain, LossDesc, Square, Sub, SumColumns};
+
     pub fn mse() -> LossDesc {
         let chain = ElementChain::new()
             .add(Box::new(Sub::new(4)))
@@ -27,9 +38,12 @@ mod losses {
 
 mod optimizers {
     use neurocore::optimizer_plan::{OptimizerDesc, OptCubeDesc};
-    pub fn sgd() -> OptimizerDesc {
+
+    /// SGD с явно заданным learning rate.
+    /// `lr` передаётся в ScaleGradient, а не берётся из дефолта.
+    pub fn sgd(lr: f32) -> OptimizerDesc {
         OptimizerDesc::new()
-            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ScaleGradient(lr))
             .add(OptCubeDesc::ApplyUpdate)
     }
 }
@@ -38,12 +52,14 @@ fn data() -> Tensor2D {
     Tensor2D::new(vec![vec![1.0, 2.0, 3.0, 4.0]])
 }
 
-fn base_training() -> neurocore::training_plan::TrainingPlan {
+/// Общая фабрика плана обучения с параметром `lr`.
+fn make_training_plan(lr: f32) -> neurocore::training_plan::TrainingPlan {
     use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
+
     TrainingPlan::new()
         .model(models::linear_model)
         .loss(losses::mse())
-        .optimizer(optimizers::sgd())
+        .optimizer(optimizers::sgd(lr))
         .epochs(100)
         .batch_size(1)
         .train_data(DataSource::from_tensor2d(data()))
@@ -52,103 +68,82 @@ fn base_training() -> neurocore::training_plan::TrainingPlan {
         .output_tensors(vec!["prediction".to_string()])
 }
 
-mod training_plan_v1 {
+// ---------------------------------------------------------------------------
+// По одной обёртке на каждое значение lr.
+// `run_training!` принимает путь к функции без аргументов, поэтому
+// каждый lr закреплён в своём модуле.
+// ---------------------------------------------------------------------------
+
+mod training_plan_lr_0 {
     use neurocore::training_plan::TrainingPlan;
-    pub fn plan() -> TrainingPlan { super::base_training() }
+    pub fn plan() -> TrainingPlan { super::make_training_plan(0.0) }
 }
-mod device_plan_v1 {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192) }
-}
-mod training_plan_v2 {
+mod training_plan_lr_1e_9 {
     use neurocore::training_plan::TrainingPlan;
-    pub fn plan() -> TrainingPlan { super::base_training() }
+    pub fn plan() -> TrainingPlan { super::make_training_plan(1e-9) }
 }
-mod device_plan_v2 {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192) }
-}
-mod training_plan_v3 {
+mod training_plan_lr_1e_6 {
     use neurocore::training_plan::TrainingPlan;
-    pub fn plan() -> TrainingPlan { super::base_training() }
+    pub fn plan() -> TrainingPlan { super::make_training_plan(1e-6) }
 }
-mod device_plan_v3 {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096) }
-}
-mod training_plan_v4 {
+mod training_plan_lr_1e_4 {
     use neurocore::training_plan::TrainingPlan;
-    pub fn plan() -> TrainingPlan { super::base_training() }
+    pub fn plan() -> TrainingPlan { super::make_training_plan(1e-4) }
 }
-mod device_plan_v4_cpu {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192) }
-}
-mod device_plan_v4_gpu {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096) }
-}
-mod training_plan_v5 {
+mod training_plan_lr_1e_2 {
     use neurocore::training_plan::TrainingPlan;
-    pub fn plan() -> TrainingPlan { super::base_training() }
+    pub fn plan() -> TrainingPlan { super::make_training_plan(1e-2) }
 }
-mod device_plan_v5_gpu {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192).gpu(0).vram(0, 0, 4096) }
-}
-mod device_plan_v5_cpu {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 2).ram(0, 8192) }
-}
-mod training_plan_v6 {
+mod training_plan_lr_0p1 {
     use neurocore::training_plan::TrainingPlan;
-    pub fn plan() -> TrainingPlan { super::base_training() }
+    pub fn plan() -> TrainingPlan { super::make_training_plan(0.1) }
 }
-mod device_plan_v6 {
-    use neurocore::device_plan::DevicePlan;
-    pub fn plan() -> DevicePlan { DevicePlan::empty().cpu(0, 4).ram(0, 8192).ssd(0, "neurocore_ssd_cache", 5000) }
+mod training_plan_lr_1p0 {
+    use neurocore::training_plan::TrainingPlan;
+    pub fn plan() -> TrainingPlan { super::make_training_plan(1.0) }
 }
 
-mod training_plan_v7 {
-    use neurocore::training_plan::{TrainingPlan, ProfileMode};
-    pub fn plan() -> TrainingPlan {
-        super::base_training().profile(ProfileMode::Full)
-    }
-}
-mod device_plan_v7 {
+/// Единый device_plan: CPU 2 потока, RAM 8 ГБ.
+mod device_plan {
     use neurocore::device_plan::DevicePlan;
     pub fn plan() -> DevicePlan {
-        DevicePlan::empty().cpu(0, 4).ram(0, 8192).gpu(0).vram(0, 0, 4096)
+        DevicePlan::empty().cpu(0, 2).ram(0, 8192)
     }
 }
 
 fn print_result(label: &str, r: &neurocore::training_plan::execution::TrainingResult) {
-    println!("{}  time={:.3}s | best_loss={:.6} @ epoch {} | zero_loss_epoch={:?}",
-             label, r.training_time_secs, r.best_loss, r.best_epoch, r.zero_loss_epoch);
-    if let Some(ref prof) = r.profile {
-        println!("  Profile: total={:.3}s, peak_mem={:.2} MB",
-                 prof.total_time_secs,
-                 prof.memory_peak_bytes_by_device.values().sum::<usize>() as f64 / 1_048_576.0);
-    }
+    println!(
+        "{}  time={:.3}s | best_loss={:.6} @ epoch {} | zero_loss_epoch={:?}",
+        label, r.training_time_secs, r.best_loss, r.best_epoch, r.zero_loss_epoch
+    );
 }
 
 fn main() {
-    let r1 = neurocore::run_training!(training_plan_v1::plan, device = device_plan_v1::plan);
-    print_result("V1 CPU 2t", &r1);
-    let r2 = neurocore::run_training!(training_plan_v2::plan, device = device_plan_v2::plan);
-    print_result("V2 CPU 4t", &r2);
-    let r3 = neurocore::run_training!(training_plan_v3::plan, device = device_plan_v3::plan);
-    print_result("V3 GPU   ", &r3);
-    let r4_cpu = neurocore::run_training!(training_plan_v4::plan, device = device_plan_v4_cpu::plan);
-    print_result("V4a CPU 2t", &r4_cpu);
-    let r4_gpu = neurocore::run_training!(training_plan_v4::plan, device = device_plan_v4_gpu::plan);
-    print_result("V4b GPU ", &r4_gpu);
-    let r5_gpu = neurocore::run_training!(training_plan_v5::plan, device = device_plan_v5_gpu::plan);
-    print_result("V5a GPU ", &r5_gpu);
-    let r5_cpu = neurocore::run_training!(training_plan_v5::plan, device = device_plan_v5_cpu::plan);
-    print_result("V5b CPU 2t", &r5_cpu);
-    let r6 = neurocore::run_training!(training_plan_v6::plan, device = device_plan_v6::plan);
-    print_result("V6 SSD  ", &r6);
-    let r7 = neurocore::run_training!(training_plan_v7::plan, device = device_plan_v7::plan);
-    print_result("V7 Prof ", &r7);
+    println!();
+    println!("=== LINEAR_TEST: lr sweep ===");
+    println!();
+
+    let r = neurocore::run_training!(training_plan_lr_0::plan, device = device_plan::plan);
+    print_result("lr=0.0    ", &r);
+
+    let r = neurocore::run_training!(training_plan_lr_1e_9::plan, device = device_plan::plan);
+    print_result("lr=1e-9   ", &r);
+
+    let r = neurocore::run_training!(training_plan_lr_1e_6::plan, device = device_plan::plan);
+    print_result("lr=1e-6   ", &r);
+
+    let r = neurocore::run_training!(training_plan_lr_1e_4::plan, device = device_plan::plan);
+    print_result("lr=1e-4   ", &r);
+
+    let r = neurocore::run_training!(training_plan_lr_1e_2::plan, device = device_plan::plan);
+    print_result("lr=1e-2   ", &r);
+
+    let r = neurocore::run_training!(training_plan_lr_0p1::plan, device = device_plan::plan);
+    print_result("lr=0.1    ", &r);
+
+    let r = neurocore::run_training!(training_plan_lr_1p0::plan, device = device_plan::plan);
+    print_result("lr=1.0    ", &r);
+
+    println!();
+    println!("=== end lr sweep ===");
 }

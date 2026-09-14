@@ -26,35 +26,21 @@ use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 // Отладочные переключатели
 // ============================================================================
 //
-// NEUROCORE_DEBUG_TRAIN=1  — включает диагностику тренировочного цикла:
-//   * шапка (num_samples, lr, init ||p||);
-//   * loss и ||g|| по каждому батчу (первые LOG_FIRST_EPOCHS эпох);
-//   * содержимое и per-sample MSE всех батчей на epoch 0;
-//   * ANOMALY-эпохи (loss батча > ANOMALY_MULTIPLIER × avg) — полный список
-//     батчей, per-sample MSE, содержимое худшего sample'а;
-//   * эволюция β и θ слоя LearnableSoftplus из ParamStore
-//     (первые LOG_LSF_EVO_FIRST эпох, затем раз в LOG_LSF_EVO_EVERY эпох);
-//   * раз в LOG_NORM_EVERY эпох — ||params||_2.
-//
-// NEUROCORE_DEBUG_LAYERS=1 — точечная диагностика для сравнения CPU и GPU:
-//   * после forward — checksum prediction (sum/l2/min/max);
-//   * после backward — checksum первого gradient-буфера (sum/l2/min/max);
-//   * после update (для последнего батча первых эпох) — ||params||_2.
-//   Печатается для каждого батча всех эпох. Логи одинакового формата
-//   для CPU и GPU, что позволяет построчное сравнение.
-//
-// ВАЖНО: чтение параметров для checksum выполняется через
-// `ParamGradients::to_flat_vec` (для градиентов) и через
-// `Tensor`-безопасный путь (для prediction). Для параметров используется
-// `param_store_read_all_safe`, который корректно обрабатывает GPU-буферы:
-// скачивает их во временный CPU-хэндл и читает оттуда.
-// ============================================================================
+// NEUROCORE_DEBUG_TRAIN=1  — диагностика тренировочного цикла (как раньше).
+// NEUROCORE_DEBUG_NAN=1    — прицельный поиск первого NaN: печатает этап, на
+//                            котором он появился, размеры и статистику буфера,
+//                            индексы первых NaN-элементов. После первого
+//                            попадания больше не срабатывает (одноразовый
+//                            триггер), но счётчик этапов продолжает расти.
 
 static TRAIN_DEBUG: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_TRAIN").is_ok());
 
 static LAYER_DEBUG: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_LAYERS").is_ok());
+
+static NAN_DEBUG: Lazy<bool> =
+    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_NAN").is_ok());
 
 const LOG_FIRST_EPOCHS: usize = 3;
 const LOG_NORM_EVERY: usize = 10;
@@ -109,7 +95,6 @@ fn train_dbg_print_vec(label: &str, data: &[f32]) {
     println!("    [TRAIN] {} (len={}): {:?}", label, data.len(), data);
 }
 
-/// Краткая однострочная сводка по срезу для сравнения CPU/GPU.
 fn train_dbg_summary(data: &[f32]) -> String {
     if data.is_empty() {
         return "len=0".to_string();
@@ -133,12 +118,131 @@ fn train_dbg_summary(data: &[f32]) -> String {
     )
 }
 
-/// Безопасное чтение всех параметров модели.
+// ============================================================================
+// Точечная диагностика NaN
+// ============================================================================
+
+/// Счётчики попаданий NaN по этапам. Первое попадание в каждый этап
+/// инициирует подробную печать, последующие — нет.
+struct NanTracker {
+    init_reported: bool,
+    forward_reported: bool,
+    loss_reported: bool,
+    backward_reported: bool,
+    update_reported: bool,
+    total_steps_observed: usize,
+}
+
+impl NanTracker {
+    fn new() -> Self {
+        Self {
+            init_reported: false,
+            forward_reported: false,
+            loss_reported: false,
+            backward_reported: false,
+            update_reported: false,
+            total_steps_observed: 0,
+        }
+    }
+
+    fn bump(&mut self) {
+        self.total_steps_observed += 1;
+    }
+
+    /// Возвращает true, если по этому этапу уже был отчёт.
+    fn should_report(&self, stage: &str) -> bool {
+        match stage {
+            "init" => !self.init_reported,
+            "forward" => !self.forward_reported,
+            "loss" => !self.loss_reported,
+            "backward" => !self.backward_reported,
+            "update" => !self.update_reported,
+            _ => false,
+        }
+    }
+
+    fn mark_reported(&mut self, stage: &str) {
+        match stage {
+            "init" => self.init_reported = true,
+            "forward" => self.forward_reported = true,
+            "loss" => self.loss_reported = true,
+            "backward" => self.backward_reported = true,
+            "update" => self.update_reported = true,
+            _ => {}
+        }
+    }
+}
+
+/// Проверяет, есть ли в срезе NaN или Inf.
+fn contains_bad(data: &[f32]) -> bool {
+    data.iter().any(|v| !v.is_finite())
+}
+
+/// Возвращает индексы первых `limit` плохих элементов (NaN или Inf).
+fn first_bad_indices(data: &[f32], limit: usize) -> Vec<usize> {
+    let mut out = Vec::with_capacity(limit);
+    for (i, v) in data.iter().enumerate() {
+        if !v.is_finite() {
+            out.push(i);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Печатает подробный отчёт о первом NaN на данном этапе.
 ///
-/// В отличие от `ParamStore::get_all_params`, корректно обрабатывает
-/// GPU-буферы: скачивает их во временный CPU-хэндл и читает оттуда.
-/// Работает только при наличии активного GpuCompute — который есть у
-/// `MixedModel` через `compute_executor`.
+/// # Аргументы
+/// * `stage`     — строка-идентификатор этапа: init / forward / loss / backward / update.
+/// * `epoch`     — номер эпохи (для контекста).
+/// * `batch_idx` — номер батча в эпохе (для контекста).
+/// * `shapes`    — список (имя, число строк, число столбцов) для буферов, связанных с этапом.
+/// * `data`      — плоский срез значений буфера, в котором ищется NaN.
+/// * `extra`     — произвольный текст (доп. контекст, например значения loss).
+fn report_first_nan(
+    stage: &str,
+    epoch: usize,
+    batch_idx: usize,
+    shapes: &[(&str, usize, usize)],
+    data: &[f32],
+    extra: Option<&str>,
+) {
+    println!();
+    println!("========== [NAN-DEBUG] first NaN at stage = '{}' ==========", stage);
+    println!("  epoch = {}, batch_idx = {}", epoch, batch_idx);
+    if let Some(e) = extra {
+        println!("  extra: {}", e);
+    }
+    println!("  buffer shapes:");
+    for (name, r, c) in shapes {
+        println!("    {}: {} x {}", name, r, c);
+    }
+    println!("  buffer len = {}", data.len());
+    train_dbg_print_stats(&format!("{} buffer", stage), data);
+
+    let bad_idx = first_bad_indices(data, 16);
+    println!("  first bad indices (up to 16): {:?}", bad_idx);
+    println!("  first 16 values:");
+    let show = data.len().min(16);
+    println!("    {:?}", &data[..show]);
+
+    println!("  last 16 values:");
+    if data.len() >= 16 {
+        println!("    {:?}", &data[data.len() - 16..]);
+    } else {
+        println!("    {:?}", data);
+    }
+
+    println!("========== [NAN-DEBUG] end ==========");
+    println!();
+}
+
+// ============================================================================
+// Безопасное чтение параметров
+// ============================================================================
+
 fn read_all_params_safe(model: &MixedModel) -> Option<Vec<f32>> {
     let ps = model.param_store().lock().unwrap();
     if ps.is_empty() {
@@ -187,9 +291,6 @@ struct LsfEvoSnap {
     grad_thetas: Vec<f32>,
 }
 
-/// Собирает снимок raw_beta/theta и их градиентов для всех LearnableSoftplus
-/// в модели. Работает только на CPU-параметрах (этот путь активируется
-/// через TRAIN_DEBUG и рассчитан на отладку CPU-сценариев).
 fn collect_lsf_evo(model: &MixedModel) -> Vec<LsfEvoSnap> {
     let ps_guard = model.param_store().lock().unwrap();
     let mut out = Vec::new();
@@ -202,8 +303,6 @@ fn collect_lsf_evo(model: &MixedModel) -> Vec<LsfEvoSnap> {
                     let params_h = ps_guard.params_handle(slice);
                     let grads_h = ps_guard.grads_handle(slice);
                     if params_h.is_gpu() || grads_h.is_gpu() {
-                        // Пропускаем GPU-параметры: этот диагностический путь
-                        // рассчитан на CPU.
                         continue;
                     }
                     let raw_betas = params_h.read_range(slice.start, f);
@@ -226,7 +325,6 @@ fn collect_lsf_evo(model: &MixedModel) -> Vec<LsfEvoSnap> {
     out
 }
 
-/// Печатает эволюцию β/θ для текущей эпохи.
 fn print_lsf_evo(epoch: usize, snaps: &[LsfEvoSnap]) {
     if snaps.is_empty() {
         println!("  [LSF-EVOLUTION ep{}] (no LearnableSoftplus on CPU found)", epoch);
@@ -268,16 +366,8 @@ fn print_lsf_evo(epoch: usize, snaps: &[LsfEvoSnap]) {
 
         let grad_beta_l2 = train_dbg_l2(&s.grad_raw_betas);
         let grad_theta_l2 = train_dbg_l2(&s.grad_thetas);
-        let grad_beta_inf = s
-            .grad_raw_betas
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0, f32::max);
-        let grad_theta_inf = s
-            .grad_thetas
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0, f32::max);
+        let grad_beta_inf = s.grad_raw_betas.iter().map(|v| v.abs()).fold(0.0, f32::max);
+        let grad_theta_inf = s.grad_thetas.iter().map(|v| v.abs()).fold(0.0, f32::max);
 
         println!(
             "  [LSF-EVOLUTION ep{}] m{} l{} F={}",
@@ -291,14 +381,8 @@ fn print_lsf_evo(epoch: usize, snaps: &[LsfEvoSnap]) {
             "    θ: min={:.6} max={:.6} mean={:.6} |θ|_inf={:.6}",
             theta_min, theta_max, theta_mean, theta_abs_inf
         );
-        println!(
-            "    grad_raw_β: l2={:.6} |·|_inf={:.6}",
-            grad_beta_l2, grad_beta_inf
-        );
-        println!(
-            "    grad_θ:     l2={:.6} |·|_inf={:.6}",
-            grad_theta_l2, grad_theta_inf
-        );
+        println!("    grad_raw_β: l2={:.6} |·|_inf={:.6}", grad_beta_l2, grad_beta_inf);
+        println!("    grad_θ:     l2={:.6} |·|_inf={:.6}", grad_theta_l2, grad_theta_inf);
     }
 }
 
@@ -372,6 +456,7 @@ fn execute_inner(
         );
     }
 
+    // --- Инициализация весов ---
     {
         let mut ps = model.param_store().lock().unwrap();
         let len = ps.total_params();
@@ -389,6 +474,23 @@ fn execute_inner(
                     *p = rng.gen_range(*min..*max);
                 }
                 ps.set_all_params(&params);
+            }
+        }
+    }
+
+    // --- Проверка инициализации на NaN ---
+    let mut nan_tracker = NanTracker::new();
+    if *NAN_DEBUG {
+        if let Some(flat) = read_all_params_safe(model) {
+            if contains_bad(&flat) && nan_tracker.should_report("init") {
+                report_first_nan(
+                    "init",
+                    0, 0,
+                    &[("params_after_init", flat.len(), 1)],
+                    &flat,
+                    Some("NaN/Inf обнаружен в параметрах СРАЗУ после инициализации"),
+                );
+                nan_tracker.mark_reported("init");
             }
         }
     }
@@ -441,8 +543,6 @@ fn execute_inner(
         None
     };
 
-    // Проверяем, являются ли параметры CPU (для TRAIN_DEBUG-путей, которые
-    // читают параметры как CPU).
     let params_are_cpu_initially = {
         let ps = model.param_store().lock().unwrap();
         ps.is_empty() || {
@@ -506,6 +606,8 @@ fn execute_inner(
             let batch_tensor = train_data.batch(start, end);
             let target_batch = target_data.batch(start, end);
 
+            nan_tracker.bump();
+
             if *TRAIN_DEBUG && epoch == 0 {
                 let input_flat = batch_tensor.to_flat();
                 let target_flat = target_batch.to_flat();
@@ -541,7 +643,26 @@ fn execute_inner(
             let (pred, _ctxs) = model.forward(batch_tensor.clone());
             let forward_dt = t0.elapsed().as_nanos() as u64;
 
-            // === Точечная диагностика: checksum prediction ===
+            // === Точечная диагностика NaN: forward ===
+            if *NAN_DEBUG && nan_tracker.should_report("forward") {
+                let pred_flat = pred.to_flat();
+                if contains_bad(&pred_flat) {
+                    report_first_nan(
+                        "forward",
+                        epoch,
+                        batch_idx,
+                        &[("pred (flat)", 1, pred_flat.len()),
+                          ("batch_tensor (flat)", 1, batch_tensor.to_flat().len())],
+                        &pred_flat,
+                        Some(&format!(
+                            "epoch={} batch_idx={} range=[{}..{})",
+                            epoch, batch_idx, start, end
+                        )),
+                    );
+                    nan_tracker.mark_reported("forward");
+                }
+            }
+
             if *LAYER_DEBUG {
                 let pred_flat = pred.to_flat();
                 println!(
@@ -558,6 +679,35 @@ fn execute_inner(
             );
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
+            // === Точечная диагностика NaN: loss ===
+            if *NAN_DEBUG && nan_tracker.should_report("loss") {
+                let delta_flat = delta.to_flat();
+                let pred_flat = pred.to_flat();
+                let target_flat = target_batch.to_flat();
+                let bad = loss.is_nan() || loss.is_infinite() || contains_bad(&delta_flat);
+                if bad {
+                    let shapes = [
+                        ("pred", 1, pred_flat.len()),
+                        ("target", 1, target_flat.len()),
+                        ("delta", 1, delta_flat.len()),
+                    ];
+                    report_first_nan(
+                        "loss",
+                        epoch,
+                        batch_idx,
+                        &shapes,
+                        &delta_flat,
+                        Some(&format!(
+                            "epoch={} batch_idx={} loss={:?} pred_summary=[{}] target_summary=[{}]",
+                            epoch, batch_idx, loss,
+                            train_dbg_summary(&pred_flat),
+                            train_dbg_summary(&target_flat),
+                        )),
+                    );
+                    nan_tracker.mark_reported("loss");
+                }
+            }
+
             let t2 = Instant::now();
             let (_, grads) = model.backward(delta);
             let backward_dt = t2.elapsed().as_nanos() as u64;
@@ -565,7 +715,24 @@ fn execute_inner(
             let grads_flat = grads.to_flat_vec();
             let grad_l2 = train_dbg_l2(&grads_flat);
 
-            // === Точечная диагностика: checksum градиентов ===
+            // === Точечная диагностика NaN: backward ===
+            if *NAN_DEBUG && nan_tracker.should_report("backward") {
+                if contains_bad(&grads_flat) {
+                    report_first_nan(
+                        "backward",
+                        epoch,
+                        batch_idx,
+                        &[("grads (flat)", 1, grads_flat.len())],
+                        &grads_flat,
+                        Some(&format!(
+                            "epoch={} batch_idx={} range=[{}..{})",
+                            epoch, batch_idx, start, end
+                        )),
+                    );
+                    nan_tracker.mark_reported("backward");
+                }
+            }
+
             if *LAYER_DEBUG {
                 println!(
                     "[DBG-GRAD] epoch={:>3} batch={:>2} [{}..{}) {}",
@@ -595,9 +762,26 @@ fn execute_inner(
             model.update_params_buffered(plan.optimizer_desc.clone(), &[]);
             let update_dt = t3.elapsed().as_nanos() as u64;
 
-            // === Точечная диагностика: checksum параметров после update ===
-            // Для первых эпох, после последнего батча. Безопасно читает
-            // параметры как на CPU, так и на GPU (через временный CPU-хэндл).
+            // === Точечная диагностика NaN: update ===
+            if *NAN_DEBUG && nan_tracker.should_report("update") {
+                if let Some(flat) = read_all_params_safe(model) {
+                    if contains_bad(&flat) {
+                        report_first_nan(
+                            "update",
+                            epoch,
+                            batch_idx,
+                            &[("params_after_update (flat)", 1, flat.len())],
+                            &flat,
+                            Some(&format!(
+                                "epoch={} batch_idx={} range=[{}..{})",
+                                epoch, batch_idx, start, end
+                            )),
+                        );
+                        nan_tracker.mark_reported("update");
+                    }
+                }
+            }
+
             if *LAYER_DEBUG && batch_idx == num_batches_per_epoch - 1 && epoch < LOG_FIRST_EPOCHS {
                 if let Some(flat) = read_all_params_safe(model) {
                     println!(
@@ -646,9 +830,6 @@ fn execute_inner(
             0.0
         };
 
-        // ====================================================================
-        // Диагностика эволюции β/θ
-        // ====================================================================
         if *TRAIN_DEBUG {
             let log_evo = epoch < LOG_LSF_EVO_FIRST
                 || epoch % LOG_LSF_EVO_EVERY == 0
@@ -659,9 +840,6 @@ fn execute_inner(
             }
         }
 
-        // ====================================================================
-        // Диагностика аномалий в эпохе
-        // ====================================================================
         if *TRAIN_DEBUG && !epoch_batches.is_empty() {
             let n = epoch_batches.len();
             let sum: f32 = epoch_batches.iter().map(|b| b.loss).sum();
@@ -811,6 +989,18 @@ fn execute_inner(
                 }
             }
         }
+    }
+
+    // === Итоговая диагностика NaN, если за всё обучение ни одного отчёта не было ===
+    if *NAN_DEBUG {
+        println!();
+        println!("[NAN-DEBUG] observed steps: {}", nan_tracker.total_steps_observed);
+        println!("[NAN-DEBUG] reported stages:");
+        println!("  init     : {}", nan_tracker.init_reported);
+        println!("  forward  : {}", nan_tracker.forward_reported);
+        println!("  loss     : {}", nan_tracker.loss_reported);
+        println!("  backward : {}", nan_tracker.backward_reported);
+        println!("  update   : {}", nan_tracker.update_reported);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();

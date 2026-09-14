@@ -6,4 +6,4 @@ pub mod gpu;
 
 mod cpu;
 
-pub use rms_norm_learnable_eps::RMSNormWithLearnableEpsilon;
+pub use rms_norm_learnable_eps::{RMSNormWithLearnableEpsilon, EPS_MIN};

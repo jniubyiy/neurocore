@@ -161,7 +161,7 @@ impl LayerDesc {
             }
             LayerKind::LinearAttention => {
                 // Ожидаем extra = [seq_len, d_model]
-                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let _seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 4 * (d_model * d_model + d_model)
             }
@@ -174,12 +174,12 @@ impl LayerDesc {
             LayerKind::IndRNN => {
                 // extra = [input_dim, seq_len]
                 let input_dim = self.extra.get(0).copied().unwrap_or(1.0) as usize;
-                let seq_len = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                let _seq_len = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 input_dim * input_dim + 2 * input_dim
             }
             LayerKind::Mamba => {
                 // extra = [seq_len, input_dim, state_dim]
-                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let _seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let input_dim = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 let state_dim = self.extra.get(2).copied().unwrap_or(1.0) as usize;
                 state_dim * state_dim + state_dim * input_dim + input_dim * state_dim + 2
@@ -201,9 +201,16 @@ impl LayerDesc {
             LayerKind::MultiResolutionKANLinear => {
                 let in_features = self.input_shape.streams[0];
                 let out_features = self.output_shape.streams[0];
-                let coarse = 4;
-                let fine = 8;
-                in_features * out_features * (coarse + fine) + out_features
+                // См. раскладку в MultiResolutionKANLinear (v2):
+                //   bias[out] + mix_logits[in·out·2] + mix_temp_raw[in·out]
+                //   + spline_coarse[in·out·(G_c+k)] + spline_fine[in·out·(G_f+k)]
+                //   + base_weight[in·out]
+                // G_c=3, G_f=8, k=3  ⇒  (G_c+k)=6, (G_f+k)=11
+                // Итого: out + in·out·(2 + 1 + 6 + 11 + 1) = out + in·out·21
+                const G_C: usize = 3;
+                const G_F: usize = 8;
+                const K: usize = 3;
+                out_features + in_features * out_features * (4 + (G_C + K) + (G_F + K))
             }
             _ => 0,
         }
@@ -280,13 +287,11 @@ impl LayerDesc {
             }
             LayerKind::ConcreteDropout => {
                 let temp = self.extra.get(0).copied().unwrap_or(0.1);
-                // seed хранится во втором элементе extra (если есть)
                 let seed = self.extra.get(1).copied().unwrap_or(0.0) as u64;
                 Box::new(crate::layers::ConcreteDropout::new_with_seed(temp, seed))
             }
             LayerKind::AdaptiveDropout => {
                 let features = self.input_shape.streams[0];
-                // seed хранится в первом элементе extra (если есть)
                 let seed = self.extra.get(0).copied().unwrap_or(0.0) as u64;
                 Box::new(crate::layers::AdaptiveDropout::new_with_seed(features, seed))
             }

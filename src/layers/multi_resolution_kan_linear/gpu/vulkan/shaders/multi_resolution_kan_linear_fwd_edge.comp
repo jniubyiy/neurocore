@@ -1,0 +1,145 @@
+// src/layers/multi_resolution_kan_linear/gpu/vulkan/shaders/multi_resolution_kan_linear_fwd_edge.comp
+//
+// KAN v2 forward, фаза 1: вычисление "edge-вклада" для каждой тройки (r, j, i).
+//
+//   edge[r, j, i] = scale · (w_c · s_c(x_i) + w_f · s_f(x_i)) + base_w · silu(x_i)
+//
+//   где scale = 1 / sqrt(in_features),
+//       (w_c, w_f) = softmax([logit_c, logit_f] / T),
+//       T = TEMP_MIN + exp(temp_raw),
+//       s_c/s_f — значения spline для coarse/fine сеток.
+//
+// Раскладка edge_out — column-major (batch, out·in):
+//   edge_out[(j · in_features + i) · batch + r]
+//
+// Push: [batch, in_features, out_features]  (12 байт)
+// Dispatch: batch · in_features · out_features потоков.
+
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint in_features;
+    uint out_features;
+} pc;
+
+#define G_COARSE 3u
+#define G_FINE   8u
+#define K        3u
+#define COARSE_NUM_COEFFS 6u   // G_COARSE + K
+#define FINE_NUM_COEFFS   11u  // G_FINE + K
+#define MIX_BRANCHES      2u
+#define TEMP_MIN_F        1e-3
+#define GRID_MIN_F        (-1.0)
+#define GRID_MAX_F        1.0
+
+layout(binding = 0, std430) readonly buffer InputBuf {
+    float x[];        // x[i * batch + r]
+};
+
+layout(binding = 1, std430) readonly buffer ParamsBuf {
+    float params[];   // [bias | mix_logits | mix_temp_raw | spline_coarse | spline_fine | base_weight]
+};
+
+layout(binding = 2, std430) writeonly buffer EdgeOutBuf {
+    float edge_out[]; // edge_out[(j*in + i) * batch + r]
+};
+
+// ---------------------------------------------------------------------------
+// B-spline порядка K=3 на равномерной сетке.
+// Узлы: t_i = a + (i - K) * dt, i = 0..G+2K.
+// Базисы: B_{g,K}, g ∈ [0, G+K). Носитель B_{g,K} = [t_g, t_{g+K+1}).
+// ---------------------------------------------------------------------------
+
+float bspline3_value(float x_val, uint g, float a, float dt) {
+    float t0 = a + (float(g) - 3.0) * dt;
+    float t1 = t0 + dt;
+    float t2 = t1 + dt;
+    float t3 = t2 + dt;
+    float t4 = t3 + dt;
+
+    if (x_val < t0 || x_val >= t4) return 0.0;
+
+    float inv_dt = 1.0 / dt;
+
+    float b00 = ((x_val >= t0) && (x_val < t1)) ? 1.0 : 0.0;
+    float b10 = ((x_val >= t1) && (x_val < t2)) ? 1.0 : 0.0;
+    float b20 = ((x_val >= t2) && (x_val < t3)) ? 1.0 : 0.0;
+    float b30 = ((x_val >= t3) && (x_val < t4)) ? 1.0 : 0.0;
+
+    float b01 = (x_val - t0) * inv_dt * b00 + (t2 - x_val) * inv_dt * b10;
+    float b11 = (x_val - t1) * inv_dt * b10 + (t3 - x_val) * inv_dt * b20;
+    float b21 = (x_val - t2) * inv_dt * b20 + (t4 - x_val) * inv_dt * b30;
+
+    float inv_2dt = 0.5 * inv_dt;
+    float b02 = (x_val - t0) * inv_2dt * b01 + (t3 - x_val) * inv_2dt * b11;
+    float b12 = (x_val - t1) * inv_2dt * b11 + (t4 - x_val) * inv_2dt * b21;
+
+    float inv_3dt = inv_dt / 3.0;
+    float b03 = (x_val - t0) * inv_3dt * b02 + (t4 - x_val) * inv_3dt * b12;
+
+    return b03;
+}
+
+void main() {
+    uint total = pc.batch * pc.out_features * pc.in_features;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    // idx = (j * in + i) * batch + r
+    uint r = idx % pc.batch;
+    uint t = idx / pc.batch;
+    uint i = t % pc.in_features;
+    uint j = t / pc.in_features;
+
+    uint mi = j * pc.in_features + i;
+
+    // Смещения блоков в params
+    uint bias_start   = 0u;
+    uint logits_start = bias_start + pc.out_features;
+    uint temp_start   = logits_start + pc.in_features * pc.out_features * MIX_BRANCHES;
+    uint sc_start     = temp_start + pc.in_features * pc.out_features;
+    uint sf_start     = sc_start + pc.in_features * pc.out_features * COARSE_NUM_COEFFS;
+    uint bw_start     = sf_start + pc.in_features * pc.out_features * FINE_NUM_COEFFS;
+
+    float x_val = x[i * pc.batch + r];
+
+    // --- Softmax-смесь coarse/fine spline ---
+    float temp_raw = params[temp_start + mi];
+    float temp     = TEMP_MIN_F + exp(temp_raw);
+    float inv_t    = 1.0 / temp;
+    float lc       = params[logits_start + mi * MIX_BRANCHES + 0u];
+    float lf       = params[logits_start + mi * MIX_BRANCHES + 1u];
+    float m        = max(lc, lf);
+    float ec       = exp((lc - m) * inv_t);
+    float ef       = exp((lf - m) * inv_t);
+    float denom    = ec + ef;
+    float w_c      = ec / denom;
+    float w_f      = ef / denom;
+
+    // --- Coarse spline ---
+    float dt_c = (GRID_MAX_F - GRID_MIN_F) / float(G_COARSE);
+    float s_c = 0.0;
+    for (uint g = 0u; g < COARSE_NUM_COEFFS; ++g) {
+        float b = bspline3_value(x_val, g, GRID_MIN_F, dt_c);
+        s_c += params[sc_start + mi * COARSE_NUM_COEFFS + g] * b;
+    }
+
+    // --- Fine spline ---
+    float dt_f = (GRID_MAX_F - GRID_MIN_F) / float(G_FINE);
+    float s_f = 0.0;
+    for (uint g = 0u; g < FINE_NUM_COEFFS; ++g) {
+        float b = bspline3_value(x_val, g, GRID_MIN_F, dt_f);
+        s_f += params[sf_start + mi * FINE_NUM_COEFFS + g] * b;
+    }
+
+    // --- SiLU base ---
+    float bw = params[bw_start + mi];
+    float silu_v = x_val / (1.0 + exp(-x_val));
+
+    // --- Нормировка ---
+    float scale = inversesqrt(float(pc.in_features));
+
+    edge_out[idx] = scale * (w_c * s_c + w_f * s_f) + bw * silu_v;
+}

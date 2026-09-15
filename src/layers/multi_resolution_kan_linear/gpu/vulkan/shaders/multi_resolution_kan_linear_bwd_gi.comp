@@ -1,0 +1,134 @@
+// src/layers/multi_resolution_kan_linear/gpu/vulkan/shaders/multi_resolution_kan_linear_bwd_gi.comp
+//
+// KAN v2 backward, фаза 2: градиент по входу.
+// Один поток на (r, i). Цикл по j (внутри потока).
+//
+//   gi[i, r] = Σ_j go[j, r] · ( scale · (w_c·∂s_c/∂x + w_f·∂s_f/∂x) + base_w·silu'(x) )
+//
+// Push: [batch, in_features, out_features]  (12 байт)
+// Dispatch: batch · in_features потоков.
+
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint in_features;
+    uint out_features;
+} pc;
+
+#define G_COARSE 3u
+#define G_FINE   8u
+#define K        3u
+#define COARSE_NUM_COEFFS 6u
+#define FINE_NUM_COEFFS   11u
+#define MIX_BRANCHES      2u
+#define TEMP_MIN_F        1e-3
+#define GRID_MIN_F        (-1.0)
+#define GRID_MAX_F        1.0
+
+layout(binding = 0, std430) readonly buffer InputBuf {
+    float x[];
+};
+
+layout(binding = 1, std430) readonly buffer GradOutBuf {
+    float go[];
+};
+
+layout(binding = 2, std430) readonly buffer ParamsBuf {
+    float params[];
+};
+
+layout(binding = 3, std430) writeonly buffer GradInBuf {
+    float gi[];
+};
+
+// B_{g,2} — промежуточный базис для производной.
+float bspline2_value(float x_val, uint g, float a, float dt) {
+    float t0 = a + (float(g) - 3.0) * dt;
+    float t1 = t0 + dt;
+    float t2 = t1 + dt;
+    float t3 = t2 + dt;
+
+    if (x_val < t0 || x_val >= t3) return 0.0;
+
+    float inv_dt = 1.0 / dt;
+
+    float b00 = ((x_val >= t0) && (x_val < t1)) ? 1.0 : 0.0;
+    float b10 = ((x_val >= t1) && (x_val < t2)) ? 1.0 : 0.0;
+    float b20 = ((x_val >= t2) && (x_val < t3)) ? 1.0 : 0.0;
+
+    float b01 = (x_val - t0) * inv_dt * b00 + (t2 - x_val) * inv_dt * b10;
+    float b11 = (x_val - t1) * inv_dt * b10 + (t3 - x_val) * inv_dt * b20;
+
+    float inv_2dt = 0.5 * inv_dt;
+    return (x_val - t0) * inv_2dt * b01 + (t3 - x_val) * inv_2dt * b11;
+}
+
+// dB_{g,3}/dx = (B_{g,2} − B_{g+1,2}) / dt для равномерной сетки.
+float bspline3_deriv(float x_val, uint g, float a, float dt) {
+    float b2_g  = bspline2_value(x_val, g,     a, dt);
+    float b2_g1 = bspline2_value(x_val, g + 1u, a, dt);
+    return (b2_g - b2_g1) / dt;
+}
+
+void main() {
+    uint total = pc.batch * pc.in_features;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    // idx = i * batch + r
+    uint r = idx % pc.batch;
+    uint i = idx / pc.batch;
+
+    float x_val = x[idx];
+    float scale = inversesqrt(float(pc.in_features));
+
+    // SiLU и производная — не зависят от j
+    float sig = 1.0 / (1.0 + exp(-x_val));
+    float silu_d = sig + x_val * sig * (1.0 - sig);
+
+    uint logits_start = pc.out_features;
+    uint temp_start   = logits_start + pc.in_features * pc.out_features * MIX_BRANCHES;
+    uint sc_start     = temp_start + pc.in_features * pc.out_features;
+    uint sf_start     = sc_start + pc.in_features * pc.out_features * COARSE_NUM_COEFFS;
+    uint bw_start     = sf_start + pc.in_features * pc.out_features * FINE_NUM_COEFFS;
+
+    float dt_c = (GRID_MAX_F - GRID_MIN_F) / float(G_COARSE);
+    float dt_f = (GRID_MAX_F - GRID_MIN_F) / float(G_FINE);
+
+    float acc = 0.0;
+    for (uint j = 0u; j < pc.out_features; ++j) {
+        uint mi = j * pc.in_features + i;
+
+        float temp_raw = params[temp_start + mi];
+        float temp     = TEMP_MIN_F + exp(temp_raw);
+        float inv_t    = 1.0 / temp;
+        float lc       = params[logits_start + mi * MIX_BRANCHES + 0u];
+        float lf       = params[logits_start + mi * MIX_BRANCHES + 1u];
+        float m        = max(lc, lf);
+        float ec       = exp((lc - m) * inv_t);
+        float ef       = exp((lf - m) * inv_t);
+        float denom    = ec + ef;
+        float w_c      = ec / denom;
+        float w_f      = ef / denom;
+
+        float ds_c = 0.0;
+        for (uint g = 0u; g < COARSE_NUM_COEFFS; ++g) {
+            ds_c += params[sc_start + mi * COARSE_NUM_COEFFS + g]
+                  * bspline3_deriv(x_val, g, GRID_MIN_F, dt_c);
+        }
+        float ds_f = 0.0;
+        for (uint g = 0u; g < FINE_NUM_COEFFS; ++g) {
+            ds_f += params[sf_start + mi * FINE_NUM_COEFFS + g]
+                  * bspline3_deriv(x_val, g, GRID_MIN_F, dt_f);
+        }
+
+        float bw = params[bw_start + mi];
+        float go_val = go[j * pc.batch + r];
+        float dx = scale * (w_c * ds_c + w_f * ds_f) + bw * silu_d;
+        acc += go_val * dx;
+    }
+
+    gi[idx] = acc;
+}

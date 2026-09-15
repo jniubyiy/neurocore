@@ -315,9 +315,9 @@ pub fn process_forward_gpu_buffered(
             }));
             current = out_handle;
         } else if let Some(kan) = layer.as_multi_resolution_kan_linear() {
-            let in_features = kan.in_features;
-            let out_features = kan.out_features;
-            let params_len = in_features * out_features * 12 + out_features;
+            let in_features = kan.input_features();
+            let out_features = kan.output_features();
+            let params_len = kan.param_len();
             let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, params_len);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(current.rows(), out_features);
             gpu_compute.run_multi_resolution_kan_linear_forward_buffered_handle(
@@ -329,6 +329,7 @@ pub fn process_forward_gpu_buffered(
                 input: current.clone(),
             }));
             current = out_handle;
+            let _ = in_features; // используется в assert внутри run_*
         } else if let Some(adnorm) = layer.as_adaptive_normalization() {
             let features = adnorm.features;
             let params_len = 7 * features;
@@ -606,10 +607,6 @@ pub fn process_backward_gpu_buffered(
     //
     // Явное обнуление здесь эквивалентно перезаписи и делает семантику
     // GPU-пути согласованной с CPU-путём.
-    //
-    // Это было подтверждено логами: V3 GPU на батче 1 даёт
-    //   grad = grad(batch=0) + grad(batch=1),
-    // что точно совпадает по сумме, а не по отдельным значениям.
     // ========================================================================
     if grad_params_handle.is_gpu()
         && grad_params_handle.rows() * grad_params_handle.cols() > 0
@@ -990,9 +987,9 @@ pub fn process_backward_gpu_buffered(
             );
             current_grad = grad_input_handle;
         } else if let Some(kan) = layer.as_multi_resolution_kan_linear() {
-            let in_features = kan.in_features;
-            let out_features = kan.out_features;
-            let params_len = in_features * out_features * 12 + out_features;
+            let in_features = kan.input_features();
+            let out_features = kan.output_features();
+            let params_len = kan.param_len();
             let DynamicContext::Buffered(bc) = ctx;
             let input_handle = match bc {
                 BufferedContext::MultiResolutionKANLinear { input } => input.clone(),
@@ -1009,6 +1006,7 @@ pub fn process_backward_gpu_buffered(
                 &grad_params_view,
             );
             current_grad = grad_input_handle;
+            let _ = out_features; // используется в assert внутри run_*
         } else if let Some(adnorm) = layer.as_adaptive_normalization() {
             let features = adnorm.features;
             let params_len = 7 * features;

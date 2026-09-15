@@ -1,0 +1,193 @@
+// src/layers/multi_resolution_kan_linear/gpu/vulkan/shaders/multi_resolution_kan_linear_bwd_edge.comp
+//
+// KAN v2 backward, фаза 1: градиенты по всем параметрам слоя.
+// Один поток на (r, j, i). Все записи — атомарные (ATOMIC_ADD_FLOAT).
+//
+//   grad_bias[j]                          += go       (только при i == 0)
+//   grad_logits[mi, 0/1]                  += scale · go · inv_t · w_d · (s_d − s_mixed)
+//   grad_temp_raw[mi]                     += scale · go · (T−Tmin)/T² · (L_w·s_mixed − Σ_d s_d·w_d·L_d)
+//   grad_coarse[mi, g]                    += scale · go · w_c · B_g^coarse(x)
+//   grad_fine  [mi, g]                    += scale · go · w_f · B_g^fine(x)
+//   grad_base_weight[mi]                  += go · silu(x)
+//
+// ВАЖНО: bias[j] должен получить вклад ровно один раз на (r, j).
+//   Поэтому запись grad_bias выполняется только потоком с i == 0.
+//   Для logits/temp/splines/base_weight каждая ячейка (mi, g) соответствует
+//   ровно одному потоку (j, i), поэтому там атомарное сложение корректно
+//   собирает вклады всех r.
+//
+// Push: [batch, in_features, out_features]  (12 байт)
+// Dispatch: batch · in_features · out_features потоков.
+
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConsts {
+    uint batch;
+    uint in_features;
+    uint out_features;
+} pc;
+
+#define G_COARSE 3u
+#define G_FINE   8u
+#define K        3u
+#define COARSE_NUM_COEFFS 6u
+#define FINE_NUM_COEFFS   11u
+#define MIX_BRANCHES      2u
+#define TEMP_MIN_F        1e-3
+#define GRID_MIN_F        (-1.0)
+#define GRID_MAX_F        1.0
+
+layout(binding = 0, std430) readonly buffer InputBuf {
+    float x[];
+};
+
+layout(binding = 1, std430) readonly buffer GradOutBuf {
+    float go[];
+};
+
+layout(binding = 2, std430) readonly buffer ParamsBuf {
+    float params[];
+};
+
+layout(binding = 3, std430) buffer GradParamsBuf {
+    uint grad_params[];   // битовое представление float (для CAS)
+};
+
+#define ATOMIC_ADD_FLOAT(target, value) \
+{ \
+    uint expected = target; \
+    uint desired; \
+    do { \
+        float cur = uintBitsToFloat(expected); \
+        desired = floatBitsToUint(cur + (value)); \
+        uint old = atomicCompSwap(target, expected, desired); \
+        if (old == expected) break; \
+        expected = old; \
+    } while (true); \
+}
+
+float bspline3_value(float x_val, uint g, float a, float dt) {
+    float t0 = a + (float(g) - 3.0) * dt;
+    float t1 = t0 + dt;
+    float t2 = t1 + dt;
+    float t3 = t2 + dt;
+    float t4 = t3 + dt;
+
+    if (x_val < t0 || x_val >= t4) return 0.0;
+
+    float inv_dt = 1.0 / dt;
+
+    float b00 = ((x_val >= t0) && (x_val < t1)) ? 1.0 : 0.0;
+    float b10 = ((x_val >= t1) && (x_val < t2)) ? 1.0 : 0.0;
+    float b20 = ((x_val >= t2) && (x_val < t3)) ? 1.0 : 0.0;
+    float b30 = ((x_val >= t3) && (x_val < t4)) ? 1.0 : 0.0;
+
+    float b01 = (x_val - t0) * inv_dt * b00 + (t2 - x_val) * inv_dt * b10;
+    float b11 = (x_val - t1) * inv_dt * b10 + (t3 - x_val) * inv_dt * b20;
+    float b21 = (x_val - t2) * inv_dt * b20 + (t4 - x_val) * inv_dt * b30;
+
+    float inv_2dt = 0.5 * inv_dt;
+    float b02 = (x_val - t0) * inv_2dt * b01 + (t3 - x_val) * inv_2dt * b11;
+    float b12 = (x_val - t1) * inv_2dt * b11 + (t4 - x_val) * inv_2dt * b21;
+
+    float inv_3dt = inv_dt / 3.0;
+    return (x_val - t0) * inv_3dt * b02 + (t4 - x_val) * inv_3dt * b12;
+}
+
+void main() {
+    uint total = pc.batch * pc.out_features * pc.in_features;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    uint r = idx % pc.batch;
+    uint t = idx / pc.batch;
+    uint i = t % pc.in_features;
+    uint j = t / pc.in_features;
+
+    uint mi = j * pc.in_features + i;
+
+    uint bias_start   = 0u;
+    uint logits_start = bias_start + pc.out_features;
+    uint temp_start   = logits_start + pc.in_features * pc.out_features * MIX_BRANCHES;
+    uint sc_start     = temp_start + pc.in_features * pc.out_features;
+    uint sf_start     = sc_start + pc.in_features * pc.out_features * COARSE_NUM_COEFFS;
+    uint bw_start     = sf_start + pc.in_features * pc.out_features * FINE_NUM_COEFFS;
+
+    float x_val  = x[i * pc.batch + r];
+    float go_val = go[j * pc.batch + r];
+
+    float temp_raw = params[temp_start + mi];
+    float temp     = TEMP_MIN_F + exp(temp_raw);
+    float inv_t    = 1.0 / temp;
+    float lc       = params[logits_start + mi * MIX_BRANCHES + 0u];
+    float lf       = params[logits_start + mi * MIX_BRANCHES + 1u];
+    float m        = max(lc, lf);
+    float ec       = exp((lc - m) * inv_t);
+    float ef       = exp((lf - m) * inv_t);
+    float denom    = ec + ef;
+    float w_c      = ec / denom;
+    float w_f      = ef / denom;
+
+    float dt_c = (GRID_MAX_F - GRID_MIN_F) / float(G_COARSE);
+    float dt_f = (GRID_MAX_F - GRID_MIN_F) / float(G_FINE);
+
+    // s_c, s_f
+    float s_c = 0.0;
+    for (uint g = 0u; g < COARSE_NUM_COEFFS; ++g) {
+        s_c += params[sc_start + mi * COARSE_NUM_COEFFS + g]
+             * bspline3_value(x_val, g, GRID_MIN_F, dt_c);
+    }
+    float s_f = 0.0;
+    for (uint g = 0u; g < FINE_NUM_COEFFS; ++g) {
+        s_f += params[sf_start + mi * FINE_NUM_COEFFS + g]
+             * bspline3_value(x_val, g, GRID_MIN_F, dt_f);
+    }
+
+    float scale    = inversesqrt(float(pc.in_features));
+    float s_mixed  = w_c * s_c + w_f * s_f;
+    float L_w      = w_c * lc + w_f * lf;
+    float s_w_L    = w_c * lc * s_c + w_f * lf * s_f;
+
+    // ---- bias: ровно один раз на (r, j) ----
+    // Ячейка grad_params[bias_start + j] должна получить сумму Σ_r go[j, r].
+    // Так как потоков с одинаковым j, но разными i — in_features штук на каждое r,
+    // запись делается только для i == 0.
+    if (i == 0u) {
+        ATOMIC_ADD_FLOAT(grad_params[bias_start + j], go_val);
+    }
+
+    // ---- logits ----
+    float dlogit_c = scale * go_val * inv_t * w_c * (s_c - s_mixed);
+    float dlogit_f = scale * go_val * inv_t * w_f * (s_f - s_mixed);
+    ATOMIC_ADD_FLOAT(grad_params[logits_start + mi * MIX_BRANCHES + 0u], dlogit_c);
+    ATOMIC_ADD_FLOAT(grad_params[logits_start + mi * MIX_BRANCHES + 1u], dlogit_f);
+
+    // ---- temp_raw ----
+    float dt_draw = temp - TEMP_MIN_F;
+    float inv_t2  = inv_t * inv_t;
+    float dtemp   = scale * go_val * dt_draw * inv_t2 * (L_w * s_mixed - s_w_L);
+    ATOMIC_ADD_FLOAT(grad_params[temp_start + mi], dtemp);
+
+    // ---- spline coarse ----
+    for (uint g = 0u; g < COARSE_NUM_COEFFS; ++g) {
+        float b = bspline3_value(x_val, g, GRID_MIN_F, dt_c);
+        ATOMIC_ADD_FLOAT(
+            grad_params[sc_start + mi * COARSE_NUM_COEFFS + g],
+            scale * go_val * w_c * b
+        );
+    }
+
+    // ---- spline fine ----
+    for (uint g = 0u; g < FINE_NUM_COEFFS; ++g) {
+        float b = bspline3_value(x_val, g, GRID_MIN_F, dt_f);
+        ATOMIC_ADD_FLOAT(
+            grad_params[sf_start + mi * FINE_NUM_COEFFS + g],
+            scale * go_val * w_f * b
+        );
+    }
+
+    // ---- base_weight ----
+    float silu_v = x_val / (1.0 + exp(-x_val));
+    ATOMIC_ADD_FLOAT(grad_params[bw_start + mi], go_val * silu_v);
+}

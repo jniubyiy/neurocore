@@ -20,27 +20,41 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
     unsafe { std::slice::from_raw_parts(ptr, bytes.len() / 4) }
 }
 
-/// Пайплайны MultiResolutionKANLinear.
+/// Пайплайны MultiResolutionKANLinear (v2).
 ///
-/// Forward:  multi_resolution_kan_linear_fwd.
-/// Backward: bwd_params (фаза 0) → bwd_input (фаза 1).
+/// Forward:
+///   fwd_edge    → edge_out[batch · out · in]   (3 буфера, push=12)
+///   fwd_reduce  → y[batch · out]               (3 буфера, push=12)
+///
+/// Backward:
+///   bwd_edge    → grad_params (атомарно)        (4 буфера, push=12)
+///   bwd_gi      → grad_input                    (4 буфера, push=12)
 pub struct MultiResolutionKANLinearPipelines {
-    pub forward: Arc<ComputePipeline>,
-    pub bwd_params: Arc<ComputePipeline>,
-    pub bwd_input: Arc<ComputePipeline>,
+    pub fwd_edge: Arc<ComputePipeline>,
+    pub fwd_reduce: Arc<ComputePipeline>,
+    pub bwd_edge: Arc<ComputePipeline>,
+    pub bwd_gi: Arc<ComputePipeline>,
 }
 
 impl MultiResolutionKANLinearPipelines {
     pub fn new(device: Arc<Device>) -> Self {
-        let fwd_bytes = include_bytes!("vulkan/shaders/multi_resolution_kan_linear_fwd.spv");
-        let bwd_params_bytes =
-            include_bytes!("vulkan/shaders/multi_resolution_kan_linear_bwd_params.spv");
-        let bwd_input_bytes =
-            include_bytes!("vulkan/shaders/multi_resolution_kan_linear_bwd_input.spv");
+        let fwd_edge_bytes = include_bytes!(
+            "vulkan/shaders/multi_resolution_kan_linear_fwd_edge.spv"
+        );
+        let fwd_reduce_bytes = include_bytes!(
+            "vulkan/shaders/multi_resolution_kan_linear_fwd_reduce.spv"
+        );
+        let bwd_edge_bytes = include_bytes!(
+            "vulkan/shaders/multi_resolution_kan_linear_bwd_edge.spv"
+        );
+        let bwd_gi_bytes = include_bytes!(
+            "vulkan/shaders/multi_resolution_kan_linear_bwd_gi.spv"
+        );
 
-        let fwd_spv = as_u32_slice(fwd_bytes);
-        let bwd_params_spv = as_u32_slice(bwd_params_bytes);
-        let bwd_input_spv = as_u32_slice(bwd_input_bytes);
+        let fwd_edge_spv = as_u32_slice(fwd_edge_bytes);
+        let fwd_reduce_spv = as_u32_slice(fwd_reduce_bytes);
+        let bwd_edge_spv = as_u32_slice(bwd_edge_bytes);
+        let bwd_gi_spv = as_u32_slice(bwd_gi_bytes);
 
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
             let mut bindings = std::collections::BTreeMap::new();
@@ -64,7 +78,7 @@ impl MultiResolutionKANLinearPipelines {
                     ..Default::default()
                 },
             )
-            .expect("Failed to create descriptor set layout for MultiResolutionKANLinear")
+            .expect("Failed to create descriptor set layout for KAN")
         }
 
         fn build(
@@ -105,15 +119,19 @@ impl MultiResolutionKANLinearPipelines {
             .unwrap_or_else(|_| panic!("Failed to create {} pipeline", name))
         }
 
-        // Все три шейдера используют push = [batch, in, out] (12 байт).
-        let forward    = build(device.clone(), fwd_spv,        3, 12, "KAN forward");
-        let bwd_params = build(device.clone(), bwd_params_spv, 4, 12, "KAN bwd_params");
-        let bwd_input  = build(device.clone(), bwd_input_spv,  4, 12, "KAN bwd_input");
+        // Push = [batch, in_features, out_features] — 12 байт.
+        const PUSH: u32 = 12;
+
+        let fwd_edge   = build(device.clone(), fwd_edge_spv,   3, PUSH, "KAN fwd_edge");
+        let fwd_reduce = build(device.clone(), fwd_reduce_spv, 3, PUSH, "KAN fwd_reduce");
+        let bwd_edge   = build(device.clone(), bwd_edge_spv,   4, PUSH, "KAN bwd_edge");
+        let bwd_gi     = build(device.clone(), bwd_gi_spv,     4, PUSH, "KAN bwd_gi");
 
         Self {
-            forward,
-            bwd_params,
-            bwd_input,
+            fwd_edge,
+            fwd_reduce,
+            bwd_edge,
+            bwd_gi,
         }
     }
 }

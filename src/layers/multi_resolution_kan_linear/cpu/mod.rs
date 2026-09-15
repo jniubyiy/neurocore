@@ -1,5 +1,7 @@
 // src/layers/multi_resolution_kan_linear/cpu/mod.rs
 
+use once_cell::sync::Lazy;
+
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
 use crate::layers::buffered_context::BufferedContext;
@@ -8,8 +10,140 @@ use crate::model_plan::param_store::ParamSlice;
 
 use super::super::multi_resolution_kan_linear::MultiResolutionKANLinear;
 
-const COARSE_GRID: usize = 4;
-const FINE_GRID: usize = 8;
+// ---------------------------------------------------------------------------
+// Конфигурация spline-сеток
+// ---------------------------------------------------------------------------
+
+const G_COARSE: usize = 3;
+const G_FINE: usize = 8;
+const K: usize = 3;
+const COARSE_NUM_COEFFS: usize = G_COARSE + K; // 6
+const FINE_NUM_COEFFS: usize = G_FINE + K; // 11
+const MIXTURE_BRANCHES: usize = 2;
+const GRID_MIN: f32 = -1.0;
+const GRID_MAX: f32 = 1.0;
+const TEMP_MIN: f32 = 1e-3;
+
+fn build_grid(g: usize, k: usize, a: f32, b: f32) -> Vec<f32> {
+    let dt = (b - a) / g as f32;
+    let n = g + 2 * k + 1;
+    (0..n).map(|i| a + (i as f32 - k as f32) * dt).collect()
+}
+
+static COARSE_GRID: Lazy<Vec<f32>> =
+    Lazy::new(|| build_grid(G_COARSE, K, GRID_MIN, GRID_MAX));
+static FINE_GRID: Lazy<Vec<f32>> =
+    Lazy::new(|| build_grid(G_FINE, K, GRID_MIN, GRID_MAX));
+
+// ---------------------------------------------------------------------------
+// B-spline (Cox–de Boor)
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn bspline_basis(grid: &[f32], i: usize, k: usize, x: f32) -> f32 {
+    if x < grid[i] || x >= grid[i + k + 1] {
+        return 0.0;
+    }
+    if k == 0 {
+        return 1.0;
+    }
+    let d1 = grid[i + k] - grid[i];
+    let d2 = grid[i + k + 1] - grid[i + 1];
+    let mut acc = 0.0f32;
+    if d1.abs() > 1e-30 {
+        acc += (x - grid[i]) / d1 * bspline_basis(grid, i, k - 1, x);
+    }
+    if d2.abs() > 1e-30 {
+        acc += (grid[i + k + 1] - x) / d2 * bspline_basis(grid, i + 1, k - 1, x);
+    }
+    acc
+}
+
+#[inline]
+fn bspline_deriv(grid: &[f32], i: usize, k: usize, x: f32) -> f32 {
+    if k == 0 {
+        return 0.0;
+    }
+    let d1 = grid[i + k] - grid[i];
+    let d2 = grid[i + k + 1] - grid[i + 1];
+    let mut acc = 0.0f32;
+    if d1.abs() > 1e-30 {
+        acc += bspline_basis(grid, i, k - 1, x) / d1;
+    }
+    if d2.abs() > 1e-30 {
+        acc -= bspline_basis(grid, i + 1, k - 1, x) / d2;
+    }
+    acc * (k as f32)
+}
+
+#[inline]
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn silu_deriv(x: f32) -> f32 {
+    let s = 1.0 / (1.0 + (-x).exp());
+    s + x * s * (1.0 - s)
+}
+
+#[inline]
+fn mix_weights(logit_c: f32, logit_f: f32, temp: f32) -> (f32, f32) {
+    let m = logit_c.max(logit_f);
+    let inv_t = 1.0 / temp;
+    let e_c = ((logit_c - m) * inv_t).exp();
+    let e_f = ((logit_f - m) * inv_t).exp();
+    let denom = e_c + e_f;
+    (e_c / denom, e_f / denom)
+}
+
+// ---------------------------------------------------------------------------
+// Раскладка
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct Offsets {
+    bias: usize,
+    mix_logits: usize,
+    mix_temp_raw: usize,
+    spline_coarse: usize,
+    spline_fine: usize,
+    base_weight: usize,
+}
+
+impl Offsets {
+    fn new(base: usize, in_feat: usize, out_feat: usize) -> Self {
+        let bias = base;
+        let mix_logits = bias + out_feat;
+        let mix_temp_raw = mix_logits + in_feat * out_feat * MIXTURE_BRANCHES;
+        let spline_coarse = mix_temp_raw + in_feat * out_feat;
+        let spline_fine = spline_coarse + in_feat * out_feat * COARSE_NUM_COEFFS;
+        let base_weight = spline_fine + in_feat * out_feat * FINE_NUM_COEFFS;
+        Self {
+            bias,
+            mix_logits,
+            mix_temp_raw,
+            spline_coarse,
+            spline_fine,
+            base_weight,
+        }
+    }
+}
+
+/// Нормировочный множитель spline-ветки.
+///
+/// Гарантирует, что выход Σ_i spline_i(x_i) не растёт как O(in_features).
+/// Это стандартный приём KAN (Liu et al. 2024): spline_weight инициализируется
+/// как U(-1/sqrt(in·(G+k)), +...), и та же логика выдерживается в runtime,
+/// чтобы параметры не «разгонялись» из-за суммирования по входам.
+#[inline]
+fn spline_scale(in_features: usize) -> f32 {
+    1.0 / (in_features as f32).sqrt()
+}
+
+// ---------------------------------------------------------------------------
+// Forward / Backward
+// ---------------------------------------------------------------------------
 
 impl UniversalLayerBuffered for MultiResolutionKANLinear {
     fn forward_buffered(
@@ -26,6 +160,11 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
         debug_assert_eq!(output.cols(), out_feat);
         debug_assert!(slice.start + self.param_len() <= params.rows() * params.cols());
 
+        let off = Offsets::new(slice.start, in_feat, out_feat);
+        let coarse_grid: &[f32] = &COARSE_GRID;
+        let fine_grid: &[f32] = &FINE_GRID;
+        let scale = spline_scale(in_feat);
+
         let ids = [input.id(), output.id(), params.id()];
         input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
@@ -34,25 +173,37 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
             let y: &mut [f32] = &mut *second[0];
             let p: &[f32] = &*rest[0];
 
-            let base = slice.start;
-            let coarse_offset = base;
-            let fine_offset = coarse_offset + in_feat * out_feat * COARSE_GRID;
-            let bias_offset = fine_offset + in_feat * out_feat * FINE_GRID;
-
             for r in 0..batch {
                 for j in 0..out_feat {
-                    let mut sum = p[bias_offset + j];
+                    let mut sum = p[off.bias + j];
                     for i in 0..in_feat {
-                        let x_val = x[i * batch + r].clamp(-1.0, 1.0);
+                        let x_val = x[i * batch + r];
+                        let mi = j * in_feat + i;
 
-                        // Грубая сетка
-                        let coarse_base = coarse_offset + (j * in_feat + i) * COARSE_GRID;
-                        let coarse_val = linear_interpolate(x_val, COARSE_GRID, &p[coarse_base..coarse_base + COARSE_GRID]);
-                        // Точная сетка
-                        let fine_base = fine_offset + (j * in_feat + i) * FINE_GRID;
-                        let fine_val = linear_interpolate(x_val, FINE_GRID, &p[fine_base..fine_base + FINE_GRID]);
+                        let temp_raw = p[off.mix_temp_raw + mi];
+                        let temp = TEMP_MIN + temp_raw.exp();
+                        let logit_c = p[off.mix_logits + mi * MIXTURE_BRANCHES];
+                        let logit_f = p[off.mix_logits + mi * MIXTURE_BRANCHES + 1];
+                        let (w_c, w_f) = mix_weights(logit_c, logit_f, temp);
 
-                        sum += coarse_val + fine_val;
+                        let coarse_base = off.spline_coarse + mi * COARSE_NUM_COEFFS;
+                        let mut s_c = 0.0f32;
+                        for g in 0..COARSE_NUM_COEFFS {
+                            s_c += p[coarse_base + g]
+                                * bspline_basis(coarse_grid, g, K, x_val);
+                        }
+
+                        let fine_base = off.spline_fine + mi * FINE_NUM_COEFFS;
+                        let mut s_f = 0.0f32;
+                        for g in 0..FINE_NUM_COEFFS {
+                            s_f += p[fine_base + g]
+                                * bspline_basis(fine_grid, g, K, x_val);
+                        }
+
+                        let bw = p[off.base_weight + mi];
+                        let base = bw * silu(x_val);
+
+                        sum += scale * (w_c * s_c + w_f * s_f) + base;
                     }
                     y[j * batch + r] = sum;
                 }
@@ -79,6 +230,12 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
         let in_feat = self.in_features;
         let out_feat = self.out_features;
 
+        let off = Offsets::new(slice.start, in_feat, out_feat);
+        let coarse_grid: &[f32] = &COARSE_GRID;
+        let fine_grid: &[f32] = &FINE_GRID;
+        let param_len = self.param_len();
+        let scale = spline_scale(in_feat);
+
         let ids = [
             input_handle.id(),
             grad_output.id(),
@@ -101,67 +258,101 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
                 let p: &[f32] = &*fourth[0];
                 let gp: &mut [f32] = &mut *rest[0];
 
-                let base = slice.start;
-                let coarse_offset = base;
-                let fine_offset = coarse_offset + in_feat * out_feat * COARSE_GRID;
-                let bias_offset = fine_offset + in_feat * out_feat * FINE_GRID;
-
-                // Инициализируем градиенты параметров нулями
-                let mut grad_coarse = vec![0.0f32; in_feat * out_feat * COARSE_GRID];
-                let mut grad_fine = vec![0.0f32; in_feat * out_feat * FINE_GRID];
-                let mut grad_bias = vec![0.0f32; out_feat];
+                for v in gp[slice.start..slice.start + param_len].iter_mut() {
+                    *v = 0.0;
+                }
+                for v in gi.iter_mut() {
+                    *v = 0.0;
+                }
 
                 for r in 0..batch {
                     for j in 0..out_feat {
                         let gout = go[j * batch + r];
-                        grad_bias[j] += gout;
+                        gp[off.bias + j] += gout;
+
                         for i in 0..in_feat {
-                            let x_val = x[i * batch + r].clamp(-1.0, 1.0);
+                            let x_val = x[i * batch + r];
+                            let mi = j * in_feat + i;
 
-                            // Грубая сетка
-                            let coarse_base = coarse_offset + (j * in_feat + i) * COARSE_GRID;
-                            let (c_val, c_deriv, c_indices, c_weights) = linear_interpolate_deriv(
-                                x_val, COARSE_GRID, &p[coarse_base..coarse_base + COARSE_GRID]
-                            );
-                            // Точная сетка
-                            let fine_base = fine_offset + (j * in_feat + i) * FINE_GRID;
-                            let (f_val, f_deriv, f_indices, f_weights) = linear_interpolate_deriv(
-                                x_val, FINE_GRID, &p[fine_base..fine_base + FINE_GRID]
-                            );
+                            let temp_raw = p[off.mix_temp_raw + mi];
+                            let temp = TEMP_MIN + temp_raw.exp();
+                            let logit_c = p[off.mix_logits + mi * MIXTURE_BRANCHES];
+                            let logit_f = p[off.mix_logits + mi * MIXTURE_BRANCHES + 1];
+                            let (w_c, w_f) = mix_weights(logit_c, logit_f, temp);
 
-                            // Градиент по входу
-                            gi[i * batch + r] += gout * (c_deriv + f_deriv);
+                            let coarse_base =
+                                off.spline_coarse + mi * COARSE_NUM_COEFFS;
+                            let fine_base = off.spline_fine + mi * FINE_NUM_COEFFS;
 
-                            // Градиенты по коэффициентам
-                            for k in 0..2 {
-                                let idx_c = c_indices[k];
-                                let w_c = c_weights[k];
-                                grad_coarse[(j * in_feat + i) * COARSE_GRID + idx_c] += gout * w_c;
+                            let mut s_c = 0.0f32;
+                            let mut ds_c = 0.0f32;
+                            let mut basis_c = [0.0f32; COARSE_NUM_COEFFS];
+                            for g in 0..COARSE_NUM_COEFFS {
+                                let b = bspline_basis(coarse_grid, g, K, x_val);
+                                basis_c[g] = b;
+                                let c = p[coarse_base + g];
+                                s_c += c * b;
+                                ds_c += c * bspline_deriv(coarse_grid, g, K, x_val);
                             }
-                            for k in 0..2 {
-                                let idx_f = f_indices[k];
-                                let w_f = f_weights[k];
-                                grad_fine[(j * in_feat + i) * FINE_GRID + idx_f] += gout * w_f;
+
+                            let mut s_f = 0.0f32;
+                            let mut ds_f = 0.0f32;
+                            let mut basis_f = [0.0f32; FINE_NUM_COEFFS];
+                            for g in 0..FINE_NUM_COEFFS {
+                                let b = bspline_basis(fine_grid, g, K, x_val);
+                                basis_f[g] = b;
+                                let c = p[fine_base + g];
+                                s_f += c * b;
+                                ds_f += c * bspline_deriv(fine_grid, g, K, x_val);
                             }
+
+                            // Spline-коэффициенты: масштабируем на `scale`,
+                            // т.к. в forward spline-ветка входит с этим множителем.
+                            for g in 0..COARSE_NUM_COEFFS {
+                                gp[coarse_base + g] += scale * gout * w_c * basis_c[g];
+                            }
+                            for g in 0..FINE_NUM_COEFFS {
+                                gp[fine_base + g] += scale * gout * w_f * basis_f[g];
+                            }
+
+                            // base_weight без scale (SiLU-ветка входит без нормировки).
+                            let silu_val = silu(x_val);
+                            let bw = p[off.base_weight + mi];
+                            gp[off.base_weight + mi] += gout * silu_val;
+
+                            // Mixture: множитель scale общий.
+                            let s_mixed = w_c * s_c + w_f * s_f;
+                            let inv_t = 1.0 / temp;
+
+                            gp[off.mix_logits + mi * MIXTURE_BRANCHES] +=
+                                scale * gout * inv_t * w_c * (s_c - s_mixed);
+                            gp[off.mix_logits + mi * MIXTURE_BRANCHES + 1] +=
+                                scale * gout * inv_t * w_f * (s_f - s_mixed);
+
+                            let l_w = logit_c * w_c + logit_f * w_f;
+                            let s_w_l = s_c * w_c * logit_c + s_f * w_f * logit_f;
+                            let dt_draw = temp - TEMP_MIN;
+                            let inv_t2 = inv_t * inv_t;
+                            gp[off.mix_temp_raw + mi] +=
+                                scale * gout * dt_draw * inv_t2 * (l_w * s_mixed - s_w_l);
+
+                            // Градиент по входу: spline-ветка масштабируется на
+                            // scale, SiLU-ветка — нет.
+                            let s_prime = silu_deriv(x_val);
+                            let dx =
+                                scale * (w_c * ds_c + w_f * ds_f) + bw * s_prime;
+                            gi[i * batch + r] += gout * dx;
                         }
                     }
-                }
-
-                // Записываем градиенты параметров
-                for j in 0..out_feat {
-                    gp[bias_offset + j] = grad_bias[j];
-                }
-                for idx in 0..(in_feat * out_feat * COARSE_GRID) {
-                    gp[coarse_offset + idx] = grad_coarse[idx];
-                }
-                for idx in 0..(in_feat * out_feat * FINE_GRID) {
-                    gp[fine_offset + idx] = grad_fine[idx];
                 }
             });
     }
 
     fn param_len(&self) -> usize {
-        self.in_features * self.out_features * (COARSE_GRID + FINE_GRID) + self.out_features
+        self.out_features
+            + self.in_features
+                * self.out_features
+                * (2 + 1 + (G_COARSE + K) + (G_FINE + K) + 1)
     }
 
     fn input_features(&self) -> usize {
@@ -171,28 +362,4 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
     fn output_features(&self) -> usize {
         self.out_features
     }
-}
-
-/// Линейная интерполяция по равномерной сетке на [-1, 1].
-/// Возвращает интерполированное значение.
-fn linear_interpolate(x: f32, grid_size: usize, coeffs: &[f32]) -> f32 {
-    let (val, _, _, _) = linear_interpolate_deriv(x, grid_size, coeffs);
-    val
-}
-
-/// Линейная интерполяция с возвратом значения, производной и информации для градиентов.
-fn linear_interpolate_deriv(x: f32, grid_size: usize, coeffs: &[f32]) -> (f32, f32, [usize; 2], [f32; 2]) {
-    // Нормализуем x в [0,1]
-    let t = (x + 1.0) * 0.5;
-    let scaled = t * (grid_size - 1) as f32;
-    let idx0 = scaled.floor() as usize;
-    let idx1 = (idx0 + 1).min(grid_size - 1);
-    let frac = scaled - idx0 as f32;
-    let w0 = 1.0 - frac;
-    let w1 = frac;
-    let val = w0 * coeffs[idx0] + w1 * coeffs[idx1];
-    // Производная по x с учётом масштабирования: d/dx = d/dt * dt/dx = d/dt * 0.5
-    // d/dt ≈ (coeffs[idx1] - coeffs[idx0]) * (grid_size-1), но с учётом нормализации.
-    let deriv = (coeffs[idx1] - coeffs[idx0]) * (grid_size - 1) as f32 * 0.5;
-    (val, deriv, [idx0, idx1], [w0, w1])
 }

@@ -13,7 +13,7 @@ use crate::layers::{
     DualSlopeReLU, LearnableMish, LearnableSoftplus, RMSNormWithLearnableEpsilon,
     AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
-    SpectrallyNormalizedLinear,
+    SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
 };
 use crate::model_plan::param_store::ParamSlice;
 
@@ -146,6 +146,10 @@ fn call_forward_buffered(
         <Mamba as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else if let Some(l) = layer.as_spectral_norm_linear() {
         <SpectrallyNormalizedLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_linear_attention() {
+        <LinearAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
+    } else if let Some(l) = layer.as_relative_position_attention() {
+        <RelativePositionAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice)
     } else {
         unreachable!(
             "Layer {:?} does not implement UniversalLayerBuffered for CPU path",
@@ -235,6 +239,26 @@ fn build_buffered_context(
         }
     } else if layer.as_spectral_norm_linear().is_some() {
         BufferedContext::SpectralNormLinear { input: input.clone() }
+    } else if layer.as_linear_attention().is_some() {
+        BufferedContext::LinearAttention {
+            input: input.clone(),
+            q_raw: None,
+            k_raw: None,
+            v_raw: None,
+            q_phi: None,
+            k_phi: None,
+            kv: None,
+            z: None,
+        }
+    } else if layer.as_relative_position_attention().is_some() {
+        BufferedContext::RelativePositionAttention {
+            input: input.clone(),
+            q: None,
+            k: None,
+            v: None,
+            scores: None,
+            weights: None,
+        }
     } else {
         BufferedContext::Identity { input: input.clone() }
     }

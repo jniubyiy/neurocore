@@ -19,7 +19,7 @@ use crate::layers::{
     DualSlopeReLU, LearnableMish, LearnableSoftplus, RMSNormWithLearnableEpsilon,
     AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
-    SpectrallyNormalizedLinear,
+    SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
 };
 use crate::model_plan::param_store::ParamSlice;
 
@@ -441,6 +441,10 @@ fn call_forward_buffered(
         <Mamba as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
     } else if let Some(l) = layer.as_spectral_norm_linear() {
         <SpectrallyNormalizedLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+    } else if let Some(l) = layer.as_linear_attention() {
+        <LinearAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+    } else if let Some(l) = layer.as_relative_position_attention() {
+        <RelativePositionAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
     } else {
         unreachable!("Unsupported layer in parallel forward");
     }
@@ -507,6 +511,10 @@ fn call_backward_buffered(
         <Mamba as UniversalLayerBuffered>::backward_buffered(l, ctx, grad_output, grad_input, params, slice, grad_params);
     } else if let Some(l) = layer.as_spectral_norm_linear() {
         <SpectrallyNormalizedLinear as UniversalLayerBuffered>::backward_buffered(l, ctx, grad_output, grad_input, params, slice, grad_params);
+    } else if let Some(l) = layer.as_linear_attention() {
+        <LinearAttention as UniversalLayerBuffered>::backward_buffered(l, ctx, grad_output, grad_input, params, slice, grad_params);
+    } else if let Some(l) = layer.as_relative_position_attention() {
+        <RelativePositionAttention as UniversalLayerBuffered>::backward_buffered(l, ctx, grad_output, grad_input, params, slice, grad_params);
     } else {
         unreachable!("Unsupported layer in parallel backward");
     }
@@ -593,6 +601,26 @@ fn build_buffered_context(
         }
     } else if layer.as_spectral_norm_linear().is_some() {
         BufferedContext::SpectralNormLinear { input: input.clone() }
+    } else if layer.as_linear_attention().is_some() {
+        BufferedContext::LinearAttention {
+            input: input.clone(),
+            q_raw: None,
+            k_raw: None,
+            v_raw: None,
+            q_phi: None,
+            k_phi: None,
+            kv: None,
+            z: None,
+        }
+    } else if layer.as_relative_position_attention().is_some() {
+        BufferedContext::RelativePositionAttention {
+            input: input.clone(),
+            q: None,
+            k: None,
+            v: None,
+            scores: None,
+            weights: None,
+        }
     } else {
         BufferedContext::Identity { input: input.clone() }
     }
@@ -606,6 +634,8 @@ pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
             || l.as_concrete_dropout().is_some()
             || l.as_adaptive_dropout().is_some()
             || l.as_batch_renorm().is_some()
+            || l.as_linear_attention().is_some()
+            || l.as_relative_position_attention().is_some()
     })
 }
 

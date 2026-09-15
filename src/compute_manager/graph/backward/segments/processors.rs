@@ -9,7 +9,7 @@ use crate::layers::{
     DualSlopeReLU, LearnableMish, LearnableSoftplus, RMSNormWithLearnableEpsilon,
     AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
-    SpectrallyNormalizedLinear,
+    SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
 };
 use crate::model_plan::param_store::ParamSlice;
 
@@ -170,6 +170,14 @@ fn call_backward_buffered(
         );
     } else if let Some(l) = layer.as_spectral_norm_linear() {
         <SpectrallyNormalizedLinear as UniversalLayerBuffered>::backward_buffered(
+            l, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(l) = layer.as_linear_attention() {
+        <LinearAttention as UniversalLayerBuffered>::backward_buffered(
+            l, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(l) = layer.as_relative_position_attention() {
+        <RelativePositionAttention as UniversalLayerBuffered>::backward_buffered(
             l, ctx, grad_output, grad_input, params, slice, grad_params_handle,
         );
     } else {

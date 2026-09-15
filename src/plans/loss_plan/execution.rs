@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use super::expr::LossExpr;
+use super::expr::{Aggregation, LossExpr};
 
 /// Вычисляет значение функции потерь и градиент по предсказанию на CPU с использованием
 /// управляемых буферов `MatrixBufferHandle` и пула `TempMatrixPool`.
@@ -69,8 +69,29 @@ pub fn compute_loss_mat_buffered(
     // full_input больше не нужен
     pool.release(full_input);
 
-    // Градиент по агрегированному loss (вектор единиц)
-    let grad_loss = vec![1.0f32; batch];
+    // ========================================================================
+    // Масштаб градиента согласован с агрегацией loss.
+    //
+    //   aggregate_loss(loss_vec):
+    //     Sum  -> Σ_r loss_vec[r]              => ∂loss/∂loss_vec[r] = 1
+    //     Mean -> Σ_r loss_vec[r] / n          => ∂loss/∂loss_vec[r] = 1 / n
+    //
+    // Ранее в CPU-ветке grad_loss всегда был [1.0; batch]. Для Mean это
+    // давало градиент в B раз больше ожидаемого. GPU-ветка
+    // (`compute_loss_gpu_buffered_handle` в gpu_exec.rs) этот множитель
+    // применяет корректно. Приводим CPU к тому же поведению.
+    //
+    // ВНИМАНИЕ (побочный эффект):
+    //   После этой правки эффективный шаг SGD на CPU для всех примеров
+    //   с batch_size > 1 уменьшается в B раз. Это математически корректно,
+    //   но меняет скорость обучения. Если где-то требуется сохранить
+    //   прежнюю скорость — увеличьте lr в соответствующем примере в B раз.
+    // ========================================================================
+    let grad_scale = match expr.aggregation() {
+        Aggregation::Sum => 1.0f32,
+        Aggregation::Mean => 1.0f32 / batch as f32,
+    };
+    let grad_loss = vec![grad_scale; batch];
     let grad_full = expr.backward_chunk_buffered(&intermediates, &grad_loss, pool);
 
     // Извлекаем градиент только по pred (первые pred_feat столбцов)

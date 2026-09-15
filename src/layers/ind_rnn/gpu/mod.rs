@@ -24,6 +24,9 @@ impl GpuCompute {
     /// Скрытые состояния `h_all` хранятся в row-major:
     ///   `(r * seq_len + t) * input_dim + i`
     /// и передаются как GPU-дескриптор из контекста слоя.
+    ///
+    /// Раскладка биндингов соответствует шейдеру `ind_rnn_fwd_step.comp`:
+    ///   0 InputBuf, 1 WeightBuf, 2 UBuf, 3 BiasBuf, 4 HAllBuf, 5 OutputBuf.
     pub fn run_ind_rnn_forward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -109,6 +112,22 @@ impl GpuCompute {
     /// Градиенты по параметрам записываются в `grad_params` (view на W, u, b)
     /// через атомарное накопление. Вход/выходные градиенты — GPU-дескрипторы
     /// (column-major). Скрытые состояния `h_all` приходят из контекста слоя.
+    ///
+    /// Раскладка биндингов соответствует шейдеру `ind_rnn_bwd_step.comp`:
+    ///    0  InputBuf         (x)
+    ///    1  WeightBuf        (W)
+    ///    2  UBuf             (u)
+    ///    3  GradOutBuf       (go)
+    ///    4  HAllBuf          (h_all)
+    ///    5  DeltaNextInBuf   (delta_next_in)
+    ///    6  GradWeightBuf    (grad_w, uint)
+    ///    7  GradUBuf         (grad_u, uint)
+    ///    8  GradBiasBuf      (grad_b, uint)
+    ///    9  GradInputBuf     (gi)
+    ///   10  DeltaNextOutBuf  (delta_next_out)
+    ///
+    /// Отдельного BiasBuf в обратном шейдере нет: bias восстанавливается
+    /// через накопление `grad_b`.
     pub fn run_ind_rnn_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -203,7 +222,7 @@ impl GpuCompute {
 
         let w_buf = subbuffer_from_view(self, &w_view);
         let u_buf = subbuffer_from_view(self, &u_view);
-        let b_buf = subbuffer_from_view(self, &b_view);
+        let _b_buf = subbuffer_from_view(self, &b_view); // bias в backward не нужен
         let gw_buf = subbuffer_from_view(self, &gw_view);
         let gu_buf = subbuffer_from_view(self, &gu_view);
         let gb_buf = subbuffer_from_view(self, &gb_view);
@@ -235,18 +254,17 @@ impl GpuCompute {
             self.run_compute_shader(
                 bwd_pipeline,
                 &[
-                    (0, in_buf.clone()),
-                    (1, w_buf.clone()),
-                    (2, u_buf.clone()),
-                    (3, b_buf.clone()),
-                    (4, go_buf.clone()),
-                    (5, h_buf.clone()),
-                    (6, current_delta_in.clone()),
-                    (7, gw_buf.clone()),
-                    (8, gu_buf.clone()),
-                    (9, gb_buf.clone()),
-                    (10, gi_buf.clone()),
-                    (11, current_delta_out.clone()),
+                    (0,  in_buf.clone()),
+                    (1,  w_buf.clone()),
+                    (2,  u_buf.clone()),
+                    (3,  go_buf.clone()),
+                    (4,  h_buf.clone()),
+                    (5,  current_delta_in.clone()),
+                    (6,  gw_buf.clone()),
+                    (7,  gu_buf.clone()),
+                    (8,  gb_buf.clone()),
+                    (9,  gi_buf.clone()),
+                    (10, current_delta_out.clone()),
                 ],
                 &push,
                 batch * d,

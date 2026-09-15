@@ -7,6 +7,18 @@
 // вход и выход имеют одинаковую размерность (seq_len * input_dim).
 // Демонстрирует несколько вариантов запуска: CPU с разным числом потоков,
 // GPU, SSD, а также профилирование.
+//
+// ВАЖНО (о данных):
+//   Входы генерируются в [0, 1), а не [-1, 1). Причина — слой IndRNN
+//   использует ReLU как встроенную активацию. На данных, содержащих
+//   отрицательные значения, identity-задача (target = input) недостижима
+//   в принципе: ReLU не может выдать отрицательное число, поэтому MSE
+//   упирается в теоретический предел E[max(0,−x)²]·features ≈ 3.33 при
+//   равномерном [-1,1]. Наблюдаемый в исходной версии loss ≈ 3.22 —
+//   это не «застой из-за бага», а архитектурный предел выбранной модели.
+//
+//   На положительных данных (x ∈ [0, 1)) этот предел исчезает: identity
+//   достигается точно при W = I, u = 0, b = 0, и MSE сходится к 0.
 
 use neurocore::tensor::Tensor2D;
 use neurocore::training_plan::ProfileMode;
@@ -54,8 +66,11 @@ mod optimizers {
 }
 
 /// Генерирует обучающие данные: случайные последовательности.
-/// Каждый пример — вектор из seq_len * input_dim элементов.
+/// Каждый пример — вектор из seq_len * input_dim элементов в [0, 1).
 /// Целевые значения равны входным (автоэнкодер).
+///
+/// Значения строго неотрицательные — это ключевое условие для
+/// сходимости модели с ReLU-активацией (см. комментарий в шапке файла).
 fn generate_data(
     num_samples: usize,
     seq_len: usize,
@@ -72,7 +87,7 @@ fn generate_data(
 
     for _ in 0..num_samples {
         let sample: Vec<f32> = (0..feature_count)
-            .map(|_| rng.gen_range(-1.0..1.0))
+            .map(|_| rng.gen_range(0.0..1.0))
             .collect();
         inputs.push(sample.clone());
         targets.push(sample);
@@ -84,8 +99,8 @@ fn generate_data(
 fn base_training() -> neurocore::training_plan::TrainingPlan {
     use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
 
-    let input_dim = 4;
     let seq_len = 5;
+    let input_dim = 4;
     let feature_count = seq_len * input_dim;
     let num_samples = 40;
     let batch_size = 10;

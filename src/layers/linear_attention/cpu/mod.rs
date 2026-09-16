@@ -704,6 +704,59 @@ impl UniversalLayerBuffered for LinearAttention {
         let head_size = self.head_param_count();
         let h_raw_idx = slice.start + self.max_heads * head_size;
 
+        // ------------------------------------------------------------------
+        // КРИТИЧНО (fix deadlock):
+        //
+        // Per-head state-буферы читаем ЗАРАНЕЕ, до входа в
+        // with_cpu_slices_mut, потому что with_cpu_slices_mut держит
+        // ЭКСКЛЮЗИВНУЮ блокировку MemoryExecutor, а read_range пытается
+        // взять блокировку на чтение того же RwLock → deadlock (RwLock
+        // не реентерабельный). Раньше этот код вызывал head_cache.*.read_range
+        // внутри замыкания — и вешался на batch>1 (backward вообще не
+        // вызывался при диагностическом forward=1).
+        //
+        // Порядок чтения совпадает с порядком в forward-е: по каждой активной
+        // голове — q, k, v, kv, z, attn_out, y.
+        // ------------------------------------------------------------------
+        struct HeadSnapshot {
+            weight: f32,
+            head_index: usize,
+            q_phi: Vec<f32>,
+            k_phi: Vec<f32>,
+            v_raw: Vec<f32>,
+            kv: Vec<f32>,
+            z: Vec<f32>,
+            attn_out: Vec<f32>,
+            y_h: Vec<f32>,
+        }
+
+        let total_head = batch * seq * dh;
+
+        let mut snapshots: Vec<HeadSnapshot> = Vec::with_capacity(cpu_heads.len());
+        for hc in cpu_heads {
+            let q_phi = hc.q.read_range(0, total_head);
+            let k_phi = hc.k.read_range(0, total_head);
+            let v_raw = hc.v.read_range(0, total_head);
+            let kv = hc.kv.read_range(0, dh * dh);
+            let z = hc.z.read_range(0, dh);
+            let attn_out = hc.attn_out.read_range(0, total_head);
+            let y_h = hc.y.read_range(0, total_in);
+
+            snapshots.push(HeadSnapshot {
+                weight: hc.weight,
+                head_index: hc.head_index,
+                q_phi,
+                k_phi,
+                v_raw,
+                kv,
+                z,
+                attn_out,
+                y_h,
+            });
+        }
+
+        // Теперь безопасно берём write-блокировку один раз и работаем с
+        // сырыми срезами буферов. Никаких read_range внутри замыкания.
         let ids = [
             input_handle.id(),
             grad_output.id(),
@@ -738,12 +791,12 @@ impl UniversalLayerBuffered for LinearAttention {
                 }
                 for v in gi.iter_mut() { *v = 0.0; }
 
-                let mut dL_dh_raw_total = 0.0f32;
+                let mut d_l_dh_raw_total = 0.0f32;
                 let mut go_h = vec![0.0f32; total_in];
 
-                for head_cache in cpu_heads {
-                    let h = head_cache.head_index;
-                    let w_h = head_cache.weight;
+                for snap in &snapshots {
+                    let h = snap.head_index;
+                    let w_h = snap.weight;
                     let head_base = slice.start + h * head_size;
 
                     // go_h = w_h * go
@@ -751,29 +804,21 @@ impl UniversalLayerBuffered for LinearAttention {
                         go_h[i] = w_h * go[i];
                     }
 
-                    // Считываем per-head буферы из контекста.
-                    let q_phi = head_cache.q.read_range(0, head_cache.q.rows() * head_cache.q.cols());
-                    let k_phi = head_cache.k.read_range(0, head_cache.k.rows() * head_cache.k.cols());
-                    let v_raw = head_cache.v.read_range(0, head_cache.v.rows() * head_cache.v.cols());
-                    let kv = head_cache.kv.read_range(0, head_cache.kv.rows() * head_cache.kv.cols());
-                    let z = head_cache.z.read_range(0, head_cache.z.rows() * head_cache.z.cols());
-                    let attn_out = head_cache.attn_out.read_range(0, head_cache.attn_out.rows() * head_cache.attn_out.cols());
-                    let y_h = head_cache.y.read_range(0, head_cache.y.rows() * head_cache.y.cols());
-
                     // dL/dw_h = dot(go, y_h)
-                    let mut dL_dw_h = 0.0f32;
+                    let mut d_l_dw_h = 0.0f32;
                     for i in 0..total_in {
-                        dL_dw_h += go[i] * y_h[i];
+                        d_l_dw_h += go[i] * snap.y_h[i];
                     }
 
                     // dL/dh_soft += dL/dw_h * dw_h/dh_soft
                     let dw_dhs = head_weight_derivative(h_soft, h);
-                    dL_dh_raw_total += dL_dw_h * dw_dhs;
+                    d_l_dh_raw_total += d_l_dw_h * dw_dhs;
 
                     // Backward головы.
                     let res = compute_head_backward(
                         x, &go_h, p, head_base,
-                        &q_phi, &k_phi, &v_raw, &kv, &z, &attn_out,
+                        &snap.q_phi, &snap.k_phi, &snap.v_raw,
+                        &snap.kv, &snap.z, &snap.attn_out,
                         batch, seq, d, dh,
                     );
 
@@ -814,25 +859,25 @@ impl UniversalLayerBuffered for LinearAttention {
                         println!(
                             "    [LINATT bwd] head {}: w={:.6}, dL/dw={:.6e}, \
                              dL/dh_soft={:.6e}, ||gi_head||={:.4e}",
-                            h, w_h, dL_dw_h, dL_dw_h * dw_dhs, linatt_l2(&res.gi)
+                            h, w_h, d_l_dw_h, d_l_dw_h * dw_dhs, linatt_l2(&res.gi)
                         );
                     }
                 }
 
                 let dh_soft_dh_raw = compute_h_soft_derivative(h_raw, self.min_heads, self.max_heads);
-                let dL_dh_raw = dL_dh_raw_total * dh_soft_dh_raw;
-                gp[h_raw_idx] = dL_dh_raw;
+                let d_l_dh_raw = d_l_dh_raw_total * dh_soft_dh_raw;
+                gp[h_raw_idx] = d_l_dh_raw;
 
                 if *LINATT_DEBUG {
                     let has_anom = linatt_has_bad(gi)
-                        || !dL_dh_raw.is_finite()
-                        || !dL_dh_raw_total.is_finite();
+                        || !d_l_dh_raw.is_finite()
+                        || !d_l_dh_raw_total.is_finite();
                     if log_this || has_anom {
                         println!(
                             "[LINATT bwd #{}] d_model={}, d_head={}, h_raw={:.6}, \
                              h_soft={:.6}, active_heads={}, dL/dh_raw={:.6e}",
                             call_id, d, dh, h_raw, h_soft,
-                            cpu_heads.len(), dL_dh_raw
+                            snapshots.len(), d_l_dh_raw
                         );
                         linatt_stats("go (grad_out)", go);
                         linatt_stats("gi (grad_input)", gi);
@@ -844,8 +889,8 @@ impl UniversalLayerBuffered for LinearAttention {
                         println!(
                             "[LINATT traj bwd #{}] h_raw={:.4} h_soft={:.4} \
                              active_heads={} dL/dh_raw={:.4e} ||go||={:.4e} ||gi||={:.4e}",
-                            call_id, h_raw, h_soft, cpu_heads.len(),
-                            dL_dh_raw, linatt_l2(go), linatt_l2(gi)
+                            call_id, h_raw, h_soft, snapshots.len(),
+                            d_l_dh_raw, linatt_l2(go), linatt_l2(gi)
                         );
                     }
                 }

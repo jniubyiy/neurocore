@@ -2,8 +2,9 @@
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -17,16 +18,37 @@ impl UniversalLayerBuffered for AdaptiveDropout {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
-        debug_assert_eq!(cols, self.features);
-        debug_assert!(slice.start + self.param_len() <= params.rows() * params.cols());
+        let total = rows * cols;
 
-        // Считываем theta и T из общего буфера параметров.
+        debug_assert_eq!(cols, self.features);
+        debug_assert!(
+            slice.start + self.param_len() <= params.rows() * params.cols(),
+            "AdaptiveDropout: parameter slice out of bounds"
+        );
+
+        // ------------------------------------------------------------------
+        // Per-chunk state-буферы:
+        //   mask: (total × 1) — бинарная маска z ∈ {0, 1}.
+        //   arg:  (total × 1) — аргумент сигмоиды a = (|x| − θ) / T.
+        //
+        // Оба буфера создаются из пула, живут в контексте до конца backward,
+        // затем освобождаются.
+        // ------------------------------------------------------------------
+        let mask_handle = pool.acquire(total, 1);
+        let arg_handle = pool.acquire(total, 1);
+
+        // ------------------------------------------------------------------
+        // Считываем θ и T из общего буфера параметров.
+        // ------------------------------------------------------------------
         let (theta, temp) = {
             let p_guard = params.read();
-            let p = p_guard.as_slice().unwrap();
+            let p = p_guard
+                .as_slice()
+                .expect("AdaptiveDropout: params must be CPU");
             let theta_start = slice.start;
             let temp_start = theta_start + self.features;
             (
@@ -37,43 +59,61 @@ impl UniversalLayerBuffered for AdaptiveDropout {
 
         let eps = 1e-6;
         let mut rng = StdRng::seed_from_u64(self.seed);
-        let total = rows * cols;
 
-        let mut mask = vec![0.0f32; total];
-        let mut probs = vec![0.0f32; total];
+        // ------------------------------------------------------------------
+        // Основной проход: генерируем маску, пишем arg, вычисляем выход.
+        // ------------------------------------------------------------------
+        let ids = [
+            input.id(),
+            output.id(),
+            mask_handle.id(),
+            arg_handle.id(),
+        ];
 
-        // Первый проход: генерация маски и вероятностей.
-        {
-            let input_guard = input.read();
-            let x = input_guard.as_slice().unwrap();
+        input
+            .memory()
+            .write()
+            .unwrap()
+            .with_cpu_slices_mut(&ids, |slices| {
+                let (first, rest) = slices.split_at_mut(1);
+                let x: &[f32] = &*first[0];
 
-            for c in 0..cols {
-                let theta_c = theta[c];
-                let temp_c = temp[c].abs() + eps;
-                for r in 0..rows {
-                    let idx = c * rows + r;
-                    let x_val = x[idx].abs();
-                    let p = 1.0 / (1.0 + (-(x_val - theta_c) / temp_c).exp());
-                    probs[idx] = p;
-                    let keep = rng.gen::<f32>() < p;
-                    mask[idx] = if keep { 1.0 } else { 0.0 };
+                let (second, rest) = rest.split_at_mut(1);
+                let y: &mut [f32] = &mut *second[0];
+
+                let (third, rest) = rest.split_at_mut(1);
+                let mask: &mut [f32] = &mut *third[0];
+
+                let (fourth, _) = rest.split_at_mut(1);
+                let arg: &mut [f32] = &mut *fourth[0];
+
+                for c in 0..cols {
+                    let theta_c = theta[c];
+                    let temp_c = temp[c].abs() + eps;
+                    for r in 0..rows {
+                        let idx = c * rows + r;
+                        let x_val = x[idx].abs();
+                        let a = (x_val - theta_c) / temp_c;
+                        let p_keep = 1.0 / (1.0 + (-a).exp());
+
+                        // Генерация Bernoulli для маски.
+                        let keep = rng.gen::<f32>() < p_keep;
+                        let z = if keep { 1.0 } else { 0.0 };
+
+                        // Сохраняем a и z для обратного прохода.
+                        arg[idx] = a;
+                        mask[idx] = z;
+
+                        // Выход: y = x · z / (p + eps).
+                        y[idx] = x[idx] * z / (p_keep + eps);
+                    }
                 }
-            }
-        }
+            });
 
-        // Сохраняем маску в состояние слоя (arg на CPU не используется).
-        // Клонируем, чтобы использовать локальную копию для второго прохода.
-        self.store_state(mask.clone(), Vec::new());
-
-        // Второй проход: вычисление выхода y = x * z / (p + eps).
-        {
-            let input_guard = input.read();
-            let x = input_guard.as_slice().unwrap();
-            let mut output_guard = output.write();
-            let y = output_guard.as_slice_mut().unwrap();
-            for i in 0..total {
-                y[i] = x[i] * mask[i] / (probs[i] + eps);
-            }
+        BufferedContext::AdaptiveDropout {
+            input: input.clone(),
+            mask: mask_handle,
+            arg: arg_handle,
         }
     }
 
@@ -87,29 +127,32 @@ impl UniversalLayerBuffered for AdaptiveDropout {
         grad_params: &MatrixBufferHandle,
     ) {
         let DynamicContext::Buffered(bc) = ctx;
-        let input_handle = match bc {
-            BufferedContext::AdaptiveDropout { input, .. } => input,
-            _ => panic!("Expected AdaptiveDropout context"),
-        };
-
-        // Извлекаем маску из состояния и инвалидируем его.
-        // std::mem::take позволяет избежать клонирования буфера маски.
-        let mask = {
-            let mut guard = self.state.write().unwrap();
-            assert!(
-                guard.valid,
-                "AdaptiveDropout backward called without forward"
-            );
-            guard.valid = false;
-            std::mem::take(&mut guard.mask)
+        let (input_handle, mask_handle, arg_handle) = match bc {
+            BufferedContext::AdaptiveDropout { input, mask, arg } => {
+                (input, mask, arg)
+            }
+            _ => panic!("Expected AdaptiveDropout Buffered context"),
         };
 
         let rows = grad_output.rows();
         let cols = grad_output.cols();
         let total = rows * cols;
+
         debug_assert_eq!(cols, self.features);
         debug_assert_eq!(rows, input_handle.rows());
-        debug_assert_eq!(mask.len(), total);
+        debug_assert_eq!(total, mask_handle.rows() * mask_handle.cols());
+        debug_assert_eq!(total, arg_handle.rows() * arg_handle.cols());
+
+        debug_assert!(
+            slice.start + self.param_len() <= params.rows() * params.cols(),
+            "AdaptiveDropout backward: parameter slice out of bounds"
+        );
+        debug_assert!(
+            slice.start + self.param_len() <= grad_params.rows() * grad_params.cols(),
+            "AdaptiveDropout backward: grad parameter slice out of bounds"
+        );
+
+        let eps = 1e-6;
 
         let ids = [
             input_handle.id(),
@@ -117,6 +160,8 @@ impl UniversalLayerBuffered for AdaptiveDropout {
             grad_input.id(),
             params.id(),
             grad_params.id(),
+            mask_handle.id(),
+            arg_handle.id(),
         ];
 
         input_handle
@@ -126,17 +171,27 @@ impl UniversalLayerBuffered for AdaptiveDropout {
             .with_cpu_slices_mut(&ids, |slices| {
                 let (first, rest) = slices.split_at_mut(1);
                 let x: &[f32] = &*first[0];
+
                 let (second, rest) = rest.split_at_mut(1);
                 let go: &[f32] = &*second[0];
+
                 let (third, rest) = rest.split_at_mut(1);
                 let gi: &mut [f32] = &mut *third[0];
+
                 let (fourth, rest) = rest.split_at_mut(1);
                 let p: &[f32] = &*fourth[0];
-                let gp: &mut [f32] = &mut *rest[0];
+
+                let (fifth, rest) = rest.split_at_mut(1);
+                let gp: &mut [f32] = &mut *fifth[0];
+
+                let (sixth, rest) = rest.split_at_mut(1);
+                let mask: &[f32] = &*sixth[0];
+
+                let (seventh, _) = rest.split_at_mut(1);
+                let arg: &[f32] = &*seventh[0];
 
                 let theta_start = slice.start;
                 let temp_start = theta_start + self.features;
-                let eps = 1e-6;
 
                 let mut grad_theta = vec![0.0f32; self.features];
                 let mut grad_temp = vec![0.0f32; self.features];
@@ -152,20 +207,25 @@ impl UniversalLayerBuffered for AdaptiveDropout {
                         let idx = c * rows + r;
                         let x_val = x[idx];
                         let gout = go[idx];
-                        let prob = 1.0 / (1.0 + (-(x_val.abs() - theta_c) / temp_c).exp());
                         let z = mask[idx];
+                        let a = arg[idx];
+
+                        // Восстанавливаем p_keep из arg — сигмоида.
+                        let p_keep = 1.0 / (1.0 + (-a).exp());
 
                         // Градиент по входу.
-                        gi[idx] = gout * z / (prob + eps);
+                        gi[idx] = gout * z / (p_keep + eps);
 
                         // Производные сигмоиды по theta и T.
-                        let dsig_darg = prob * (1.0 - prob);
+                        let dsig_darg = p_keep * (1.0 - p_keep);
                         let dprob_dtheta = -dsig_darg / temp_c;
-                        let dprob_dtemp =
-                            -dsig_darg * (x_val.abs() - theta_c) / (temp_c * temp_c);
+                        let dprob_dtemp = -dsig_darg * (x_val.abs() - theta_c)
+                            / (temp_c * temp_c);
 
                         // Производная выхода по вероятности удержания.
-                        let dy_dprob = -x_val * z / ((prob + eps) * (prob + eps));
+                        let dy_dprob =
+                            -x_val * z / ((p_keep + eps) * (p_keep + eps));
+
                         d_theta_acc += gout * dy_dprob * dprob_dtheta;
                         d_temp_acc += gout * dy_dprob * dprob_dtemp;
                     }

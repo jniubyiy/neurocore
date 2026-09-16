@@ -15,6 +15,16 @@ use super::compute::GpuCompute;
 /// Параметры сегмента уже должны находиться на GPU (в `params_handle`).
 /// Доступ к отдельным слоям осуществляется через `MatrixBufferView`,
 /// который представляет собой непрерывный диапазон внутри буфера.
+///
+/// # Per-chunk state
+///
+/// Слои, у которых есть состояние, передают свои state-буферы через
+/// `BufferedContext`. На GPU большая часть состояния хранится в
+/// собственных механизмах слоя (`gpu_compute.memory_states` для Memory,
+/// глобальный `FORWARD_CACHE` для LinearAttention, временные буферы для
+/// Mamba), но некоторые дескрипторы обязаны жить в контексте, потому что
+/// CPU-backward и GPU-backward используют единый `BufferedContext`.
+/// Где GPU-путь state не использует, в контекст кладутся заглушки.
 pub fn process_forward_gpu_buffered(
     gpu_compute: &GpuCompute,
     layers: &[Box<dyn UniversalLayer>],
@@ -30,7 +40,7 @@ pub fn process_forward_gpu_buffered(
 
     let mut current = input;
     let mut ctxs = Vec::with_capacity(layers.len());
-    let mut memory_idx = 0usize; // счётчик слоёв Memory
+    let mut memory_idx = 0usize;
 
     for (layer, slice) in layers.iter().zip(slices.iter()) {
         // ================ Существующие слои ================
@@ -118,8 +128,18 @@ pub fn process_forward_gpu_buffered(
                 memory_idx,
             );
             memory_idx += 1;
+
+            // GPU-путь хранит якоря Memory в gpu_compute.memory_states.
+            // Поля min_cells/max_cells в контексте — заглушки для
+            // согласованности с вариантом BufferedContext::Memory;
+            // GPU-backward их не читает.
+            let min_cells = gpu_compute.allocate_gpu_matrix_handle(1, 1);
+            let max_cells = gpu_compute.allocate_gpu_matrix_handle(1, 1);
+
             ctxs.push(DynamicContext::Buffered(BufferedContext::Memory {
                 input: current.clone(),
+                min_cells,
+                max_cells,
             }));
             current = out_handle;
         } else if let Some(soft_sparse) = layer.as_soft_sparse_gate() {
@@ -270,7 +290,7 @@ pub fn process_forward_gpu_buffered(
             let mask_out = gpu_compute.allocate_gpu_matrix_handle(batch, features);
             let arg_out = gpu_compute.allocate_gpu_matrix_handle(batch, features);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(batch, features);
-            let seed = adrop.seed as u32; // Приведение u64 -> u32
+            let seed = adrop.seed as u32;
             gpu_compute.run_adaptive_dropout_forward_buffered_handle(
                 &current,
                 &params_view,
@@ -329,7 +349,7 @@ pub fn process_forward_gpu_buffered(
                 input: current.clone(),
             }));
             current = out_handle;
-            let _ = in_features; // используется в assert внутри run_*
+            let _ = in_features;
         } else if let Some(adnorm) = layer.as_adaptive_normalization() {
             let features = adnorm.features;
             let params_len = 7 * features;
@@ -354,7 +374,6 @@ pub fn process_forward_gpu_buffered(
                 &params_view,
                 &out_handle,
             );
-            // В GPU статистики пересчитываются в backward, поэтому храним заглушки
             ctxs.push(DynamicContext::Buffered(BufferedContext::BatchRenorm {
                 input: current.clone(),
                 mean: Vec::new(),
@@ -368,7 +387,7 @@ pub fn process_forward_gpu_buffered(
             let batch = current.rows();
             let arg_out = gpu_compute.allocate_gpu_matrix_handle(batch * current.cols(), 1);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(batch, current.cols());
-            let seed = cdrop.seed as u32; // Приведение u64 -> u32
+            let seed = cdrop.seed as u32;
             gpu_compute.run_concrete_dropout_forward_buffered_handle(
                 &current,
                 &logit_view,
@@ -421,14 +440,24 @@ pub fn process_forward_gpu_buffered(
                 state_dim,
                 &h_all,
             );
+
+            // a_bar/b_bar на GPU-backward пересчитываются из параметров
+            // слоя; в контекст кладём заглушки для согласованности с
+            // BufferedContext::Mamba.
+            let a_bar = gpu_compute.allocate_gpu_matrix_handle(state_dim, state_dim);
+            let b_bar = gpu_compute.allocate_gpu_matrix_handle(state_dim, input_dim);
+
             ctxs.push(DynamicContext::Buffered(BufferedContext::Mamba {
                 input: current.clone(),
                 h_all,
+                a_bar,
+                b_bar,
             }));
             current = out_handle;
         } else if let Some(lin_att) = layer.as_linear_attention() {
             let seq_len = lin_att.seq_len;
             let d_model = lin_att.d_model;
+            let d_head = lin_att.d_head();
             let batch = current.rows();
             let total_tokens = batch * seq_len;
 
@@ -462,6 +491,13 @@ pub fn process_forward_gpu_buffered(
 
             ctxs.push(DynamicContext::Buffered(BufferedContext::LinearAttention {
                 input: current.clone(),
+                cpu_heads: Vec::new(),
+                h_raw: 0.0,
+                h_soft: 0.0,
+                batch,
+                seq: seq_len,
+                d_model,
+                d_head,
                 q_raw: Some(q_raw),
                 k_raw: Some(k_raw),
                 v_raw: Some(v_raw),
@@ -508,6 +544,7 @@ pub fn process_forward_gpu_buffered(
                 v: Some(v),
                 scores: Some(scores),
                 weights: Some(weights),
+                attn_out: None,
             }));
             current = out_handle;
         } else if let Some(sn) = layer.as_spectral_norm_linear() {
@@ -515,16 +552,16 @@ pub fn process_forward_gpu_buffered(
             let out_feat = sn.out_features;
             let params_len = in_feat * out_feat + out_feat + 1;
             let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, params_len);
-            // Временные GPU буферы для состояния (u, v, sigma)
+
+            // Временные GPU буферы для состояния (u, v, sigma).
             let u_state = gpu_compute.allocate_gpu_matrix_handle(in_feat, 1);
             let v_state = gpu_compute.allocate_gpu_matrix_handle(out_feat, 1);
             let sigma_state = gpu_compute.allocate_gpu_matrix_handle(1, 1);
-            // Загружаем начальные значения (можно инициализировать единицами)
             gpu_compute.fill_gpu_handle(&u_state, 1.0);
             gpu_compute.fill_gpu_handle(&v_state, 1.0);
             gpu_compute.fill_gpu_handle(&sigma_state, 1.0);
 
-            // Извлекаем scale из параметров (последний элемент)
+            // Извлекаем scale из параметров (последний элемент).
             let scale_view = MatrixBufferView::new(
                 params_handle.clone(),
                 slice.start + in_feat * out_feat + out_feat,
@@ -547,13 +584,13 @@ pub fn process_forward_gpu_buffered(
                 &sigma_state,
             );
 
-            // После forward получаем sigma с GPU и сохраняем в слое
-            let sigma_vec = gpu_compute.download_gpu_handle_to_vec(&sigma_state);
-            let sigma = sigma_vec[0];
-            sn.set_last_sigma(sigma);
-
+            // Состояние степенного метода теперь живёт в контексте —
+            // слою больше не нужен set_last_sigma.
             ctxs.push(DynamicContext::Buffered(BufferedContext::SpectralNormLinear {
                 input: current.clone(),
+                u_state,
+                v_state,
+                sigma_state,
             }));
             current = out_handle;
         } else {
@@ -588,25 +625,11 @@ pub fn process_backward_gpu_buffered(
     // ========================================================================
     // КРИТИЧНО: обнуляем буфер градиентов параметров перед backward.
     //
-    // GPU-шейдеры слоёв (linear_bwd.comp, learnable_softplus_bwd.comp и все
-    // остальные *_bwd.comp, у которых есть параметры) накапливают градиенты
-    // по параметрам через ATOMIC_ADD_FLOAT (CAS-loop). Это необходимо для
-    // корректной работы внутри одного шейдера, где много потоков пишут в
-    // одни и те же ячейки.
-    //
-    // Однако если буфер grad_params не обнулить перед вызовом backward, то
-    // атомарные сложения будут добавляться к градиентам от ПРЕДЫДУЩЕГО
-    // backward. Это приводит к экспоненциальному накоплению:
-    //   grad(batch=1) = grad(0) + grad(1)
-    //   grad(batch=2) = grad(0) + grad(1) + grad(2)
-    //   ...
-    //
-    // CPU-ветка от этой проблемы свободна: CPU-реализации слоёв пишут
-    // градиенты параметров напрямую (`gp[i] = sum`), без accumulation,
-    // тем самым неявно перезаписывая предыдущие значения.
-    //
-    // Явное обнуление здесь эквивалентно перезаписи и делает семантику
-    // GPU-пути согласованной с CPU-путём.
+    // GPU-шейдеры слоёв накапливают градиенты по параметрам через
+    // ATOMIC_ADD_FLOAT (CAS-loop). Без обнуления атомарные сложения будут
+    // добавляться к градиентам от ПРЕДЫДУЩЕГО backward, что приводит к
+    // экспоненциальному накоплению. CPU-ветка от этой проблемы свободна:
+    // CPU-реализации пишут градиенты параметров напрямую (gp[i] = sum).
     // ========================================================================
     if grad_params_handle.is_gpu()
         && grad_params_handle.rows() * grad_params_handle.cols() > 0
@@ -800,8 +823,6 @@ pub fn process_backward_gpu_buffered(
             let max_view = MatrixBufferView::new(params_handle.clone(), slice.start + features, features);
             let alpha_view = MatrixBufferView::new(params_handle.clone(), slice.start + 2 * features, 1);
 
-            // Единый view на весь блок градиентов параметров слоя:
-            // [grad_min (features), grad_max (features), grad_alpha (1)].
             let grad_params_view = MatrixBufferView::new(
                 grad_params_handle.clone(),
                 slice.start,
@@ -967,6 +988,7 @@ pub fn process_backward_gpu_buffered(
                 &grad_params_view,
             );
             current_grad = grad_input_handle;
+            let _ = out_features;
         } else if let Some(sfs) = layer.as_sparse_feature_selection_gate() {
             let features = sfs.features;
             let params_len = features + 1;
@@ -1006,7 +1028,7 @@ pub fn process_backward_gpu_buffered(
                 &grad_params_view,
             );
             current_grad = grad_input_handle;
-            let _ = out_features; // используется в assert внутри run_*
+            let _ = out_features;
         } else if let Some(adnorm) = layer.as_adaptive_normalization() {
             let features = adnorm.features;
             let params_len = 7 * features;
@@ -1094,7 +1116,7 @@ pub fn process_backward_gpu_buffered(
             let state_dim = mamba.state_dim;
             let DynamicContext::Buffered(bc) = ctx;
             let (input_handle, h_all_handle) = match bc {
-                BufferedContext::Mamba { input, h_all } => (input.clone(), h_all.clone()),
+                BufferedContext::Mamba { input, h_all, .. } => (input.clone(), h_all.clone()),
                 _ => panic!("Expected Mamba Buffered context"),
             };
             let params_len = state_dim * state_dim + state_dim * input_dim + input_dim * state_dim + 2;
@@ -1118,9 +1140,26 @@ pub fn process_backward_gpu_buffered(
             let d_model = lin_att.d_model;
             let DynamicContext::Buffered(bc) = ctx;
             let (input_handle, q_raw, k_raw, v_raw, q_phi, k_phi, kv, z) = match bc {
-                BufferedContext::LinearAttention { input, q_raw, k_raw, v_raw, q_phi, k_phi, kv, z } => {
-                    (input.clone(), q_raw.clone().unwrap(), k_raw.clone().unwrap(), v_raw.clone().unwrap(), q_phi.clone().unwrap(), k_phi.clone().unwrap(), kv.clone().unwrap(), z.clone().unwrap())
-                },
+                BufferedContext::LinearAttention {
+                    input,
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    q_phi,
+                    k_phi,
+                    kv,
+                    z,
+                    ..
+                } => (
+                    input.clone(),
+                    q_raw.clone().unwrap(),
+                    k_raw.clone().unwrap(),
+                    v_raw.clone().unwrap(),
+                    q_phi.clone().unwrap(),
+                    k_phi.clone().unwrap(),
+                    kv.clone().unwrap(),
+                    z.clone().unwrap(),
+                ),
                 _ => panic!("Expected LinearAttention Buffered context"),
             };
 
@@ -1152,9 +1191,22 @@ pub fn process_backward_gpu_buffered(
             let d_model = rel_att.d_model;
             let DynamicContext::Buffered(bc) = ctx;
             let (input_handle, q, k, v, scores, weights) = match bc {
-                BufferedContext::RelativePositionAttention { input, q, k, v, scores, weights } => {
-                    (input.clone(), q.clone().unwrap(), k.clone().unwrap(), v.clone().unwrap(), scores.clone().unwrap(), weights.clone().unwrap())
-                },
+                BufferedContext::RelativePositionAttention {
+                    input,
+                    q,
+                    k,
+                    v,
+                    scores,
+                    weights,
+                    ..
+                } => (
+                    input.clone(),
+                    q.clone().unwrap(),
+                    k.clone().unwrap(),
+                    v.clone().unwrap(),
+                    scores.clone().unwrap(),
+                    weights.clone().unwrap(),
+                ),
                 _ => panic!("Expected RelativePositionAttention Buffered context"),
             };
 
@@ -1184,15 +1236,17 @@ pub fn process_backward_gpu_buffered(
             let out_feat = sn.out_features;
             let params_len = in_feat * out_feat + out_feat + 1;
             let DynamicContext::Buffered(bc) = ctx;
-            let input_handle = match bc {
-                BufferedContext::SpectralNormLinear { input } => input.clone(),
+            let (input_handle, sigma_state) = match bc {
+                BufferedContext::SpectralNormLinear { input, sigma_state, .. } => {
+                    (input.clone(), sigma_state.clone())
+                }
                 _ => panic!("Expected SpectralNormLinear Buffered context"),
             };
             let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, params_len);
             let grad_params_view = MatrixBufferView::new(grad_params_handle.clone(), slice.start, params_len);
             let grad_input_handle = gpu_compute.allocate_gpu_matrix_handle(current_grad.rows(), in_feat);
 
-            // Извлекаем scale из параметров
+            // Извлекаем scale из параметров.
             let scale_view = MatrixBufferView::new(
                 params_handle.clone(),
                 slice.start + in_feat * out_feat + out_feat,
@@ -1204,7 +1258,12 @@ pub fn process_backward_gpu_buffered(
                 guard.as_slice().unwrap()[scale_view.offset_elements()]
             };
 
-            let sigma = sn.get_last_sigma();
+            // sigma читаем из per-chunk state-буфера (слой больше не хранит
+            // last_sigma).
+            let sigma = {
+                let vec = gpu_compute.download_gpu_handle_to_vec(&sigma_state);
+                vec[0]
+            };
 
             gpu_compute.run_spectral_norm_linear_backward_buffered_handle(
                 &input_handle,

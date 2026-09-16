@@ -1,7 +1,7 @@
 // src/layers/sigmoid/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for Sigmoid {
         output: &MatrixBufferHandle,
         _params: &MatrixBufferHandle,
         _slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let ids = [input.id(), output.id()];
         input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
             let (first, rest) = slices.split_at_mut(1);
@@ -25,6 +26,12 @@ impl UniversalLayerBuffered for Sigmoid {
                 y[i] = 1.0 / (1.0 + (-x[i]).exp());
             }
         });
+
+        // Backward использует выход сигмоиды, поэтому кладём в контекст
+        // именно output.
+        BufferedContext::Sigmoid {
+            output: output.clone(),
+        }
     }
 
     fn backward_buffered(

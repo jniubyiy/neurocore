@@ -1,7 +1,7 @@
 // src/layers/feature_fusion/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -12,15 +12,6 @@ use super::super::feature_fusion::FeatureFusion;
 const TEMP_EPS: f32 = 1e-6;
 
 /// Численно устойчивый softmax от `L / T` для одного выхода слоя.
-///
-/// Возвращает вектор весов длины `fin` в буфер `w` (перезаписывает его).
-///
-/// Аргументы:
-/// * `p`   — весь буфер параметров (родитель).
-/// * `logits_offset` — начало логитов выхода j в `p`.
-/// * `fin` — число входных признаков.
-/// * `t_eff` — эффективная температура (положительная).
-/// * `w` — выходной буфер весов, длина `fin`.
 #[inline]
 fn softmax_over_logits(
     p: &[f32],
@@ -32,8 +23,6 @@ fn softmax_over_logits(
     debug_assert_eq!(w.len(), fin);
     let inv_t = 1.0 / t_eff;
 
-    // Численно устойчивый softmax: сначала max(L), потом exp((L-max)/T).
-    // Сдвиг на max(L) не меняет softmax, поскольку сдвиг одинаков для всех i.
     let mut max_l = f32::NEG_INFINITY;
     for i in 0..fin {
         let l = p[logits_offset + i];
@@ -62,7 +51,8 @@ impl UniversalLayerBuffered for FeatureFusion {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let batch = input.rows();
         let cols_in = input.cols();
         let cols_out = self.out_features;
@@ -99,8 +89,6 @@ impl UniversalLayerBuffered for FeatureFusion {
 
                     softmax_over_logits(p, logits_offset, fin, t_eff, &mut w);
 
-                    // y_{j,r} = Σ_i w_i · x_{i,r} — чистая convex combination,
-                    // без bias.
                     for r in 0..batch {
                         let mut acc = 0.0f32;
                         for i in 0..fin {
@@ -110,6 +98,10 @@ impl UniversalLayerBuffered for FeatureFusion {
                     }
                 }
             });
+
+        BufferedContext::FeatureFusion {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -165,7 +157,6 @@ impl UniversalLayerBuffered for FeatureFusion {
                 let logits_start = base;
                 let temp_start = base + fout * fin;
 
-                // Обнуляем накопители градиентов параметров и входной градиент.
                 for i in 0..self.param_len() {
                     gp[base + i] = 0.0;
                 }
@@ -183,10 +174,8 @@ impl UniversalLayerBuffered for FeatureFusion {
                     let t_eff = t_raw.abs() + TEMP_EPS;
                     let inv_t = 1.0 / t_eff;
 
-                    // 1. Пересчёт softmax для выхода j — идентичен forward.
                     softmax_over_logits(p, logits_offset, fin, t_eff, &mut w);
 
-                    // 2. u_{j,r} = Σ_i w_i · x_{i,r} — attention output.
                     for r in 0..batch {
                         let mut acc = 0.0f32;
                         for i in 0..fin {
@@ -195,7 +184,6 @@ impl UniversalLayerBuffered for FeatureFusion {
                         u_local[r] = acc;
                     }
 
-                    // 3. dz_k = ∂L/∂z_{j,k}, где z = L / T_eff.
                     for dzk in dz.iter_mut() {
                         *dzk = 0.0;
                     }
@@ -208,11 +196,6 @@ impl UniversalLayerBuffered for FeatureFusion {
                         }
                     }
 
-                    // 4. Градиент по логитам: ∂L/∂L_k = dz_k / T_eff.
-                    //    Градиент по температуре:
-                    //      ∂L/∂T = −(1/T²) · Σ_k L_k · dz_k,
-                    //    и через |·| для T_raw:
-                    //      ∂L/∂T_raw = ∂L/∂T · sign(T_raw).
                     let mut dot_ldz = 0.0f32;
                     for i in 0..fin {
                         let l_i = p[logits_offset + i];
@@ -228,9 +211,6 @@ impl UniversalLayerBuffered for FeatureFusion {
                     };
                     gp[temp_start + j] = -sign_t * dot_ldz * inv_t * inv_t;
 
-                    // 5. Градиент по входу: ∂L/∂x_{i,r} += go_{j,r} · w_i.
-                    //    Не зависит от T, поскольку w — функция от x через
-                    //    softmax по логитам, а сами логиты от x не зависят.
                     for r in 0..batch {
                         let gout = go[j * batch + r];
                         for i in 0..fin {

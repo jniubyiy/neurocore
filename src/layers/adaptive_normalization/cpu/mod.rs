@@ -1,7 +1,7 @@
 // src/layers/adaptive_normalization/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
@@ -36,7 +37,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
             let f = self.features;
             let eps = 1e-5f32;
 
-            // Смещения параметров (всего 7f элементов)
             let ln_gamma_start = base;
             let ln_beta_start = ln_gamma_start + f;
             let rms_gamma_start = ln_beta_start + f;
@@ -45,7 +45,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
             let logits_ln_start = bn_beta_start + f;
             let logits_rms_start = logits_ln_start + f;
 
-            // Статистики по строкам и столбцам
             let mut row_mean = vec![0.0f32; rows];
             let mut row_var = vec![0.0f32; rows];
             let mut row_rms_sq = vec![0.0f32; rows];
@@ -82,7 +81,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 col_var[c] = var.max(0.0f32);
             }
 
-            // Основной цикл
             for c in 0..cols {
                 let logit_ln = p[logits_ln_start + c];
                 let logit_rms = p[logits_rms_start + c];
@@ -115,6 +113,10 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 }
             }
         });
+
+        BufferedContext::AdaptiveNormalization {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -171,7 +173,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 let f = self.features;
                 let eps = 1e-5f32;
 
-                // Смещения параметров
                 let ln_gamma_start = base;
                 let ln_beta_start = ln_gamma_start + f;
                 let rms_gamma_start = ln_beta_start + f;
@@ -180,12 +181,10 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 let logits_ln_start = bn_beta_start + f;
                 let logits_rms_start = logits_ln_start + f;
 
-                // Инициализируем градиенты параметров нулями
                 for i in 0..(7 * f) {
                     gp[base + i] = 0.0f32;
                 }
 
-                // Вычисляем статистики (аналогично forward)
                 let mut row_mean = vec![0.0f32; rows];
                 let mut row_var = vec![0.0f32; rows];
                 let mut row_rms_sq = vec![0.0f32; rows];
@@ -222,8 +221,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                     col_var[c] = var.max(0.0f32);
                 }
 
-                // Вычисляем w_ln, w_rms, w_bn и промежуточные градиенты ветвей
-                // Также сразу накапливаем градиенты параметров и промежуточные суммы
                 let mut grad_gamma_ln = vec![0.0f32; f];
                 let mut grad_beta_ln = vec![0.0f32; f];
                 let mut grad_gamma_rms = vec![0.0f32; f];
@@ -232,12 +229,10 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                 let mut grad_logits_ln = vec![0.0f32; f];
                 let mut grad_logits_rms = vec![0.0f32; f];
 
-                // Промежуточные значения dln, drms, dbn для каждого элемента
                 let mut dln = vec![0.0f32; rows * cols];
                 let mut drms = vec![0.0f32; rows * cols];
                 let mut dbn = vec![0.0f32; rows * cols];
 
-                // Заполняем dln, drms, dbn и накапливаем некоторые суммы
                 for c in 0..cols {
                     let logit_ln = p[logits_ln_start + c];
                     let logit_rms = p[logits_rms_start + c];
@@ -275,20 +270,17 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                         drms[idx] = drms_val;
                         dbn[idx] = dbn_val;
 
-                        // Накапливаем градиенты параметров
                         grad_gamma_ln[c] += dln_val * (x_val - row_mean[r]) / (row_var[r] + eps).sqrt();
                         grad_beta_ln[c] += dln_val;
                         grad_gamma_rms[c] += drms_val * x_val / (row_rms_sq[r] + eps).sqrt();
                         grad_gamma_bn[c] += dbn_val * (x_val - col_mean[c]) / (col_var[c] + eps).sqrt();
                         grad_beta_bn[c] += dbn_val;
 
-                        // Градиенты по логитам
                         grad_logits_ln[c] += gout * w_ln * (ln_val - (w_ln * ln_val + w_rms * rms_val + w_bn * bn_val));
                         grad_logits_rms[c] += gout * w_rms * (rms_val - (w_ln * ln_val + w_rms * rms_val + w_bn * bn_val));
                     }
                 }
 
-                // Вычисляем суммы для корректировок статистик
                 let mut sum_dln_per_row = vec![0.0f32; rows];
                 let mut sum_dln_x_per_row = vec![0.0f32; rows];
                 let mut sum_drms_x_per_row = vec![0.0f32; rows];
@@ -321,7 +313,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                     sum_dbn_x_per_col[c] = s2;
                 }
 
-                // Вычисляем градиент по входу gi
                 for c in 0..cols {
                     let gamma_ln = p[ln_gamma_start + c];
                     let gamma_rms = p[rms_gamma_start + c];
@@ -331,7 +322,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                         let idx = c * rows + r;
                         let x_val = x[idx];
 
-                        // Вклад от LayerNorm
                         let inv_std_ln = 1.0 / (row_var[r] + eps).sqrt();
                         let term_ln = gamma_ln * inv_std_ln * (
                             dln[idx]
@@ -339,14 +329,12 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                             - (x_val - row_mean[r]) / (cols as f32 * (row_var[r] + eps)) * sum_dln_x_per_row[r]
                         );
 
-                        // Вклад от RMSNorm
                         let inv_std_rms = 1.0 / (row_rms_sq[r] + eps).sqrt();
                         let term_rms = gamma_rms * inv_std_rms * (
                             drms[idx]
                             - (x_val / (cols as f32 * (row_rms_sq[r] + eps))) * sum_drms_x_per_row[r]
                         );
 
-                        // Вклад от BatchNorm
                         let inv_std_bn = 1.0 / (col_var[c] + eps).sqrt();
                         let term_bn = gamma_bn * inv_std_bn * (
                             dbn[idx]
@@ -358,7 +346,6 @@ impl UniversalLayerBuffered for AdaptiveNormalization {
                     }
                 }
 
-                // Записываем градиенты параметров
                 for c in 0..f {
                     gp[ln_gamma_start + c] = grad_gamma_ln[c];
                     gp[ln_beta_start + c] = grad_beta_ln[c];

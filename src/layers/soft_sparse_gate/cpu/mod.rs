@@ -1,7 +1,7 @@
 // src/layers/soft_sparse_gate/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for SoftSparseGate {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         let ids = [input.id(), output.id(), params.id()];
@@ -41,6 +42,10 @@ impl UniversalLayerBuffered for SoftSparseGate {
                 }
             }
         });
+
+        BufferedContext::SoftSparseGate {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -95,7 +100,7 @@ impl UniversalLayerBuffered for SoftSparseGate {
 
                     gi[idx] = go[idx] * df_dx;
 
-                    // Градиент по порогам: d_s_dthr = -ds
+                    // Градиент по порогам: d_s_dthr = -ds.
                     d_thr += -go[idx] * x_val * ds;
                 }
                 gp[slice.start + c] = d_thr;

@@ -3,12 +3,16 @@
 use std::sync::RwLock;
 use crate::layers::UniversalLayer;
 
-/// Внутреннее состояние слоя BatchRenorm1d.
+/// Внутреннее персистентное состояние слоя BatchRenorm1d.
 ///
 /// Содержит скользящие статистики (`running_mean`, `running_var`),
-/// обновляемые во время обучения, и флаг режима `training`.
-/// Режим хранится внутри состояния, чтобы его чтение и запись
-/// выполнялись под одним замком вместе со статистиками.
+/// обновляемые во время обучения между батчами, и флаг режима `training`.
+///
+/// Эти данные — **персистентные параметры слоя**, аналогичные весам.
+/// Они НЕ переносятся в `BufferedContext`, потому что должны накапливать
+/// статистику за всё обучение. Per-batch статистики (mean/var текущего
+/// forward) живут в `BufferedContext::BatchRenorm` и передаются в backward
+/// для конкретного чанка/батча.
 pub(crate) struct BatchRenormState {
     pub running_mean: Vec<f32>,
     pub running_var: Vec<f32>,
@@ -26,6 +30,17 @@ pub(crate) struct BatchRenormState {
 ///
 /// Параметры слоя (в порядке в общем буфере):
 ///   γ (features), β (features), r (features), d (features).
+///
+/// # Параллелизм
+///
+/// Слой **не поддерживает** чанковое распараллеливание:
+/// - R2: статистики считаются по всему батчу, разбиение по строкам
+///   меняет математику слоя;
+/// - R1: персистентные running-статистики обновляются в `state` и не
+///   могут быть изолированы по чанкам.
+///
+/// Поэтому `can_parallelize` для этого слоя возвращает `false`, и он
+/// всегда исполняется в последовательном пути, где гонки за `state` нет.
 pub struct BatchRenorm1d {
     /// Количество признаков (столбцов матрицы).
     pub features: usize,
@@ -33,7 +48,7 @@ pub struct BatchRenorm1d {
     pub momentum: f32,
     /// Эпсилон для численной стабильности.
     pub eps: f32,
-    /// Состояние слоя (running stats + режим).
+    /// Персистентное состояние слоя (running-статистики + режим).
     pub(crate) state: RwLock<BatchRenormState>,
 }
 
@@ -73,6 +88,10 @@ impl BatchRenorm1d {
     }
 
     /// Устанавливает режим обучения.
+    ///
+    /// В режиме `training = true` forward использует статистики текущего
+    /// батча и обновляет running-статистики. В режиме `training = false`
+    /// forward использует накопленные running-статистики.
     pub fn set_training(&self, training: bool) {
         let mut guard = self.state.write().unwrap();
         guard.training = training;
@@ -84,6 +103,7 @@ impl BatchRenorm1d {
     }
 
     /// Сбрасывает скользящие статистики к начальным значениям.
+    ///
     /// Флаг `training` не изменяется.
     pub fn reset_running_stats(&self) {
         let mut guard = self.state.write().unwrap();

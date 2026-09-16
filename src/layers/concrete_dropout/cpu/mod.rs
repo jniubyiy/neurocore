@@ -2,8 +2,9 @@
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -17,7 +18,8 @@ impl UniversalLayerBuffered for ConcreteDropout {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         let total = rows * cols;
@@ -26,44 +28,54 @@ impl UniversalLayerBuffered for ConcreteDropout {
             "ConcreteDropout: parameter slice out of bounds"
         );
 
-        // Читаем logit_p.
-        let logit_p = {
-            let p_guard = params.read();
-            let p = p_guard
-                .as_slice()
-                .expect("ConcreteDropout: expected CPU buffer");
-            p[slice.start]
-        };
+        // Per-chunk буфер для аргументов сигмоиды.
+        // Форма — вектор-столбец длины total.
+        let arg_handle = pool.acquire(total, 1);
 
-        let temp = self.temperature;
-        let mut rng = StdRng::seed_from_u64(self.seed);
-        let eps = 1e-8f32;
+        // Всё чтение/запись выполняем одним срезом.
+        let ids = [
+            input.id(),
+            output.id(),
+            params.id(),
+            arg_handle.id(),
+        ];
+        input
+            .memory()
+            .write()
+            .unwrap()
+            .with_cpu_slices_mut(&ids, |slices| {
+                let (first, rest) = slices.split_at_mut(1);
+                let x: &[f32] = &*first[0];
 
-        let mut arg = vec![0.0f32; total];
+                let (second, rest) = rest.split_at_mut(1);
+                let y: &mut [f32] = &mut *second[0];
 
-        {
-            let input_guard = input.read();
-            let x = input_guard
-                .as_slice()
-                .expect("ConcreteDropout: expected CPU buffer");
-            let mut output_guard = output.write();
-            let y = output_guard
-                .as_slice_mut()
-                .expect("ConcreteDropout: expected CPU buffer");
+                let (third, rest) = rest.split_at_mut(1);
+                let p: &[f32] = &*third[0];
 
-            for i in 0..total {
-                let u: f32 = rng.gen();
-                let log_u = (u + eps).ln();
-                let log_1mu = (1.0 - u + eps).ln();
-                let a = (logit_p + log_u - log_1mu) / temp;
-                let z = 1.0 / (1.0 + (-a).exp());
-                arg[i] = a;
-                y[i] = x[i] * z;
-            }
+                let (fourth, _) = rest.split_at_mut(1);
+                let arg: &mut [f32] = &mut *fourth[0];
+
+                let logit_p = p[slice.start];
+                let temp = self.temperature;
+                let mut rng = StdRng::seed_from_u64(self.seed);
+                let eps = 1e-8f32;
+
+                for i in 0..total {
+                    let u: f32 = rng.gen();
+                    let log_u = (u + eps).ln();
+                    let log_1mu = (1.0 - u + eps).ln();
+                    let a = (logit_p + log_u - log_1mu) / temp;
+                    let z = 1.0 / (1.0 + (-a).exp());
+                    arg[i] = a;
+                    y[i] = x[i] * z;
+                }
+            });
+
+        BufferedContext::ConcreteDropout {
+            input: input.clone(),
+            arg: arg_handle,
         }
-
-        // Сохраняем аргумент для обратного прохода.
-        self.store_state(arg);
     }
 
     fn backward_buffered(
@@ -76,21 +88,9 @@ impl UniversalLayerBuffered for ConcreteDropout {
         grad_params: &MatrixBufferHandle,
     ) {
         let DynamicContext::Buffered(bc) = ctx;
-        let input_handle = match bc {
-            BufferedContext::ConcreteDropout { input, .. } => input,
-            _ => panic!("Expected ConcreteDropout context"),
-        };
-
-        // Извлекаем состояние и инвалидируем его.
-        // std::mem::take позволяет избежать клонирования буфера.
-        let arg = {
-            let mut guard = self.state.write().unwrap();
-            assert!(
-                guard.valid,
-                "ConcreteDropout backward called without forward"
-            );
-            guard.valid = false;
-            std::mem::take(&mut guard.arg)
+        let (input_handle, arg_handle) = match bc {
+            BufferedContext::ConcreteDropout { input, arg } => (input, arg),
+            _ => panic!("Expected ConcreteDropout Buffered context"),
         };
 
         let rows = grad_output.rows();
@@ -98,7 +98,7 @@ impl UniversalLayerBuffered for ConcreteDropout {
         let total = rows * cols;
         debug_assert_eq!(rows, input_handle.rows());
         debug_assert_eq!(cols, input_handle.cols());
-        debug_assert_eq!(total, arg.len());
+        debug_assert_eq!(total, arg_handle.rows() * arg_handle.cols());
         debug_assert!(
             slice.start + self.param_len() <= params.rows() * params.cols(),
             "ConcreteDropout backward: parameter slice out of bounds"
@@ -114,6 +114,7 @@ impl UniversalLayerBuffered for ConcreteDropout {
             grad_input.id(),
             params.id(),
             grad_params.id(),
+            arg_handle.id(),
         ];
 
         input_handle
@@ -123,13 +124,21 @@ impl UniversalLayerBuffered for ConcreteDropout {
             .with_cpu_slices_mut(&ids, |slices| {
                 let (first, rest) = slices.split_at_mut(1);
                 let x: &[f32] = &*first[0];
+
                 let (second, rest) = rest.split_at_mut(1);
                 let go: &[f32] = &*second[0];
+
                 let (third, rest) = rest.split_at_mut(1);
                 let gi: &mut [f32] = &mut *third[0];
+
                 let (fourth, rest) = rest.split_at_mut(1);
                 let _p: &[f32] = &*fourth[0];
-                let gp: &mut [f32] = &mut *rest[0];
+
+                let (fifth, rest) = rest.split_at_mut(1);
+                let gp: &mut [f32] = &mut *fifth[0];
+
+                let (sixth, _) = rest.split_at_mut(1);
+                let arg: &[f32] = &*sixth[0];
 
                 let temp = self.temperature;
                 let mut grad_logit_p = 0.0f32;

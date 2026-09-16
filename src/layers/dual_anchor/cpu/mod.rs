@@ -1,7 +1,7 @@
 // src/layers/dual_anchor/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for DualAnchor {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         let ids = [input.id(), output.id(), params.id()];
@@ -44,6 +45,10 @@ impl UniversalLayerBuffered for DualAnchor {
                 }
             }
         });
+
+        BufferedContext::DualAnchor1D {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(

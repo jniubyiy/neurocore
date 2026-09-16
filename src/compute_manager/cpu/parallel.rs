@@ -1,4 +1,26 @@
 // src/compute_manager/cpu/parallel.rs
+//
+// Параллельный forward/backward по чанкам батча.
+//
+// Ключевая идея forward'а:
+//   * Планировщик разбивает батч на чанки (start, size, end).
+//   * Для каждого чанка строится ChunkSlice — описание того, какие
+//     строки входа он читает и в какие строки выхода он пишет свой
+//     результат. В стандартном режиме in_range == out_range.
+//   * Каждый воркер для каждого своего чанка:
+//       - извлекает входной срез из общего input;
+//       - прогоняет через всю цепочку слоёв;
+//       - получает BufferedContext от каждого слоя (слой сам строит
+//         свой контекст, включая per-chunk state, если он есть);
+//       - пишет финальный результат в СВОЙ per-chunk буфер;
+//       - сохраняет контексты слоёв в ctx_storage[chunk_id].
+//   * После завершения всех воркеров выполняется фаза merge:
+//     последовательно копирует per-chunk буферы в output по
+//     out_start..out_end из плана.
+//
+// Backward устроен проще: градиенты пишутся в общий grad_input сразу
+// по диапазону входного среза, потому что направление потока
+// градиента однозначно определено forward'ом.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -11,7 +33,6 @@ use crate::compute_manager::cpu::WorkerPool;
 use crate::compute_manager::executor::Executor;
 use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext};
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::layers::buffered_context::BufferedContext;
 use crate::layers::{
     UniversalLayer, UniversalLayerBuffered,
     Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
@@ -20,22 +41,77 @@ use crate::layers::{
     AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
     SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
+    BufferedContext,
 };
 use crate::model_plan::param_store::ParamSlice;
 
 // ============================================================================
 //  Отладочные переключатели
 // ============================================================================
-//
-// NEUROCORE_DEBUG_PARALLEL=1 — включает подробную диагностику по каждому
-// слою в параллельном forward и backward: тип слоя, размеры входа и выхода,
-// состояние буферов перед write_chunk.
-//
-// Несовпадение размеров в write_chunk печатается ВСЕГДА, независимо от
-// флага — это критическая ошибка, ведущая к панике.
 
 static PARALLEL_DEBUG: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_PARALLEL").is_ok());
+
+// ============================================================================
+//  План чанкования
+// ============================================================================
+
+/// Описание одного чанка в плане forward.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChunkSlice {
+    pub chunk_id: usize,
+    pub worker_id: usize,
+    pub in_start: usize,
+    pub in_end: usize,
+    pub out_start: usize,
+    pub out_end: usize,
+}
+
+impl ChunkSlice {
+    #[inline]
+    pub fn in_size(&self) -> usize {
+        self.in_end - self.in_start
+    }
+
+    #[inline]
+    pub fn as_layout_tuple(&self) -> (usize, usize, usize) {
+        (self.in_start, self.in_size(), self.in_end)
+    }
+}
+
+/// План распределения forward по чанкам.
+#[derive(Clone, Debug)]
+pub(crate) struct LayerChunkPlan {
+    pub chunks: Vec<ChunkSlice>,
+}
+
+impl LayerChunkPlan {
+    pub fn to_layout(&self) -> Vec<(usize, usize, usize)> {
+        self.chunks.iter().map(|c| c.as_layout_tuple()).collect()
+    }
+}
+
+/// Строит стандартный план чанкования из раскладки планировщика.
+pub(crate) fn default_layer_chunk_plan(
+    assignments: &[Vec<(usize, usize, usize)>],
+) -> LayerChunkPlan {
+    let mut chunks = Vec::new();
+    let mut chunk_id = 0usize;
+    for (worker_id, worker_chunks) in assignments.iter().enumerate() {
+        for &(start, _size, end) in worker_chunks {
+            chunks.push(ChunkSlice {
+                chunk_id,
+                worker_id,
+                in_start: start,
+                in_end: end,
+                out_start: start,
+                out_end: end,
+            });
+            chunk_id += 1;
+        }
+    }
+    LayerChunkPlan { chunks }
+}
 
 // ============================================================================
 //  Отслеживание состояния чанков
@@ -61,11 +137,6 @@ struct ChunkState {
     duration_ns: u64,
 }
 
-/// Событийный трекер чанков.
-///
-/// Работает без таймеров и фоновых потоков: переходы состояний
-/// (`Pending → Assigned → InProgress → Done`) фиксируются воркерами
-/// непосредственно в моменты, когда эти переходы происходят.
 #[allow(dead_code)]
 struct ChunkTracker {
     chunks: Vec<ChunkState>,
@@ -327,6 +398,7 @@ pub(crate) fn extract_chunk(
     chunk
 }
 
+/// Записывает чанк в выходной буфер, начиная со строки `start`.
 pub(crate) fn write_chunk(
     output: &MatrixBufferHandle,
     chunk: &MatrixBufferHandle,
@@ -359,14 +431,26 @@ pub(crate) fn write_chunk(
     }
 }
 
+pub(crate) fn write_chunk_to_range(
+    output: &MatrixBufferHandle,
+    chunk: &MatrixBufferHandle,
+    out_start: usize,
+    out_end: usize,
+) {
+    let chunk_rows = chunk.rows();
+    assert_eq!(
+        out_end - out_start,
+        chunk_rows,
+        "write_chunk_to_range: range size ({}) must match chunk rows ({})",
+        out_end - out_start,
+        chunk_rows,
+    );
+    write_chunk(output, chunk, out_start);
+}
+
 // ============================================================================
 //  Размерности слоёв
 // ============================================================================
-//
-// Обе функции — тонкие обёртки над методами трейта UniversalLayer.
-// Вся логика определения размерностей живёт в самом трейте, эти обёртки
-// лишь подставляют форму буфера как fallback для слоёв, сохраняющих
-// размерность.
 
 #[inline]
 fn get_output_features(layer: &Box<dyn UniversalLayer>, input: &MatrixBufferHandle) -> usize {
@@ -382,69 +466,72 @@ fn get_input_features(layer: &Box<dyn UniversalLayer>, grad_output: &MatrixBuffe
 //  Диспетчеризация слоёв
 // ============================================================================
 
+/// Единая точка вызова forward слоя. Каждый слой сам строит свой
+/// `BufferedContext` — включая per-chunk state, если он есть.
 fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,
     output: &MatrixBufferHandle,
     params: &MatrixBufferHandle,
     slice: &ParamSlice,
-) {
+    pool: &mut TempMatrixPool,
+) -> BufferedContext {
     if let Some(l) = layer.as_linear() {
-        <Linear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <Linear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_relu() {
-        <ReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <ReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_sigmoid() {
-        <Sigmoid as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <Sigmoid as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_tanh() {
-        <Tanh as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <Tanh as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_leaky_relu() {
-        <LeakyReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <LeakyReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_identity() {
-        <Identity as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <Identity as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_softmax() {
-        <Softmax as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <Softmax as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_memory() {
-        <Memory as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <Memory as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_soft_sparse_gate() {
-        <SoftSparseGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <SoftSparseGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_soft_keep_gate() {
-        <SoftKeepGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <SoftKeepGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_dual_anchor() {
-        <DualAnchor as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <DualAnchor as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_adaptive_activation() {
-        <AdaptivePerFeatureActivation as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <AdaptivePerFeatureActivation as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_dual_slope_relu() {
-        <DualSlopeReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <DualSlopeReLU as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_learnable_mish() {
-        <LearnableMish as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <LearnableMish as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_learnable_softplus() {
-        <LearnableSoftplus as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <LearnableSoftplus as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_rms_norm_learnable_eps() {
-        <RMSNormWithLearnableEpsilon as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <RMSNormWithLearnableEpsilon as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_adaptive_dropout() {
-        <AdaptiveDropout as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <AdaptiveDropout as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_feature_fusion() {
-        <FeatureFusion as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <FeatureFusion as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_sparse_feature_selection_gate() {
-        <SparseFeatureSelectionGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <SparseFeatureSelectionGate as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_multi_resolution_kan_linear() {
-        <MultiResolutionKANLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <MultiResolutionKANLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_adaptive_normalization() {
-        <AdaptiveNormalization as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <AdaptiveNormalization as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_batch_renorm() {
-        <BatchRenorm1d as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <BatchRenorm1d as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_concrete_dropout() {
-        <ConcreteDropout as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <ConcreteDropout as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_ind_rnn() {
-        <IndRNN as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <IndRNN as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_mamba() {
-        <Mamba as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <Mamba as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_spectral_norm_linear() {
-        <SpectrallyNormalizedLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <SpectrallyNormalizedLinear as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_linear_attention() {
-        <LinearAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <LinearAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_relative_position_attention() {
-        <RelativePositionAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice);
+        <RelativePositionAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else {
         unreachable!("Unsupported layer in parallel forward");
     }
@@ -520,112 +607,10 @@ fn call_backward_buffered(
     }
 }
 
-fn build_buffered_context(
-    layer: &Box<dyn UniversalLayer>,
-    input: &MatrixBufferHandle,
-    output: &MatrixBufferHandle,
-    pool_guard: &mut TempMatrixPool,
-) -> BufferedContext {
-    if layer.as_linear().is_some() {
-        BufferedContext::Linear { input: input.clone() }
-    } else if layer.as_relu().is_some() {
-        BufferedContext::ReLU { input: input.clone() }
-    } else if layer.as_sigmoid().is_some() {
-        BufferedContext::Sigmoid { output: output.clone() }
-    } else if layer.as_tanh().is_some() {
-        BufferedContext::Tanh { output: output.clone() }
-    } else if layer.as_softmax().is_some() {
-        BufferedContext::Softmax { output: output.clone() }
-    } else if layer.as_leaky_relu().is_some() {
-        BufferedContext::LeakyReLU { input: input.clone() }
-    } else if layer.as_identity().is_some() {
-        BufferedContext::Identity { input: input.clone() }
-    } else if layer.as_memory().is_some() {
-        BufferedContext::Memory { input: input.clone() }
-    } else if layer.as_soft_sparse_gate().is_some() {
-        BufferedContext::SoftSparseGate { input: input.clone() }
-    } else if layer.as_soft_keep_gate().is_some() {
-        BufferedContext::SoftKeepGate { input: input.clone() }
-    } else if layer.as_dual_anchor().is_some() {
-        BufferedContext::DualAnchor1D { input: input.clone() }
-    } else if layer.as_adaptive_activation().is_some() {
-        BufferedContext::AdaptiveActivation { input: input.clone() }
-    } else if layer.as_dual_slope_relu().is_some() {
-        BufferedContext::DualSlopeReLU { input: input.clone() }
-    } else if layer.as_learnable_mish().is_some() {
-        BufferedContext::LearnableMish { input: input.clone() }
-    } else if layer.as_learnable_softplus().is_some() {
-        BufferedContext::LearnableSoftplus { input: input.clone() }
-    } else if layer.as_rms_norm_learnable_eps().is_some() {
-        BufferedContext::RMSNormWithLearnableEpsilon { input: input.clone() }
-    } else if layer.as_adaptive_dropout().is_some() {
-        let empty_mask = pool_guard.acquire(0, 0);
-        let empty_arg = pool_guard.acquire(0, 0);
-        BufferedContext::AdaptiveDropout {
-            input: input.clone(),
-            mask: empty_mask,
-            arg: empty_arg,
-        }
-    } else if layer.as_feature_fusion().is_some() {
-        BufferedContext::FeatureFusion { input: input.clone() }
-    } else if layer.as_sparse_feature_selection_gate().is_some() {
-        BufferedContext::SparseFeatureSelectionGate { input: input.clone() }
-    } else if layer.as_multi_resolution_kan_linear().is_some() {
-        BufferedContext::MultiResolutionKANLinear { input: input.clone() }
-    } else if layer.as_adaptive_normalization().is_some() {
-        BufferedContext::AdaptiveNormalization { input: input.clone() }
-    } else if layer.as_batch_renorm().is_some() {
-        BufferedContext::BatchRenorm {
-            input: input.clone(),
-            mean: Vec::new(),
-            var: Vec::new(),
-            use_batch_stats: true,
-        }
-    } else if layer.as_concrete_dropout().is_some() {
-        let empty_arg = pool_guard.acquire(0, 0);
-        BufferedContext::ConcreteDropout {
-            input: input.clone(),
-            arg: empty_arg,
-        }
-    } else if layer.as_ind_rnn().is_some() {
-        let empty_h = pool_guard.acquire(0, 0);
-        BufferedContext::IndRNN {
-            input: input.clone(),
-            h_all: empty_h,
-        }
-    } else if layer.as_mamba().is_some() {
-        let empty_h = pool_guard.acquire(0, 0);
-        BufferedContext::Mamba {
-            input: input.clone(),
-            h_all: empty_h,
-        }
-    } else if layer.as_spectral_norm_linear().is_some() {
-        BufferedContext::SpectralNormLinear { input: input.clone() }
-    } else if layer.as_linear_attention().is_some() {
-        BufferedContext::LinearAttention {
-            input: input.clone(),
-            q_raw: None,
-            k_raw: None,
-            v_raw: None,
-            q_phi: None,
-            k_phi: None,
-            kv: None,
-            z: None,
-        }
-    } else if layer.as_relative_position_attention().is_some() {
-        BufferedContext::RelativePositionAttention {
-            input: input.clone(),
-            q: None,
-            k: None,
-            v: None,
-            scores: None,
-            weights: None,
-        }
-    } else {
-        BufferedContext::Identity { input: input.clone() }
-    }
-}
-
+/// Определяет, можно ли распараллелить цепочку слоёв по чанкам батча.
+///
+/// Список несовместимых слоёв сохранён как временный fallback; в дальнейшем
+/// он будет заменён на декларативный флаг `supports_chunked_parallel()`.
 pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
     !layers.iter().any(|l| {
         l.as_memory().is_some()
@@ -642,14 +627,6 @@ pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
 // ============================================================================
 //  Параллельный forward
 // ============================================================================
-
-#[derive(Clone, Copy)]
-struct ChunkMeta {
-    chunk_id: usize,
-    start: usize,
-    size: usize,
-    end: usize,
-}
 
 pub(crate) fn forward_universal_parallel(
     executor: &dyn Executor,
@@ -680,22 +657,17 @@ pub(crate) fn forward_universal_parallel(
         num_workers
     );
 
-    let mut global_chunks: Vec<(usize, usize, usize)> = Vec::new();
-    let mut per_worker_chunks: Vec<Vec<ChunkMeta>> = Vec::with_capacity(num_workers);
+    let plan = default_layer_chunk_plan(&assignments);
+    let total_chunks = plan.chunks.len();
 
-    for worker_chunks in assignments {
-        let mut metas = Vec::with_capacity(worker_chunks.len());
-        for (start, size, end) in worker_chunks {
-            let cid = global_chunks.len();
-            global_chunks.push((start, size, end));
-            metas.push(ChunkMeta { chunk_id: cid, start, size, end });
-        }
-        per_worker_chunks.push(metas);
-    }
-
-    let total_chunks = global_chunks.len();
     if total_chunks == 0 {
         return (Vec::new(), Vec::new());
+    }
+
+    let mut per_worker_chunks: Vec<Vec<ChunkSlice>> =
+        (0..num_workers).map(|_| Vec::new()).collect();
+    for chunk in &plan.chunks {
+        per_worker_chunks[chunk.worker_id].push(*chunk);
     }
 
     if *PARALLEL_DEBUG {
@@ -709,7 +681,8 @@ pub(crate) fn forward_universal_parallel(
         );
     }
 
-    let tracker = Arc::new(Mutex::new(ChunkTracker::new(&global_chunks)));
+    let layout_for_tracker: Vec<(usize, usize, usize)> = plan.to_layout();
+    let tracker = Arc::new(Mutex::new(ChunkTracker::new(&layout_for_tracker)));
     {
         let mut t = tracker.lock().unwrap();
         for (logical_worker_id, metas) in per_worker_chunks.iter().enumerate() {
@@ -732,12 +705,19 @@ pub(crate) fn forward_universal_parallel(
     let ctx_storage: Arc<Mutex<Vec<Vec<DynamicContext>>>> =
         Arc::new(Mutex::new(vec![Vec::new(); total_chunks]));
 
+    let chunk_outputs: Arc<Mutex<Vec<Option<MatrixBufferHandle>>>> =
+        Arc::new(Mutex::new((0..total_chunks).map(|_| None).collect()));
+
     let executor_arc: Arc<dyn Executor> = Arc::from(executor.clone_executor());
 
     for (logical_worker_id, metas) in per_worker_chunks.into_iter().enumerate() {
+        if metas.is_empty() {
+            continue;
+        }
         let shared = shared.clone();
         let tracker = tracker.clone();
         let ctx_storage = ctx_storage.clone();
+        let chunk_outputs = chunk_outputs.clone();
         let executor_for_worker = Arc::clone(&executor_arc);
 
         let task = Box::new(move || {
@@ -754,7 +734,7 @@ pub(crate) fn forward_universal_parallel(
                 let t0 = Instant::now();
 
                 let input_chunk =
-                    extract_chunk(&shared.input, m.start, m.end, &mut *pool_guard);
+                    extract_chunk(&shared.input, m.in_start, m.in_end, &mut *pool_guard);
                 let mut current = input_chunk;
                 let mut chunk_ctxs = Vec::with_capacity(shared.layers.len());
 
@@ -774,9 +754,16 @@ pub(crate) fn forward_universal_parallel(
                         );
                     }
 
-                    let buffered_ctx =
-                        build_buffered_context(layer, &current, &out, &mut *pool_guard);
-                    call_forward_buffered(layer, &current, &out, &shared.params, slice);
+                    // Слой сам строит свой BufferedContext — включая
+                    // per-chunk state, если он есть.
+                    let buffered_ctx = call_forward_buffered(
+                        layer,
+                        &current,
+                        &out,
+                        &shared.params,
+                        slice,
+                        &mut *pool_guard,
+                    );
 
                     if *PARALLEL_DEBUG {
                         eprintln!(
@@ -790,23 +777,10 @@ pub(crate) fn forward_universal_parallel(
                     current = out;
                 }
 
-                let needs_warn = shared.output.cols() != current.cols();
-                if *PARALLEL_DEBUG || needs_warn {
-                    eprintln!(
-                        "[FWD-PARALLEL] worker={} chunk={} BEFORE write_chunk: \
-                         output=({}x{}) current=({}x{}) start={} end={}",
-                        physical_worker_id,
-                        m.chunk_id,
-                        shared.output.rows(),
-                        shared.output.cols(),
-                        current.rows(),
-                        current.cols(),
-                        m.start,
-                        m.end,
-                    );
+                {
+                    let mut outputs = chunk_outputs.lock().unwrap();
+                    outputs[m.chunk_id] = Some(current);
                 }
-
-                write_chunk(&shared.output, &current, m.start);
 
                 {
                     let mut storage = ctx_storage.lock().unwrap();
@@ -822,7 +796,7 @@ pub(crate) fn forward_universal_parallel(
 
                 executor_for_worker.report_execution_time(
                     logical_worker_id,
-                    m.size,
+                    m.in_size(),
                     duration_ns as f64,
                 );
             }
@@ -833,8 +807,28 @@ pub(crate) fn forward_universal_parallel(
 
     executor.wait_all();
 
+    {
+        let mut outputs = chunk_outputs.lock().unwrap();
+        let mut pool_guard = shared.pool.lock().unwrap();
+
+        for chunk in &plan.chunks {
+            let handle = outputs[chunk.chunk_id]
+                .take()
+                .expect("forward_universal_parallel: missing chunk output after wait_all");
+
+            write_chunk_to_range(
+                &shared.output,
+                &handle,
+                chunk.out_start,
+                chunk.out_end,
+            );
+
+            pool_guard.release(handle);
+        }
+    }
+
     let storage = ctx_storage.lock().unwrap();
-    (storage.clone(), global_chunks)
+    (storage.clone(), plan.to_layout())
 }
 
 // ============================================================================
@@ -875,17 +869,12 @@ pub(crate) fn backward_universal_parallel(
         contexts.len()
     );
 
-    let mut per_worker_chunks: Vec<Vec<ChunkMeta>> =
+    let mut per_worker_chunks: Vec<Vec<(usize, usize, usize, usize)>> =
         (0..num_workers).map(|_| Vec::new()).collect();
 
     for (chunk_id, &(start, size, end)) in saved_chunks.iter().enumerate() {
         let logical_worker_id = chunk_id % num_workers;
-        per_worker_chunks[logical_worker_id].push(ChunkMeta {
-            chunk_id,
-            start,
-            size,
-            end,
-        });
+        per_worker_chunks[logical_worker_id].push((chunk_id, start, size, end));
     }
 
     let _ = batch_size;
@@ -905,8 +894,9 @@ pub(crate) fn backward_universal_parallel(
     {
         let mut t = tracker.lock().unwrap();
         for (logical_worker_id, metas) in per_worker_chunks.iter().enumerate() {
-            for m in metas {
-                t.mark_assigned(m.chunk_id, logical_worker_id);
+            for (chunk_id, start, _size, end) in metas {
+                let _ = (start, end);
+                t.mark_assigned(*chunk_id, logical_worker_id);
             }
         }
     }
@@ -945,20 +935,20 @@ pub(crate) fn backward_universal_parallel(
 
             let mut pool_guard = shared.pool.lock().unwrap();
 
-            for m in metas {
+            for (chunk_id, start, _size, end) in metas {
                 tracker
                     .lock()
                     .unwrap()
-                    .mark_in_progress(m.chunk_id, physical_worker_id);
+                    .mark_in_progress(chunk_id, physical_worker_id);
 
                 let t0 = Instant::now();
 
                 let grad_output_chunk =
-                    extract_chunk(&shared.grad_output, m.start, m.end, &mut *pool_guard);
+                    extract_chunk(&shared.grad_output, start, end, &mut *pool_guard);
                 let mut current_grad = grad_output_chunk;
 
-                let contexts_chunk = &shared.contexts[m.chunk_id];
-                let temp_grad = &temp_grads[m.chunk_id];
+                let contexts_chunk = &shared.contexts[chunk_id];
+                let temp_grad = &temp_grads[chunk_id];
 
                 for i in (0..shared.layers.len()).rev() {
                     let layer = &shared.layers[i];
@@ -974,7 +964,7 @@ pub(crate) fn backward_universal_parallel(
                             "[BWD-PARALLEL] worker={} chunk={} layer={} \
                              grad_in=({}x{}) grad_out=({}x{})",
                             physical_worker_id,
-                            m.chunk_id,
+                            chunk_id,
                             std::any::type_name_of_val(layer.as_ref()),
                             current_grad.rows(),
                             in_features,
@@ -1002,17 +992,17 @@ pub(crate) fn backward_universal_parallel(
                         "[BWD-PARALLEL] worker={} chunk={} BEFORE write_chunk: \
                          grad_input=({}x{}) current=({}x{}) start={} end={}",
                         physical_worker_id,
-                        m.chunk_id,
+                        chunk_id,
                         shared.grad_input.rows(),
                         shared.grad_input.cols(),
                         current_grad.rows(),
                         current_grad.cols(),
-                        m.start,
-                        m.end,
+                        start,
+                        end,
                     );
                 }
 
-                write_chunk(&shared.grad_input, &current_grad, m.start);
+                write_chunk(&shared.grad_input, &current_grad, start);
                 pool_guard.release(current_grad);
 
                 let duration_ns = t0.elapsed().as_nanos() as u64;
@@ -1020,7 +1010,7 @@ pub(crate) fn backward_universal_parallel(
                 tracker
                     .lock()
                     .unwrap()
-                    .mark_done(m.chunk_id, duration_ns);
+                    .mark_done(chunk_id, duration_ns);
             }
         });
 
@@ -1029,7 +1019,6 @@ pub(crate) fn backward_universal_parallel(
 
     executor.wait_all();
 
-    // Финальная редукция: суммируем temp_grads в grad_params.
     let mut pool_guard = shared.pool.lock().unwrap();
     {
         let mut grad_guard = shared.grad_params.write();

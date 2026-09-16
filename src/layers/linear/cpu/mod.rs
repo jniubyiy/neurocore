@@ -1,7 +1,7 @@
 // src/layers/linear/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for Linear {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let in_rows = input.rows();
         let in_cols = input.cols();
         let out_cols = self.out_features;
@@ -31,7 +32,6 @@ impl UniversalLayerBuffered for Linear {
             let w_start = slice.start;
             let b_start = w_start + in_cols * out_cols;
 
-            // output[r, c] = bias[c] + sum_k input[r, k] * weight[c, k]
             for r in 0..in_rows {
                 for c in 0..out_cols {
                     let mut sum = p[b_start + c];
@@ -42,6 +42,10 @@ impl UniversalLayerBuffered for Linear {
                 }
             }
         });
+
+        BufferedContext::Linear {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -84,7 +88,6 @@ impl UniversalLayerBuffered for Linear {
             let w_start = slice.start;
             let b_start = w_start + in_cols * out_cols;
 
-            // dx = grad_output * weight
             for r in 0..in_rows {
                 for c in 0..in_cols {
                     let mut sum = 0.0;
@@ -95,7 +98,6 @@ impl UniversalLayerBuffered for Linear {
                 }
             }
 
-            // dw = grad_output^T * x
             for out_idx in 0..out_cols {
                 for in_idx in 0..in_cols {
                     let mut sum = 0.0;
@@ -106,7 +108,6 @@ impl UniversalLayerBuffered for Linear {
                 }
             }
 
-            // db = сумма по строкам grad_output
             for c in 0..out_cols {
                 let mut sum = 0.0;
                 for r in 0..in_rows {

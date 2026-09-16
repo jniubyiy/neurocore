@@ -38,9 +38,10 @@ pub mod multi_resolution_kan_linear;
 pub mod layers_special;
 pub mod buffered_context;
 
-use crate::model_plan::param_store::ParamSlice;
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::TempMatrixPool;
+use crate::model_plan::param_store::ParamSlice;
 
 // ---------------------------------------------------------------------------
 // Маркерный трейт UniversalLayer (для downcasting и общей информации)
@@ -95,21 +96,6 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn output_features(&self) -> usize { 0 }
 
     /// Число выходных признаков слоя при заданном числе входных.
-    ///
-    /// Единый источник истины для определения выходной размерности слоя
-    /// во всех местах проекта (forward, backward, параллельные пути,
-    /// сегментные процессоры).
-    ///
-    /// * Если `output_features() > 0` — слой имеет фиксированное число
-    ///   выходных признаков, независимое от входа. Возвращается оно.
-    /// * Если `output_features() == 0` — слой сохраняет размерность входа.
-    ///   Возвращается `in_cols`.
-    ///
-    /// # Примеры
-    /// * `Linear(8→1).output_features_for(8)`   → 1
-    /// * `FeatureFusion(8→8).output_features_for(8)` → 8
-    /// * `SoftSparseGate(8).output_features_for(8)` → 8
-    /// * `ReLU.output_features_for(8)`          → 8
     #[inline]
     fn output_features_for(&self, in_cols: usize) -> usize {
         let of = self.output_features();
@@ -117,19 +103,6 @@ pub trait UniversalLayer: Send + Sync + 'static {
     }
 
     /// Число входных признаков слоя при неизвестном `fallback`.
-    ///
-    /// Единый источник истины для определения входной размерности слоя.
-    ///
-    /// * Если `input_features() > 0` — слой имеет фиксированное число
-    ///   входных признаков. Возвращается оно.
-    /// * Если `input_features() == 0` — слой сохраняет размерность,
-    ///   и возвращается `fallback`. Обычно `fallback` — это число столбцов
-    ///   буфера градиента на входе в слой.
-    ///
-    /// # Примеры
-    /// * `Linear(8→1).input_features_for(1)`      → 8
-    /// * `SoftSparseGate(8).input_features_for(1)` → 8
-    /// * `ReLU.input_features_for(8)`              → 8
     #[inline]
     fn input_features_for(&self, fallback: usize) -> usize {
         let inf = self.input_features();
@@ -138,8 +111,22 @@ pub trait UniversalLayer: Send + Sync + 'static {
 }
 
 // ---------------------------------------------------------------------------
-// Новый трейт UniversalLayerBuffered – основа для работы с буферами
+// UniversalLayerBuffered — единый контракт forward/backward
 // ---------------------------------------------------------------------------
+//
+// Ключевое отличие от предыдущей версии: `forward_buffered` теперь сам
+// создаёт и возвращает `BufferedContext`. Слой с внутренним состоянием
+// (например, IndRNN или LinearAttention) выделяет свои state-буферы из
+// `pool` и кладёт их в контекст. Слой без состояния возвращает один из
+// маркерных вариантов `BufferedContext` (Linear/ReLU/…/Identity).
+//
+// Это делает состояние слоя per-chunk автоматически: каждый вызов
+// forward для конкретного чанка создаёт СВОЙ `BufferedContext`, а
+// `ChunkedContexts` в parallel.rs хранит его по индексу чанка.
+//
+// `self.state` (RwLock/Mutex) в слоях больше не используется — это и
+// есть та самая обязательность: единственный источник состояния на
+// backward — `DynamicContext::Buffered`.
 
 pub trait UniversalLayerBuffered: Send + Sync + 'static {
     fn forward_buffered(
@@ -148,7 +135,8 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    );
+        pool: &mut TempMatrixPool,
+    ) -> BufferedContext;
 
     fn backward_buffered(
         &self,

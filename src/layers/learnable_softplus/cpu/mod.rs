@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -24,40 +24,20 @@ use super::super::learnable_softplus::LearnableSoftplus;
 //   y = softplus(β·u)/β,   u = x − θ
 //   ∂y/∂β = (σ(β·u)·u − y)/β
 //   ∂y/∂log_beta = ∂y/∂β · β = σ(β·u)·u − y    ← без 1/β
-//
-// Любая другая f (softplus, sigmoid, ...) оставляет 1/β в градиенте.
 // ============================================================================
 
 static LSF_DEBUG: Lazy<bool> = Lazy::new(|| std::env::var("NEUROCORE_DEBUG_LSF").is_ok());
 static LSF_FWD_CALLS: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 static LSF_BWD_CALLS: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 
-// Подробные логи первых N forward/backward (значения, распределения).
 const FORWARD_LOG_LIMIT: usize = 3;
 const BACKWARD_LOG_LIMIT: usize = 3;
-
-// Траектория β: печатается каждые LOG_TRAJECTORY_EVERY forward-вызовов.
 const LOG_TRAJECTORY_EVERY: usize = 50;
-
-// Диагностика backward при попадании в траекторию.
-// (нужно понять, куда β движется на всём протяжении обучения)
 const LOG_BWD_TRAJECTORY_EVERY: usize = 50;
-
-// ----------------------------------------------------------------------------
-// Границы β
-// ----------------------------------------------------------------------------
-//
-// Нижний clamp нужен: при β → 0 формула y = softplus(β·u)/β → ln(2)/β → +∞.
-//
-// Верхний clamp УБРАН: чтобы восстановить x = 0.01, нужна β ≈ 100.
-// β ≈ 1e8 безопасна (y → u, identity). До inf дойдёт только через decades
-// экспоненты — практически невозможно.
-// ----------------------------------------------------------------------------
 
 const BETA_MIN: f32 = 1e-3;
 const LOG_BETA_MIN: f32 = -6.907755;  // ln(1e-3)
 
-/// Печатает статистику по срезу: min, max, mean, кол-во NaN/Inf.
 fn lsf_dbg_stats(name: &str, data: &[f32]) {
     if data.is_empty() {
         println!("    [LSF] {}: <empty>", name);
@@ -69,14 +49,8 @@ fn lsf_dbg_stats(name: &str, data: &[f32]) {
     let mut nan_cnt = 0usize;
     let mut inf_cnt = 0usize;
     for &v in data {
-        if v.is_nan() {
-            nan_cnt += 1;
-            continue;
-        }
-        if v.is_infinite() {
-            inf_cnt += 1;
-            continue;
-        }
+        if v.is_nan() { nan_cnt += 1; continue; }
+        if v.is_infinite() { inf_cnt += 1; continue; }
         if v < mn { mn = v; }
         if v > mx { mx = v; }
         sum += v as f64;
@@ -89,7 +63,6 @@ fn lsf_dbg_stats(name: &str, data: &[f32]) {
     );
 }
 
-/// Устойчивый softplus: log(1 + exp(z)) без переполнения.
 #[inline]
 fn softplus_stable(z: f32) -> f32 {
     if z > 0.0 {
@@ -99,8 +72,6 @@ fn softplus_stable(z: f32) -> f32 {
     }
 }
 
-/// Применяет clamp к log_beta (только снизу) и возвращает
-/// (log_beta_eff, beta_eff, is_clamped).
 #[inline]
 fn effective_beta(log_beta: f32) -> (f32, f32, bool) {
     if log_beta < LOG_BETA_MIN {
@@ -110,7 +81,6 @@ fn effective_beta(log_beta: f32) -> (f32, f32, bool) {
     }
 }
 
-/// Краткая сводка β для траекторного лога.
 fn lsf_traj_print(label: &str, log_betas: &[f32], y: &[f32]) {
     let (betas_eff, n_clamped) = {
         let mut betas = Vec::with_capacity(log_betas.len());
@@ -140,7 +110,8 @@ impl UniversalLayerBuffered for LearnableSoftplus {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
@@ -212,13 +183,16 @@ impl UniversalLayerBuffered for LearnableSoftplus {
                     }
                     lsf_dbg_stats("y (output)", y);
                 }
-                // Траектория β
                 if lsf_traj_this {
                     let log_betas = &p[log_beta_start..log_beta_start + self.features];
                     lsf_traj_print(&format!("#{}", lsf_call_id), log_betas, y);
                 }
             }
         });
+
+        BufferedContext::LearnableSoftplus {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -325,9 +299,6 @@ impl UniversalLayerBuffered for LearnableSoftplus {
                         gi[idx] = gout * sigmoid;
 
                         // ∂y/∂log_beta = σ(β·u)·u − y
-                        // (без множителя β — это результат chain rule через
-                        //  f(β_raw)=exp(β_raw), f'=β, устраняющий 1/β).
-                        // Если β зажат снизу — градиент через него не течёт.
                         if !is_clamped {
                             let d_log_beta = sigmoid * u - y_val;
                             d_log_beta_acc += gout * d_log_beta;
@@ -354,7 +325,6 @@ impl UniversalLayerBuffered for LearnableSoftplus {
                         lsf_dbg_stats("grad_theta", &grad_theta);
                         lsf_dbg_stats("gi (grad_input)", gi);
                     }
-                    // Траектория: краткая сводка градиента по log_beta и θ.
                     if lsf_traj_this {
                         let gl_min = grad_log_beta.iter().cloned().fold(f32::INFINITY, f32::min);
                         let gl_max = grad_log_beta.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

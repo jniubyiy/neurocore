@@ -3,7 +3,7 @@
 use once_cell::sync::Lazy;
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -34,10 +34,6 @@ static COARSE_GRID: Lazy<Vec<f32>> =
     Lazy::new(|| build_grid(G_COARSE, K, GRID_MIN, GRID_MAX));
 static FINE_GRID: Lazy<Vec<f32>> =
     Lazy::new(|| build_grid(G_FINE, K, GRID_MIN, GRID_MAX));
-
-// ---------------------------------------------------------------------------
-// B-spline (Cox–de Boor)
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn bspline_basis(grid: &[f32], i: usize, k: usize, x: f32) -> f32 {
@@ -97,10 +93,6 @@ fn mix_weights(logit_c: f32, logit_f: f32, temp: f32) -> (f32, f32) {
     (e_c / denom, e_f / denom)
 }
 
-// ---------------------------------------------------------------------------
-// Раскладка
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy)]
 struct Offsets {
     bias: usize,
@@ -130,20 +122,10 @@ impl Offsets {
     }
 }
 
-/// Нормировочный множитель spline-ветки.
-///
-/// Гарантирует, что выход Σ_i spline_i(x_i) не растёт как O(in_features).
-/// Это стандартный приём KAN (Liu et al. 2024): spline_weight инициализируется
-/// как U(-1/sqrt(in·(G+k)), +...), и та же логика выдерживается в runtime,
-/// чтобы параметры не «разгонялись» из-за суммирования по входам.
 #[inline]
 fn spline_scale(in_features: usize) -> f32 {
     1.0 / (in_features as f32).sqrt()
 }
-
-// ---------------------------------------------------------------------------
-// Forward / Backward
-// ---------------------------------------------------------------------------
 
 impl UniversalLayerBuffered for MultiResolutionKANLinear {
     fn forward_buffered(
@@ -152,7 +134,8 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let batch = input.rows();
         let in_feat = self.in_features;
         let out_feat = self.out_features;
@@ -209,6 +192,10 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
                 }
             }
         });
+
+        BufferedContext::MultiResolutionKANLinear {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -306,8 +293,6 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
                                 ds_f += c * bspline_deriv(fine_grid, g, K, x_val);
                             }
 
-                            // Spline-коэффициенты: масштабируем на `scale`,
-                            // т.к. в forward spline-ветка входит с этим множителем.
                             for g in 0..COARSE_NUM_COEFFS {
                                 gp[coarse_base + g] += scale * gout * w_c * basis_c[g];
                             }
@@ -315,12 +300,10 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
                                 gp[fine_base + g] += scale * gout * w_f * basis_f[g];
                             }
 
-                            // base_weight без scale (SiLU-ветка входит без нормировки).
                             let silu_val = silu(x_val);
                             let bw = p[off.base_weight + mi];
                             gp[off.base_weight + mi] += gout * silu_val;
 
-                            // Mixture: множитель scale общий.
                             let s_mixed = w_c * s_c + w_f * s_f;
                             let inv_t = 1.0 / temp;
 
@@ -336,8 +319,6 @@ impl UniversalLayerBuffered for MultiResolutionKANLinear {
                             gp[off.mix_temp_raw + mi] +=
                                 scale * gout * dt_draw * inv_t2 * (l_w * s_mixed - s_w_l);
 
-                            // Градиент по входу: spline-ветка масштабируется на
-                            // scale, SiLU-ветка — нет.
                             let s_prime = silu_deriv(x_val);
                             let dx =
                                 scale * (w_c * ds_c + w_f * ds_f) + bw * s_prime;

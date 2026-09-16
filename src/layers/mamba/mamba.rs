@@ -1,40 +1,6 @@
 // src/layers/mamba/mamba.rs
 
-use std::sync::RwLock;
 use crate::layers::UniversalLayer;
-
-/// Кэш прямого прохода для обратного распространения.
-///
-/// Все тензоры хранятся в column-major раскладке, согласованной с общей
-/// раскладкой проекта.
-///
-/// - `input` — входной тензор, форма `(batch, seq_len * input_dim)`, column-major.
-/// - `h_all` — все скрытые состояния, форма `(batch * seq_len, state_dim)`,
-///   индексация `(r * seq_len + t) * state_dim + i`.
-/// - `A_bar` — дискретизированная матрица A, форма `(state_dim, state_dim)`,
-///   row-major по индексу `i * state_dim + j` (как в шейдере `mamba_discretize.comp`).
-/// - `B_bar` — дискретизированная матрица B, форма `(state_dim, input_dim)`,
-///   row-major по индексу `i * input_dim + j`.
-pub(crate) struct MambaForwardCache {
-    /// Входной тензор в column-major порядке: `(batch, seq_len * input_dim)`.
-    pub input: Vec<f32>,
-    /// Все скрытые состояния: `(batch * seq_len, state_dim)`.
-    pub h_all: Vec<f32>,
-    /// Дискретизированная матрица A_bar: `(state_dim, state_dim)`, row-major.
-    pub a_bar: Vec<f32>,
-    /// Дискретизированная матрица B_bar: `(state_dim, input_dim)`, row-major.
-    pub b_bar: Vec<f32>,
-}
-
-/// Состояние слоя Mamba.
-///
-/// Содержит кэш последнего прямого прохода и флаг `valid`, указывающий,
-/// актуален ли кэш для предстоящего обратного прохода.
-/// Пока `valid == false`, содержимое `cache` не определено.
-pub(crate) struct MambaForwardState {
-    pub cache: MambaForwardCache,
-    pub valid: bool,
-}
 
 /// Упрощённый слой Mamba (State Space Model).
 ///
@@ -51,12 +17,28 @@ pub(crate) struct MambaForwardState {
 /// - Δ: скаляр (шаг дискретизации)
 ///
 /// Вход: `(batch, seq_len * input_dim)`. Выход: `(batch, seq_len * input_dim)`.
+///
+/// # Состояние forward
+///
+/// Кэш прямого прохода (`h_all`, `a_bar`, `b_bar`) **не хранится**
+/// в структуре слоя. Он создаётся per-chunk в `forward_buffered` из
+/// `TempMatrixPool` и передаётся в backward через
+/// `BufferedContext::Mamba { input, h_all, a_bar, b_bar }`.
+///
+/// Это делает слой безопасным для чанкового распараллеливания:
+/// каждый чанк получает свои изолированные state-буферы, гонки
+/// за общее состояние слоя не возникает.
+///
+/// # Раскладка state-буферов
+///
+/// - `h_all`: `(batch * seq_len × state_dim)`, column-major,
+///   элемент `(r, t, i)` лежит по адресу `i * (batch * seq) + (r * seq + t)`.
+/// - `a_bar`: `(state_dim × state_dim)`, row-major.
+/// - `b_bar`: `(state_dim × input_dim)`, row-major.
 pub struct Mamba {
     pub seq_len: usize,
     pub input_dim: usize,
     pub state_dim: usize,
-    /// Состояние слоя: кэш последнего forward.
-    pub(crate) state: RwLock<MambaForwardState>,
 }
 
 impl Mamba {
@@ -70,38 +52,7 @@ impl Mamba {
             seq_len,
             input_dim,
             state_dim,
-            state: RwLock::new(MambaForwardState {
-                cache: MambaForwardCache {
-                    input: Vec::new(),
-                    h_all: Vec::new(),
-                    a_bar: Vec::new(),
-                    b_bar: Vec::new(),
-                },
-                valid: false,
-            }),
         }
-    }
-
-    /// Сохраняет кэш прямого прохода.
-    pub(crate) fn store_cache(&self, cache: MambaForwardCache) {
-        let mut guard = self.state.write().unwrap();
-        guard.cache = cache;
-        guard.valid = true;
-    }
-
-    /// Помечает состояние как недействительное.
-    ///
-    /// Используется после успешного завершения обратного прохода, чтобы
-    /// повторный backward без нового forward вызывал осмысленную панику.
-    /// Данные не освобождаются, чтобы избежать лишних аллокаций.
-    pub(crate) fn invalidate(&self) {
-        let mut guard = self.state.write().unwrap();
-        guard.valid = false;
-    }
-
-    /// Возвращает `true`, если в слое сохранено актуальное состояние.
-    pub(crate) fn has_valid_state(&self) -> bool {
-        self.state.read().unwrap().valid
     }
 }
 

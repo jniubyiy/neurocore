@@ -1,7 +1,7 @@
 // src/layers/learnable_mish/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for LearnableMish {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
@@ -41,6 +42,10 @@ impl UniversalLayerBuffered for LearnableMish {
                 y[i] = x_val * tanh_sp;
             }
         });
+
+        BufferedContext::LearnableMish {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(

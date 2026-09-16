@@ -1,33 +1,11 @@
 // src/layers/spectral_norm_linear/spectral_norm_linear.rs
 
-use std::sync::RwLock;
 use crate::layers::UniversalLayer;
-
-/// Внутреннее состояние спектральной нормализации.
-///
-/// Содержит векторы `u` (длины `in_features`) и `v` (длины `out_features`),
-/// используемые в степенном методе, а также последнее вычисленное значение
-/// `sigma` (используется в обратном проходе).
-///
-/// Поле `initialized` показывает, была ли выполнена инициализация векторов
-/// `u` и `v` (по первому прямому проходу). Пока `initialized == false`,
-/// содержимое `u` и `v` не определено и не используется.
-pub(crate) struct SpectralNormState {
-    /// Вектор `u` длины `in_features`.
-    pub(crate) u: Vec<f32>,
-    /// Вектор `v` длины `out_features`.
-    pub(crate) v: Vec<f32>,
-    /// Флаг инициализации векторов `u` и `v`.
-    pub(crate) initialized: bool,
-    /// Последнее вычисленное значение `sigma`.
-    pub(crate) last_sigma: f32,
-}
 
 /// Линейный слой со спектральной нормализацией весов.
 ///
-/// Поддерживает обучаемый масштаб `scale`.
-/// Внутри хранит векторы `u` и `v` для степенного метода (не обучаются),
-/// обновляемые при каждом прямом проходе.
+/// Поддерживает обучаемый масштаб `scale`. Внутри использует степенной
+/// метод (power iteration) для оценки спектральной нормы весовой матрицы.
 ///
 /// Формула:
 ///   sigma = u^T W v
@@ -39,11 +17,37 @@ pub(crate) struct SpectralNormState {
 /// - bias: вектор (out_features)
 /// - scale: скаляр
 /// Общее число параметров = out_features * in_features + out_features + 1.
+///
+/// # Состояние forward
+///
+/// Кэш степенного метода (`u`, `v`, `sigma`) **не хранится** в структуре
+/// слоя. Он создаётся per-chunk в `forward_buffered` из `TempMatrixPool`
+/// и передаётся в backward через
+/// `BufferedContext::SpectralNormLinear { input, u_state, v_state, sigma_state }`.
+///
+/// Это делает слой безопасным для чанкового распараллеливания: каждый
+/// чанк получает свои изолированные векторы `u`/`v` и скаляр `sigma`,
+/// гонки за общее состояние слоя не возникает.
+///
+/// # Замечание о семантике
+///
+/// В прежней версии векторы `u` и `v` **накапливались** между forward-вызовами
+/// (это классический подход power iteration в Spectral Normalization: между
+/// шагами SGD векторы сохраняются, чтобы следующий шаг power iteration
+/// стартовал близко к текущему приближению). При переносе в
+/// `BufferedContext` это свойство теряется: на каждом forward `u` и `v`
+/// инициализируются заново (единицами).
+///
+/// Для корректного приближения `sigma` при одном forward этого достаточно
+/// (power iteration сходится за несколько итераций даже из константного
+/// старта). Если требуется **точная** эмуляция исходной динамики с
+/// персистентными `u`/`v` между эпохами — эту пару нужно вынести в
+/// отдельное персистентное поле слоя (аналогично `BatchRenorm1d::state`).
 pub struct SpectrallyNormalizedLinear {
+    /// Размерность входа.
     pub in_features: usize,
+    /// Размерность выхода.
     pub out_features: usize,
-    /// Состояние слоя.
-    pub(crate) state: RwLock<SpectralNormState>,
 }
 
 impl SpectrallyNormalizedLinear {
@@ -59,29 +63,7 @@ impl SpectrallyNormalizedLinear {
         Self {
             in_features,
             out_features,
-            state: RwLock::new(SpectralNormState {
-                u: vec![0.0; in_features],
-                v: vec![0.0; out_features],
-                initialized: false,
-                last_sigma: 1.0,
-            }),
         }
-    }
-
-    /// Возвращает сохранённое значение `sigma`, вычисленное при последнем
-    /// прямом проходе.
-    pub(crate) fn get_last_sigma(&self) -> f32 {
-        self.state.read().unwrap().last_sigma
-    }
-
-    /// Сохраняет новое значение `sigma`.
-    pub(crate) fn set_last_sigma(&self, sigma: f32) {
-        self.state.write().unwrap().last_sigma = sigma;
-    }
-
-    /// Возвращает `true`, если векторы `u` и `v` были инициализированы.
-    pub(crate) fn is_initialized(&self) -> bool {
-        self.state.read().unwrap().initialized
     }
 }
 

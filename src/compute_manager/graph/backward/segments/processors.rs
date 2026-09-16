@@ -16,6 +16,12 @@ use crate::model_plan::param_store::ParamSlice;
 impl crate::compute_manager::graph::model::MixedModel {
     /// Последовательный обратный проход через цепочку слоёв UniversalProcessor.
     /// Используется в CPU‑ветке, когда параллелизм не применяется.
+    ///
+    /// Контексты слоёв (`ctxs`) были созданы в forward и содержат всё
+    /// per-chunk состояние, необходимое backward'у: у каждого слоя — свой
+    /// `BufferedContext`, включая state-буферы (h_all, mask, arg, per-head
+    /// буферы LinearAttention и т.д.). Слой не читает состояние из своих
+    /// полей.
     pub(crate) fn backward_universal_batch_buffered_handle(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -26,6 +32,17 @@ impl crate::compute_manager::graph::model::MixedModel {
         params: &MatrixBufferHandle,
         grad_params_handle: &MatrixBufferHandle,
     ) -> MatrixBufferHandle {
+        assert_eq!(
+            layers.len(),
+            slices.len(),
+            "backward_universal_batch_buffered_handle: layers/slices count mismatch"
+        );
+        assert_eq!(
+            layers.len(),
+            ctxs.len(),
+            "backward_universal_batch_buffered_handle: layers/contexts count mismatch"
+        );
+
         let mut current_grad = grad_out;
         for i in (0..layers.len()).rev() {
             let layer = &layers[i];
@@ -59,6 +76,12 @@ impl crate::compute_manager::graph::model::MixedModel {
 }
 
 /// Диспетчеризация обратного прохода для конкретного слоя.
+///
+/// В каждой ветке `as_*` передаётся та же сигнатура `backward_buffered`,
+/// которую объявляет трейт `UniversalLayerBuffered`. Никакие сигнатуры
+/// не менялись по сравнению с прежней версией — слои читают состояние
+/// из `ctx` (вариант `DynamicContext::Buffered(BufferedContext::…)`),
+/// а не из собственных полей.
 fn call_backward_buffered(
     layer: &Box<dyn UniversalLayer>,
     ctx: &DynamicContext,

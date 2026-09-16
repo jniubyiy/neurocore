@@ -1,7 +1,7 @@
 // src/layers/sparse_feature_selection_gate/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for SparseFeatureSelectionGate {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
@@ -32,7 +33,7 @@ impl UniversalLayerBuffered for SparseFeatureSelectionGate {
             let base = slice.start;
             let logits_start = base;
             let temp_idx = base + self.features;
-            let temperature = p[temp_idx].abs() + 1e-6; // гарантируем положительность
+            let temperature = p[temp_idx].abs() + 1e-6;
 
             for c in 0..cols {
                 let mask = 1.0 / (1.0 + (-p[logits_start + c] / temperature).exp());
@@ -42,6 +43,10 @@ impl UniversalLayerBuffered for SparseFeatureSelectionGate {
                 }
             }
         });
+
+        BufferedContext::SparseFeatureSelectionGate {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -116,7 +121,6 @@ impl UniversalLayerBuffered for SparseFeatureSelectionGate {
                     grad_temp += d_temp_acc;
                 }
 
-                // записываем градиенты параметров
                 for c in 0..self.features {
                     gp[logits_start + c] = grad_logits[c];
                 }

@@ -1,7 +1,7 @@
 // src/layers/adaptive_activation/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -67,7 +67,8 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         assert!(
             self.num_activations <= MAX_ACTIVATIONS,
             "AdaptivePerFeatureActivation CPU: num_activations > {} not supported",
@@ -77,7 +78,6 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.in_features);
-        // Проверяем, что слайс помещается в общий буфер параметров.
         debug_assert!(
             slice.start + self.param_len() <= params.rows() * params.cols(),
             "AdaptivePerFeatureActivation: parameter slice out of bounds"
@@ -120,6 +120,10 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
                 }
             }
         });
+
+        BufferedContext::AdaptiveActivation {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -147,7 +151,6 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
         let cols = grad_output.cols();
         debug_assert_eq!(cols, self.in_features);
         debug_assert_eq!(rows, input_handle.rows());
-        // Проверяем, что слайсы помещаются в буферы параметров и градиентов.
         debug_assert!(
             slice.start + self.param_len() <= params.rows() * params.cols(),
             "AdaptivePerFeatureActivation backward: parameter slice out of bounds"
@@ -185,7 +188,6 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
                 let param_len = num_act * features;
 
                 // Обнуляем весь диапазон градиентов параметров слоя.
-                // Дальше накапливаем градиенты логитов напрямую в gp.
                 for i in 0..param_len {
                     gp[base + i] = 0.0;
                 }
@@ -222,8 +224,7 @@ impl UniversalLayerBuffered for AdaptivePerFeatureActivation {
                         }
                         gi[idx] = gout * sum_der;
 
-                        // Градиенты по логитам накапливаем напрямую в gp
-                        // (без промежуточного Vec<f32>).
+                        // Градиенты по логитам накапливаем напрямую в gp.
                         for k in 0..num_act {
                             let d_l = gout * (activation_value(k, x_val) - y_val) * w[k];
                             gp[base + k * features + c] += d_l;

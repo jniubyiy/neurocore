@@ -5,42 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 
 use super::super::rms_norm_learnable_eps::{RMSNormWithLearnableEpsilon, EPS_MIN};
-
-// ============================================================================
-// Отладочные переключатели RMSNormWithLearnableEpsilon (CPU)
-// ============================================================================
-//
-// Логи включаются переменной окружения NEUROCORE_DEBUG_RMSNORM=1.
-//
-// Что печатается:
-//   * первые FORWARD_LOG_LIMIT forward-вызовов: gamma, eps_raw, eps_eff
-//     (= EPS_MIN + exp(eps_raw)), x, mean_sq, y, плюс диагностика
-//     min(mean_sq + eps_eff) и счётчик «плохих» элементов
-//     (mean_sq + eps_eff <= 0);
-//   * первые BACKWARD_LOG_LIMIT backward-вызовов: grad_gamma, grad_eps_raw,
-//     gi (grad_input);
-//   * ЛЮБЫЕ вызовы с NaN/Inf в выходе/градиентах, даже после исчерпания
-//     лимита подробных логов;
-//   * траектория параметров и градиентов каждые LOG_TRAJECTORY_EVERY
-//     вызовов forward и backward соответственно.
-//
-// Обеспечение корректности формулы ∂L/∂x (фикс B):
-//   Реализованный backward вычисляет
-//     gi_c = go_c·γ_c/d_c  −  (x_c / F) · Σ_j  go_j·γ_j·x_j / d_j³,
-//   где d_j = sqrt(mean_sq + ε_j), F = features, ε_j — per-feature обучаемый
-//   эффективный эпсилон. Это аналитически точная производная от forward-
-//   формулы y_c = γ_c·x_c/d_c при per-feature ε_c (улучшение слоя
-//   относительно PyTorch-канона с общим скалярным ε сохранено).
-//
-//   В пределе ε_j = const (обычный PyTorch RMSNorm) формула сводится к
-//   PyTorch-канонической; при разных ε_j учитывает per-feature природу
-//   каждого знаменателя под суммой (d_j³ внутри суммы, а не d_c³ снаружи).
 
 static RMSN_DEBUG: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_RMSNORM").is_ok());
@@ -51,10 +21,6 @@ const FORWARD_LOG_LIMIT: usize = 3;
 const BACKWARD_LOG_LIMIT: usize = 3;
 const LOG_TRAJECTORY_EVERY: usize = 50;
 const LOG_BWD_TRAJECTORY_EVERY: usize = 50;
-
-// ----------------------------------------------------------------------------
-// Утилиты диагностики
-// ----------------------------------------------------------------------------
 
 fn rmsn_stats(name: &str, data: &[f32]) {
     if data.is_empty() {
@@ -67,14 +33,8 @@ fn rmsn_stats(name: &str, data: &[f32]) {
     let mut nan_cnt = 0usize;
     let mut inf_cnt = 0usize;
     for &v in data {
-        if v.is_nan() {
-            nan_cnt += 1;
-            continue;
-        }
-        if v.is_infinite() {
-            inf_cnt += 1;
-            continue;
-        }
+        if v.is_nan() { nan_cnt += 1; continue; }
+        if v.is_infinite() { inf_cnt += 1; continue; }
         if v < mn { mn = v; }
         if v > mx { mx = v; }
         sum += v as f64;
@@ -107,10 +67,6 @@ fn compute_eps_eff(eps_raw: &[f32]) -> Vec<f32> {
     eps_raw.iter().map(|&r| EPS_MIN + r.exp()).collect()
 }
 
-// ----------------------------------------------------------------------------
-// Forward
-// ----------------------------------------------------------------------------
-
 impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
     fn forward_buffered(
         &self,
@@ -118,7 +74,8 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
@@ -145,7 +102,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
             let gamma_start = slice.start;
             let eps_start = gamma_start + self.features;
 
-            // mean(x^2) для каждой строки.
             let mut mean_sq = vec![0.0f32; rows];
             for r in 0..rows {
                 let mut sum_sq = 0.0f32;
@@ -157,24 +113,17 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                 mean_sq[r] = sum_sq / cols as f32;
             }
 
-            // Параметризация: ε = EPS_MIN + exp(eps_raw).
-            // ε гарантированно > 0, поэтому mean_sq + ε всегда > 0.
             let eps_raw = &p[eps_start..eps_start + self.features];
             let eps_eff = compute_eps_eff(eps_raw);
 
-            // Диагностика.
             let mut bad_arg_count = 0usize;
             let mut min_arg = f32::INFINITY;
             for c in 0..cols {
                 let eps = eps_eff[c];
                 for r in 0..rows {
                     let arg = mean_sq[r] + eps;
-                    if arg < min_arg {
-                        min_arg = arg;
-                    }
-                    if arg <= 0.0 {
-                        bad_arg_count += 1;
-                    }
+                    if arg < min_arg { min_arg = arg; }
+                    if arg <= 0.0 { bad_arg_count += 1; }
                 }
             }
 
@@ -196,7 +145,7 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                 if bad_arg_count > 0 {
                     println!(
                         "    [RMSN] !! WARNING: {} элементов с mean_sq + eps_eff <= 0 \
-                         (min_arg = {:.6e}). При <0 sqrt даст NaN, при =0 деление на ноль.",
+                         (min_arg = {:.6e}).",
                         bad_arg_count, min_arg
                     );
                 } else {
@@ -213,7 +162,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                 );
             }
 
-            // Основной цикл.
             for c in 0..cols {
                 let gamma = p[gamma_start + c];
                 let eps = eps_eff[c];
@@ -250,12 +198,8 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                         let eps = eps_eff[c];
                         for r in 0..rows {
                             let arg = mean_sq[r] + eps;
-                            if arg < min_arg_traj {
-                                min_arg_traj = arg;
-                            }
-                            if arg <= 0.0 {
-                                bad_traj += 1;
-                            }
+                            if arg < min_arg_traj { min_arg_traj = arg; }
+                            if arg <= 0.0 { bad_traj += 1; }
                         }
                     }
                     println!(
@@ -265,24 +209,11 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                 }
             }
         });
-    }
 
-    // ------------------------------------------------------------------------
-    // Backward
-    //
-    // Формула (фикс B применён):
-    //
-    //   d_j    = sqrt(mean_sq + ε_j)
-    //   gi_c   = go_c · γ_c / d_c  −  (x_c / F) · Σ_j  go_j·γ_j·x_j / d_j³
-    //
-    //   ∂L/∂γ_c   = Σ_r go_c · x_c / d_c
-    //   ∂L/∂ε_c   = Σ_r − 0.5 · go_c · γ_c · x_c / d_c³
-    //   ∂L/∂eps_raw_c = ∂L/∂ε_c · exp(eps_raw_c)
-    //
-    // Куб знаменателя стоит ПОД суммой по j (учёт per-feature ε_j),
-    // а не снаружи как d_c³-множитель. При ε_j = const формула совпадает
-    // с PyTorch-канонической RMSNorm; при разных ε_j — обобщает её.
-    // ------------------------------------------------------------------------
+        BufferedContext::RMSNormWithLearnableEpsilon {
+            input: input.clone(),
+        }
+    }
 
     fn backward_buffered(
         &self,
@@ -336,7 +267,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                 let gamma_start = slice.start;
                 let eps_start = gamma_start + self.features;
 
-                // mean_sq по строкам (как в forward).
                 let mut mean_sq = vec![0.0f32; rows];
                 for r in 0..rows {
                     let mut sum_sq = 0.0f32;
@@ -348,7 +278,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                     mean_sq[r] = sum_sq / cols as f32;
                 }
 
-                // ε = EPS_MIN + exp(eps_raw); ∂ε/∂eps_raw = exp(eps_raw).
                 let eps_raw = &p[eps_start..eps_start + self.features];
                 let eps_eff = compute_eps_eff(eps_raw);
                 let deps_draw: Vec<f32> = eps_raw.iter().map(|&r| r.exp()).collect();
@@ -370,12 +299,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                         let denom = (mean_sq[r] + eps).sqrt();
                         let denom3 = denom * denom * denom;
 
-                        // Градиент по входу (фикс B):
-                        //   gi_c = go_c·γ_c/d_c − (x_c / F) · Σ_j go_j·γ_j·x_j / d_j³
-                        //
-                        // В сумме по j для каждого j используется СВОЙ
-                        // знаменатель d_j³ (учитывая per-feature ε_j). При
-                        // ε_j = const это в точности PyTorch-канон.
                         let term1 = gamma / denom;
                         let sum_j = {
                             let mut s = 0.0f32;
@@ -392,15 +315,11 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                         let term2 = (1.0 / cols as f32) * x_val * sum_j;
                         gi[idx] = gout * term1 - term2;
 
-                        // Градиенты параметров.
-                        //   ∂y_c/∂γ_c = x_c / d_c
-                        //   ∂y_c/∂ε_c = − 0.5 · γ_c · x_c / d_c³
                         d_gamma_acc += gout * x_val / denom;
                         d_eps_acc += -0.5 * gout * gamma * x_val / denom3;
                     }
 
                     grad_gamma[c] = d_gamma_acc;
-                    // Chain-rule: ∂L/∂eps_raw = ∂L/∂ε · ∂ε/∂eps_raw.
                     grad_eps_raw[c] = d_eps_acc * deps_draw[c];
                 }
 

@@ -1,20 +1,6 @@
 // src/layers/concrete_dropout/concrete_dropout.rs
 
-use std::sync::RwLock;
 use crate::layers::UniversalLayer;
-
-/// Состояние слоя ConcreteDropout для одного шага forward/backward.
-///
-/// `arg` содержит аргументы сигмоиды
-/// `a = (logit_p + log(u) - log(1 - u)) / temperature`
-/// для каждого элемента входа (размер `batch * features`, column-major).
-/// `valid` устанавливается в `true` при выполнении прямого прохода и
-/// используется в обратном проходе как индикатор наличия актуального
-/// состояния. Пока `valid == false`, содержимое `arg` не определено.
-pub(crate) struct ConcreteDropoutState {
-    pub arg: Vec<f32>,
-    pub valid: bool,
-}
 
 /// Слой ConcreteDropout — dropout с обучаемой вероятностью удержания,
 /// основанный на Concrete (Gumbel-Softmax) релаксации Bernoulli.
@@ -28,13 +14,15 @@ pub(crate) struct ConcreteDropoutState {
 /// Выход: `y = x * z`.
 ///
 /// Слой предназначен для регуляризации и автоматической настройки силы dropout.
+///
+/// Состояние прямого прохода (аргументы сигмоиды `a`) не хранится в структуре
+/// слоя — оно создаётся per-chunk в `forward_buffered` и передаётся через
+/// `BufferedContext::ConcreteDropout`.
 pub struct ConcreteDropout {
     /// Температура Gumbel-Softmax. Обычно около 0.1.
     pub temperature: f32,
     /// Зерно для генератора случайных чисел. Используется для воспроизводимости.
     pub seed: u64,
-    /// Состояние последнего прямого прохода.
-    pub(crate) state: RwLock<ConcreteDropoutState>,
 }
 
 impl ConcreteDropout {
@@ -55,33 +43,7 @@ impl ConcreteDropout {
         Self {
             temperature,
             seed,
-            state: RwLock::new(ConcreteDropoutState {
-                arg: Vec::new(),
-                valid: false,
-            }),
         }
-    }
-
-    /// Сохраняет аргументы сигмоиды для обратного прохода.
-    pub(crate) fn store_state(&self, arg: Vec<f32>) {
-        let mut guard = self.state.write().unwrap();
-        guard.arg = arg;
-        guard.valid = true;
-    }
-
-    /// Помечает состояние как недействительное.
-    ///
-    /// Используется после успешного завершения обратного прохода, чтобы
-    /// повторный backward без нового forward вызывал осмысленную панику.
-    /// Данные не освобождаются, чтобы избежать лишних аллокаций.
-    pub(crate) fn invalidate(&self) {
-        let mut guard = self.state.write().unwrap();
-        guard.valid = false;
-    }
-
-    /// Возвращает `true`, если в слое сохранено актуальное состояние.
-    pub(crate) fn has_valid_state(&self) -> bool {
-        self.state.read().unwrap().valid
     }
 }
 

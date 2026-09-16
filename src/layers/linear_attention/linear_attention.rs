@@ -1,59 +1,6 @@
 // src/layers/linear_attention/linear_attention.rs
 
-use std::sync::RwLock;
 use crate::layers::UniversalLayer;
-
-/// Кэш одного активного head'а в LinearAttention.
-///
-/// Все тензоры хранятся в column-major раскладке, согласованной с общей
-/// раскладкой проекта.
-///
-/// # Размерности
-///
-/// d_head = d_model / max_heads — размерность подпространства одной головы.
-///
-/// - `q`, `k`, `v`:  (batch, seq_len, d_head), column-major,
-///                    индекс (r, t, j) → (t * d_head + j) * batch + r
-/// - `kv`:           (d_head, d_head), column-major,
-///                    индекс (i, l) → l * d_head + i
-/// - `z`:            (d_head,)
-/// - `attn_out`:     (batch, seq_len, d_head), column-major,
-///                    индекс (r, t, i) → (t * d_head + i) * batch + r
-/// - `y`:            (batch, seq_len, d_model), column-major,
-///                    индекс (r, t, k) → (t * d_model + k) * batch + r
-pub(crate) struct LinearAttentionHeadCache {
-    pub q: Vec<f32>,
-    pub k: Vec<f32>,
-    pub v: Vec<f32>,
-    pub kv: Vec<f32>,
-    pub z: Vec<f32>,
-    pub attn_out: Vec<f32>,
-    pub y: Vec<f32>,
-    /// Вес head'а на момент forward: w_h = head_weight(h_soft, h).
-    pub weight: f32,
-    /// Индекс head'а в общем списке голов (для сопоставления с параметрами).
-    pub head_index: usize,
-}
-
-/// Кэш прямого прохода LinearAttention (multi-head).
-pub(crate) struct LinearAttentionCache {
-    /// Кэш активных head'ов. Неактивные (w_h ≈ 0) сюда не попадают.
-    pub heads: Vec<LinearAttentionHeadCache>,
-    pub batch: usize,
-    pub seq: usize,
-    pub d_model: usize,
-    pub d_head: usize,
-    /// Мягкое число голов на момент forward.
-    pub h_soft: f32,
-    /// Сырое значение h_raw на момент forward.
-    pub h_raw: f32,
-}
-
-/// Состояние слоя LinearAttention.
-pub(crate) struct LinearAttentionState {
-    pub cache: LinearAttentionCache,
-    pub valid: bool,
-}
 
 /// Слой линейного внимания (Linear Attention) со стандартным multi-head
 /// (d_head = d_model / max_heads), обучаемым количеством голов и обучаемой
@@ -118,6 +65,17 @@ pub(crate) struct LinearAttentionState {
 /// Итого на head: `4 · d_head · d_model + 3 · d_head + d_model + 1`.
 /// Плюс один общий скаляр `h_raw` в конце.
 ///
+/// # Состояние forward
+///
+/// Кэш прямого прохода (per-head q_phi/k_phi/v_raw/kv/z/attn_out/y, а также
+/// h_raw и h_soft) **не хранится** в структуре слоя. Он создаётся per-chunk
+/// в `forward_buffered` из `TempMatrixPool` и передаётся в backward через
+/// `BufferedContext::LinearAttention`.
+///
+/// Это делает слой безопасным для чанкового распараллеливания: каждый
+/// чанк получает свои изолированные state-буферы, гонки за общее состояние
+/// слоя не возникает.
+///
 /// # Паника
 ///
 /// `new` паникует, если `d_model` не делится на `max_heads`.
@@ -126,10 +84,15 @@ pub struct LinearAttention {
     pub d_model: usize,
     pub min_heads: usize,
     pub max_heads: usize,
-    pub(crate) state: RwLock<LinearAttentionState>,
 }
 
 impl LinearAttention {
+    /// Создаёт слой.
+    ///
+    /// # Паника
+    ///
+    /// Паникует, если `seq_len == 0`, `d_model == 0`, `min_heads == 0`,
+    /// `max_heads < min_heads` или `d_model` не делится на `max_heads`.
     pub fn new(seq_len: usize, d_model: usize, min_heads: usize, max_heads: usize) -> Self {
         assert!(seq_len > 0, "LinearAttention: seq_len must be positive");
         assert!(d_model > 0, "LinearAttention: d_model must be positive");
@@ -150,18 +113,6 @@ impl LinearAttention {
             d_model,
             min_heads,
             max_heads,
-            state: RwLock::new(LinearAttentionState {
-                cache: LinearAttentionCache {
-                    heads: Vec::new(),
-                    batch: 0,
-                    seq: 0,
-                    d_model: 0,
-                    d_head: 0,
-                    h_soft: 0.0,
-                    h_raw: 0.0,
-                },
-                valid: false,
-            }),
         }
     }
 
@@ -177,21 +128,6 @@ impl LinearAttention {
         let d = self.d_model;
         let dh = self.d_head();
         4 * dh * d + 3 * dh + d + 1
-    }
-
-    pub(crate) fn store_cache(&self, cache: LinearAttentionCache) {
-        let mut guard = self.state.write().unwrap();
-        guard.cache = cache;
-        guard.valid = true;
-    }
-
-    pub(crate) fn invalidate(&self) {
-        let mut guard = self.state.write().unwrap();
-        guard.valid = false;
-    }
-
-    pub(crate) fn has_valid_state(&self) -> bool {
-        self.state.read().unwrap().valid
     }
 }
 

@@ -1,7 +1,7 @@
 // src/layers/dual_slope_relu/cpu/mod.rs
 
 use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
 use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
@@ -15,7 +15,8 @@ impl UniversalLayerBuffered for DualSlopeReLU {
         output: &MatrixBufferHandle,
         params: &MatrixBufferHandle,
         slice: &ParamSlice,
-    ) {
+        _pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
         let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
@@ -45,6 +46,10 @@ impl UniversalLayerBuffered for DualSlopeReLU {
                 }
             }
         });
+
+        BufferedContext::DualSlopeReLU {
+            input: input.clone(),
+        }
     }
 
     fn backward_buffered(
@@ -124,7 +129,6 @@ impl UniversalLayerBuffered for DualSlopeReLU {
                     grad_beta[c] = d_beta_acc;
                 }
 
-                // записываем градиенты в общий буфер
                 for c in 0..self.features {
                     gp[alpha_start + c] = grad_alpha[c];
                     gp[beta_start + c] = grad_beta[c];

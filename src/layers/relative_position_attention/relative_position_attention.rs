@@ -1,72 +1,72 @@
 // src/layers/relative_position_attention/relative_position_attention.rs
 
-use std::sync::RwLock;
 use crate::layers::UniversalLayer;
-
-/// Кэш промежуточных результатов прямого прохода для обратного распространения.
-///
-/// Все тензоры хранятся в column-major раскладке, согласованной с общей
-/// раскладкой проекта.
-///
-/// Раскладка тензоров формы `(batch, seq_len * d_model)`, column-major:
-///   элемент `(r, t, j)` лежит по адресу `(t * d_model + j) * batch + r`
-///
-/// Раскладка тензоров формы `(batch, seq_len * seq_len)`, column-major:
-///   элемент `(r, t, s)` лежит по адресу `(t * seq_len + s) * batch + r`
-pub(crate) struct RelativePositionAttentionCache {
-    /// Преобразованные запросы Q.
-    /// Форма `(batch, seq_len * d_model)`, column-major.
-    pub q: Vec<f32>,
-    /// Преобразованные ключи K.
-    /// Форма `(batch, seq_len * d_model)`, column-major.
-    pub k: Vec<f32>,
-    /// Преобразованные значения V.
-    /// Форма `(batch, seq_len * d_model)`, column-major.
-    pub v: Vec<f32>,
-    /// Скоры внимания до softmax.
-    /// Форма `(batch, seq_len * seq_len)`, column-major.
-    pub scores: Vec<f32>,
-    /// Веса внимания после softmax.
-    /// Форма `(batch, seq_len * seq_len)`, column-major.
-    pub attention_weights: Vec<f32>,
-    /// Результат внимания до выходного линейного слоя.
-    /// Форма `(batch, seq_len * d_model)`, column-major.
-    pub attn_out: Vec<f32>,
-    /// Размер батча.
-    pub batch: usize,
-    /// Длина последовательности.
-    pub seq: usize,
-    /// Размерность модели.
-    pub d_model: usize,
-}
-
-/// Состояние слоя RelativePositionAttention.
-///
-/// Содержит кэш последнего прямого прохода и флаг `valid`, указывающий,
-/// актуален ли кэш для предстоящего обратного прохода.
-/// Пока `valid == false`, содержимое `cache` не определено.
-pub(crate) struct RelativePositionAttentionState {
-    pub cache: RelativePositionAttentionCache,
-    pub valid: bool,
-}
 
 /// Слой RelativePositionAttention.
 ///
 /// Одноголовое внимание с относительным позиционным смещением.
-/// Вход: (batch, seq_len * d_model).
-/// Слой выполняет линейные преобразования Q, K, V, добавляет к матрице сходства
-/// обучаемое смещение, зависящее от относительной позиции, и применяет softmax.
+/// Вход: `(batch, seq_len * d_model)`.
+/// Выход: `(batch, seq_len * d_model)`.
 ///
-/// Параметры:
-/// - W_q, W_k, W_v, W_o размером d_model × d_model,
-/// - b_q, b_k, b_v, b_o размером d_model,
-/// - relative_bias длиной 2 * seq_len - 1 (для относительных позиций).
-/// Общее число параметров = 4*(d_model² + d_model) + (2*seq_len - 1).
+/// # Формула
+///
+/// Для каждого элемента последовательности выполняется линейное
+/// преобразование Q, K, V:
+///
+///   q = x · Wq + bq    (batch, seq, d_model)
+///   k = x · Wk + bk    (batch, seq, d_model)
+///   v = x · Wv + bv    (batch, seq, d_model)
+///
+/// Затем вычисляется матрица сходства с относительным смещением:
+///
+///   dot[t, s]   = (q_t · k_s) / sqrt(d_model)
+///   score[t, s] = dot[t, s] + rel_bias[s − t + (seq − 1)]
+///   weights     = softmax_s(score)
+///
+/// Результат внимания:
+///
+///   attn_out[t, i] = Σ_s weights[t, s] · v[s, i]
+///
+/// и выходной линейный слой:
+///
+///   y[t, j] = Σ_i attn_out[t, i] · Wo[j, i] + bo[j]
+///
+/// # Параметры
+///
+/// Раскладка параметров в общем буфере (смещение `slice.start`):
+///
+/// | Смещение        | Размер             | Что                    |
+/// |-----------------|--------------------|------------------------|
+/// | `0`             | `d_model · d_model`| `Wq` (row-major)       |
+/// | `d²`            | `d_model`          | `bq`                   |
+/// | `d² + d`        | `d_model · d_model`| `Wk` (row-major)       |
+/// | `2·d² + d`      | `d_model`          | `bk`                   |
+/// | `2·d² + 2·d`    | `d_model · d_model`| `Wv` (row-major)       |
+/// | `3·d² + 2·d`    | `d_model`          | `bv`                   |
+/// | `3·d² + 3·d`    | `d_model · d_model`| `Wo` (row-major)       |
+/// | `4·d² + 3·d`    | `d_model`          | `bo`                   |
+/// | `4·d² + 4·d`    | `2·seq_len − 1`    | `relative_bias`        |
+///
+/// Итого: `4·(d_model² + d_model) + (2·seq_len − 1)` параметров.
+///
+/// # Состояние forward
+///
+/// Кэш прямого прохода (Q, K, V, weights, attn_out) **не хранится**
+/// в структуре слоя. Он создаётся per-chunk в `forward_buffered` из
+/// `TempMatrixPool` и передаётся в backward через
+/// `BufferedContext::RelativePositionAttention`.
+///
+/// Это делает слой безопасным для чанкового распараллеливания: каждый
+/// чанк получает свои изолированные state-буферы, гонки за общее
+/// состояние слоя не возникает.
+///
+/// Матрица `scores` в контекст не кладётся — она используется только
+/// внутри forward для вычисления softmax и освобождается сразу после.
 pub struct RelativePositionAttention {
+    /// Длина последовательности.
     pub seq_len: usize,
+    /// Размерность модели (число признаков на одном токене).
     pub d_model: usize,
-    /// Состояние слоя: кэш последнего forward.
-    pub(crate) state: RwLock<RelativePositionAttentionState>,
 }
 
 impl RelativePositionAttention {
@@ -83,46 +83,7 @@ impl RelativePositionAttention {
             d_model > 0,
             "RelativePositionAttention: d_model must be positive"
         );
-        Self {
-            seq_len,
-            d_model,
-            state: RwLock::new(RelativePositionAttentionState {
-                cache: RelativePositionAttentionCache {
-                    q: Vec::new(),
-                    k: Vec::new(),
-                    v: Vec::new(),
-                    scores: Vec::new(),
-                    attention_weights: Vec::new(),
-                    attn_out: Vec::new(),
-                    batch: 0,
-                    seq: 0,
-                    d_model: 0,
-                },
-                valid: false,
-            }),
-        }
-    }
-
-    /// Сохраняет кэш прямого прохода.
-    pub(crate) fn store_cache(&self, cache: RelativePositionAttentionCache) {
-        let mut guard = self.state.write().unwrap();
-        guard.cache = cache;
-        guard.valid = true;
-    }
-
-    /// Помечает состояние как недействительное.
-    ///
-    /// Используется после успешного завершения обратного прохода, чтобы
-    /// повторный backward без нового forward вызывал осмысленную панику.
-    /// Данные не освобождаются, чтобы избежать лишних аллокаций.
-    pub(crate) fn invalidate(&self) {
-        let mut guard = self.state.write().unwrap();
-        guard.valid = false;
-    }
-
-    /// Возвращает `true`, если в слое сохранено актуальное состояние.
-    pub(crate) fn has_valid_state(&self) -> bool {
-        self.state.read().unwrap().valid
+        Self { seq_len, d_model }
     }
 }
 

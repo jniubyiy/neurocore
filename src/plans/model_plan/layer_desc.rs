@@ -160,10 +160,43 @@ impl LayerDesc {
                 2 * self.input_shape.streams[0]
             }
             LayerKind::LinearAttention => {
-                // Ожидаем extra = [seq_len, d_model]
-                let _seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                // extra = [seq_len, d_model, min_heads, max_heads]
+                //
+                // Multi-head LinearAttention со стандартным делением
+                // подпространств: d_head = d_model / max_heads.
+                //
+                // Требуется d_model % max_heads == 0 (валидируется в
+                // конструкторе слоя).
+                //
+                // Раскладка параметров одного head'а:
+                //   Wq_h: d_head × d_model  (row-major)
+                //   bq_h: d_head
+                //   Wk_h: d_head × d_model  (row-major)
+                //   bk_h: d_head
+                //   Wv_h: d_head × d_model  (row-major)
+                //   bv_h: d_head
+                //   Wo_h: d_model × d_head  (row-major)
+                //   bo_h: d_model
+                //   self_bias_h: 1
+                //
+                // Итого на head: 4 · d_head · d_model + 3 · d_head + d_model + 1.
+                //
+                // В конце всего буфера — один скаляр h_raw (обучаемое
+                // число голов).
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
-                4 * (d_model * d_model + d_model)
+                let min_heads = self.extra.get(2).copied().unwrap_or(1.0).max(1.0) as usize;
+                let max_heads_raw = self.extra.get(3).copied().unwrap_or(min_heads as f32) as usize;
+                let max_heads = max_heads_raw.max(min_heads);
+                assert!(
+                    max_heads > 0 && d_model % max_heads == 0,
+                    "LinearAttention: d_model ({}) must be divisible by max_heads ({}). \
+                     Pick max_heads as a divisor of d_model.",
+                    d_model,
+                    max_heads
+                );
+                let d_head = d_model / max_heads;
+                let head_param_count = 4 * d_head * d_model + 3 * d_head + d_model + 1;
+                max_heads * head_param_count + 1
             }
             LayerKind::RelativePositionAttention => {
                 // extra = [seq_len, d_model]
@@ -296,9 +329,24 @@ impl LayerDesc {
                 Box::new(crate::layers::AdaptiveDropout::new_with_seed(features, seed))
             }
             LayerKind::LinearAttention => {
+                // extra = [seq_len, d_model, min_heads, max_heads]
+                //
+                // Multi-head LinearAttention со стандартным делением
+                // подпространств: d_head = d_model / max_heads.
+                //
+                // Требуется d_model % max_heads == 0 (валидируется в
+                // конструкторе слоя; assert там же).
                 let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
-                Box::new(crate::layers::LinearAttention::new(seq_len, d_model))
+                let min_heads = self.extra.get(2).copied().unwrap_or(1.0).max(1.0) as usize;
+                let max_heads_raw = self.extra.get(3).copied().unwrap_or(min_heads as f32) as usize;
+                let max_heads = max_heads_raw.max(min_heads);
+                Box::new(crate::layers::LinearAttention::new(
+                    seq_len,
+                    d_model,
+                    min_heads,
+                    max_heads,
+                ))
             }
             LayerKind::RelativePositionAttention => {
                 let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;

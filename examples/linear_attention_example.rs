@@ -1,11 +1,35 @@
 // examples/linear_attention_example.rs
-// Пример обучения автоэнкодера с использованием слоя LinearAttention.
-// LinearAttention — механизм внимания с линейной сложностью по длине последовательности,
-// основанный на факторизации ядра (kernel factorization). Вход и выход имеют
-// размерность (batch, seq_len * d_model). В данном примере модель учится
-// восстанавливать входные последовательности.
-// Демонстрирует несколько вариантов запуска: CPU с разным числом потоков,
-// GPU, SSD, а также профилирование.
+//
+// Пример обучения LinearAttention (multi-head) на задаче денойзинга через
+// агрегацию.
+//
+// # Идея задачи
+//
+// LinearAttention перераспределяет информацию между токенами, поэтому
+// естественная для него задача — не identity (сохранить вход как есть),
+// а агрегация: собрать согласованный сигнал из нескольких зашумлённых
+// наблюдений.
+//
+// Каждая выборка — вектор констант c длины d_model. Все seq_len токенов
+// содержат одну и ту же константу плюс независимый шум:
+//
+//     input[r, t, j]  = c[r, j] + noise[r, t, j]
+//     target[r, t, j] = c[r, j]
+//
+// Слой должен научиться усреднять информацию по токенам и подавлять шум.
+//
+// # Роль multi-head
+//
+// min_heads = 1, max_heads = 2. d_model = 4, значит d_head = d_model /
+// max_heads = 2. Слой стартует с одной активной головы (h_soft ≈ 1) и
+// может по мере обучения «вырастить» вторую. Обучаемый self_bias позволяет
+// голове при необходимости выучить сохранение уникальной информации.
+//
+// Ожидаемая динамика loss:
+//   Старт:      ~5.8   (все параметры случайны, шум большой)
+//   Середина:   ~1.0   (модель начала усреднять)
+//   Финал:      ~0.12  (усреднение по 4 токенам даёт 4-кратное подавление
+//                       шума по дисперсии)
 
 use neurocore::tensor::Tensor2D;
 use neurocore::training_plan::ProfileMode;
@@ -14,21 +38,31 @@ mod models {
     use neurocore::model_plan::{LayerKind, LayerDesc};
     use neurocore::shape;
 
-    pub fn linear_attention_autoencoder() -> Vec<LayerDesc> {
+    pub fn linear_attention_denoiser() -> Vec<LayerDesc> {
         let seq_len = 4;
-        let d_model = 2;
+        let d_model = 4;      // должно делиться на max_heads
+        let min_heads = 1;
+        let max_heads = 2;    // d_head = d_model / max_heads = 2
 
         vec![
-            // LinearAttention с заданными seq_len и d_model
             LayerDesc::new(LayerKind::LinearAttention)
-                .input(shape!(batch, A[seq_len * d_model]))   // 8 признаков
-                .output(shape!(batch, A[seq_len * d_model]))  // 8 признаков
-                .extra(vec![seq_len as f32, d_model as f32]),
+                .input(shape!(batch, A[seq_len * d_model]))
+                .output(shape!(batch, A[seq_len * d_model]))
+                .extra(vec![
+                    seq_len as f32,
+                    d_model as f32,
+                    min_heads as f32,
+                    max_heads as f32,
+                ]),
         ]
     }
 }
 
 mod losses {
+    // MSE без деления на feature_count:
+    //   loss = (1/batch_size) · Σ_r Σ_j (pred[r,j] - target[r,j])²
+    //
+    // То есть loss = MSE_per_element · feature_count.
     use neurocore::loss_plan::{
         Aggregation, ElementChain, LossDesc, Square, Sub, SumColumns,
     };
@@ -38,7 +72,13 @@ mod losses {
             .add(Box::new(Sub::new(feature_count)))
             .add(Box::new(Square))
             .add(Box::new(SumColumns));
-        LossDesc::from_chain(chain, Aggregation::Mean, batch_size, feature_count, feature_count)
+        LossDesc::from_chain(
+            chain,
+            Aggregation::Mean,
+            batch_size,
+            feature_count,
+            feature_count,
+        )
     }
 }
 
@@ -47,15 +87,25 @@ mod optimizers {
 
     pub fn sgd() -> OptimizerDesc {
         OptimizerDesc::new()
-            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ScaleGradient(0.05))
             .add(OptCubeDesc::ApplyUpdate)
     }
 }
 
-/// Генерирует обучающие данные: случайные последовательности.
-/// Каждый пример — вектор из seq_len * d_model элементов (column-major).
-/// Целевые значения равны входным (автоэнкодер).
-fn generate_data(num_samples: usize, seq_len: usize, d_model: usize, seed: u64) -> (Tensor2D, Tensor2D) {
+/// Генерирует данные для задачи денойзинга.
+///
+/// Каждая выборка — вектор констант `c` длины `d_model`. Все токены в
+/// примере содержат одну и ту же константу плюс независимый шум.
+///
+/// Задача слоя — восстановить `c` на всех токенах, используя усреднение
+/// информации по последовательности.
+fn generate_data(
+    num_samples: usize,
+    seq_len: usize,
+    d_model: usize,
+    noise_level: f32,
+    seed: u64,
+) -> (Tensor2D, Tensor2D) {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -65,11 +115,22 @@ fn generate_data(num_samples: usize, seq_len: usize, d_model: usize, seed: u64) 
     let mut targets = Vec::with_capacity(num_samples);
 
     for _ in 0..num_samples {
-        let sample: Vec<f32> = (0..feature_count)
-            .map(|_| rng.gen_range(-1.0..1.0))
-            .collect();
-        inputs.push(sample.clone());
-        targets.push(sample);
+        // Вектор констант для этой выборки.
+        let c: Vec<f32> = (0..d_model).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        let mut input_row = Vec::with_capacity(feature_count);
+        let mut target_row = Vec::with_capacity(feature_count);
+
+        // Раскладка признаков — column-major: индекс признака `t*d + j`.
+        for _t in 0..seq_len {
+            for j in 0..d_model {
+                let noise: f32 = rng.gen_range(-noise_level..noise_level);
+                input_row.push(c[j] + noise);
+                target_row.push(c[j]);
+            }
+        }
+        inputs.push(input_row);
+        targets.push(target_row);
     }
 
     (Tensor2D::new(inputs), Tensor2D::new(targets))
@@ -79,14 +140,16 @@ fn base_training() -> neurocore::training_plan::TrainingPlan {
     use neurocore::training_plan::plan::{TrainingPlan, DataSource, Initializer};
 
     let seq_len = 4;
-    let d_model = 2;
-    let feature_count = seq_len * d_model;
-    let num_samples = 30;
+    let d_model = 4;
+    let feature_count = seq_len * d_model;   // 16
+    let num_samples = 100;
     let batch_size = 10;
-    let (train_x, train_y) = generate_data(num_samples, seq_len, d_model, 42);
+    let noise_level = 0.3;
+
+    let (train_x, train_y) = generate_data(num_samples, seq_len, d_model, noise_level, 42);
 
     TrainingPlan::new()
-        .model(models::linear_attention_autoencoder)
+        .model(models::linear_attention_denoiser)
         .loss(losses::mse(batch_size, feature_count))
         .optimizer(optimizers::sgd())
         .epochs(300)
@@ -124,8 +187,6 @@ macro_rules! device_plan_v {
     };
 }
 
-// ВНИМАНИЕ: минимальное число CPU-потоков — 2 (см. DevicePlan::cpu).
-// Один поток уходит под управление, второй — на вычисления.
 device_plan_v!(device_plan_v1, 2, 8192, false, 0, false);
 device_plan_v!(device_plan_v2, 4, 8192, false, 0, false);
 device_plan_v!(device_plan_v3, 2, 8192, true, 4096, false);

@@ -1,103 +1,55 @@
 // src/layers/linear_attention/gpu/vulkan/shaders/linear_attention_fwd.comp
 //
-// Прямой проход LinearAttention в column-major раскладке.
+// Прямой проход одной головы LinearAttention: вычисление attn.
 //
-// Формула:
-//   denom[r, t]   = eps + Σ_l q_phi[r, t, l] * z[l]
-//   num[r, t, j]  = Σ_l q_phi[r, t, l] * ( Σ_i KV[l, i] * w_o[j, i] )
-//   y[r, t, j]    = b_o[j] + num[r, t, j] / denom[r, t]
+//   num[r,t,i]  = self_bias · v[r,t,i] + Σ_l q_phi[r,t,l] · kv[l, i]
+//   attn[r,t,i] = num[r,t,i] / denom[r,t]
 //
-// где KV[l, i] хранится как kv[i * d + l] (column-major).
+// Один поток на (r, t, i). Цикл по l (d_head).
 //
-// Раскладка всех тензоров — column-major.
+// Раскладка:
+//   q_phi (batch, seq, d_head), column-major
+//   v     (batch, seq, d_head), column-major
+//   kv    (d_head, d_head), row-major: kv[l * d_head + i]
+//   denom (batch, seq), column-major
+//   attn  (batch, seq, d_head), column-major
 //
-// Bindings:
-//   0: q_phi — (batch, seq_len * d_model), column-major:
-//              q_phi[(t * d + l) * batch + r]
-//   1: kv    — (d_model, d_model), column-major:
-//              kv[i * d + l] = KV[l, i]
-//   2: z     — (d_model,), линейный вектор
-//   3: w_o   — (d_model, d_model), row-major:
-//              w_o[j * d + i]
-//   4: b_o   — (d_model,)
-//   5: y     — (batch, seq_len * d_model), column-major:
-//              y[(t * d + j) * batch + r]
-//
-// Push-константы: batch, seq_len, d_model
-// Dispatch: batch * seq_len * d_model потоков.
+// Push: [batch, seq, d_head, self_bias_bits]  (16 байт)
+// Dispatch: batch · seq · d_head потоков.
 
 #version 450
-
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PushConsts {
     uint batch;
-    uint seq_len;
-    uint d_model;
+    uint seq;
+    uint d_head;
+    float self_bias;
 } pc;
 
-layout(binding = 0, std430) readonly buffer QPhiBuf {
-    float q_phi[];
-};
-
-layout(binding = 1, std430) readonly buffer KVBuf {
-    float kv[];
-};
-
-layout(binding = 2, std430) readonly buffer ZBuf {
-    float z[];
-};
-
-layout(binding = 3, std430) readonly buffer WoBuf {
-    float w_o[];
-};
-
-layout(binding = 4, std430) readonly buffer BoBuf {
-    float b_o[];
-};
-
-layout(binding = 5, std430) writeonly buffer OutBuf {
-    float y[];
-};
+layout(binding = 0, std430) readonly buffer QPhiBuf { float q_phi[]; };
+layout(binding = 1, std430) readonly buffer VBuf { float v[]; };
+layout(binding = 2, std430) readonly buffer KVBuf { float kv[]; };
+layout(binding = 3, std430) readonly buffer DenomBuf { float denom[]; };
+layout(binding = 4, std430) writeonly buffer AttnBuf { float attn[]; };
 
 void main() {
-    uint d = pc.d_model;
-    uint total = pc.batch * pc.seq_len * d;
     uint idx = gl_GlobalInvocationID.x;
-    if (idx >= total) return;
+    if (idx >= pc.batch * pc.seq * pc.d_head) return;
 
-    // Восстанавливаем (r, t, j) из column-major индекса:
-    // idx = (t * d + j) * batch + r
-    uint r   = idx % pc.batch;
+    uint r = idx % pc.batch;
     uint tmp = idx / pc.batch;
-    uint j   = tmp % d;
-    uint t   = tmp / d;
+    uint i = tmp % pc.d_head;
+    uint t = tmp / pc.d_head;
 
-    uint q_base = (t * d) * pc.batch + r; // база для q_phi[r, t, 0]
+    uint tok = t * pc.batch + r;
+    float inv_denom = 1.0 / denom[tok];
 
-    // 1. Вычисляем denom = eps + Σ_l q_phi[r, t, l] * z[l]
-    float eps = 1e-6;
-    float denom = eps;
-    for (uint l = 0u; l < d; ++l) {
-        float q_l = q_phi[q_base + l * pc.batch];
-        denom += q_l * z[l];
-    }
-    float inv_denom = 1.0 / denom;
-
-    // 2. Вычисляем числитель:
-    // num = Σ_l q_phi[r, t, l] * ( Σ_i KV[l, i] * w_o[j, i] )
-    //     = Σ_l q_phi[r, t, l] * ( Σ_i kv[i * d + l] * w_o[j * d + i] )
-    float num = 0.0;
-    uint w_row_base = j * d;
-    for (uint l = 0u; l < d; ++l) {
-        float q_l = q_phi[q_base + l * pc.batch];
-        float inner = 0.0;
-        for (uint i = 0u; i < d; ++i) {
-            inner += kv[i * d + l] * w_o[w_row_base + i];
-        }
-        num += q_l * inner;
+    uint base = (t * pc.d_head) * pc.batch + r;
+    float num = pc.self_bias * v[base + i * pc.batch];
+    for (uint l = 0u; l < pc.d_head; ++l) {
+        num += q_phi[base + l * pc.batch] * kv[l * pc.d_head + i];
     }
 
-    // 3. Записываем результат.
-    y[idx] = b_o[j] + num * inv_denom;
+    attn[idx] = num * inv_denom;
 }

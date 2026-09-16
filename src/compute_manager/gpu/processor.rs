@@ -387,7 +387,22 @@ pub fn process_forward_gpu_buffered(
             let batch = current.rows();
             let arg_out = gpu_compute.allocate_gpu_matrix_handle(batch * current.cols(), 1);
             let out_handle = gpu_compute.allocate_gpu_matrix_handle(batch, current.cols());
-            let seed = cdrop.seed as u32;
+
+            // FIX (стохастичность dropout на GPU):
+            //
+            // Раньше здесь использовалось `cdrop.seed as u32` — константа,
+            // передаваемая в шейдер. Это давало одну и ту же маску на всех
+            // forward-проходах, точно так же, как было на CPU до фикса.
+            //
+            // Теперь используется `cdrop.next_seed()` — атомарный счётчик
+            // вызовов forward в структуре слоя. Счётчик общий с CPU-путём,
+            // поэтому поведение согласовано: и на CPU, и на GPU каждый
+            // forward получает свежий seed.
+            //
+            // Приведение u64 → u32 сохраняет нижние 32 бита — этого
+            // достаточно для RNG шейдера (xorshift32). Коллизии возможны
+            // раз в 2^32 вызовов, что при обучении недостижимо.
+            let seed = cdrop.next_seed() as u32;
             gpu_compute.run_concrete_dropout_forward_buffered_handle(
                 &current,
                 &logit_view,

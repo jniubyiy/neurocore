@@ -25,13 +25,6 @@ use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 // ============================================================================
 // Отладочные переключатели
 // ============================================================================
-//
-// NEUROCORE_DEBUG_TRAIN=1  — диагностика тренировочного цикла (как раньше).
-// NEUROCORE_DEBUG_NAN=1    — прицельный поиск первого NaN: печатает этап, на
-//                            котором он появился, размеры и статистику буфера,
-//                            индексы первых NaN-элементов. После первого
-//                            попадания больше не срабатывает (одноразовый
-//                            триггер), но счётчик этапов продолжает расти.
 
 static TRAIN_DEBUG: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_TRAIN").is_ok());
@@ -48,7 +41,6 @@ const ANOMALY_MULTIPLIER: f32 = 2.0;
 const ANOMALY_MIN_LOSS: f32 = 0.05;
 const ANOMALY_DIAG_LIMIT: usize = 10;
 
-// Диагностика эволюции β/θ
 const LOG_LSF_EVO_FIRST: usize = 20;
 const LOG_LSF_EVO_EVERY: usize = 20;
 
@@ -122,8 +114,6 @@ fn train_dbg_summary(data: &[f32]) -> String {
 // Точечная диагностика NaN
 // ============================================================================
 
-/// Счётчики попаданий NaN по этапам. Первое попадание в каждый этап
-/// инициирует подробную печать, последующие — нет.
 struct NanTracker {
     init_reported: bool,
     forward_reported: bool,
@@ -149,7 +139,6 @@ impl NanTracker {
         self.total_steps_observed += 1;
     }
 
-    /// Возвращает true, если по этому этапу уже был отчёт.
     fn should_report(&self, stage: &str) -> bool {
         match stage {
             "init" => !self.init_reported,
@@ -173,12 +162,10 @@ impl NanTracker {
     }
 }
 
-/// Проверяет, есть ли в срезе NaN или Inf.
 fn contains_bad(data: &[f32]) -> bool {
     data.iter().any(|v| !v.is_finite())
 }
 
-/// Возвращает индексы первых `limit` плохих элементов (NaN или Inf).
 fn first_bad_indices(data: &[f32], limit: usize) -> Vec<usize> {
     let mut out = Vec::with_capacity(limit);
     for (i, v) in data.iter().enumerate() {
@@ -192,15 +179,6 @@ fn first_bad_indices(data: &[f32], limit: usize) -> Vec<usize> {
     out
 }
 
-/// Печатает подробный отчёт о первом NaN на данном этапе.
-///
-/// # Аргументы
-/// * `stage`     — строка-идентификатор этапа: init / forward / loss / backward / update.
-/// * `epoch`     — номер эпохи (для контекста).
-/// * `batch_idx` — номер батча в эпохе (для контекста).
-/// * `shapes`    — список (имя, число строк, число столбцов) для буферов, связанных с этапом.
-/// * `data`      — плоский срез значений буфера, в котором ищется NaN.
-/// * `extra`     — произвольный текст (доп. контекст, например значения loss).
 fn report_first_nan(
     stage: &str,
     epoch: usize,
@@ -409,6 +387,59 @@ pub struct TrainingResult {
 }
 
 // ----------------------------------------------------------------------------
+// Layer-aware инициализация
+// ----------------------------------------------------------------------------
+//
+// После того как пользовательский `Initializer` применён ко всем параметрам,
+// для ряда слоёв применяются канонические инициализации. Это критично для
+// слоёв нормализации, где произвольная инициализация (например,
+// `uniform[-0.1, 0.1]`) ломает семантику слоя.
+//
+// В частности, для `BatchRenorm1d` канонической является:
+//
+//     γ = 1, β = 0, r = 1, d = 0
+//
+// При таком init выход слоя имеет нулевое среднее и единичную дисперсию по
+// батчу (y ≈ x_hat), что сохраняет ~50% активных признаков после
+// следующего ReLU и обеспечивает корректный поток градиента.
+//
+// При `γ, r ~ 0.05` (типичный uniform[-0.1, 0.1]) вклад x_hat в y
+// становится ~ 0.0025·x_hat, доминирует β со случайным знаком, часть
+// признаков получает y < 0 ВСЕГДА, ReLU их жёстко обнуляет, и градиент
+// через них не проходит. Это приводит к dead-ReLU по признакам и
+// остановке обучения.
+//
+// Функция возвращает список (buffer_idx, offset, values), которые нужно
+// записать в ParamStore поверх пользовательской инициализации.
+fn build_layer_aware_overrides(model: &MixedModel) -> Vec<(usize, usize, Vec<f32>)> {
+    let mut out = Vec::new();
+
+    for m in model.models() {
+        if let Model::UniversalProcessor(layers, slices, _) = m {
+            for (i, layer) in layers.iter().enumerate() {
+                let slice = &slices[i];
+
+                // ---------- BatchRenorm1d ----------
+                if let Some(br) = layer.as_batch_renorm() {
+                    let f = br.features;
+                    // Раскладка: [γ (f) | β (f) | r (f) | d (f)]
+                    let mut buf = vec![0.0f32; 4 * f];
+                    for c in 0..f {
+                        buf[0 * f + c] = 1.0; // γ
+                        // buf[1*f + c] = 0.0;   // β
+                        buf[2 * f + c] = 1.0; // r
+                        // buf[3*f + c] = 0.0;   // d
+                    }
+                    out.push((slice.buffer_idx, slice.start, buf));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+// ----------------------------------------------------------------------------
 // Публичный API
 // ----------------------------------------------------------------------------
 
@@ -449,7 +480,7 @@ fn execute_inner(
     if plan.train_data_streams.is_some() || plan.target_data_streams.is_some() ||
        plan.test_input_streams.is_some() || plan.test_target_streams.is_some() {
         return Err(
-            "Многопотоковые данные (train_data_streams, target_data_streams, \
+            "Многопоточковые данные (train_data_streams, target_data_streams, \
              test_input_streams, test_target_streams) пока не поддерживаются \
              в автоматическом обучении. Используйте ручной цикл с forward_multi/backward_multi."
                 .to_string(),
@@ -457,6 +488,10 @@ fn execute_inner(
     }
 
     // --- Инициализация весов ---
+    //
+    // 1. Применяем пользовательский Initializer ко ВСЕМ параметрам.
+    // 2. Применяем layer-aware канонические инициализации для BN-подобных
+    //    слоёв (перезаписывая generic-init).
     {
         let mut ps = model.param_store().lock().unwrap();
         let len = ps.total_params();
@@ -475,6 +510,16 @@ fn execute_inner(
                 }
                 ps.set_all_params(&params);
             }
+        }
+
+        // Layer-aware overrides.
+        let overrides = build_layer_aware_overrides(model);
+        for (buffer_idx, start, buf) in overrides {
+            let handle = ps.get_param_buffer_by_idx(buffer_idx).params.clone();
+            // write_range на CPU-буфере выполняется напрямую (без выделения
+            // временной копии); на GPU-буфере запаникует — но на этапе
+            // инициализации параметры всегда на CPU (см. set_all_params).
+            handle.write_range(start, &buf);
         }
     }
 
@@ -643,7 +688,6 @@ fn execute_inner(
             let (pred, _ctxs) = model.forward(batch_tensor.clone());
             let forward_dt = t0.elapsed().as_nanos() as u64;
 
-            // === Точечная диагностика NaN: forward ===
             if *NAN_DEBUG && nan_tracker.should_report("forward") {
                 let pred_flat = pred.to_flat();
                 if contains_bad(&pred_flat) {
@@ -679,7 +723,6 @@ fn execute_inner(
             );
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
-            // === Точечная диагностика NaN: loss ===
             if *NAN_DEBUG && nan_tracker.should_report("loss") {
                 let delta_flat = delta.to_flat();
                 let pred_flat = pred.to_flat();
@@ -715,7 +758,6 @@ fn execute_inner(
             let grads_flat = grads.to_flat_vec();
             let grad_l2 = train_dbg_l2(&grads_flat);
 
-            // === Точечная диагностика NaN: backward ===
             if *NAN_DEBUG && nan_tracker.should_report("backward") {
                 if contains_bad(&grads_flat) {
                     report_first_nan(
@@ -762,7 +804,6 @@ fn execute_inner(
             model.update_params_buffered(plan.optimizer_desc.clone(), &[]);
             let update_dt = t3.elapsed().as_nanos() as u64;
 
-            // === Точечная диагностика NaN: update ===
             if *NAN_DEBUG && nan_tracker.should_report("update") {
                 if let Some(flat) = read_all_params_safe(model) {
                     if contains_bad(&flat) {
@@ -991,7 +1032,6 @@ fn execute_inner(
         }
     }
 
-    // === Итоговая диагностика NaN, если за всё обучение ни одного отчёта не было ===
     if *NAN_DEBUG {
         println!();
         println!("[NAN-DEBUG] observed steps: {}", nan_tracker.total_steps_observed);

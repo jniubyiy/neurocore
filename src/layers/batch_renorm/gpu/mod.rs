@@ -85,10 +85,18 @@ impl GpuCompute {
 
     /// Обратный проход BatchRenorm1d на GPU.
     ///
-    /// Градиенты по параметрам записываются в `grad_params` (часть общего GPU-буфера
-    /// градиентов). Вход/выходные градиенты — GPU-дескрипторы.
-    /// Перед вызовом область `grad_params` обнуляется, так как шейдер использует
-    /// атомарное накопление. Статистики пересчитываются заново.
+    /// Реализует каноническую BN-формулу градиента по входу, согласованную
+    /// с CPU-реализацией. Порядок операций:
+    ///
+    ///   1. Обнуление области `grad_params` (накопление атомарное).
+    ///   2. Пересчёт `col_mean`, `col_var` (те же, что в forward — статистики
+    ///      по текущему батчу).
+    ///   3. Промежуточный проход `bwd_sums`: для каждого признака c считаются
+    ///      суммы Σ_r g·γ·r и Σ_r g·γ·r·x̂.
+    ///   4. Основной backward: gi через каноническую формулу, плюс атомарные
+    ///      градиенты по γ, β, r, d.
+    ///
+    /// Входной градиент (`grad_out`) и выходной (`grad_input`) — GPU-дескрипторы.
     pub fn run_batch_renorm_backward_buffered_handle(
         &self,
         input: &MatrixBufferHandle,
@@ -113,7 +121,9 @@ impl GpuCompute {
         assert_eq!(params.len(), 4 * features, "Params length mismatch");
         assert_eq!(grad_params.len(), 4 * features, "grad_params length mismatch");
 
-        // Обнуляем область grad_params перед накоплением
+        // -------------------------------------------------------------------
+        // 1. Обнуляем область grad_params перед накоплением.
+        // -------------------------------------------------------------------
         let zero_handle = self.upload_vec_to_gpu_handle(
             &vec![0.0f32; grad_params.len()],
             grad_params.len(),
@@ -128,9 +138,13 @@ impl GpuCompute {
         );
         // zero_handle выйдет из области видимости и будет освобождён
 
-        // Выделяем временные буферы для статистик
+        // -------------------------------------------------------------------
+        // 2. Временные буферы: статистики + суммы.
+        // -------------------------------------------------------------------
         let (col_mean_buf, col_mean_raw) = self.acquire_temp_buffer(features);
         let (col_var_buf, col_var_raw) = self.acquire_temp_buffer(features);
+        let (sum_gamma_r_buf, sum_gamma_r_raw) = self.acquire_temp_buffer(features);
+        let (sum_gamma_r_xhat_buf, sum_gamma_r_xhat_raw) = self.acquire_temp_buffer(features);
 
         // Получаем нужные Subbuffer'ы
         let in_buf = self.get_gpu_subbuffer_from_handle(input);
@@ -139,7 +153,9 @@ impl GpuCompute {
         let params_buf = subbuffer_from_view(self, params);
         let grad_params_buf = subbuffer_from_view(self, grad_params);
 
-        // Пересчитываем статистики
+        // -------------------------------------------------------------------
+        // 3. Пересчёт статистик (те же, что в forward).
+        // -------------------------------------------------------------------
         let col_stats_pipeline = &self.batch_renorm_pipelines().col_stats;
         let push_stats = [batch as u32, features as u32];
         self.run_compute_shader(
@@ -153,7 +169,28 @@ impl GpuCompute {
             features,
         );
 
-        // Запускаем основной backward-шейдер
+        // -------------------------------------------------------------------
+        // 4. Промежуточный проход: суммы Σg·γ·r и Σg·γ·r·x̂.
+        // -------------------------------------------------------------------
+        let bwd_sums_pipeline = &self.batch_renorm_pipelines().bwd_sums;
+        self.run_compute_shader(
+            bwd_sums_pipeline,
+            &[
+                (0, go_buf.clone()),
+                (1, params_buf.clone()),
+                (2, in_buf.clone()),
+                (3, col_mean_buf.clone()),
+                (4, col_var_buf.clone()),
+                (5, sum_gamma_r_buf.clone()),
+                (6, sum_gamma_r_xhat_buf.clone()),
+            ],
+            &push_stats,
+            features,
+        );
+
+        // -------------------------------------------------------------------
+        // 5. Основной backward-шейдер.
+        // -------------------------------------------------------------------
         let backward_pipeline = &self.batch_renorm_pipelines().backward;
         let push_bwd = [batch as u32, features as u32];
         self.run_compute_shader(
@@ -166,13 +203,19 @@ impl GpuCompute {
                 (4, col_var_buf.clone()),
                 (5, gi_buf),
                 (6, grad_params_buf),
+                (7, sum_gamma_r_buf.clone()),
+                (8, sum_gamma_r_xhat_buf.clone()),
             ],
             &push_bwd,
             total,
         );
 
-        // Освобождаем временные буферы
+        // -------------------------------------------------------------------
+        // 6. Освобождаем временные буферы.
+        // -------------------------------------------------------------------
         self.release_temp_buffer(col_mean_buf, col_mean_raw);
         self.release_temp_buffer(col_var_buf, col_var_raw);
+        self.release_temp_buffer(sum_gamma_r_buf, sum_gamma_r_raw);
+        self.release_temp_buffer(sum_gamma_r_xhat_buf, sum_gamma_r_xhat_raw);
     }
 }

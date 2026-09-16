@@ -20,10 +20,21 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
     unsafe { std::slice::from_raw_parts(ptr, bytes.len() / 4) }
 }
 
+/// Пайплайны BatchRenorm1d.
+///
+/// Forward:
+///   col_stats → forward
+///
+/// Backward:
+///   col_stats → bwd_sums → bwd
 pub struct BatchRenormPipelines {
     pub forward: Arc<ComputePipeline>,
     pub backward: Arc<ComputePipeline>,
     pub col_stats: Arc<ComputePipeline>,
+    /// Промежуточный проход: суммы Σg·γ·r и Σg·γ·r·x̂ по батчу для каждого
+    /// признака. Используются основным backward-шейдером для канонической
+    /// BN-формулы градиента по входу.
+    pub bwd_sums: Arc<ComputePipeline>,
 }
 
 impl BatchRenormPipelines {
@@ -31,10 +42,12 @@ impl BatchRenormPipelines {
         let fwd_bytes = include_bytes!("vulkan/shaders/batch_renorm_fwd.spv");
         let bwd_bytes = include_bytes!("vulkan/shaders/batch_renorm_bwd.spv");
         let stats_bytes = include_bytes!("vulkan/shaders/batch_renorm_col_stats.spv");
+        let bwd_sums_bytes = include_bytes!("vulkan/shaders/batch_renorm_bwd_sums.spv");
 
         let fwd_spv = as_u32_slice(fwd_bytes);
         let bwd_spv = as_u32_slice(bwd_bytes);
         let stats_spv = as_u32_slice(stats_bytes);
+        let bwd_sums_spv = as_u32_slice(bwd_sums_bytes);
 
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
             let mut bindings = std::collections::BTreeMap::new();
@@ -92,8 +105,18 @@ impl BatchRenormPipelines {
         )
         .expect("Failed to create BatchRenorm forward pipeline");
 
-        // ==================== Backward ====================
-        let bwd_layout = create_ds_layout(device.clone(), 7);
+        // ==================== Backward (основной) ====================
+        // 9 буферов:
+        //   0: InputBuf
+        //   1: GradOutBuf
+        //   2: ParamsBuf
+        //   3: ColMeanBuf
+        //   4: ColVarBuf
+        //   5: GradInBuf
+        //   6: GradParamsBuf (atomic uint)
+        //   7: SumGammaRBuf
+        //   8: SumGammaRXhatBuf
+        let bwd_layout = create_ds_layout(device.clone(), 9);
         let bwd_module = unsafe {
             ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_spv))
                 .expect("Failed to create BatchRenorm backward shader module")
@@ -148,12 +171,56 @@ impl BatchRenormPipelines {
             .expect("BatchRenorm col stats entry point not found");
         let stats_stage = PipelineShaderStageCreateInfo::new(stats_entry);
         let col_stats = ComputePipeline::new(
-            device,
+            device.clone(),
             None,
             ComputePipelineCreateInfo::stage_layout(stats_stage, stats_pipeline_layout),
         )
         .expect("Failed to create BatchRenorm col stats pipeline");
 
-        Self { forward, backward, col_stats }
+        // ==================== Backward: суммы по батчу ====================
+        // 7 буферов:
+        //   0: GradOutBuf
+        //   1: ParamsBuf
+        //   2: InputBuf
+        //   3: ColMeanBuf
+        //   4: ColVarBuf
+        //   5: SumGammaRBuf (write)
+        //   6: SumGammaRXhatBuf (write)
+        let bwd_sums_layout = create_ds_layout(device.clone(), 7);
+        let bwd_sums_module = unsafe {
+            ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(bwd_sums_spv))
+                .expect("Failed to create BatchRenorm bwd_sums shader module")
+        };
+        let bwd_sums_push = PushConstantRange {
+            stages: ShaderStages::COMPUTE,
+            offset: 0,
+            size: 8, // batch, features
+        };
+        let bwd_sums_pipeline_layout = PipelineLayout::new(
+            device.clone(),
+            PipelineLayoutCreateInfo {
+                set_layouts: vec![bwd_sums_layout],
+                push_constant_ranges: vec![bwd_sums_push],
+                ..Default::default()
+            },
+        )
+        .expect("Failed to create BatchRenorm bwd_sums pipeline layout");
+        let bwd_sums_entry = bwd_sums_module
+            .entry_point_with_execution("main", ExecutionModel::GLCompute)
+            .expect("BatchRenorm bwd_sums entry point not found");
+        let bwd_sums_stage = PipelineShaderStageCreateInfo::new(bwd_sums_entry);
+        let bwd_sums = ComputePipeline::new(
+            device,
+            None,
+            ComputePipelineCreateInfo::stage_layout(bwd_sums_stage, bwd_sums_pipeline_layout),
+        )
+        .expect("Failed to create BatchRenorm bwd_sums pipeline");
+
+        Self {
+            forward,
+            backward,
+            col_stats,
+            bwd_sums,
+        }
     }
 }

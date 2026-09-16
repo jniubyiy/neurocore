@@ -1,443 +1,38 @@
-// src/plans/training_plan/execution.rs
+// src/plans/training_plan/execution/execute.rs
+//
+// Оркестраторы обучения: публичный `execute` и внутренний `execute_inner`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 
-use once_cell::sync::Lazy;
-
 use rand::Rng;
 use rand::SeedableRng;
 
 use crate::compute_manager::dim_change::DynamicTensor;
 use crate::compute_manager::graph::model::MixedModel;
-use crate::compute_manager::graph::types::Model;
+use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 use crate::device_plan::DevicePlan;
 use crate::logging::training_monitor::TrainingMonitor;
 use crate::model_plan::Plan;
 use crate::tensor::Tensor2D;
 
-use super::plan::{Initializer, TrainingPlan};
-use super::profiling::{Profiler, ProfileMode, ProfileResult};
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use super::super::plan::{Initializer, TrainingPlan};
+use super::super::profiling::{Profiler, ProfileMode};
 
-// ============================================================================
-// Отладочные переключатели
-// ============================================================================
-
-static TRAIN_DEBUG: Lazy<bool> =
-    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_TRAIN").is_ok());
-
-static LAYER_DEBUG: Lazy<bool> =
-    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_LAYERS").is_ok());
-
-static NAN_DEBUG: Lazy<bool> =
-    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_NAN").is_ok());
-
-const LOG_FIRST_EPOCHS: usize = 3;
-const LOG_NORM_EVERY: usize = 10;
-const ANOMALY_MULTIPLIER: f32 = 2.0;
-const ANOMALY_MIN_LOSS: f32 = 0.05;
-const ANOMALY_DIAG_LIMIT: usize = 10;
-
-const LOG_LSF_EVO_FIRST: usize = 20;
-const LOG_LSF_EVO_EVERY: usize = 20;
-
-// ----------------------------------------------------------------------------
-// Утилиты
-// ----------------------------------------------------------------------------
-
-fn train_dbg_l2(data: &[f32]) -> f64 {
-    let mut s = 0.0f64;
-    for &v in data {
-        if v.is_finite() {
-            s += (v as f64) * (v as f64);
-        }
-    }
-    s.sqrt()
-}
-
-fn train_dbg_print_stats(name: &str, data: &[f32]) {
-    if data.is_empty() {
-        println!("    [TRAIN] {}: <empty>", name);
-        return;
-    }
-    let mut mn = f32::INFINITY;
-    let mut mx = f32::NEG_INFINITY;
-    let mut sum = 0.0f64;
-    let mut nan_cnt = 0usize;
-    let mut inf_cnt = 0usize;
-    for &v in data {
-        if v.is_nan() { nan_cnt += 1; continue; }
-        if v.is_infinite() { inf_cnt += 1; continue; }
-        if v < mn { mn = v; }
-        if v > mx { mx = v; }
-        sum += v as f64;
-    }
-    let finite = data.len().saturating_sub(nan_cnt + inf_cnt);
-    let mean = if finite > 0 { sum / finite as f64 } else { 0.0 };
-    println!(
-        "    [TRAIN] {}: len={}, min={:.6}, max={:.6}, mean={:.6}, l2={:.6}, nan={}, inf={}",
-        name, data.len(), mn, mx, mean, train_dbg_l2(data), nan_cnt, inf_cnt
-    );
-}
-
-fn train_dbg_print_vec(label: &str, data: &[f32]) {
-    println!("    [TRAIN] {} (len={}): {:?}", label, data.len(), data);
-}
-
-fn train_dbg_summary(data: &[f32]) -> String {
-    if data.is_empty() {
-        return "len=0".to_string();
-    }
-    let mut mn = f32::INFINITY;
-    let mut mx = f32::NEG_INFINITY;
-    let mut sum = 0.0f64;
-    let mut nan_cnt = 0usize;
-    let mut inf_cnt = 0usize;
-    for &v in data {
-        if v.is_nan() { nan_cnt += 1; continue; }
-        if v.is_infinite() { inf_cnt += 1; continue; }
-        if v < mn { mn = v; }
-        if v > mx { mx = v; }
-        sum += v as f64;
-    }
-    let l2 = train_dbg_l2(data);
-    format!(
-        "len={} sum={:.6e} l2={:.6e} min={:.6e} max={:.6e} nan={} inf={}",
-        data.len(), sum, l2, mn, mx, nan_cnt, inf_cnt
-    )
-}
-
-// ============================================================================
-// Точечная диагностика NaN
-// ============================================================================
-
-struct NanTracker {
-    init_reported: bool,
-    forward_reported: bool,
-    loss_reported: bool,
-    backward_reported: bool,
-    update_reported: bool,
-    total_steps_observed: usize,
-}
-
-impl NanTracker {
-    fn new() -> Self {
-        Self {
-            init_reported: false,
-            forward_reported: false,
-            loss_reported: false,
-            backward_reported: false,
-            update_reported: false,
-            total_steps_observed: 0,
-        }
-    }
-
-    fn bump(&mut self) {
-        self.total_steps_observed += 1;
-    }
-
-    fn should_report(&self, stage: &str) -> bool {
-        match stage {
-            "init" => !self.init_reported,
-            "forward" => !self.forward_reported,
-            "loss" => !self.loss_reported,
-            "backward" => !self.backward_reported,
-            "update" => !self.update_reported,
-            _ => false,
-        }
-    }
-
-    fn mark_reported(&mut self, stage: &str) {
-        match stage {
-            "init" => self.init_reported = true,
-            "forward" => self.forward_reported = true,
-            "loss" => self.loss_reported = true,
-            "backward" => self.backward_reported = true,
-            "update" => self.update_reported = true,
-            _ => {}
-        }
-    }
-}
-
-fn contains_bad(data: &[f32]) -> bool {
-    data.iter().any(|v| !v.is_finite())
-}
-
-fn first_bad_indices(data: &[f32], limit: usize) -> Vec<usize> {
-    let mut out = Vec::with_capacity(limit);
-    for (i, v) in data.iter().enumerate() {
-        if !v.is_finite() {
-            out.push(i);
-            if out.len() >= limit {
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn report_first_nan(
-    stage: &str,
-    epoch: usize,
-    batch_idx: usize,
-    shapes: &[(&str, usize, usize)],
-    data: &[f32],
-    extra: Option<&str>,
-) {
-    println!();
-    println!("========== [NAN-DEBUG] first NaN at stage = '{}' ==========", stage);
-    println!("  epoch = {}, batch_idx = {}", epoch, batch_idx);
-    if let Some(e) = extra {
-        println!("  extra: {}", e);
-    }
-    println!("  buffer shapes:");
-    for (name, r, c) in shapes {
-        println!("    {}: {} x {}", name, r, c);
-    }
-    println!("  buffer len = {}", data.len());
-    train_dbg_print_stats(&format!("{} buffer", stage), data);
-
-    let bad_idx = first_bad_indices(data, 16);
-    println!("  first bad indices (up to 16): {:?}", bad_idx);
-    println!("  first 16 values:");
-    let show = data.len().min(16);
-    println!("    {:?}", &data[..show]);
-
-    println!("  last 16 values:");
-    if data.len() >= 16 {
-        println!("    {:?}", &data[data.len() - 16..]);
-    } else {
-        println!("    {:?}", data);
-    }
-
-    println!("========== [NAN-DEBUG] end ==========");
-    println!();
-}
-
-// ============================================================================
-// Безопасное чтение параметров
-// ============================================================================
-
-fn read_all_params_safe(model: &MixedModel) -> Option<Vec<f32>> {
-    let ps = model.param_store().lock().unwrap();
-    if ps.is_empty() {
-        return Some(Vec::new());
-    }
-    let gpu_opt = model.compute_executor().gpu_compute();
-    let mut result = Vec::with_capacity(ps.total_params());
-    for buffer_idx in 0..ps.num_buffers() {
-        let buf = ps.get_param_buffer_by_idx(buffer_idx);
-        if buf.params.is_gpu() {
-            let gpu = gpu_opt.as_ref()?;
-            let data = gpu.download_gpu_handle_to_vec(&buf.params);
-            result.extend_from_slice(&data);
-        } else {
-            let guard = buf.params.read();
-            let slice = guard.as_slice()?;
-            result.extend_from_slice(slice);
-        }
-    }
-    Some(result)
-}
-
-fn per_sample_mse(pred_flat: &[f32], target_flat: &[f32]) -> f32 {
-    assert_eq!(pred_flat.len(), target_flat.len());
-    let n = pred_flat.len();
-    if n == 0 { return 0.0; }
-    let mut s = 0.0f32;
-    for i in 0..n {
-        let d = pred_flat[i] - target_flat[i];
-        s += d * d;
-    }
-    s / n as f32
-}
-
-// ----------------------------------------------------------------------------
-// Диагностика эволюции β и θ слоя LearnableSoftplus
-// ----------------------------------------------------------------------------
-
-struct LsfEvoSnap {
-    model_idx: usize,
-    layer_idx: usize,
-    features: usize,
-    raw_betas: Vec<f32>,
-    thetas: Vec<f32>,
-    grad_raw_betas: Vec<f32>,
-    grad_thetas: Vec<f32>,
-}
-
-fn collect_lsf_evo(model: &MixedModel) -> Vec<LsfEvoSnap> {
-    let ps_guard = model.param_store().lock().unwrap();
-    let mut out = Vec::new();
-    for (m_idx, m) in model.models().iter().enumerate() {
-        if let Model::UniversalProcessor(layers, slices, _) = m {
-            for (l_idx, layer) in layers.iter().enumerate() {
-                if let Some(lsf) = layer.as_learnable_softplus() {
-                    let f = lsf.features;
-                    let slice = &slices[l_idx];
-                    let params_h = ps_guard.params_handle(slice);
-                    let grads_h = ps_guard.grads_handle(slice);
-                    if params_h.is_gpu() || grads_h.is_gpu() {
-                        continue;
-                    }
-                    let raw_betas = params_h.read_range(slice.start, f);
-                    let thetas = params_h.read_range(slice.start + f, f);
-                    let grad_raw_betas = grads_h.read_range(slice.start, f);
-                    let grad_thetas = grads_h.read_range(slice.start + f, f);
-                    out.push(LsfEvoSnap {
-                        model_idx: m_idx,
-                        layer_idx: l_idx,
-                        features: f,
-                        raw_betas,
-                        thetas,
-                        grad_raw_betas,
-                        grad_thetas,
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-fn print_lsf_evo(epoch: usize, snaps: &[LsfEvoSnap]) {
-    if snaps.is_empty() {
-        println!("  [LSF-EVOLUTION ep{}] (no LearnableSoftplus on CPU found)", epoch);
-        return;
-    }
-    for s in snaps {
-        let mut beta_min = f32::INFINITY;
-        let mut beta_max = f32::NEG_INFINITY;
-        let mut beta_sum = 0.0f32;
-        let mut beta_dev_inf = 0.0f32;
-        let mut n_valid = 0usize;
-        for &rb in &s.raw_betas {
-            let b = (1.0 + rb).max(1e-3);
-            if b < beta_min { beta_min = b; }
-            if b > beta_max { beta_max = b; }
-            beta_sum += b;
-            let dev = (b - 1.0).abs();
-            if dev > beta_dev_inf { beta_dev_inf = dev; }
-            n_valid += 1;
-        }
-        let beta_mean = if n_valid > 0 { beta_sum / n_valid as f32 } else { 0.0 };
-
-        let mut theta_min = f32::INFINITY;
-        let mut theta_max = f32::NEG_INFINITY;
-        let mut theta_sum = 0.0f32;
-        let mut theta_abs_inf = 0.0f32;
-        for &t in &s.thetas {
-            if t < theta_min { theta_min = t; }
-            if t > theta_max { theta_max = t; }
-            theta_sum += t;
-            let a = t.abs();
-            if a > theta_abs_inf { theta_abs_inf = a; }
-        }
-        let theta_mean = if !s.thetas.is_empty() {
-            theta_sum / s.thetas.len() as f32
-        } else {
-            0.0
-        };
-
-        let grad_beta_l2 = train_dbg_l2(&s.grad_raw_betas);
-        let grad_theta_l2 = train_dbg_l2(&s.grad_thetas);
-        let grad_beta_inf = s.grad_raw_betas.iter().map(|v| v.abs()).fold(0.0, f32::max);
-        let grad_theta_inf = s.grad_thetas.iter().map(|v| v.abs()).fold(0.0, f32::max);
-
-        println!(
-            "  [LSF-EVOLUTION ep{}] m{} l{} F={}",
-            epoch, s.model_idx, s.layer_idx, s.features
-        );
-        println!(
-            "    β: min={:.6} max={:.6} mean={:.6} |β−1|_inf={:.6}",
-            beta_min, beta_max, beta_mean, beta_dev_inf
-        );
-        println!(
-            "    θ: min={:.6} max={:.6} mean={:.6} |θ|_inf={:.6}",
-            theta_min, theta_max, theta_mean, theta_abs_inf
-        );
-        println!("    grad_raw_β: l2={:.6} |·|_inf={:.6}", grad_beta_l2, grad_beta_inf);
-        println!("    grad_θ:     l2={:.6} |·|_inf={:.6}", grad_theta_l2, grad_theta_inf);
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Структуры
-// ----------------------------------------------------------------------------
-
-struct BatchInfo {
-    start: usize,
-    end: usize,
-    loss: f32,
-    grad_l2: f64,
-}
-
-pub struct TrainingResult {
-    pub tensors: HashMap<String, DynamicTensor>,
-    pub final_loss: f32,
-    pub training_time_secs: f64,
-    pub best_epoch: usize,
-    pub best_loss: f32,
-    pub zero_loss_epoch: Option<usize>,
-    pub profile: Option<ProfileResult>,
-    pub monitor_summary: Option<crate::logging::TrainingSummary>,
-}
-
-// ----------------------------------------------------------------------------
-// Layer-aware инициализация
-// ----------------------------------------------------------------------------
-//
-// После того как пользовательский `Initializer` применён ко всем параметрам,
-// для ряда слоёв применяются канонические инициализации. Это критично для
-// слоёв нормализации, где произвольная инициализация (например,
-// `uniform[-0.1, 0.1]`) ломает семантику слоя.
-//
-// В частности, для `BatchRenorm1d` канонической является:
-//
-//     γ = 1, β = 0, r = 1, d = 0
-//
-// При таком init выход слоя имеет нулевое среднее и единичную дисперсию по
-// батчу (y ≈ x_hat), что сохраняет ~50% активных признаков после
-// следующего ReLU и обеспечивает корректный поток градиента.
-//
-// При `γ, r ~ 0.05` (типичный uniform[-0.1, 0.1]) вклад x_hat в y
-// становится ~ 0.0025·x_hat, доминирует β со случайным знаком, часть
-// признаков получает y < 0 ВСЕГДА, ReLU их жёстко обнуляет, и градиент
-// через них не проходит. Это приводит к dead-ReLU по признакам и
-// остановке обучения.
-//
-// Функция возвращает список (buffer_idx, offset, values), которые нужно
-// записать в ParamStore поверх пользовательской инициализации.
-fn build_layer_aware_overrides(model: &MixedModel) -> Vec<(usize, usize, Vec<f32>)> {
-    let mut out = Vec::new();
-
-    for m in model.models() {
-        if let Model::UniversalProcessor(layers, slices, _) = m {
-            for (i, layer) in layers.iter().enumerate() {
-                let slice = &slices[i];
-
-                // ---------- BatchRenorm1d ----------
-                if let Some(br) = layer.as_batch_renorm() {
-                    let f = br.features;
-                    // Раскладка: [γ (f) | β (f) | r (f) | d (f)]
-                    let mut buf = vec![0.0f32; 4 * f];
-                    for c in 0..f {
-                        buf[0 * f + c] = 1.0; // γ
-                        // buf[1*f + c] = 0.0;   // β
-                        buf[2 * f + c] = 1.0; // r
-                        // buf[3*f + c] = 0.0;   // d
-                    }
-                    out.push((slice.buffer_idx, slice.start, buf));
-                }
-            }
-        }
-    }
-
-    out
-}
+use super::debug::{
+    TRAIN_DEBUG, LAYER_DEBUG, NAN_DEBUG,
+    train_dbg_l2, train_dbg_print_vec, train_dbg_print_stats, train_dbg_summary,
+    LOG_FIRST_EPOCHS, LOG_NORM_EVERY,
+    ANOMALY_MULTIPLIER, ANOMALY_MIN_LOSS, ANOMALY_DIAG_LIMIT,
+    LOG_LSF_EVO_FIRST, LOG_LSF_EVO_EVERY,
+};
+use super::lsf_evo::{collect_lsf_evo, print_lsf_evo};
+use super::nan_debug::{contains_bad, report_first_nan, NanTracker};
+use super::overrides::build_layer_aware_overrides;
+use super::params::{per_sample_mse, read_all_params_safe};
+use super::types::{BatchInfo, TrainingResult};
 
 // ----------------------------------------------------------------------------
 // Публичный API
@@ -1036,11 +631,11 @@ fn execute_inner(
         println!();
         println!("[NAN-DEBUG] observed steps: {}", nan_tracker.total_steps_observed);
         println!("[NAN-DEBUG] reported stages:");
-        println!("  init     : {}", nan_tracker.init_reported);
-        println!("  forward  : {}", nan_tracker.forward_reported);
-        println!("  loss     : {}", nan_tracker.loss_reported);
-        println!("  backward : {}", nan_tracker.backward_reported);
-        println!("  update   : {}", nan_tracker.update_reported);
+        println!("  init     : {}", nan_tracker.should_report("init") == false);
+        println!("  forward  : {}", nan_tracker.should_report("forward") == false);
+        println!("  loss     : {}", nan_tracker.should_report("loss") == false);
+        println!("  backward : {}", nan_tracker.should_report("backward") == false);
+        println!("  update   : {}", nan_tracker.should_report("update") == false);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();

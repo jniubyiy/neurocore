@@ -1,9 +1,5 @@
 // src/layers/rms_norm_learnable_eps/cpu/mod.rs
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use once_cell::sync::Lazy;
-
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::buffered_context::BufferedContext;
@@ -11,56 +7,6 @@ use crate::layers::UniversalLayerBuffered;
 use crate::model_plan::param_store::ParamSlice;
 
 use super::super::rms_norm_learnable_eps::{RMSNormWithLearnableEpsilon, EPS_MIN};
-
-static RMSN_DEBUG: Lazy<bool> =
-    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_RMSNORM").is_ok());
-static RMSN_FWD_CALLS: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
-static RMSN_BWD_CALLS: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
-
-const FORWARD_LOG_LIMIT: usize = 3;
-const BACKWARD_LOG_LIMIT: usize = 3;
-const LOG_TRAJECTORY_EVERY: usize = 50;
-const LOG_BWD_TRAJECTORY_EVERY: usize = 50;
-
-fn rmsn_stats(name: &str, data: &[f32]) {
-    if data.is_empty() {
-        println!("    [RMSN] {}: <empty>", name);
-        return;
-    }
-    let mut mn = f32::INFINITY;
-    let mut mx = f32::NEG_INFINITY;
-    let mut sum = 0.0f64;
-    let mut nan_cnt = 0usize;
-    let mut inf_cnt = 0usize;
-    for &v in data {
-        if v.is_nan() { nan_cnt += 1; continue; }
-        if v.is_infinite() { inf_cnt += 1; continue; }
-        if v < mn { mn = v; }
-        if v > mx { mx = v; }
-        sum += v as f64;
-    }
-    let finite = data.len().saturating_sub(nan_cnt + inf_cnt);
-    let mean = if finite > 0 { sum / finite as f64 } else { 0.0 };
-    let l2: f64 = data
-        .iter()
-        .filter(|v| v.is_finite())
-        .map(|&v| (v as f64) * (v as f64))
-        .sum::<f64>()
-        .sqrt();
-    println!(
-        "    [RMSN] {}: len={}, min={:.6}, max={:.6}, mean={:.6}, l2={:.6}, nan={}, inf={}",
-        name, data.len(), mn, mx, mean, l2, nan_cnt, inf_cnt
-    );
-}
-
-fn rmsn_first(label: &str, data: &[f32], k: usize) {
-    let show = data.len().min(k);
-    println!("    [RMSN] {} (first {}): {:?}", label, show, &data[..show]);
-}
-
-fn rmsn_has_bad(data: &[f32]) -> bool {
-    data.iter().any(|v| !v.is_finite())
-}
 
 /// Вычисляет `ε = EPS_MIN + exp(eps_raw)` поэлементно.
 fn compute_eps_eff(eps_raw: &[f32]) -> Vec<f32> {
@@ -83,13 +29,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
             slice.start + self.param_len() <= params.rows() * params.cols(),
             "RMSNormWithLearnableEpsilon: parameter slice out of bounds"
         );
-
-        let (log_this, call_id, traj_this) = if *RMSN_DEBUG {
-            let n = RMSN_FWD_CALLS.fetch_add(1, Ordering::Relaxed);
-            (n < FORWARD_LOG_LIMIT, n, n % LOG_TRAJECTORY_EVERY == 0)
-        } else {
-            (false, 0usize, false)
-        };
 
         let ids = [input.id(), output.id(), params.id()];
         input.memory().write().unwrap().with_cpu_slices_mut(&ids, |slices| {
@@ -116,52 +55,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
             let eps_raw = &p[eps_start..eps_start + self.features];
             let eps_eff = compute_eps_eff(eps_raw);
 
-            let mut bad_arg_count = 0usize;
-            let mut min_arg = f32::INFINITY;
-            for c in 0..cols {
-                let eps = eps_eff[c];
-                for r in 0..rows {
-                    let arg = mean_sq[r] + eps;
-                    if arg < min_arg { min_arg = arg; }
-                    if arg <= 0.0 { bad_arg_count += 1; }
-                }
-            }
-
-            if *RMSN_DEBUG && log_this {
-                println!(
-                    "[RMSN fwd #{}] rows={}, cols={}, slice.start={}, features={}",
-                    call_id, rows, cols, slice.start, self.features
-                );
-                let gammas = &p[gamma_start..gamma_start + self.features];
-                rmsn_stats("gamma (raw)", gammas);
-                rmsn_stats("eps_raw (stored)", eps_raw);
-                rmsn_stats("eps_eff = EPS_MIN + exp(eps_raw)", &eps_eff);
-                rmsn_stats("mean_sq (per row)", &mean_sq);
-                rmsn_stats("x (input)", x);
-                rmsn_first("gamma", gammas, 8);
-                rmsn_first("eps_raw", eps_raw, 8);
-                rmsn_first("eps_eff", &eps_eff, 8);
-                rmsn_first("mean_sq", &mean_sq, 8);
-                if bad_arg_count > 0 {
-                    println!(
-                        "    [RMSN] !! WARNING: {} элементов с mean_sq + eps_eff <= 0 \
-                         (min_arg = {:.6e}).",
-                        bad_arg_count, min_arg
-                    );
-                } else {
-                    println!(
-                        "    [RMSN] min(mean_sq + eps_eff) = {:.6e} (все > 0)",
-                        min_arg
-                    );
-                }
-            } else if *RMSN_DEBUG && bad_arg_count > 0 {
-                println!(
-                    "[RMSN fwd #{}] ANOMALY: {} элементов с mean_sq + eps_eff <= 0 \
-                     (min_arg = {:.6e})",
-                    call_id, bad_arg_count, min_arg
-                );
-            }
-
             for c in 0..cols {
                 let gamma = p[gamma_start + c];
                 let eps = eps_eff[c];
@@ -169,43 +62,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                     let idx = c * rows + r;
                     let denom = (mean_sq[r] + eps).sqrt();
                     y[idx] = (x[idx] / denom) * gamma;
-                }
-            }
-
-            if *RMSN_DEBUG {
-                let has_anom = rmsn_has_bad(y);
-                if log_this || has_anom {
-                    if has_anom && !log_this {
-                        println!(
-                            "[RMSN fwd #{}] ANOMALY (non-finite in output)",
-                            call_id
-                        );
-                    }
-                    rmsn_stats("y (output)", y);
-                }
-                if traj_this {
-                    let gammas = &p[gamma_start..gamma_start + self.features];
-                    println!(
-                        "[RMSN traj fwd #{}] gamma/eps summary:",
-                        call_id
-                    );
-                    rmsn_stats("  gamma", gammas);
-                    rmsn_stats("  eps_raw", eps_raw);
-                    rmsn_stats("  eps_eff", &eps_eff);
-                    let mut min_arg_traj = f32::INFINITY;
-                    let mut bad_traj = 0usize;
-                    for c in 0..cols {
-                        let eps = eps_eff[c];
-                        for r in 0..rows {
-                            let arg = mean_sq[r] + eps;
-                            if arg < min_arg_traj { min_arg_traj = arg; }
-                            if arg <= 0.0 { bad_traj += 1; }
-                        }
-                    }
-                    println!(
-                        "[RMSN traj fwd #{}] min(mean_sq + eps_eff) = {:.6e}, bad_count = {}",
-                        call_id, min_arg_traj, bad_traj
-                    );
                 }
             }
         });
@@ -234,13 +90,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
         let cols = grad_output.cols();
         debug_assert_eq!(cols, self.features);
         debug_assert_eq!(rows, input_handle.rows());
-
-        let (log_this, call_id, traj_this) = if *RMSN_DEBUG {
-            let n = RMSN_BWD_CALLS.fetch_add(1, Ordering::Relaxed);
-            (n < BACKWARD_LOG_LIMIT, n, n % LOG_BWD_TRAJECTORY_EVERY == 0)
-        } else {
-            (false, 0usize, false)
-        };
 
         let ids = [
             input_handle.id(),
@@ -326,71 +175,6 @@ impl UniversalLayerBuffered for RMSNormWithLearnableEpsilon {
                 for c in 0..self.features {
                     gp[gamma_start + c] = grad_gamma[c];
                     gp[eps_start + c] = grad_eps_raw[c];
-                }
-
-                if *RMSN_DEBUG && log_this {
-                    println!(
-                        "[RMSN bwd #{}] rows={}, cols={}, slice.start={}",
-                        call_id, rows, cols, slice.start
-                    );
-                    let gammas = &p[gamma_start..gamma_start + self.features];
-                    rmsn_stats("gamma", gammas);
-                    rmsn_stats("eps_raw", eps_raw);
-                    rmsn_stats("eps_eff", &eps_eff);
-                    rmsn_stats("x (input)", x);
-                    rmsn_stats("go (grad_out)", go);
-                    rmsn_stats("grad_gamma", &grad_gamma);
-                    rmsn_stats("grad_eps_raw", &grad_eps_raw);
-                    rmsn_stats("gi (grad_input)", gi);
-                    rmsn_first("grad_gamma", &grad_gamma, 8);
-                    rmsn_first("grad_eps_raw", &grad_eps_raw, 8);
-                }
-
-                if *RMSN_DEBUG {
-                    let has_anom = rmsn_has_bad(&grad_gamma)
-                        || rmsn_has_bad(&grad_eps_raw)
-                        || rmsn_has_bad(gi);
-                    if has_anom && !log_this {
-                        println!(
-                            "[RMSN bwd #{}] ANOMALY (non-finite grad)",
-                            call_id
-                        );
-                        rmsn_stats("grad_gamma", &grad_gamma);
-                        rmsn_stats("grad_eps_raw", &grad_eps_raw);
-                        rmsn_stats("gi", gi);
-                    }
-                }
-
-                if *RMSN_DEBUG && traj_this {
-                    let gg_l2: f32 = {
-                        let s: f64 = grad_gamma
-                            .iter()
-                            .filter(|v| v.is_finite())
-                            .map(|&v| (v as f64) * (v as f64))
-                            .sum();
-                        s.sqrt() as f32
-                    };
-                    let ge_l2: f32 = {
-                        let s: f64 = grad_eps_raw
-                            .iter()
-                            .filter(|v| v.is_finite())
-                            .map(|&v| (v as f64) * (v as f64))
-                            .sum();
-                        s.sqrt() as f32
-                    };
-                    let gi_l2: f32 = {
-                        let s: f64 = gi
-                            .iter()
-                            .filter(|v| v.is_finite())
-                            .map(|&v| (v as f64) * (v as f64))
-                            .sum();
-                        s.sqrt() as f32
-                    };
-                    println!(
-                        "[RMSN traj bwd #{}] ||grad_gamma||={:.6e}, \
-                         ||grad_eps_raw||={:.6e}, ||gi||={:.6e}",
-                        call_id, gg_l2, ge_l2, gi_l2
-                    );
                 }
             });
     }

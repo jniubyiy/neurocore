@@ -16,28 +16,16 @@ use crate::model_plan::param_store::{ParamSlice, ParamStore};
 use crate::optimizer_plan::{OptimizerDesc, OptimizerExpr};
 
 /// Коллекция градиентов параметров модели, представленная управляемыми буферами.
-///
-/// В отличие от обычных `Vec<f32>`, этот тип не копирует данные и сохраняет
-/// прямую связь с буферами градиентов внутри `ParamStore`. Это позволяет
-/// избежать накладных расходов на сериализацию и оставаться в рамках
-/// управляемой памяти.
 pub struct ParamGradients {
-    /// Клоны дескрипторов буферов градиентов (по одному на сегмент модели).
     buffers: Vec<MatrixBufferHandle>,
     compute_executor: Arc<ComputeExecutor>,
 }
 
 impl ParamGradients {
-    /// Возвращает срез дескрипторов буферов градиентов.
     pub fn buffers(&self) -> &[MatrixBufferHandle] {
         &self.buffers
     }
 
-    /// Возвращает плоский вектор всех градиентов (с копированием данных).
-    ///
-    /// Этот метод следует использовать только для диагностики, логирования
-    /// или интеграции с внешним кодом, которому нужен числовой доступ.
-    /// В горячем пути обучения его вызывать не рекомендуется.
     pub fn to_flat_vec(&self) -> Vec<f32> {
         let mut result = Vec::new();
         for buf in &self.buffers {
@@ -58,11 +46,6 @@ impl ParamGradients {
 }
 
 /// Раскладка чанков, зафиксированная в момент forward.
-///
-/// Вектор `(start, end)` соответствует глобальному порядку чанков, в котором
-/// были сохранены контексты слоёв. Используется backward'ом, чтобы гарантировать
-/// соответствие между `contexts[i]` и диапазоном батча, для которого этот
-/// контекст был построен.
 pub type SavedChunkLayout = Vec<(usize, usize, usize)>;
 
 pub struct MixedModel {
@@ -79,12 +62,6 @@ pub struct MixedModel {
     pub(crate) output_shapes: Vec<Vec<usize>>,
     pub(crate) temp_matrix_pool: Arc<Mutex<TempMatrixPool>>,
     pub(crate) optimizer_exprs: HashMap<usize, OptimizerExpr>,
-    /// Для каждой модели — пара (контексты слоёв, раскладка чанков).
-    ///
-    /// Раскладка сохраняется в момент forward и переиспользуется в backward,
-    /// чтобы forward и backward работали с одинаковым разбиением батча
-    /// (см. `parallel::forward_universal_parallel` /
-    /// `parallel::backward_universal_parallel`).
     pub(crate) last_forward_contexts: HashMap<usize, (ChunkedContexts, SavedChunkLayout)>,
 }
 
@@ -221,8 +198,6 @@ impl MixedModel {
         (in_tensors, param_grads)
     }
 
-    /// Собирает клоны дескрипторов градиентных буферов из ParamStore.
-    /// Не копирует данные — только дескрипторы.
     fn collect_param_gradients(&self) -> ParamGradients {
         let ps = self.param_store.lock().unwrap();
         let mut buffers = Vec::with_capacity(ps.num_buffers());
@@ -345,7 +320,7 @@ impl MixedModel {
         buf: MatrixBufferHandle,
         shape: &[usize],
     ) -> DynamicTensor {
-        let (batch, features, flat) = if buf.is_gpu() {
+        let (_batch, _features, flat) = if buf.is_gpu() {
             let gpu_compute = self
                 .compute_executor
                 .gpu_compute()

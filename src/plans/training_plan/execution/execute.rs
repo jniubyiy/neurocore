@@ -21,18 +21,8 @@ use crate::tensor::Tensor2D;
 use super::super::plan::{Initializer, TrainingPlan};
 use super::super::profiling::{Profiler, ProfileMode};
 
-use super::debug::{
-    TRAIN_DEBUG, LAYER_DEBUG, NAN_DEBUG,
-    train_dbg_l2, train_dbg_print_vec, train_dbg_print_stats, train_dbg_summary,
-    LOG_FIRST_EPOCHS, LOG_NORM_EVERY,
-    ANOMALY_MULTIPLIER, ANOMALY_MIN_LOSS, ANOMALY_DIAG_LIMIT,
-    LOG_LSF_EVO_FIRST, LOG_LSF_EVO_EVERY,
-};
-use super::lsf_evo::{collect_lsf_evo, print_lsf_evo};
-use super::nan_debug::{contains_bad, report_first_nan, NanTracker};
 use super::overrides::build_layer_aware_overrides;
-use super::params::{per_sample_mse, read_all_params_safe};
-use super::types::{BatchInfo, TrainingResult};
+use super::types::TrainingResult;
 
 // ----------------------------------------------------------------------------
 // Публичный API
@@ -118,23 +108,6 @@ fn execute_inner(
         }
     }
 
-    // --- Проверка инициализации на NaN ---
-    let mut nan_tracker = NanTracker::new();
-    if *NAN_DEBUG {
-        if let Some(flat) = read_all_params_safe(model) {
-            if contains_bad(&flat) && nan_tracker.should_report("init") {
-                report_first_nan(
-                    "init",
-                    0, 0,
-                    &[("params_after_init", flat.len(), 1)],
-                    &flat,
-                    Some("NaN/Inf обнаружен в параметрах СРАЗУ после инициализации"),
-                );
-                nan_tracker.mark_reported("init");
-            }
-        }
-    }
-
     let opt_chain = plan.optimizer_desc.build_chain();
 
     let learning_rate = opt_chain
@@ -175,7 +148,6 @@ fn execute_inner(
 
     let num_samples = train_data.num_samples();
     let batch_size = plan.batch_size.max(1);
-    let num_batches_per_epoch = (num_samples + batch_size - 1) / batch_size;
 
     let mut profiler = if plan.profile != ProfileMode::None {
         Some(Profiler::new(plan.profile))
@@ -183,48 +155,9 @@ fn execute_inner(
         None
     };
 
-    let params_are_cpu_initially = {
-        let ps = model.param_store().lock().unwrap();
-        ps.is_empty() || {
-            let buf = ps.get_param_buffer_by_idx(0);
-            !buf.params.is_gpu()
-        }
-    };
-
-    if *TRAIN_DEBUG && params_are_cpu_initially {
-        println!("=== [TRAIN DEBUG] execution_inner ===");
-        println!("  num_samples = {}", num_samples);
-        println!("  batch_size  = {}", batch_size);
-        println!("  epochs      = {}", plan.epochs);
-        println!("  lr (from ScaleGradient) = {:.6}", learning_rate);
-        println!("  num mini-batches/epoch  = {}", num_batches_per_epoch);
-        if let Some(flat) = read_all_params_safe(model) {
-            println!("  total params = {}", flat.len());
-            train_dbg_print_stats("init params", &flat);
-        }
-        let snaps = collect_lsf_evo(model);
-        print_lsf_evo(0, &snaps);
-        println!();
-    }
-
-    if *LAYER_DEBUG {
-        println!("=== [LAYERS DEBUG] per-batch checksums ===");
-        println!(
-            "  num_samples={} batch_size={} num_batches/epoch={}",
-            num_samples, batch_size, num_batches_per_epoch
-        );
-        if let Some(flat) = read_all_params_safe(model) {
-            println!("  init_params: {}", train_dbg_summary(&flat));
-        } else {
-            println!("  init_params: (safe read returned None)");
-        }
-        println!();
-    }
-
     let mut best_loss = f32::MAX;
     let mut best_epoch = 0usize;
     let mut zero_loss_epoch: Option<usize> = None;
-    let mut anomaly_diag_done: usize = 0;
 
     for epoch in 0..plan.epochs {
         model.compute_executor().redistribute(model.models(), plan.batch_size, true);
@@ -233,82 +166,16 @@ fn execute_inner(
 
         let mut epoch_loss = 0.0f32;
 
-        let log_all_batches_this_epoch = *TRAIN_DEBUG && epoch < LOG_FIRST_EPOCHS;
-        let log_epoch_summary_this_epoch =
-            *TRAIN_DEBUG && (epoch < LOG_FIRST_EPOCHS || epoch % LOG_NORM_EVERY == 0);
-
-        let mut epoch_batches: Vec<BatchInfo> = Vec::with_capacity(num_batches_per_epoch);
-
-        for (batch_idx, start) in (0..num_samples).step_by(batch_size).enumerate() {
+        for start in (0..num_samples).step_by(batch_size) {
             let end = (start + batch_size).min(num_samples);
             let batch_size_actual = end - start;
 
             let batch_tensor = train_data.batch(start, end);
             let target_batch = target_data.batch(start, end);
 
-            nan_tracker.bump();
-
-            if *TRAIN_DEBUG && epoch == 0 {
-                let input_flat = batch_tensor.to_flat();
-                let target_flat = target_batch.to_flat();
-                println!(
-                    "  [DATA e0 b{}-{}] input dims = {:?}, target dims = {:?}",
-                    start, end,
-                    train_data.dimensions(),
-                    target_data.dimensions(),
-                );
-                train_dbg_print_vec(&format!("input b{}-{}", start, end), &input_flat);
-                train_dbg_print_vec(&format!("target b{}-{}", start, end), &target_flat);
-                train_dbg_print_stats(&format!("input b{}-{}", start, end), &input_flat);
-
-                println!(
-                    "    [TRAIN] per-sample MSE for batch [{}-{}) on epoch 0:",
-                    start, end
-                );
-                for k in 0..batch_size_actual {
-                    let s = start + k;
-                    let e = s + 1;
-                    let sub_input = train_data.batch(s, e);
-                    let sub_target = target_data.batch(s, e);
-                    let (sub_pred, _) = model.forward(sub_input);
-                    let pv = sub_pred.to_flat();
-                    let tv = sub_target.to_flat();
-                    let loss = per_sample_mse(&pv, &tv);
-                    println!("      sample {:>2}: MSE = {:.6}", s, loss);
-                }
-                println!();
-            }
-
             let t0 = Instant::now();
             let (pred, _ctxs) = model.forward(batch_tensor.clone());
             let forward_dt = t0.elapsed().as_nanos() as u64;
-
-            if *NAN_DEBUG && nan_tracker.should_report("forward") {
-                let pred_flat = pred.to_flat();
-                if contains_bad(&pred_flat) {
-                    report_first_nan(
-                        "forward",
-                        epoch,
-                        batch_idx,
-                        &[("pred (flat)", 1, pred_flat.len()),
-                          ("batch_tensor (flat)", 1, batch_tensor.to_flat().len())],
-                        &pred_flat,
-                        Some(&format!(
-                            "epoch={} batch_idx={} range=[{}..{})",
-                            epoch, batch_idx, start, end
-                        )),
-                    );
-                    nan_tracker.mark_reported("forward");
-                }
-            }
-
-            if *LAYER_DEBUG {
-                let pred_flat = pred.to_flat();
-                println!(
-                    "[DBG-PRED] epoch={:>3} batch={:>2} [{}..{}) {}",
-                    epoch, batch_idx, start, end, train_dbg_summary(&pred_flat)
-                );
-            }
 
             let t1 = Instant::now();
             let (loss, delta) = model.compute_loss(
@@ -318,119 +185,15 @@ fn execute_inner(
             );
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
-            if *NAN_DEBUG && nan_tracker.should_report("loss") {
-                let delta_flat = delta.to_flat();
-                let pred_flat = pred.to_flat();
-                let target_flat = target_batch.to_flat();
-                let bad = loss.is_nan() || loss.is_infinite() || contains_bad(&delta_flat);
-                if bad {
-                    let shapes = [
-                        ("pred", 1, pred_flat.len()),
-                        ("target", 1, target_flat.len()),
-                        ("delta", 1, delta_flat.len()),
-                    ];
-                    report_first_nan(
-                        "loss",
-                        epoch,
-                        batch_idx,
-                        &shapes,
-                        &delta_flat,
-                        Some(&format!(
-                            "epoch={} batch_idx={} loss={:?} pred_summary=[{}] target_summary=[{}]",
-                            epoch, batch_idx, loss,
-                            train_dbg_summary(&pred_flat),
-                            train_dbg_summary(&target_flat),
-                        )),
-                    );
-                    nan_tracker.mark_reported("loss");
-                }
-            }
-
             let t2 = Instant::now();
             let (_, grads) = model.backward(delta);
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
             let grads_flat = grads.to_flat_vec();
-            let grad_l2 = train_dbg_l2(&grads_flat);
-
-            if *NAN_DEBUG && nan_tracker.should_report("backward") {
-                if contains_bad(&grads_flat) {
-                    report_first_nan(
-                        "backward",
-                        epoch,
-                        batch_idx,
-                        &[("grads (flat)", 1, grads_flat.len())],
-                        &grads_flat,
-                        Some(&format!(
-                            "epoch={} batch_idx={} range=[{}..{})",
-                            epoch, batch_idx, start, end
-                        )),
-                    );
-                    nan_tracker.mark_reported("backward");
-                }
-            }
-
-            if *LAYER_DEBUG {
-                println!(
-                    "[DBG-GRAD] epoch={:>3} batch={:>2} [{}..{}) {}",
-                    epoch, batch_idx, start, end, train_dbg_summary(&grads_flat)
-                );
-            }
-
-            epoch_batches.push(BatchInfo {
-                start,
-                end,
-                loss,
-                grad_l2,
-            });
-
-            if *TRAIN_DEBUG && log_all_batches_this_epoch {
-                println!(
-                    "  [e{} b{}-{}] loss={:.6}  |grad|={:.6}  (fwd={}us loss={}us bwd={}us)",
-                    epoch, start, end, loss, grad_l2,
-                    forward_dt / 1000, loss_dt / 1000, backward_dt / 1000
-                );
-                if epoch == 0 && start == 0 {
-                    train_dbg_print_stats("grad (first batch)", &grads_flat);
-                }
-            }
 
             let t3 = Instant::now();
             model.update_params_buffered(plan.optimizer_desc.clone(), &[]);
             let update_dt = t3.elapsed().as_nanos() as u64;
-
-            if *NAN_DEBUG && nan_tracker.should_report("update") {
-                if let Some(flat) = read_all_params_safe(model) {
-                    if contains_bad(&flat) {
-                        report_first_nan(
-                            "update",
-                            epoch,
-                            batch_idx,
-                            &[("params_after_update (flat)", 1, flat.len())],
-                            &flat,
-                            Some(&format!(
-                                "epoch={} batch_idx={} range=[{}..{})",
-                                epoch, batch_idx, start, end
-                            )),
-                        );
-                        nan_tracker.mark_reported("update");
-                    }
-                }
-            }
-
-            if *LAYER_DEBUG && batch_idx == num_batches_per_epoch - 1 && epoch < LOG_FIRST_EPOCHS {
-                if let Some(flat) = read_all_params_safe(model) {
-                    println!(
-                        "[DBG-PARAMS-AFTER-EPOCH] epoch={:>3} {}",
-                        epoch, train_dbg_summary(&flat)
-                    );
-                } else {
-                    println!(
-                        "[DBG-PARAMS-AFTER-EPOCH] epoch={:>3} (safe read returned None)",
-                        epoch
-                    );
-                }
-            }
 
             epoch_loss += loss * batch_size_actual as f32;
 
@@ -465,118 +228,6 @@ fn execute_inner(
         } else {
             0.0
         };
-
-        if *TRAIN_DEBUG {
-            let log_evo = epoch < LOG_LSF_EVO_FIRST
-                || epoch % LOG_LSF_EVO_EVERY == 0
-                || epoch == plan.epochs - 1;
-            if log_evo {
-                let snaps = collect_lsf_evo(model);
-                print_lsf_evo(epoch, &snaps);
-            }
-        }
-
-        if *TRAIN_DEBUG && !epoch_batches.is_empty() {
-            let n = epoch_batches.len();
-            let sum: f32 = epoch_batches.iter().map(|b| b.loss).sum();
-            let avg = sum / n as f32;
-
-            let anomalous: Vec<&BatchInfo> = epoch_batches
-                .iter()
-                .filter(|b| b.loss > ANOMALY_MULTIPLIER * avg && b.loss > ANOMALY_MIN_LOSS)
-                .collect();
-
-            if !anomalous.is_empty() {
-                println!(
-                    "=== [ANOMALY EPOCH {}] avg={:.6}, anomalous batches: {} ===",
-                    epoch, avg, anomalous.len()
-                );
-                for b in &epoch_batches {
-                    let is_anom = b.loss > ANOMALY_MULTIPLIER * avg && b.loss > ANOMALY_MIN_LOSS;
-                    println!(
-                        "  b{}-{}: loss={:.6}  |grad|={:.6}{}",
-                        b.start, b.end, b.loss, b.grad_l2,
-                        if is_anom { "  <-- ANOMALY" } else { "" }
-                    );
-                }
-
-                if anomaly_diag_done < ANOMALY_DIAG_LIMIT {
-                    anomaly_diag_done += 1;
-                    for b in anomalous {
-                        println!(
-                            "  [per-sample diag] epoch {} batch b{}-{}:",
-                            epoch, b.start, b.end
-                        );
-                        let mut per_sample: Vec<(usize, f32)> = Vec::with_capacity(b.end - b.start);
-                        for s in b.start..b.end {
-                            let sub_input = train_data.batch(s, s + 1);
-                            let sub_target = target_data.batch(s, s + 1);
-                            let (sub_pred, _) = model.forward(sub_input);
-                            let pv = sub_pred.to_flat();
-                            let tv = sub_target.to_flat();
-                            let loss = per_sample_mse(&pv, &tv);
-                            per_sample.push((s, loss));
-                        }
-                        let (_, &(max_s, _)) = per_sample
-                            .iter()
-                            .enumerate()
-                            .max_by(|a, bb| a.1 .1.partial_cmp(&bb.1 .1).unwrap_or(std::cmp::Ordering::Equal))
-                            .unwrap_or((0, &(b.start, 0.0)));
-                        for &(s, loss) in &per_sample {
-                            let mark = if s == max_s { "  <-- MAX" } else { "" };
-                            println!("    sample {:>3}: MSE = {:.6}{}", s, loss, mark);
-                        }
-                        let worst_input = train_data.batch(max_s, max_s + 1);
-                        let worst_target = target_data.batch(max_s, max_s + 1);
-                        println!(
-                            "    worst sample {:>3}: input={:?}  target={:?}",
-                            max_s,
-                            worst_input.to_flat(),
-                            worst_target.to_flat()
-                        );
-                    }
-                } else {
-                    println!(
-                        "  [per-sample diag] suppressed (limit {} reached)",
-                        ANOMALY_DIAG_LIMIT
-                    );
-                }
-                println!();
-            }
-        }
-
-        if log_epoch_summary_this_epoch {
-            let min_loss = epoch_batches.iter().map(|b| b.loss).fold(f32::INFINITY, f32::min);
-            let max_loss = epoch_batches.iter().map(|b| b.loss).fold(f32::NEG_INFINITY, f32::max);
-            let (min_idx, _) = epoch_batches
-                .iter()
-                .enumerate()
-                .min_by(|a, b| a.1.loss.partial_cmp(&b.1.loss).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or((0, &BatchInfo { start: 0, end: 0, loss: 0.0, grad_l2: 0.0 }));
-            let (max_idx, _) = epoch_batches
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.loss.partial_cmp(&b.1.loss).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or((0, &BatchInfo { start: 0, end: 0, loss: 0.0, grad_l2: 0.0 }));
-            println!(
-                "  [ep-summary {}] avg={:.6} min={:.6}@batch[{}..{}] max={:.6}@batch[{}..{}] ratio={:.2}",
-                epoch,
-                avg_loss,
-                min_loss,
-                epoch_batches[min_idx].start,
-                epoch_batches[min_idx].end,
-                max_loss,
-                epoch_batches[max_idx].start,
-                epoch_batches[max_idx].end,
-                if min_loss > 1e-9 { max_loss / min_loss } else { 0.0 },
-            );
-
-            if epoch < LOG_FIRST_EPOCHS || epoch % LOG_NORM_EVERY == 0 {
-                if let Some(flat) = read_all_params_safe(model) {
-                    train_dbg_print_stats(&format!("params @ epoch {}", epoch), &flat);
-                }
-            }
-        }
 
         if avg_loss < best_loss {
             best_loss = avg_loss;
@@ -625,17 +276,6 @@ fn execute_inner(
                 }
             }
         }
-    }
-
-    if *NAN_DEBUG {
-        println!();
-        println!("[NAN-DEBUG] observed steps: {}", nan_tracker.total_steps_observed);
-        println!("[NAN-DEBUG] reported stages:");
-        println!("  init     : {}", nan_tracker.should_report("init") == false);
-        println!("  forward  : {}", nan_tracker.should_report("forward") == false);
-        println!("  loss     : {}", nan_tracker.should_report("loss") == false);
-        println!("  backward : {}", nan_tracker.should_report("backward") == false);
-        println!("  update   : {}", nan_tracker.should_report("update") == false);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();

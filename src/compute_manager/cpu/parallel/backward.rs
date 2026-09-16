@@ -15,7 +15,7 @@ use crate::model_plan::param_store::ParamSlice;
 use super::chunk_ops::{extract_chunk, write_chunk};
 use super::dims::get_input_features;
 use super::dispatch::call_backward_buffered;
-use super::shared::{BackwardTaskShared, PARALLEL_DEBUG};
+use super::shared::BackwardTaskShared;
 use super::tracker::ChunkTracker;
 
 #[allow(clippy::too_many_arguments)]
@@ -31,7 +31,6 @@ pub(crate) fn backward_universal_parallel(
     params: MatrixBufferHandle,
     grad_params: MatrixBufferHandle,
 ) {
-    let batch_size = grad_output.rows();
     let num_workers = executor.num_workers();
 
     assert!(
@@ -59,19 +58,6 @@ pub(crate) fn backward_universal_parallel(
     for (chunk_id, &(start, size, end)) in saved_chunks.iter().enumerate() {
         let logical_worker_id = chunk_id % num_workers;
         per_worker_chunks[logical_worker_id].push((chunk_id, start, size, end));
-    }
-
-    let _ = batch_size;
-
-    if *PARALLEL_DEBUG {
-        eprintln!(
-            "[BWD-PARALLEL-START] batch_size={} num_workers={} total_chunks={} \
-             grad_output=({}x{}) grad_input=({}x{}) layers={}",
-            batch_size, num_workers, total_chunks,
-            grad_output.rows(), grad_output.cols(),
-            grad_input.rows(), grad_input.cols(),
-            layers.len(),
-        );
     }
 
     let tracker = Arc::new(Mutex::new(ChunkTracker::new(saved_chunks)));
@@ -143,20 +129,6 @@ pub(crate) fn backward_universal_parallel(
                     let grad_input_chunk =
                         pool_guard.acquire(current_grad.rows(), in_features);
 
-                    if *PARALLEL_DEBUG {
-                        eprintln!(
-                            "[BWD-PARALLEL] worker={} chunk={} layer={} \
-                             grad_in=({}x{}) grad_out=({}x{})",
-                            physical_worker_id,
-                            chunk_id,
-                            std::any::type_name_of_val(layer.as_ref()),
-                            current_grad.rows(),
-                            in_features,
-                            current_grad.rows(),
-                            current_grad.cols(),
-                        );
-                    }
-
                     call_backward_buffered(
                         layer,
                         ctx,
@@ -169,21 +141,6 @@ pub(crate) fn backward_universal_parallel(
 
                     pool_guard.release(current_grad);
                     current_grad = grad_input_chunk;
-                }
-
-                if *PARALLEL_DEBUG || shared.grad_input.cols() != current_grad.cols() {
-                    eprintln!(
-                        "[BWD-PARALLEL] worker={} chunk={} BEFORE write_chunk: \
-                         grad_input=({}x{}) current=({}x{}) start={} end={}",
-                        physical_worker_id,
-                        chunk_id,
-                        shared.grad_input.rows(),
-                        shared.grad_input.cols(),
-                        current_grad.rows(),
-                        current_grad.cols(),
-                        start,
-                        end,
-                    );
                 }
 
                 write_chunk(&shared.grad_input, &current_grad, start);

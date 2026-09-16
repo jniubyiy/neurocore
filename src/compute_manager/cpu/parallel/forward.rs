@@ -16,7 +16,7 @@ use super::chunk_ops::{extract_chunk, write_chunk_to_range};
 use super::dims::get_output_features;
 use super::dispatch::call_forward_buffered;
 use super::plan::{default_layer_chunk_plan, ChunkSlice};
-use super::shared::{ForwardTaskShared, PARALLEL_DEBUG};
+use super::shared::ForwardTaskShared;
 use super::tracker::ChunkTracker;
 
 pub(crate) fn forward_universal_parallel(
@@ -59,17 +59,6 @@ pub(crate) fn forward_universal_parallel(
         (0..num_workers).map(|_| Vec::new()).collect();
     for chunk in &plan.chunks {
         per_worker_chunks[chunk.worker_id].push(*chunk);
-    }
-
-    if *PARALLEL_DEBUG {
-        eprintln!(
-            "[FWD-PARALLEL-START] batch_size={} num_workers={} total_chunks={} \
-             input=({}x{}) output=({}x{}) layers={}",
-            batch_size, num_workers, total_chunks,
-            input.rows(), input.cols(),
-            output.rows(), output.cols(),
-            layers.len(),
-        );
     }
 
     let layout_for_tracker: Vec<(usize, usize, usize)> = plan.to_layout();
@@ -133,18 +122,6 @@ pub(crate) fn forward_universal_parallel(
                     let out_cols = get_output_features(layer, &current);
                     let out = pool_guard.acquire(current.rows(), out_cols);
 
-                    if *PARALLEL_DEBUG {
-                        eprintln!(
-                            "[FWD-PARALLEL] worker={} chunk={} layer={} in=({}x{}) out_cols={}",
-                            physical_worker_id,
-                            m.chunk_id,
-                            std::any::type_name_of_val(layer.as_ref()),
-                            current.rows(),
-                            current.cols(),
-                            out_cols,
-                        );
-                    }
-
                     // Слой сам строит свой BufferedContext — включая
                     // per-chunk state, если он есть.
                     let buffered_ctx = call_forward_buffered(
@@ -155,14 +132,6 @@ pub(crate) fn forward_universal_parallel(
                         slice,
                         &mut *pool_guard,
                     );
-
-                    if *PARALLEL_DEBUG {
-                        eprintln!(
-                            "[FWD-PARALLEL]   after forward: out=({}x{})",
-                            out.rows(),
-                            out.cols(),
-                        );
-                    }
 
                     chunk_ctxs.push(DynamicContext::Buffered(buffered_ctx));
                     current = out;

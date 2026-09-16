@@ -36,9 +36,6 @@ impl RawBufferRegistry {
     }
 
     /// Регистрирует новый сырой буфер и резервирует память в соответствующем пуле.
-    ///
-    /// Перед резервированием выполняется проверка наличия свободного места в пуле.
-    /// Если памяти недостаточно, генерируется паника с подробным сообщением.
     pub fn register(
         &mut self,
         device_id: DeviceId,
@@ -46,9 +43,8 @@ impl RawBufferRegistry {
         memory_type: MemoryTypeFilter,
         pools: &mut HashMap<MemoryDeviceKind, MemoryPool>,
     ) -> RawBufferId {
-        let elements = (size_bytes / 4) as usize; // переводим байты в количество f32
+        let elements = (size_bytes / 4) as usize;
 
-        // Определяем целевой пул на основе флагов памяти.
         let target_pool_kind = memory_kind_from_filter(memory_type, device_id);
 
         let pool = pools
@@ -70,10 +66,8 @@ impl RawBufferRegistry {
             );
         }
 
-        // Резервируем память в пуле
         pool.reserve(elements);
 
-        // Создаём запись в реестре
         let id = RawBufferId(self.next_raw_id.fetch_add(1, Ordering::SeqCst));
         self.raw_buffers.insert(
             id,
@@ -119,9 +113,7 @@ impl RawBufferRegistry {
 ///
 /// Устройство:
 /// - если фильтр явно предпочитает или требует `DEVICE_LOCAL`, это VRAM (DeviceVram);
-/// - если фильтр явно предпочитает или требует `HOST_VISIBLE`, это HostRam.
-///
-/// Если ни один из этих флагов не установлен, по умолчанию используется HostRam.
+/// - во всех остальных случаях — HostRam.
 fn memory_kind_from_filter(
     memory_type: MemoryTypeFilter,
     device_id: DeviceId,
@@ -133,15 +125,6 @@ fn memory_kind_from_filter(
             .preferred_flags
             .contains(MemoryPropertyFlags::DEVICE_LOCAL);
 
-    let is_host = memory_type
-        .required_flags
-        .contains(MemoryPropertyFlags::HOST_VISIBLE)
-        || memory_type
-            .preferred_flags
-            .contains(MemoryPropertyFlags::HOST_VISIBLE);
-
-    // Если фильтр помечен как DEVICE_LOCAL, считаем это VRAM.
-    // В противном случае — HostRam (даже если is_host == false, это безопасное значение по умолчанию).
     if is_device {
         MemoryDeviceKind::DeviceVram(device_id)
     } else {

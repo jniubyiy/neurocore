@@ -1,19 +1,12 @@
 // src/plans/training_plan/execution/types.rs
 //
-// Типы результата обучения и вспомогательные структуры.
+// Тип результата обучения.
 
 use std::collections::HashMap;
 
 use crate::compute_manager::dim_change::DynamicTensor;
 
 use super::super::profiling::ProfileResult;
-
-pub(super) struct BatchInfo {
-    pub start: usize,
-    pub end: usize,
-    pub loss: f32,
-    pub grad_l2: f64,
-}
 
 pub struct TrainingResult {
     pub tensors: HashMap<String, DynamicTensor>,

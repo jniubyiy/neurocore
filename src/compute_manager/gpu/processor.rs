@@ -458,6 +458,7 @@ pub fn process_forward_gpu_buffered(
             let seq_len = lin_att.seq_len;
             let d_model = lin_att.d_model;
             let d_head = lin_att.d_head();
+            let max_heads = lin_att.max_heads;
             let batch = current.rows();
             let total_tokens = batch * seq_len;
 
@@ -466,8 +467,23 @@ pub fn process_forward_gpu_buffered(
             let v_raw = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
             let q_phi = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
             let k_phi = gpu_compute.allocate_gpu_matrix_handle(total_tokens, d_model);
-            let kv = gpu_compute.allocate_gpu_matrix_handle(d_model * d_model, 1);
-            let z = gpu_compute.allocate_gpu_matrix_handle(d_model, 1);
+
+            // FIX: kv и z теперь per-example (как в CPU-версии).
+            //
+            //   kv на голову: batch · d_head · d_head
+            //   z  на голову: batch · d_head
+            //
+            // Суммарный размер на все max_heads голов:
+            //   max_heads · batch · d_head · d_head  (kv)
+            //   max_heads · batch · d_head           (z)
+            //
+            // Раньше было d_model·d_model и d_model — глобальная агрегация
+            // по всему батчу. Это делало attention глобальным pooling'ом,
+            // а не вниманием внутри примера (см. CPU-fix).
+            let kv_size = max_heads * batch * d_head * d_head;
+            let z_size = max_heads * batch * d_head;
+            let kv = gpu_compute.allocate_gpu_matrix_handle(kv_size, 1);
+            let z = gpu_compute.allocate_gpu_matrix_handle(z_size, 1);
 
             let param_len = lin_att.param_len();
             let params_view = MatrixBufferView::new(params_handle.clone(), slice.start, param_len);

@@ -15,12 +15,20 @@ use vulkano::buffer::Subbuffer;
 // ============================================================================
 // Константы «резинки с горкой» (согласованы с CPU-версией)
 // ============================================================================
+//
+// A (правка ядра): H_SOFT_TAU расширен с 0.1 до 0.5.
+// D (правка ядра): HEAD_WEIGHT_K понижен с 8.0 до 4.0.
+// B (правка ядра): порог θ_k = k − 1.0 (см. compute_h_soft).
+//
+// FIX (этот прогон): kv и z теперь per-example.
+// Раньше compute_kvz суммировал глобально по batch·seq, что делало
+// attention глобальным pooling'ом, а не вниманием внутри примера.
 
 /// Температура сигмоид в h_soft(h_raw). Меньше = резче переходы.
-const H_SOFT_TAU: f32 = 0.1;
+const H_SOFT_TAU: f32 = 0.5;
 
 /// Коэффициент сглаживания w_h(h_soft). Меньше = резче граница головы.
-const HEAD_WEIGHT_K: f32 = 8.0;
+const HEAD_WEIGHT_K: f32 = 4.0;
 
 /// Порог, ниже которого head считается неактивным и не обрабатывается.
 const HEAD_WEIGHT_EPS: f32 = 1e-4;
@@ -51,7 +59,7 @@ fn sigmoid(x: f32) -> f32 {
 /// Мягкое число голов как функция от обучаемого h_raw.
 ///
 ///   h_soft(h_raw) = min_heads + Σ_{k=1}^{max−min} σ((h_raw − θ_k) / τ)
-///   θ_k = k − 0.5
+///   θ_k = k − 1.0
 #[inline]
 fn compute_h_soft(h_raw: f32, min_heads: usize, max_heads: usize) -> f32 {
     if min_heads >= max_heads {
@@ -60,7 +68,10 @@ fn compute_h_soft(h_raw: f32, min_heads: usize, max_heads: usize) -> f32 {
     let n_trans = max_heads - min_heads;
     let mut h = min_heads as f32;
     for k in 1..=n_trans {
-        let theta_k = (k as f32) - 0.5;
+        // B: θ_k = k − 1.0 (было k − 0.5).
+        // При h_raw = 0 первый переход даёт σ(0/tau) = 0.5,
+        // то есть h_soft(0) = min_heads + 0.5.
+        let theta_k = (k as f32) - 1.0;
         h += sigmoid((h_raw - theta_k) / H_SOFT_TAU);
     }
     h
@@ -75,7 +86,7 @@ fn compute_h_soft_derivative(h_raw: f32, min_heads: usize, max_heads: usize) -> 
     let n_trans = max_heads - min_heads;
     let mut d = 0.0f32;
     for k in 1..=n_trans {
-        let theta_k = (k as f32) - 0.5;
+        let theta_k = (k as f32) - 1.0;
         let s = sigmoid((h_raw - theta_k) / H_SOFT_TAU);
         d += s * (1.0 - s) / H_SOFT_TAU;
     }
@@ -110,9 +121,6 @@ fn head_weight_derivative(h_soft: f32, h: usize) -> f32 {
 ///   в конце — один скаляр h_raw.
 ///
 /// Итого: max_heads · head_param_count + 1.
-///
-/// Так как dh = d_model / max_heads, а max_heads — делитель d_model,
-/// перебираем всех делителей и ищем совпадение по длине.
 fn parse_heads_from_params(params_len: usize, d_model: usize) -> (usize, usize) {
     assert!(d_model > 0, "LinearAttention GPU: d_model must be positive");
     for max_heads in 1..=d_model {
@@ -160,10 +168,6 @@ struct ForwardCache {
 }
 
 /// Ключ кэша: (offset в родительском буфере параметров, id входного буфера).
-///
-/// `params.offset_elements()` уникален для каждого слоя внутри сегмента.
-/// `input.id()` уникален для каждого forward-вызова (в пределах одной
-/// тренировочной итерации). Вместе — однозначная идентификация forward-кэша.
 type CacheKey = (usize, usize);
 
 static FORWARD_CACHE: Lazy<Mutex<HashMap<CacheKey, ForwardCache>>> =
@@ -224,17 +228,11 @@ impl GpuCompute {
     ///
     ///   [head 0: batch · seq_len · dh][head 1: ...][...]
     ///
-    /// где `dh = d_model / max_heads`. Внутри одного head данные
-    /// интерпретируются как `(batch, seq_len · dh)` column-major,
-    /// ровно так, как ожидают шейдеры.
+    /// Буферы `kv` (размер `max_heads · batch · d_head · d_head`) и
+    /// `z` (размер `max_heads · batch · d_head`) — per-example:
     ///
-    /// Буферы `kv` (размер `d_model · d_model`) и `z` (размер `d_model`)
-    /// интерпретируются как конкатенация per-head секций:
-    ///   kv: [head 0: dh·dh][head 1: dh·dh]...   всего: max_heads · dh·dh ≤ d_model²
-    ///   z:  [head 0: dh][head 1: dh]...         всего: max_heads · dh = d_model
-    ///
-    /// Per-head буферы `denom`, `attn`, `y_h` выделяются внутри метода и
-    /// сохраняются в глобальном кэше для последующего backward.
+    ///   kv: [head 0: batch · dh·dh][head 1: ...]...
+    ///   z:  [head 0: batch · dh][head 1: ...]...
     pub fn run_linear_attention_forward_buffered_handle_with_dims(
         &self,
         input: &MatrixBufferHandle,
@@ -263,7 +261,6 @@ impl GpuCompute {
         let head_param_count = 4 * dh * d_model + 3 * dh + d_model + 1;
 
         // Читаем h_raw и self_bias каждой головы из параметров.
-        // params.parent_handle() — родительский буфер сегмента.
         let params_vec = self.download_gpu_handle_to_vec(params.parent_handle());
         let base = params.offset_elements();
 
@@ -319,8 +316,11 @@ impl GpuCompute {
             let v_raw_view = MatrixBufferView::new(v_raw.clone(), h * total_head, total_head);
             let q_phi_view = MatrixBufferView::new(q_phi.clone(), h * total_head, total_head);
             let k_phi_view = MatrixBufferView::new(k_phi.clone(), h * total_head, total_head);
-            let kv_view = MatrixBufferView::new(kv.clone(), h * dh * dh, dh * dh);
-            let z_view = MatrixBufferView::new(z.clone(), h * dh, dh);
+            // FIX: per-example kv (batch · dh·dh) и z (batch · dh) на голову.
+            let kv_per_head = batch * dh * dh;
+            let z_per_head = batch * dh;
+            let kv_view = MatrixBufferView::new(kv.clone(), h * kv_per_head, kv_per_head);
+            let z_view = MatrixBufferView::new(z.clone(), h * z_per_head, z_per_head);
 
             // Subbuffers для шейдеров.
             let q_raw_sb = subbuffer_from_view(self, &q_raw_view);
@@ -362,6 +362,7 @@ impl GpuCompute {
             );
 
             // ===== 3. compute_kvz =====
+            // FIX: dispatch = batch · (dh·dh + dh), а не dh·dh + dh.
             let kvz_pipeline = &self.linear_attention_pipelines().compute_kvz;
             let push_kvz = [batch as u32, seq_len as u32, dh as u32];
             self.run_compute_shader(
@@ -373,7 +374,7 @@ impl GpuCompute {
                     (3, z_sb),
                 ],
                 &push_kvz,
-                dh * dh + dh,
+                batch * (dh * dh + dh),
             );
 
             // ===== 4. denom =====
@@ -464,17 +465,6 @@ impl GpuCompute {
     // ------------------------------------------------------------------------
 
     /// Обратный проход многоголового LinearAttention на GPU.
-    ///
-    /// Для каждой активной головы h:
-    ///   1. dL/dw_h = dot(go, y_h)                            (CPU)
-    ///   2. go_h = w_h · go                                   (CPU→GPU)
-    ///   3. Запуск 12 backward-шейдеров, каждый пишет в свой
-    ///      per-head участок grad_params
-    ///   4. d_x_h скачивается и аккумулируется в gi_accum      (CPU)
-    ///
-    /// После цикла:
-    ///   * gi_accum → grad_input
-    ///   * dL/dh_raw = Σ_h dL/dw_h · dw_h/dh_soft · dh_soft/dh_raw → grad_params
     pub fn run_linear_attention_backward_buffered_handle_with_dims(
         &self,
         input: &MatrixBufferHandle,
@@ -539,6 +529,10 @@ impl GpuCompute {
         let total_head = batch * seq_len * dh;
         let total_rt = batch * seq_len;
 
+        // FIX: per-example размеры.
+        let kv_per_head = batch * dh * dh;
+        let z_per_head = batch * dh;
+
         // Скачиваем go один раз (переиспользуем для всех голов).
         let go_vec = self.download_gpu_handle_to_vec(grad_out);
 
@@ -559,8 +553,11 @@ impl GpuCompute {
         let d_num_buf = self.allocate_gpu_matrix_handle(batch, seq_len * dh);
         let d_denom_buf = self.allocate_gpu_matrix_handle(batch, seq_len);
         let d_q_phi_buf = self.allocate_gpu_matrix_handle(batch, seq_len * dh);
-        let d_z_buf = self.allocate_gpu_matrix_handle(dh, 1);
-        let d_kv_buf = self.allocate_gpu_matrix_handle(dh, dh);
+
+        // FIX: d_z и d_kv теперь per-example.
+        let d_z_buf = self.allocate_gpu_matrix_handle(batch * dh, 1);
+        let d_kv_buf = self.allocate_gpu_matrix_handle(batch * dh * dh, 1);
+
         let d_k_phi_buf = self.allocate_gpu_matrix_handle(batch, seq_len * dh);
         let d_v_buf = self.allocate_gpu_matrix_handle(batch, seq_len * dh);
         let d_q_raw_buf = self.allocate_gpu_matrix_handle(batch, seq_len * dh);
@@ -622,8 +619,9 @@ impl GpuCompute {
             let v_raw_view = MatrixBufferView::new(v_raw.clone(), h * total_head, total_head);
             let q_phi_view = MatrixBufferView::new(q_phi.clone(), h * total_head, total_head);
             let k_phi_view = MatrixBufferView::new(k_phi.clone(), h * total_head, total_head);
-            let kv_view = MatrixBufferView::new(kv.clone(), h * dh * dh, dh * dh);
-            let z_view = MatrixBufferView::new(z.clone(), h * dh, dh);
+            // FIX: per-example kv и z.
+            let kv_view = MatrixBufferView::new(kv.clone(), h * kv_per_head, kv_per_head);
+            let z_view = MatrixBufferView::new(z.clone(), h * z_per_head, z_per_head);
 
             let q_raw_sb = subbuffer_from_view(self, &q_raw_view);
             let k_raw_sb = subbuffer_from_view(self, &k_raw_view);
@@ -648,7 +646,7 @@ impl GpuCompute {
             let d_v_sb = self.get_gpu_subbuffer_from_handle(&d_v_buf);
             let d_q_raw_sb = self.get_gpu_subbuffer_from_handle(&d_q_raw_buf);
             let d_k_raw_sb = self.get_gpu_subbuffer_from_handle(&d_k_raw_buf);
-            let d_self_bias_sb = self.get_gpu_subbuffer_from_handle(&d_self_bias_buf);
+            let _d_self_bias_sb = self.get_gpu_subbuffer_from_handle(&d_self_bias_buf);
 
             // ===== 1. dL/dw_h = dot(go, y_h). =====
             let y_h_vec = self.download_gpu_handle_to_vec(&head_cache.y_h);
@@ -733,6 +731,7 @@ impl GpuCompute {
             );
 
             // ===== 8. bwd_dz. =====
+            // FIX: dispatch = batch · dh (было dh).
             self.run_compute_shader(
                 &pipelines.bwd_dz,
                 &[
@@ -741,10 +740,11 @@ impl GpuCompute {
                     (2, d_z_sb.clone()),
                 ],
                 &push_3dh,
-                dh,
+                batch * dh,
             );
 
             // ===== 9. bwd_dkv. =====
+            // FIX: dispatch = batch · dh · dh (было dh · dh).
             self.run_compute_shader(
                 &pipelines.bwd_dkv,
                 &[
@@ -753,7 +753,7 @@ impl GpuCompute {
                     (2, d_kv_sb.clone()),
                 ],
                 &push_3dh,
-                dh * dh,
+                batch * dh * dh,
             );
 
             // ===== 10. bwd_dk_phi. =====

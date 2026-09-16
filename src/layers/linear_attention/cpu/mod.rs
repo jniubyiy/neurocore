@@ -15,9 +15,16 @@ use super::super::linear_attention::linear_attention::LinearAttention;
 // ============================================================================
 // Константы «резинки с горкой»
 // ============================================================================
+//
+// A (правка ядра): H_SOFT_TAU расширен с 0.1 до 0.5.
+// D (правка ядра): HEAD_WEIGHT_K понижен с 8.0 до 4.0.
+// B (правка ядра): порог θ_k = k − 1.0 (см. compute_h_soft).
+//
+// FIX (этот прогон): kv и z теперь per-example (по r), а не глобальные.
+// См. комментарии FIX ниже.
 
-const H_SOFT_TAU: f32 = 0.1;
-const HEAD_WEIGHT_K: f32 = 8.0;
+const H_SOFT_TAU: f32 = 0.5;
+const HEAD_WEIGHT_K: f32 = 4.0;
 const HEAD_WEIGHT_EPS: f32 = 1e-6;
 
 // ============================================================================
@@ -77,6 +84,30 @@ fn linatt_has_bad(data: &[f32]) -> bool {
     data.iter().any(|v| !v.is_finite())
 }
 
+fn linatt_summary(data: &[f32]) -> String {
+    if data.is_empty() {
+        return "len=0".to_string();
+    }
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut nan_cnt = 0usize;
+    let mut inf_cnt = 0usize;
+    for &v in data {
+        if v.is_nan() { nan_cnt += 1; continue; }
+        if v.is_infinite() { inf_cnt += 1; continue; }
+        if v < mn { mn = v; }
+        if v > mx { mx = v; }
+        sum += v as f64;
+    }
+    let finite = data.len().saturating_sub(nan_cnt + inf_cnt);
+    let mean = if finite > 0 { sum / finite as f64 } else { 0.0 };
+    format!(
+        "min={:.4e} max={:.4e} mean={:.4e} l2={:.4e} nan={} inf={}",
+        mn, mx, mean, linatt_l2(data), nan_cnt, inf_cnt
+    )
+}
+
 // ============================================================================
 // Математика
 // ============================================================================
@@ -107,7 +138,8 @@ fn compute_h_soft(h_raw: f32, min_heads: usize, max_heads: usize) -> f32 {
     let n_trans = max_heads - min_heads;
     let mut h = min_heads as f32;
     for k in 1..=n_trans {
-        let theta_k = (k as f32) - 0.5;
+        // B: θ_k = k − 1.0.
+        let theta_k = (k as f32) - 1.0;
         h += sigmoid((h_raw - theta_k) / H_SOFT_TAU);
     }
     h
@@ -121,7 +153,8 @@ fn compute_h_soft_derivative(h_raw: f32, min_heads: usize, max_heads: usize) -> 
     let n_trans = max_heads - min_heads;
     let mut d = 0.0f32;
     for k in 1..=n_trans {
-        let theta_k = (k as f32) - 0.5;
+        // B: θ_k = k − 1.0.
+        let theta_k = (k as f32) - 1.0;
         let s = sigmoid((h_raw - theta_k) / H_SOFT_TAU);
         d += s * (1.0 - s) / H_SOFT_TAU;
     }
@@ -149,10 +182,15 @@ struct HeadForwardResult {
     q_phi: Vec<f32>,
     k_phi: Vec<f32>,
     v_raw: Vec<f32>,
+    /// FIX: kv — per-example, layout `kv[r * dh * dh + i * dh + l]`.
+    /// Раньше был глобальный размер dh·dh.
     kv: Vec<f32>,
+    /// FIX: z — per-example, layout `z[r * dh + l]`.
+    /// Раньше был глобальный размер dh.
     z: Vec<f32>,
     attn_out: Vec<f32>,
     y_h: Vec<f32>,
+    self_bias: f32,
 }
 
 fn compute_head_forward(
@@ -213,38 +251,54 @@ fn compute_head_forward(
         k_phi[i] = phi(k_raw[i]);
     }
 
-    // 3. kv и z.
-    let mut kv = vec![0.0f32; dh * dh];
-    let mut z = vec![0.0f32; dh];
+    // 3. kv и z (FIX: per-example).
+    //
+    // Было:
+    //   kv: (dh × dh)         — сумма по всем (r', t')
+    //   z:  (dh)              — сумма по всем (r', t')
+    //
+    // Стало:
+    //   kv: (batch · dh · dh) — для каждого r своя сумма по t внутри примера
+    //   z:  (batch · dh)      — для каждого r своя сумма по t
+    //
+    // Layout (column-major по внутренним осям):
+    //   kv[r · dh·dh + i · dh + l] = Σ_t k_phi[r,t,l] · v_raw[r,t,i]
+    //   z [r · dh + l]             = Σ_t k_phi[r,t,l]
+    let mut kv = vec![0.0f32; batch * dh * dh];
+    let mut z = vec![0.0f32; batch * dh];
     for r in 0..batch {
+        let z_r = r * dh;
+        let kv_r = r * dh * dh;
         for t in 0..seq {
             let h_base = (t * dh) * batch + r;
             for i in 0..dh {
                 let ki = k_phi[h_base + i * batch];
-                z[i] += ki;
+                z[z_r + i] += ki;
                 for j in 0..dh {
                     let vj = v_raw[h_base + j * batch];
-                    kv[j * dh + i] += ki * vj;
+                    kv[kv_r + j * dh + i] += ki * vj;
                 }
             }
         }
     }
 
-    // 4. attn_out.
+    // 4. attn_out (FIX: используем per-example kv и z, индекс r).
     let eps = 1e-6f32;
     let mut attn_out = vec![0.0f32; total_head];
     for r in 0..batch {
+        let z_r = r * dh;
+        let kv_r = r * dh * dh;
         for t in 0..seq {
             let h_base = (t * dh) * batch + r;
             let mut denom = eps + self_bias;
             for l in 0..dh {
-                denom += q_phi[h_base + l * batch] * z[l];
+                denom += q_phi[h_base + l * batch] * z[z_r + l];
             }
             let inv_denom = 1.0 / denom;
             for i in 0..dh {
                 let mut num = self_bias * v_raw[h_base + i * batch];
                 for l in 0..dh {
-                    num += q_phi[h_base + l * batch] * kv[i * dh + l];
+                    num += q_phi[h_base + l * batch] * kv[kv_r + i * dh + l];
                 }
                 attn_out[h_base + i * batch] = num * inv_denom;
             }
@@ -267,7 +321,7 @@ fn compute_head_forward(
         }
     }
 
-    HeadForwardResult { q_phi, k_phi, v_raw, kv, z, attn_out, y_h }
+    HeadForwardResult { q_phi, k_phi, v_raw, kv, z, attn_out, y_h, self_bias }
 }
 
 // ============================================================================
@@ -285,6 +339,7 @@ struct HeadBackwardResult {
     grad_wo: Vec<f32>,
     grad_bo: Vec<f32>,
     grad_self_bias: f32,
+    self_bias: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -296,8 +351,8 @@ fn compute_head_backward(
     q_phi: &[f32],
     k_phi: &[f32],
     v_raw: &[f32],
-    kv: &[f32],
-    z: &[f32],
+    kv: &[f32],          // FIX: теперь (batch · dh · dh)
+    z: &[f32],           // FIX: теперь (batch · dh)
     attn_out: &[f32],
     batch: usize,
     seq: usize,
@@ -352,19 +407,28 @@ fn compute_head_backward(
     }
 
     // 2. d_q_phi, d_kv, d_z, d_self_bias.
+    //
+    // FIX: d_kv и d_z теперь per-example:
+    //   d_kv[r · dh·dh + i · dh + l]
+    //   d_z [r · dh + l]
     let eps = 1e-6f32;
     let mut d_q_phi = vec![0.0f32; total_head];
-    let mut d_kv = vec![0.0f32; dh * dh];
-    let mut d_z = vec![0.0f32; dh];
+    let mut d_kv = vec![0.0f32; batch * dh * dh];
+    let mut d_z = vec![0.0f32; batch * dh];
     let mut d_self_bias = 0.0f32;
     let mut inv_denoms = vec![0.0f32; batch * seq];
 
     for r in 0..batch {
+        let z_r = r * dh;
+        let kv_r = r * dh * dh;
+        let d_kv_r = r * dh * dh;
+        let d_z_r = r * dh;
+
         for t in 0..seq {
             let h_base = (t * dh) * batch + r;
             let mut denom = eps + self_bias;
             for l in 0..dh {
-                denom += q_phi[h_base + l * batch] * z[l];
+                denom += q_phi[h_base + l * batch] * z[z_r + l];
             }
             let inv_denom = 1.0 / denom;
             let inv_denom_sq = inv_denom * inv_denom;
@@ -382,13 +446,16 @@ fn compute_head_backward(
                 let mut dq_l = 0.0;
                 for i in 0..dh {
                     let da = d_attn_out[h_base + i * batch];
-                    let kv_li = kv[i * dh + l];
-                    dq_l += da * kv_li * inv_denom;
-                    d_kv[i * dh + l] += da * q_l * inv_denom;
+                    // FIX: kv[r, i, l] — per-example.
+                    let kv_il = kv[kv_r + i * dh + l];
+                    dq_l += da * kv_il * inv_denom;
+                    // FIX: d_kv[r, i, l] — per-example.
+                    d_kv[d_kv_r + i * dh + l] += da * q_l * inv_denom;
                 }
-                dq_l -= sum_da_ao * z[l] * inv_denom_sq;
+                dq_l -= sum_da_ao * z[z_r + l] * inv_denom_sq;
                 d_q_phi[h_base + l * batch] = dq_l;
-                d_z[l] += -q_l * inv_denom * sum_da_ao;
+                // FIX: d_z[r, l] — per-example.
+                d_z[d_z_r + l] += -q_l * inv_denom * sum_da_ao;
             }
 
             d_self_bias += -inv_denom * sum_da_ao;
@@ -404,20 +471,22 @@ fn compute_head_backward(
     let mut d_k_phi = vec![0.0f32; total_head];
     let mut d_v = vec![0.0f32; total_head];
     for r in 0..batch {
+        let d_kv_r = r * dh * dh;
+        let d_z_r = r * dh;
         for t in 0..seq {
             let h_base = (t * dh) * batch + r;
             let inv_denom = inv_denoms[t * batch + r];
             for l in 0..dh {
-                let mut sum_k = d_z[l];
+                let mut sum_k = d_z[d_z_r + l];
                 for i in 0..dh {
-                    sum_k += d_kv[i * dh + l] * v_raw[h_base + i * batch];
+                    sum_k += d_kv[d_kv_r + i * dh + l] * v_raw[h_base + i * batch];
                 }
                 d_k_phi[h_base + l * batch] = sum_k;
             }
             for i in 0..dh {
                 let mut sum_v = 0.0f32;
                 for l in 0..dh {
-                    sum_v += d_kv[i * dh + l] * k_phi[h_base + l * batch];
+                    sum_v += d_kv[d_kv_r + i * dh + l] * k_phi[h_base + l * batch];
                 }
                 let da = d_attn_out[h_base + i * batch];
                 sum_v += da * inv_denom * self_bias;
@@ -475,6 +544,7 @@ fn compute_head_backward(
         grad_wo,
         grad_bo,
         grad_self_bias: d_self_bias,
+        self_bias,
     }
 }
 
@@ -498,6 +568,9 @@ impl UniversalLayerBuffered for LinearAttention {
         let dh = self.d_head();
         let total_in = batch * seq * d;
         let total_head = batch * seq * dh;
+        // FIX: размеры per-example state-буферов.
+        let kv_per_head = batch * dh * dh;
+        let z_per_head = batch * dh;
 
         debug_assert_eq!(features, seq * d);
         debug_assert_eq!(output.rows(), batch);
@@ -514,24 +587,11 @@ impl UniversalLayerBuffered for LinearAttention {
         let head_size = self.head_param_count();
         let h_raw_idx = slice.start + self.max_heads * head_size;
 
-        // ------------------------------------------------------------------
-        // Читаем параметры и вход, выполняем все вычисления в одном блоке.
-        // x_guard и p_guard дропаются автоматически в конце этого блока,
-        // а `x` и `y_accum` (для отладки) переносятся наружу как владеемые
-        // векторы.
-        // ------------------------------------------------------------------
-
-        // Читаем параметры один раз, копируем нужные срезы в локальный Vec,
-        // потому что нам нужны они вне блока (для отладки используются p
-        // через linatt_stats, но оно читает срез, а не весь p, — здесь
-        // просто хватает guard внутри блока).
         let param_vec = params.read_range(slice.start, self.param_len());
-
-        // Читаем вход целиком один раз.
         let x_vec = input.read_range(0, total_in);
 
-        // Инициализация и хранение пер-головых буферов.
         let mut head_buffers: Vec<CpuLinearAttentionHead> = Vec::new();
+        let mut head_self_biases: Vec<(usize, f32)> = Vec::new();
         let mut y_accum = vec![0.0f32; total_in];
 
         let h_raw = param_vec[h_raw_idx - slice.start];
@@ -543,7 +603,7 @@ impl UniversalLayerBuffered for LinearAttention {
                 continue;
             }
 
-            let head_base = h * head_size; // внутри param_vec
+            let head_base = h * head_size;
             let res = compute_head_forward(
                 &x_vec,
                 &param_vec,
@@ -558,12 +618,14 @@ impl UniversalLayerBuffered for LinearAttention {
                 y_accum[i] += w_h * res.y_h[i];
             }
 
-            // Создаём буферы в пуле под промежуточные данные этой головы.
+            head_self_biases.push((h, res.self_bias));
+
+            // FIX: буферы kv и z теперь per-example.
             let q_buf = pool.acquire(total_head, 1);
             let k_buf = pool.acquire(total_head, 1);
             let v_buf = pool.acquire(total_head, 1);
-            let kv_buf = pool.acquire(dh * dh, 1);
-            let z_buf = pool.acquire(dh, 1);
+            let kv_buf = pool.acquire(kv_per_head, 1);
+            let z_buf = pool.acquire(z_per_head, 1);
             let attn_buf = pool.acquire(total_head, 1);
             let y_buf = pool.acquire(total_in, 1);
 
@@ -588,10 +650,8 @@ impl UniversalLayerBuffered for LinearAttention {
             });
         }
 
-        // Записываем выход.
         output.write_range(0, &y_accum);
 
-        // Отладочная диагностика.
         if *LINATT_DEBUG {
             let has_anom = linatt_has_bad(&y_accum);
             if log_this || has_anom {
@@ -603,12 +663,14 @@ impl UniversalLayerBuffered for LinearAttention {
                     self.min_heads, self.max_heads,
                     h_raw, h_soft, head_buffers.len()
                 );
-                for hc in &head_buffers {
+                let sb_vec: Vec<f32> = head_self_biases.iter().map(|(_, sb)| *sb).collect();
+                linatt_stats("self_bias (per active head)", &sb_vec);
+                for (hc, (_h_idx, sb)) in head_buffers.iter().zip(head_self_biases.iter()) {
                     let y_h = hc.y.read_range(0, total_in);
                     let attn = hc.attn_out.read_range(0, total_head);
                     println!(
-                        "    head {}: w={:.6}, ||attn_out||={:.4}, ||y_h||={:.4}",
-                        hc.head_index, hc.weight,
+                        "    head {}: w={:.6}, self_bias={:.6}, ||attn_out||={:.4}, ||y_h||={:.4}",
+                        hc.head_index, hc.weight, sb,
                         linatt_l2(&attn), linatt_l2(&y_h)
                     );
                 }
@@ -620,10 +682,13 @@ impl UniversalLayerBuffered for LinearAttention {
                 }
             }
             if traj_this {
+                let sb_vec: Vec<f32> = head_self_biases.iter().map(|(_, sb)| *sb).collect();
+                let sb_summary = linatt_summary(&sb_vec);
                 println!(
                     "[LINATT traj fwd #{}] h_raw={:.4} h_soft={:.4} \
-                     active_heads={} ||x||={:.4} ||y||={:.4}",
+                     active_heads={} self_bias[{}] ||x||={:.4} ||y||={:.4}",
                     call_id, h_raw, h_soft, head_buffers.len(),
+                    sb_summary,
                     linatt_l2(&x_vec), linatt_l2(&y_accum)
                 );
             }
@@ -704,41 +769,30 @@ impl UniversalLayerBuffered for LinearAttention {
         let head_size = self.head_param_count();
         let h_raw_idx = slice.start + self.max_heads * head_size;
 
-        // ------------------------------------------------------------------
-        // КРИТИЧНО (fix deadlock):
-        //
-        // Per-head state-буферы читаем ЗАРАНЕЕ, до входа в
-        // with_cpu_slices_mut, потому что with_cpu_slices_mut держит
-        // ЭКСКЛЮЗИВНУЮ блокировку MemoryExecutor, а read_range пытается
-        // взять блокировку на чтение того же RwLock → deadlock (RwLock
-        // не реентерабельный). Раньше этот код вызывал head_cache.*.read_range
-        // внутри замыкания — и вешался на batch>1 (backward вообще не
-        // вызывался при диагностическом forward=1).
-        //
-        // Порядок чтения совпадает с порядком в forward-е: по каждой активной
-        // голове — q, k, v, kv, z, attn_out, y.
-        // ------------------------------------------------------------------
         struct HeadSnapshot {
             weight: f32,
             head_index: usize,
             q_phi: Vec<f32>,
             k_phi: Vec<f32>,
             v_raw: Vec<f32>,
-            kv: Vec<f32>,
-            z: Vec<f32>,
+            kv: Vec<f32>,          // FIX: batch · dh · dh
+            z: Vec<f32>,           // FIX: batch · dh
             attn_out: Vec<f32>,
             y_h: Vec<f32>,
         }
 
         let total_head = batch * seq * dh;
+        let kv_per_head = batch * dh * dh;
+        let z_per_head = batch * dh;
 
         let mut snapshots: Vec<HeadSnapshot> = Vec::with_capacity(cpu_heads.len());
         for hc in cpu_heads {
             let q_phi = hc.q.read_range(0, total_head);
             let k_phi = hc.k.read_range(0, total_head);
             let v_raw = hc.v.read_range(0, total_head);
-            let kv = hc.kv.read_range(0, dh * dh);
-            let z = hc.z.read_range(0, dh);
+            // FIX: per-example kv и z.
+            let kv = hc.kv.read_range(0, kv_per_head);
+            let z = hc.z.read_range(0, z_per_head);
             let attn_out = hc.attn_out.read_range(0, total_head);
             let y_h = hc.y.read_range(0, total_in);
 
@@ -755,8 +809,6 @@ impl UniversalLayerBuffered for LinearAttention {
             });
         }
 
-        // Теперь безопасно берём write-блокировку один раз и работаем с
-        // сырыми срезами буферов. Никаких read_range внутри замыкания.
         let ids = [
             input_handle.id(),
             grad_output.id(),
@@ -785,7 +837,6 @@ impl UniversalLayerBuffered for LinearAttention {
                 let (fifth, _) = rest.split_at_mut(1);
                 let gp: &mut [f32] = &mut *fifth[0];
 
-                // Обнуляем градиенты параметров и входа.
                 for i in 0..self.param_len() {
                     gp[slice.start + i] = 0.0;
                 }
@@ -794,27 +845,39 @@ impl UniversalLayerBuffered for LinearAttention {
                 let mut d_l_dh_raw_total = 0.0f32;
                 let mut go_h = vec![0.0f32; total_in];
 
+                struct HeadGradSummary {
+                    head_index: usize,
+                    self_bias: f32,
+                    l2_wq: f64,
+                    l2_bq: f64,
+                    l2_wk: f64,
+                    l2_bk: f64,
+                    l2_wv: f64,
+                    l2_bv: f64,
+                    l2_wo: f64,
+                    l2_bo: f64,
+                    grad_self_bias: f32,
+                    d_l_dw_h: f32,
+                }
+                let mut head_grad_summaries: Vec<HeadGradSummary> = Vec::new();
+
                 for snap in &snapshots {
                     let h = snap.head_index;
                     let w_h = snap.weight;
                     let head_base = slice.start + h * head_size;
 
-                    // go_h = w_h * go
                     for i in 0..total_in {
                         go_h[i] = w_h * go[i];
                     }
 
-                    // dL/dw_h = dot(go, y_h)
                     let mut d_l_dw_h = 0.0f32;
                     for i in 0..total_in {
                         d_l_dw_h += go[i] * snap.y_h[i];
                     }
 
-                    // dL/dh_soft += dL/dw_h * dw_h/dh_soft
                     let dw_dhs = head_weight_derivative(h_soft, h);
                     d_l_dh_raw_total += d_l_dw_h * dw_dhs;
 
-                    // Backward головы.
                     let res = compute_head_backward(
                         x, &go_h, p, head_base,
                         &snap.q_phi, &snap.k_phi, &snap.v_raw,
@@ -826,7 +889,6 @@ impl UniversalLayerBuffered for LinearAttention {
                         gi[i] += res.gi[i];
                     }
 
-                    // Запись градиентов параметров головы.
                     let wq_start = head_base;
                     let bq_start = wq_start + dh * d;
                     let wk_start = bq_start + dh;
@@ -855,12 +917,21 @@ impl UniversalLayerBuffered for LinearAttention {
                     }
                     gp[self_bias_idx] = res.grad_self_bias;
 
-                    if *LINATT_DEBUG && (log_this || traj_this) {
-                        println!(
-                            "    [LINATT bwd] head {}: w={:.6}, dL/dw={:.6e}, \
-                             dL/dh_soft={:.6e}, ||gi_head||={:.4e}",
-                            h, w_h, d_l_dw_h, d_l_dw_h * dw_dhs, linatt_l2(&res.gi)
-                        );
+                    if *LINATT_DEBUG {
+                        head_grad_summaries.push(HeadGradSummary {
+                            head_index: h,
+                            self_bias: res.self_bias,
+                            l2_wq: linatt_l2(&res.grad_wq),
+                            l2_bq: linatt_l2(&res.grad_bq),
+                            l2_wk: linatt_l2(&res.grad_wk),
+                            l2_bk: linatt_l2(&res.grad_bk),
+                            l2_wv: linatt_l2(&res.grad_wv),
+                            l2_bv: linatt_l2(&res.grad_bv),
+                            l2_wo: linatt_l2(&res.grad_wo),
+                            l2_bo: linatt_l2(&res.grad_bo),
+                            grad_self_bias: res.grad_self_bias,
+                            d_l_dw_h,
+                        });
                     }
                 }
 
@@ -872,6 +943,7 @@ impl UniversalLayerBuffered for LinearAttention {
                     let has_anom = linatt_has_bad(gi)
                         || !d_l_dh_raw.is_finite()
                         || !d_l_dh_raw_total.is_finite();
+
                     if log_this || has_anom {
                         println!(
                             "[LINATT bwd #{}] d_model={}, d_head={}, h_raw={:.6}, \
@@ -881,6 +953,25 @@ impl UniversalLayerBuffered for LinearAttention {
                         );
                         linatt_stats("go (grad_out)", go);
                         linatt_stats("gi (grad_input)", gi);
+                        for s in &head_grad_summaries {
+                            println!(
+                                "    head {}: self_bias={:.6}, dL/dw_h={:.6e}, \
+                                 dL/dh_soft={:.6e}",
+                                s.head_index, s.self_bias, s.d_l_dw_h,
+                                s.d_l_dw_h * head_weight_derivative(h_soft, s.head_index),
+                            );
+                            println!(
+                                "      ||grad_Wq||={:.4e} ||grad_bq||={:.4e} \
+                                 ||grad_Wk||={:.4e} ||grad_bk||={:.4e}",
+                                s.l2_wq, s.l2_bq, s.l2_wk, s.l2_bk,
+                            );
+                            println!(
+                                "      ||grad_Wv||={:.4e} ||grad_bv||={:.4e} \
+                                 ||grad_Wo||={:.4e} ||grad_bo||={:.4e} \
+                                 grad_self_bias={:.6e}",
+                                s.l2_wv, s.l2_bv, s.l2_wo, s.l2_bo, s.grad_self_bias,
+                            );
+                        }
                         if has_anom && !log_this {
                             println!("[LINATT bwd #{}] ANOMALY", call_id);
                         }
@@ -892,6 +983,22 @@ impl UniversalLayerBuffered for LinearAttention {
                             call_id, h_raw, h_soft, snapshots.len(),
                             d_l_dh_raw, linatt_l2(go), linatt_l2(gi)
                         );
+                        let sb_vec: Vec<f32> =
+                            head_grad_summaries.iter().map(|s| s.self_bias).collect();
+                        let gsb_vec: Vec<f32> =
+                            head_grad_summaries.iter().map(|s| s.grad_self_bias).collect();
+                        let wq_vec: Vec<f32> = head_grad_summaries
+                            .iter()
+                            .map(|s| s.l2_wq as f32)
+                            .collect();
+                        let wo_vec: Vec<f32> = head_grad_summaries
+                            .iter()
+                            .map(|s| s.l2_wo as f32)
+                            .collect();
+                        println!("      self_bias        : {}", linatt_summary(&sb_vec));
+                        println!("      grad_self_bias   : {}", linatt_summary(&gsb_vec));
+                        println!("      ||grad_Wq|| (L2) : {}", linatt_summary(&wq_vec));
+                        println!("      ||grad_Wo|| (L2) : {}", linatt_summary(&wo_vec));
                     }
                 }
             });

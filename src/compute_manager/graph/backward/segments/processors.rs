@@ -10,18 +10,11 @@ use crate::layers::{
     AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
     SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
+    PerFeatureAttention,
 };
 use crate::model_plan::param_store::ParamSlice;
 
 impl crate::compute_manager::graph::model::MixedModel {
-    /// Последовательный обратный проход через цепочку слоёв UniversalProcessor.
-    /// Используется в CPU‑ветке, когда параллелизм не применяется.
-    ///
-    /// Контексты слоёв (`ctxs`) были созданы в forward и содержат всё
-    /// per-chunk состояние, необходимое backward'у: у каждого слоя — свой
-    /// `BufferedContext`, включая state-буферы (h_all, mask, arg, per-head
-    /// буферы LinearAttention и т.д.). Слой не читает состояние из своих
-    /// полей.
     pub(crate) fn backward_universal_batch_buffered_handle(
         &mut self,
         pool: &mut TempMatrixPool,
@@ -32,16 +25,8 @@ impl crate::compute_manager::graph::model::MixedModel {
         params: &MatrixBufferHandle,
         grad_params_handle: &MatrixBufferHandle,
     ) -> MatrixBufferHandle {
-        assert_eq!(
-            layers.len(),
-            slices.len(),
-            "backward_universal_batch_buffered_handle: layers/slices count mismatch"
-        );
-        assert_eq!(
-            layers.len(),
-            ctxs.len(),
-            "backward_universal_batch_buffered_handle: layers/contexts count mismatch"
-        );
+        assert_eq!(layers.len(), slices.len());
+        assert_eq!(layers.len(), ctxs.len());
 
         let mut current_grad = grad_out;
         for i in (0..layers.len()).rev() {
@@ -49,10 +34,6 @@ impl crate::compute_manager::graph::model::MixedModel {
             let slice = &slices[i];
             let ctx = ctxs[i];
 
-            // Входная размерность слоя. Вся логика определения — в трейте:
-            // слои с фиксированным input_features() возвращают его,
-            // слои, сохраняющие размерность, — число столбцов текущего
-            // буфера градиента.
             let in_features = layer.input_features_for(current_grad.cols());
 
             let batch = current_grad.rows();
@@ -75,13 +56,6 @@ impl crate::compute_manager::graph::model::MixedModel {
     }
 }
 
-/// Диспетчеризация обратного прохода для конкретного слоя.
-///
-/// В каждой ветке `as_*` передаётся та же сигнатура `backward_buffered`,
-/// которую объявляет трейт `UniversalLayerBuffered`. Никакие сигнатуры
-/// не менялись по сравнению с прежней версией — слои читают состояние
-/// из `ctx` (вариант `DynamicContext::Buffered(BufferedContext::…)`),
-/// а не из собственных полей.
 fn call_backward_buffered(
     layer: &Box<dyn UniversalLayer>,
     ctx: &DynamicContext,
@@ -201,6 +175,10 @@ fn call_backward_buffered(
         );
     } else if let Some(l) = layer.as_relative_position_attention() {
         <RelativePositionAttention as UniversalLayerBuffered>::backward_buffered(
+            l, ctx, grad_output, grad_input, params, slice, grad_params_handle,
+        );
+    } else if let Some(l) = layer.as_per_feature_attention() {
+        <PerFeatureAttention as UniversalLayerBuffered>::backward_buffered(
             l, ctx, grad_output, grad_input, params, slice, grad_params_handle,
         );
     } else {

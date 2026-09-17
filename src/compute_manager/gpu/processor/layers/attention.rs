@@ -1,6 +1,7 @@
 // src/compute_manager/gpu/processor/layers/attention.rs
 //
-// Категория «внимание»: LinearAttention, RelativePositionAttention.
+// Категория «внимание»: LinearAttention, RelativePositionAttention,
+// PerFeatureAttention.
 
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::gpu::compute::GpuCompute;
@@ -32,18 +33,6 @@ pub fn forward(
         let q_phi = gpu.allocate_gpu_matrix_handle(total_tokens, d_model);
         let k_phi = gpu.allocate_gpu_matrix_handle(total_tokens, d_model);
 
-        // FIX: kv и z теперь per-example (как в CPU-версии).
-        //
-        //   kv на голову: batch · d_head · d_head
-        //   z  на голову: batch · d_head
-        //
-        // Суммарный размер на все max_heads голов:
-        //   max_heads · batch · d_head · d_head  (kv)
-        //   max_heads · batch · d_head           (z)
-        //
-        // Раньше было d_model·d_model и d_model — глобальная агрегация
-        // по всему батчу. Это делало attention глобальным pooling'ом,
-        // а не вниманием внутри примера (см. CPU-fix).
         let kv_size = max_heads * batch * d_head * d_head;
         let z_size = max_heads * batch * d_head;
         let kv = gpu.allocate_gpu_matrix_handle(kv_size, 1);
@@ -57,18 +46,9 @@ pub fn forward(
             gpu.allocate_gpu_matrix_handle(input.rows(), lin_att.output_features());
 
         gpu.run_linear_attention_forward_buffered_handle_with_dims(
-            input,
-            &params_view,
-            &out_handle,
-            seq_len,
-            d_model,
-            &q_raw,
-            &k_raw,
-            &v_raw,
-            &q_phi,
-            &k_phi,
-            &kv,
-            &z,
+            input, &params_view, &out_handle,
+            seq_len, d_model,
+            &q_raw, &k_raw, &v_raw, &q_phi, &k_phi, &kv, &z,
         );
 
         let ctx = DynamicContext::Buffered(BufferedContext::LinearAttention {
@@ -112,16 +92,9 @@ pub fn forward(
             .allocate_gpu_matrix_handle(input.rows(), rel_att.output_features());
 
         gpu.run_relative_position_attention_forward_buffered_handle(
-            input,
-            &params_view,
-            &out_handle,
-            seq_len,
-            d_model,
-            &q,
-            &k,
-            &v,
-            &scores,
-            &weights,
+            input, &params_view, &out_handle,
+            seq_len, d_model,
+            &q, &k, &v, &scores, &weights,
         );
 
         let ctx = DynamicContext::Buffered(
@@ -135,6 +108,50 @@ pub fn forward(
                 attn_out: None,
             },
         );
+        return Some((out_handle, ctx));
+    }
+
+    // ---- PerFeatureAttention ----
+    if let Some(pfa) = layer.as_per_feature_attention() {
+        let seq_len = pfa.seq_len;
+        let d_model = pfa.d_model;
+        let d_head = pfa.d_head;
+        let batch = input.rows();
+
+        let token_total = batch * seq_len * d_model;
+        let dh_total = token_total * d_head;
+        let kv_total = batch * d_model * d_head * d_head;
+        let z_total = batch * d_model * d_head;
+
+        let q_raw = gpu.allocate_gpu_matrix_handle(dh_total, 1);
+        let k_raw = gpu.allocate_gpu_matrix_handle(dh_total, 1);
+        let v_raw = gpu.allocate_gpu_matrix_handle(dh_total, 1);
+        let q_phi = gpu.allocate_gpu_matrix_handle(dh_total, 1);
+        let k_phi = gpu.allocate_gpu_matrix_handle(dh_total, 1);
+        let kv = gpu.allocate_gpu_matrix_handle(kv_total, 1);
+        let z = gpu.allocate_gpu_matrix_handle(z_total, 1);
+        let attn = gpu.allocate_gpu_matrix_handle(dh_total, 1);
+        let denom = gpu.allocate_gpu_matrix_handle(token_total, 1);
+
+        let param_len = pfa.param_len();
+        let params_view =
+            MatrixBufferView::new(params_handle.clone(), slice.start, param_len);
+
+        let out_handle = gpu.allocate_gpu_matrix_handle(input.rows(), input.cols());
+
+        gpu.run_per_feature_attention_forward_buffered_handle(
+            input, &params_view, &out_handle,
+            seq_len, d_model, d_head,
+            &q_raw, &k_raw, &v_raw, &q_phi, &k_phi,
+            &kv, &z, &attn, &denom,
+        );
+
+        let ctx = DynamicContext::Buffered(BufferedContext::PerFeatureAttentionGpu {
+            input: input.clone(),
+            q_raw, k_raw, v_raw, q_phi, k_phi,
+            kv, z, attn, denom,
+            batch, seq_len, d_model, d_head,
+        });
         return Some((out_handle, ctx));
     }
 
@@ -158,15 +175,7 @@ pub fn backward(
         let DynamicContext::Buffered(bc) = ctx;
         let (input_handle, q_raw, k_raw, v_raw, q_phi, k_phi, kv, z) = match bc {
             BufferedContext::LinearAttention {
-                input,
-                q_raw,
-                k_raw,
-                v_raw,
-                q_phi,
-                k_phi,
-                kv,
-                z,
-                ..
+                input, q_raw, k_raw, v_raw, q_phi, k_phi, kv, z, ..
             } => (
                 input.clone(),
                 q_raw.clone().unwrap(),
@@ -190,20 +199,9 @@ pub fn backward(
             .allocate_gpu_matrix_handle(grad_output.rows(), lin_att.input_features());
 
         gpu.run_linear_attention_backward_buffered_handle_with_dims(
-            &input_handle,
-            grad_output,
-            &params_view,
-            &gi,
-            &grad_params_view,
-            seq_len,
-            d_model,
-            &q_raw,
-            &k_raw,
-            &v_raw,
-            &q_phi,
-            &k_phi,
-            &kv,
-            &z,
+            &input_handle, grad_output, &params_view, &gi, &grad_params_view,
+            seq_len, d_model,
+            &q_raw, &k_raw, &v_raw, &q_phi, &k_phi, &kv, &z,
         );
         return Some(gi);
     }
@@ -216,13 +214,7 @@ pub fn backward(
         let DynamicContext::Buffered(bc) = ctx;
         let (input_handle, q, k, v, scores, weights) = match bc {
             BufferedContext::RelativePositionAttention {
-                input,
-                q,
-                k,
-                v,
-                scores,
-                weights,
-                ..
+                input, q, k, v, scores, weights, ..
             } => (
                 input.clone(),
                 q.clone().unwrap(),
@@ -241,23 +233,58 @@ pub fn backward(
             MatrixBufferView::new(grad_params_handle.clone(), slice.start, param_len);
 
         let gi = gpu.allocate_gpu_matrix_handle(
-            grad_output.rows(),
-            rel_att.input_features(),
+            grad_output.rows(), rel_att.input_features(),
         );
 
         gpu.run_relative_position_attention_backward_buffered_handle(
-            &input_handle,
-            grad_output,
-            &params_view,
-            &gi,
-            &grad_params_view,
-            seq_len,
-            d_model,
-            &q,
-            &k,
-            &v,
-            &scores,
-            &weights,
+            &input_handle, grad_output, &params_view, &gi, &grad_params_view,
+            seq_len, d_model,
+            &q, &k, &v, &scores, &weights,
+        );
+        return Some(gi);
+    }
+
+    // ---- PerFeatureAttention ----
+    if let Some(pfa) = layer.as_per_feature_attention() {
+        let seq_len = pfa.seq_len;
+        let d_model = pfa.d_model;
+        let d_head = pfa.d_head;
+
+        let DynamicContext::Buffered(bc) = ctx;
+        let (input_handle, q_raw, k_raw, v_raw, q_phi, k_phi, kv, z, attn, denom) =
+            match bc {
+                BufferedContext::PerFeatureAttentionGpu {
+                    input,
+                    q_raw, k_raw, v_raw, q_phi, k_phi,
+                    kv, z, attn, denom, ..
+                } => (
+                    input.clone(),
+                    q_raw.clone(),
+                    k_raw.clone(),
+                    v_raw.clone(),
+                    q_phi.clone(),
+                    k_phi.clone(),
+                    kv.clone(),
+                    z.clone(),
+                    attn.clone(),
+                    denom.clone(),
+                ),
+                _ => panic!("Expected PerFeatureAttentionGpu Buffered context"),
+            };
+
+        let param_len = pfa.param_len();
+        let params_view =
+            MatrixBufferView::new(params_handle.clone(), slice.start, param_len);
+        let grad_params_view =
+            MatrixBufferView::new(grad_params_handle.clone(), slice.start, param_len);
+
+        let gi = gpu.allocate_gpu_matrix_handle(grad_output.rows(), pfa.input_features());
+
+        gpu.run_per_feature_attention_backward_buffered_handle(
+            &input_handle, grad_output, &params_view, &gi, &grad_params_view,
+            seq_len, d_model, d_head,
+            &q_raw, &k_raw, &v_raw, &q_phi, &k_phi,
+            &kv, &z, &attn, &denom,
         );
         return Some(gi);
     }

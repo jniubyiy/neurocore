@@ -9,7 +9,7 @@ pub struct LayerDesc {
     pub kind: LayerKind,
     pub input_shape: Shape,
     pub output_shape: Shape,
-    pub extra: Vec<f32>,   // дополнительные гиперпараметры (alpha, temperature, seed и т.п.)
+    pub extra: Vec<f32>,
 }
 
 impl LayerDesc {
@@ -33,8 +33,6 @@ impl LayerDesc {
         self
     }
 
-    /// Устанавливает множественные входные формы (для Splitter, Combiner).
-    /// Все потоки из переданных Shape объединяются в один Shape с несколькими потоками.
     pub fn inputs(mut self, shapes: Vec<Shape>) -> Self {
         let mut all_streams = Vec::new();
         let mut all_axes = Vec::new();
@@ -50,7 +48,6 @@ impl LayerDesc {
         self
     }
 
-    /// Устанавливает множественные выходные формы.
     pub fn outputs(mut self, shapes: Vec<Shape>) -> Self {
         let mut all_streams = Vec::new();
         let mut all_axes = Vec::new();
@@ -122,7 +119,6 @@ impl LayerDesc {
             LayerKind::SplitterConnector | LayerKind::CombinerConnector => 0,
             LayerKind::Unsqueeze | LayerKind::ReduceMean => 0,
 
-            // Новые слои
             LayerKind::DualSlopeReLU => {
                 assert_eq!(self.input_shape.streams.len(), 1,
                     "DualSlopeReLU expects one input stream");
@@ -131,7 +127,7 @@ impl LayerDesc {
             LayerKind::LearnableMish => {
                 assert_eq!(self.input_shape.streams.len(), 1,
                     "LearnableMish expects one input stream");
-                1 // один обучаемый параметр λ
+                1
             }
             LayerKind::LearnableSoftplus => {
                 assert_eq!(self.input_shape.streams.len(), 1,
@@ -153,44 +149,20 @@ impl LayerDesc {
                     "RMSNormWithLearnableEpsilon expects one input stream");
                 2 * self.input_shape.streams[0]
             }
-            LayerKind::ConcreteDropout => 1, // только logit_p
+            LayerKind::ConcreteDropout => 1,
             LayerKind::AdaptiveDropout => {
                 assert_eq!(self.input_shape.streams.len(), 1,
                     "AdaptiveDropout expects one input stream");
                 2 * self.input_shape.streams[0]
             }
             LayerKind::LinearAttention => {
-                // extra = [seq_len, d_model, min_heads, max_heads]
-                //
-                // Multi-head LinearAttention со стандартным делением
-                // подпространств: d_head = d_model / max_heads.
-                //
-                // Требуется d_model % max_heads == 0 (валидируется в
-                // конструкторе слоя).
-                //
-                // Раскладка параметров одного head'а:
-                //   Wq_h: d_head × d_model  (row-major)
-                //   bq_h: d_head
-                //   Wk_h: d_head × d_model  (row-major)
-                //   bk_h: d_head
-                //   Wv_h: d_head × d_model  (row-major)
-                //   bv_h: d_head
-                //   Wo_h: d_model × d_head  (row-major)
-                //   bo_h: d_model
-                //   self_bias_h: 1
-                //
-                // Итого на head: 4 · d_head · d_model + 3 · d_head + d_model + 1.
-                //
-                // В конце всего буфера — один скаляр h_raw (обучаемое
-                // число голов).
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 let min_heads = self.extra.get(2).copied().unwrap_or(1.0).max(1.0) as usize;
                 let max_heads_raw = self.extra.get(3).copied().unwrap_or(min_heads as f32) as usize;
                 let max_heads = max_heads_raw.max(min_heads);
                 assert!(
                     max_heads > 0 && d_model % max_heads == 0,
-                    "LinearAttention: d_model ({}) must be divisible by max_heads ({}). \
-                     Pick max_heads as a divisor of d_model.",
+                    "LinearAttention: d_model ({}) must be divisible by max_heads ({}).",
                     d_model,
                     max_heads
                 );
@@ -199,19 +171,16 @@ impl LayerDesc {
                 max_heads * head_param_count + 1
             }
             LayerKind::RelativePositionAttention => {
-                // extra = [seq_len, d_model]
                 let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 4 * (d_model * d_model + d_model) + (2 * seq_len - 1)
             }
             LayerKind::IndRNN => {
-                // extra = [input_dim, seq_len]
                 let input_dim = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let _seq_len = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 input_dim * input_dim + 2 * input_dim
             }
             LayerKind::Mamba => {
-                // extra = [seq_len, input_dim, state_dim]
                 let _seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let input_dim = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 let state_dim = self.extra.get(2).copied().unwrap_or(1.0) as usize;
@@ -234,22 +203,21 @@ impl LayerDesc {
             LayerKind::MultiResolutionKANLinear => {
                 let in_features = self.input_shape.streams[0];
                 let out_features = self.output_shape.streams[0];
-                // См. раскладку в MultiResolutionKANLinear (v2):
-                //   bias[out] + mix_logits[in·out·2] + mix_temp_raw[in·out]
-                //   + spline_coarse[in·out·(G_c+k)] + spline_fine[in·out·(G_f+k)]
-                //   + base_weight[in·out]
-                // G_c=3, G_f=8, k=3  ⇒  (G_c+k)=6, (G_f+k)=11
-                // Итого: out + in·out·(2 + 1 + 6 + 11 + 1) = out + in·out·21
                 const G_C: usize = 3;
                 const G_F: usize = 8;
                 const K: usize = 3;
                 out_features + in_features * out_features * (4 + (G_C + K) + (G_F + K))
             }
+            LayerKind::PerFeatureAttention => {
+                // extra = [seq_len, d_model]; d_head фиксирован в слое.
+                let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                let d_head = crate::layers::PerFeatureAttention::DEFAULT_D_HEAD;
+                d_model * (10 * d_head + 2)
+            }
             _ => 0,
         }
     }
 
-    /// Создаёт универсальный слой по описанию.
     pub fn create_universal_layer(&self) -> Box<dyn crate::layers::UniversalLayer> {
         match self.kind {
             LayerKind::Linear => Box::new(crate::layers::Linear::new(
@@ -293,7 +261,6 @@ impl LayerDesc {
                     num_activations,
                 ))
             }
-            // Новые слои
             LayerKind::DualSlopeReLU => {
                 let features = self.input_shape.streams[0];
                 Box::new(crate::layers::DualSlopeReLU::new(features))
@@ -329,13 +296,6 @@ impl LayerDesc {
                 Box::new(crate::layers::AdaptiveDropout::new_with_seed(features, seed))
             }
             LayerKind::LinearAttention => {
-                // extra = [seq_len, d_model, min_heads, max_heads]
-                //
-                // Multi-head LinearAttention со стандартным делением
-                // подпространств: d_head = d_model / max_heads.
-                //
-                // Требуется d_model % max_heads == 0 (валидируется в
-                // конструкторе слоя; assert там же).
                 let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 let min_heads = self.extra.get(2).copied().unwrap_or(1.0).max(1.0) as usize;
@@ -382,6 +342,11 @@ impl LayerDesc {
                 let in_features = self.input_shape.streams[0];
                 let out_features = self.output_shape.streams[0];
                 Box::new(crate::layers::MultiResolutionKANLinear::new(in_features, out_features))
+            }
+            LayerKind::PerFeatureAttention => {
+                let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
+                let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
+                Box::new(crate::layers::PerFeatureAttention::new(seq_len, d_model))
             }
             _ => panic!("Unsupported layer kind for UniversalLayer: {:?}", self.kind),
         }

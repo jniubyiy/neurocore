@@ -1,11 +1,4 @@
 // src/compute_manager/cpu/parallel/dispatch.rs
-//
-// Диспетчеризация forward/backward одного слоя.
-//
-// Единая точка вызова соответствующего метода `UniversalLayerBuffered`
-// для конкретного слоя — по той же схеме, что используется в
-// `graph/forward/segments/processors.rs` и
-// `graph/backward/segments/processors.rs`.
 
 use crate::compute_manager::graph::types::DynamicContext;
 use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
@@ -17,6 +10,7 @@ use crate::layers::{
     AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
     SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
+    PerFeatureAttention,
     BufferedContext,
 };
 use crate::model_plan::param_store::ParamSlice;
@@ -87,6 +81,8 @@ pub(super) fn call_forward_buffered(
         <LinearAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_relative_position_attention() {
         <RelativePositionAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
+    } else if let Some(l) = layer.as_per_feature_attention() {
+        <PerFeatureAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else {
         unreachable!("Unsupported layer in parallel forward");
     }
@@ -158,6 +154,8 @@ pub(super) fn call_backward_buffered(
         <LinearAttention as UniversalLayerBuffered>::backward_buffered(l, ctx, grad_output, grad_input, params, slice, grad_params);
     } else if let Some(l) = layer.as_relative_position_attention() {
         <RelativePositionAttention as UniversalLayerBuffered>::backward_buffered(l, ctx, grad_output, grad_input, params, slice, grad_params);
+    } else if let Some(l) = layer.as_per_feature_attention() {
+        <PerFeatureAttention as UniversalLayerBuffered>::backward_buffered(l, ctx, grad_output, grad_input, params, slice, grad_params);
     } else {
         unreachable!("Unsupported layer in parallel backward");
     }
@@ -165,8 +163,10 @@ pub(super) fn call_backward_buffered(
 
 /// Определяет, можно ли распараллелить цепочку слоёв по чанкам батча.
 ///
-/// Список несовместимых слоёв сохранён как временный fallback; в дальнейшем
-/// он будет заменён на декларативный флаг `supports_chunked_parallel()`.
+/// `PerFeatureAttention` **не входит** в список несовместимых слоёв: все его
+/// операции выполняются независимо по каждой строке батча `r` (в т.ч.
+/// reductions kv/z идут по оси `t`, а не по `r`). State-буферы создаются
+/// per-chunk в `forward_buffered` и передаются через `BufferedContext`.
 pub(crate) fn can_parallelize(layers: &[Box<dyn UniversalLayer>]) -> bool {
     !layers.iter().any(|l| {
         l.as_memory().is_some()

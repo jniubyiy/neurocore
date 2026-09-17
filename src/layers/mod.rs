@@ -35,6 +35,9 @@ pub mod feature_fusion;
 pub mod sparse_feature_selection_gate;
 pub mod multi_resolution_kan_linear;
 
+// PerFeatureAttention (CPU-only)
+pub mod per_feature_attention;
+
 pub mod layers_special;
 pub mod buffered_context;
 
@@ -81,28 +84,20 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_sparse_feature_selection_gate(&self) -> Option<&SparseFeatureSelectionGate> { None }
     fn as_multi_resolution_kan_linear(&self) -> Option<&MultiResolutionKANLinear> { None }
 
+    // PerFeatureAttention
+    fn as_per_feature_attention(&self) -> Option<&PerFeatureAttention> { None }
+
     // Общая информация о слое, используемая планировщиком.
-    //
-    // Соглашение о размерностях:
-    //   * `param_len() > 0`   — у слоя есть обучаемые параметры;
-    //   * `input_features() > 0`  — у слоя фиксированное число входных признаков;
-    //   * `output_features() > 0` — у слоя фиксированное число выходных признаков;
-    //   * `0` для `input_features()`/`output_features()` означает, что слой
-    //     сохраняет соответствующую размерность. Такое соглашение позволяет
-    //     покрыть активации, нормализации и гейты, которые не меняют
-    //     размерность, без необходимости заводить для них отдельные поля.
     fn param_len(&self) -> usize { 0 }
     fn input_features(&self) -> usize { 0 }
     fn output_features(&self) -> usize { 0 }
 
-    /// Число выходных признаков слоя при заданном числе входных.
     #[inline]
     fn output_features_for(&self, in_cols: usize) -> usize {
         let of = self.output_features();
         if of == 0 { in_cols } else { of }
     }
 
-    /// Число входных признаков слоя при неизвестном `fallback`.
     #[inline]
     fn input_features_for(&self, fallback: usize) -> usize {
         let inf = self.input_features();
@@ -113,20 +108,6 @@ pub trait UniversalLayer: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 // UniversalLayerBuffered — единый контракт forward/backward
 // ---------------------------------------------------------------------------
-//
-// Ключевое отличие от предыдущей версии: `forward_buffered` теперь сам
-// создаёт и возвращает `BufferedContext`. Слой с внутренним состоянием
-// (например, IndRNN или LinearAttention) выделяет свои state-буферы из
-// `pool` и кладёт их в контекст. Слой без состояния возвращает один из
-// маркерных вариантов `BufferedContext` (Linear/ReLU/…/Identity).
-//
-// Это делает состояние слоя per-chunk автоматически: каждый вызов
-// forward для конкретного чанка создаёт СВОЙ `BufferedContext`, а
-// `ChunkedContexts` в parallel.rs хранит его по индексу чанка.
-//
-// `self.state` (RwLock/Mutex) в слоях больше не используется — это и
-// есть та самая обязательность: единственный источник состояния на
-// backward — `DynamicContext::Buffered`.
 
 pub trait UniversalLayerBuffered: Send + Sync + 'static {
     fn forward_buffered(
@@ -193,6 +174,8 @@ pub use adaptive_dropout::AdaptiveDropout;
 pub use feature_fusion::FeatureFusion;
 pub use sparse_feature_selection_gate::SparseFeatureSelectionGate;
 pub use multi_resolution_kan_linear::MultiResolutionKANLinear;
+
+pub use per_feature_attention::PerFeatureAttention;
 
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 pub use buffered_context::BufferedContext;

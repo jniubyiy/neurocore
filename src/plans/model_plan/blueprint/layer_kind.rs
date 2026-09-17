@@ -37,4 +37,6 @@ pub enum LayerKind {
     SpectrallyNormalizedLinear,
     SparseFeatureSelectionGate,
     MultiResolutionKANLinear,
+    // PerFeatureAttention (CPU-only)
+    PerFeatureAttention,
 }

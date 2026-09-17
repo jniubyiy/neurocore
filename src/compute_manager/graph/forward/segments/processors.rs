@@ -13,6 +13,7 @@ use crate::layers::{
     AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
     SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
+    PerFeatureAttention,
     BufferedContext,
 };
 use crate::model_plan::param_store::ParamSlice;
@@ -56,8 +57,6 @@ impl MixedModel {
                 let out_features = get_buffered_output_features(layer, &current_input);
                 let output_handle = pool.acquire(batch_size, out_features);
 
-                // Слой сам строит свой BufferedContext — включая
-                // per-chunk state, если он есть.
                 let buffered_ctx = call_forward_buffered(
                     layer,
                     &current_input,
@@ -92,7 +91,6 @@ fn get_buffered_output_features(
     layer.output_features_for(input.cols())
 }
 
-/// Единая точка вызова forward слоя — параллельная версии из parallel.rs.
 fn call_forward_buffered(
     layer: &Box<dyn UniversalLayer>,
     input: &MatrixBufferHandle,
@@ -157,6 +155,8 @@ fn call_forward_buffered(
         <LinearAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else if let Some(l) = layer.as_relative_position_attention() {
         <RelativePositionAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
+    } else if let Some(l) = layer.as_per_feature_attention() {
+        <PerFeatureAttention as UniversalLayerBuffered>::forward_buffered(l, input, output, params, slice, pool)
     } else {
         unreachable!(
             "Layer {:?} does not implement UniversalLayerBuffered for CPU path",

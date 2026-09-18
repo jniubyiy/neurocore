@@ -19,3 +19,26 @@ pub use dim_change::DynamicTensor;
 pub use gpu::GpuExecutor;
 pub use matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
 pub use compute_executor::{ComputeExecutor, ModelPlacement};
+
+// ============================================================================
+// Новая архитектура v2 (изолирована фичей `v2`).
+//
+// Ни один из этих модулей не вызывается из существующего кода. Они
+// существуют параллельно старому пути (MixedModel / execute / compute_executor)
+// и подключаются только на финальном этапе миграции.
+//
+// Пока фича `v2` выключена, файлы v2 не компилируются и на старый путь
+// не влияют.
+// ============================================================================
+
+#[cfg(feature = "v2")]
+pub mod jobs_v2;
+
+#[cfg(feature = "v2")]
+pub mod operators_v2;
+
+#[cfg(feature = "v2")]
+pub mod distributor_v2;
+
+#[cfg(feature = "v2")]
+pub mod graph_v2;

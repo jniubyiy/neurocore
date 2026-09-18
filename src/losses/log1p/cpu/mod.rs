@@ -1,6 +1,6 @@
 // src/losses/log1p/cpu/mod.rs
 
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::losses::BufferedElemCube;
 use crate::losses::log1p::Log1p;
 

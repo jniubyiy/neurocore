@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 
 /// Элементарный кубик функции потерь (матричная версия).
 pub trait ElemCube: Any + Send + Sync + Debug {

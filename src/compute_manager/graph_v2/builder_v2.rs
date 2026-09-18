@@ -29,7 +29,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::jobs_v2::{ConnectorOpKind, DimOpKind};
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use crate::model_plan::param_store::ParamStore;
 use crate::plans::model_plan::blueprint::LayerKind;
 use crate::plans::model_plan::layer_desc::LayerDesc;

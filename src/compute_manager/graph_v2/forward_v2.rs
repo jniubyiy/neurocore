@@ -28,7 +28,7 @@ use crate::compute_manager::jobs_v2::{
     ConnectorDirection, ConnectorOpJob, ConnectorOpKind, DimOpJob, ForwardSegmentJob,
     Job, JobResult,
 };
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::model_plan::param_store::ParamStore;
 
 use super::types_v2::{

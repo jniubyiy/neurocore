@@ -1,7 +1,7 @@
 // src/plans/loss_plan/gpu_exec.rs
 
-use crate::compute_manager::gpu::compute::GpuCompute;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::gpu_v2::compute::GpuCompute;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::losses::{
     ElemCube, Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff,
     CrossEntropyWithLogits,

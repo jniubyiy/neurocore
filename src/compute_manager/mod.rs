@@ -1,33 +1,32 @@
 // src/compute_manager/mod.rs
-
-pub mod device;
-pub mod executor;
-pub mod dim_change;
-pub mod graph;
-pub mod cpu;
-pub mod gpu;
-pub mod memory_executor;
-pub mod matrix_buffer;
-pub mod device_spec;
-
-// Публичные реэкспорты
-pub use device::{Device, DeviceDetector, ComputeManager};
-pub use executor::Executor;
-pub use graph::types::DynamicContext;
-pub use dim_change::DynamicTensor;
-pub use gpu::GpuExecutor;
-pub use matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-
-// ============================================================================
-// Архитектура v2 — основной путь исполнения.
 //
-// Модули подключаются безусловно (этап B). Старый путь
-// (`MixedModel` + `ComputeExecutor` + `graph::forward`/`graph::backward`)
-// удалён на этапе D. Публичные реэкспорты `ComputeExecutor` и
-// `ModelPlacement` вместе с ним убраны из этого файла.
-// ============================================================================
+// Корневой модуль compute_manager после реорганизации.
+//
+// Структура:
+//   * core/           — базовые типы (Device, DeviceSpec, DynamicTensor,
+//                       DynamicContext, Executor);
+//   * jobs_v2/        — словарь заданий (Job/JobResult/...);
+//   * operators_v2/   — три оператора (Memory / CPU / GPU) и всё
+//                       вспомогательное (инфраструктура CPU, GPU, памяти);
+//   * distributor_v2/ — SmartDistributor;
+//   * graph_v2/       — GraphV2 + observer + bridge.
 
+pub mod core;
 pub mod jobs_v2;
 pub mod operators_v2;
 pub mod distributor_v2;
 pub mod graph_v2;
+
+// ---------------------------------------------------------------------------
+// Реэкспорты для обратной совместимости.
+// ---------------------------------------------------------------------------
+
+pub use core::device::{ComputeManager, Device, DeviceDetector};
+pub use core::device_spec::DeviceId;
+pub use core::dim_change::DynamicTensor;
+pub use core::dynamic_context::{ChunkedContexts, DynamicContext};
+pub use core::executor::Executor;
+
+pub use operators_v2::gpu_v2::compute::GpuCompute;
+pub use operators_v2::gpu_v2::GpuExecutor;
+pub use operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};

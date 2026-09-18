@@ -2,9 +2,9 @@
 
 pub mod pipeline;
 
-use crate::compute_manager::gpu::compute::GpuCompute;
-use crate::compute_manager::matrix_buffer::view::MatrixBufferView;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::gpu_v2::compute::GpuCompute;
+use crate::compute_manager::operators_v2::memory_v2::buffer::view::MatrixBufferView;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use vulkano::buffer::Subbuffer;
 
 /// Вспомогательная функция: получает `Subbuffer<[f32]>` из `MatrixBufferView`.

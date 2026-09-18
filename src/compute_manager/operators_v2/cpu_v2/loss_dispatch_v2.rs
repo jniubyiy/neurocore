@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::compute_manager::jobs_v2::{JobResult, LossJob};
-use crate::compute_manager::matrix_buffer::TempMatrixPool;
+use crate::compute_manager::operators_v2::memory_v2::buffer::TempMatrixPool;
 use crate::loss_plan::compute_loss_mat_buffered;
 
 /// Исполняет `LossJob` на CPU.

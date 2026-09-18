@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use crate::compute_manager::device_spec::DeviceSpec;
-use crate::compute_manager::gpu::init::GpuContext;
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::core::device_spec::DeviceSpec;
+use crate::compute_manager::operators_v2::gpu_v2::init::GpuContext;
+use crate::compute_manager::operators_v2::memory_v2::MemoryExecutor;
 
 // ---------------------------------------------------------------------------
 // Устройства (Compute / Storage)
@@ -264,7 +264,7 @@ impl DevicePlan {
         // GPU контекст для первого GPU
         let gpu_ctx = self.compute_devices.iter().find_map(|d| match d {
             ComputeDevice::Gpu { id } => {
-                let ctx = crate::compute_manager::gpu::init::create_gpu_context(*id)
+                let ctx = crate::compute_manager::operators_v2::gpu_v2::init::create_gpu_context(*id)
                     .expect("GPU context creation failed");
                 let ctx = Arc::new(ctx);
 

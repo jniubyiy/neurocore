@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::compute_manager::jobs_v2::{JobResult, OptimizerStepJob};
-use crate::compute_manager::matrix_buffer::TempMatrixPool;
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::operators_v2::memory_v2::buffer::TempMatrixPool;
+use crate::compute_manager::operators_v2::memory_v2::MemoryExecutor;
 use crate::optimizer_plan::OptimizerExpr;
 
 /// Исполняет `OptimizerStepJob`. Состояние оптимизатора хранится в
@@ -41,7 +41,7 @@ pub fn execute_optimizer_step(
         }
     }
 
-    let gpu_ref: Option<&crate::compute_manager::gpu::GpuCompute> =
+    let gpu_ref: Option<&crate::compute_manager::operators_v2::gpu_v2::GpuCompute> =
         job.gpu_compute.as_deref();
 
     let mut map = optimizers.lock().unwrap();

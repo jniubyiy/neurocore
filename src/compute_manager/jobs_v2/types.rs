@@ -28,10 +28,10 @@
 
 use std::sync::Arc;
 
-use crate::compute_manager::graph::types::ChunkedContexts;
-use crate::compute_manager::gpu::GpuCompute;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::core::dynamic_context::ChunkedContexts;
+use crate::compute_manager::operators_v2::gpu_v2::GpuCompute;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use crate::compute_manager::DynamicContext;
 
 use crate::layers::UniversalLayer;

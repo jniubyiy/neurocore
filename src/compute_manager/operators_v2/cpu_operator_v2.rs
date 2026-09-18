@@ -24,12 +24,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use crate::compute_manager::cpu::{ComputeThreadPool, ControlThreadPool, Scheduler};
+use crate::compute_manager::operators_v2::cpu_v2::{ComputeThreadPool, ControlThreadPool, Scheduler};
 use crate::compute_manager::jobs_v2::{
     Job, JobHandle, JobResult, OperatorKind, ParamInitJob,
 };
-use crate::compute_manager::matrix_buffer::TempMatrixPool;
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::operators_v2::memory_v2::buffer::TempMatrixPool;
+use crate::compute_manager::operators_v2::memory_v2::MemoryExecutor;
 use crate::optimizer_plan::OptimizerExpr;
 
 use super::capacity_v2::OperatorCapacity;

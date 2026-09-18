@@ -15,11 +15,11 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::compute_manager::device_spec::DeviceId;
-use crate::compute_manager::gpu::GpuCompute;
+use crate::compute_manager::core::device_spec::DeviceId;
+use crate::compute_manager::operators_v2::gpu_v2::GpuCompute;
 use crate::compute_manager::jobs_v2::OperatorKind;
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::MemoryExecutor;
 
 /// Снимок доступных ресурсов.
 #[derive(Clone)]

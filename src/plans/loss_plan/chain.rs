@@ -5,7 +5,7 @@ use crate::losses::{
     Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff,
     CrossEntropyWithLogits,
 };
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
 
 /// Цепочка элементарных кубиков, выполняющая последовательное преобразование над батчем.
 #[derive(Debug)]

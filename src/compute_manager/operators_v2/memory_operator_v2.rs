@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use crate::compute_manager::jobs_v2::{
     Job, JobHandle, JobKind, JobResult, MigrateJob, OperatorKind,
 };
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::operators_v2::memory_v2::MemoryExecutor;
 
 use super::capacity_v2::OperatorCapacity;
 use super::operator_v2::OperatorV2;

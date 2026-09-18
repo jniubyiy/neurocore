@@ -41,9 +41,9 @@ pub mod per_feature_attention;
 pub mod layers_special;
 pub mod buffered_context;
 
-use crate::compute_manager::graph::types::DynamicContext;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::compute_manager::matrix_buffer::TempMatrixPool;
+use crate::compute_manager::core::dynamic_context::DynamicContext;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::TempMatrixPool;
 use crate::model_plan::param_store::ParamSlice;
 
 // ---------------------------------------------------------------------------

@@ -37,18 +37,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::compute_manager::cpu::cost::CostModel;
-use crate::compute_manager::cpu::hardware::CPU_INFO;
-use crate::compute_manager::cpu::scheduler::Scheduler;
-use crate::compute_manager::cpu::{ComputeThreadPool, ControlThreadPool};
-use crate::compute_manager::device_spec::DeviceId;
-use crate::compute_manager::gpu::compute::GpuCompute;
-use crate::compute_manager::gpu::pipeline::PipelineCache;
+use crate::compute_manager::operators_v2::cpu_v2::cost::CostModel;
+use crate::compute_manager::operators_v2::cpu_v2::hardware::CPU_INFO;
+use crate::compute_manager::operators_v2::cpu_v2::scheduler::Scheduler;
+use crate::compute_manager::operators_v2::cpu_v2::{ComputeThreadPool, ControlThreadPool};
+use crate::compute_manager::core::device_spec::DeviceId;
+use crate::compute_manager::operators_v2::gpu_v2::compute::GpuCompute;
+use crate::compute_manager::operators_v2::gpu_v2::pipeline::PipelineCache;
 use crate::compute_manager::jobs_v2::{
     Job, JobHandle, JobResult, MigrateJob, OperatorKind,
 };
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use crate::compute_manager::operators_v2::{
     CpuOperatorV2, GpuOperatorV2, MemoryOperatorV2, OperatorV2,
 };

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use super::chain::ElementChain;
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
 
 /// Способ агрегирования значений потерь по задачам.
 #[derive(Debug, Clone, Copy)]

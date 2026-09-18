@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
 use super::expr::{Aggregation, LossExpr};
 
 /// Вычисляет значение функции потерь и градиент по предсказанию на CPU с использованием

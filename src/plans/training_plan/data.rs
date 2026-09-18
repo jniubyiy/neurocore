@@ -1,6 +1,6 @@
 // src/training_plan/data.rs
 
-use crate::compute_manager::dim_change::DynamicTensor;
+use crate::compute_manager::core::dim_change::DynamicTensor;
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 use super::plan::DataSource;
 

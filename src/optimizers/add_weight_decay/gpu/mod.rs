@@ -4,7 +4,7 @@ pub mod pipeline;
 
 use vulkano::buffer::Subbuffer;
 
-use crate::compute_manager::gpu::compute::GpuCompute;
+use crate::compute_manager::operators_v2::gpu_v2::compute::GpuCompute;
 
 impl GpuCompute {
     pub fn run_weight_decay(

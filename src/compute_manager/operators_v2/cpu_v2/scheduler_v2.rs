@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::compute_manager::cpu::Scheduler;
+use crate::compute_manager::operators_v2::cpu_v2::Scheduler;
 
 /// Обёртка над `Scheduler`. Держит `Arc<Mutex<Scheduler>>` — тот же
 /// объект может быть разделён с `ComputeThreadPool`.

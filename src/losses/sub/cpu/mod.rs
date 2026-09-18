@@ -1,6 +1,6 @@
 // src/losses/sub/cpu/mod.rs
 
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::losses::BufferedElemCube;
 use crate::losses::sub::Sub;
 

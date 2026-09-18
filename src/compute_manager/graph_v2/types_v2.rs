@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::compute_manager::jobs_v2::{
     ConnectorOpKind, DimOpKind, ForwardContextsV2,
 };
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::layers::UniversalLayer;
 use crate::model_plan::param_store::ParamSlice;
 

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::compute_manager::dim_change::DynamicTensor;
+use crate::compute_manager::core::dim_change::DynamicTensor;
 
 use super::super::profiling::ProfileResult;
 

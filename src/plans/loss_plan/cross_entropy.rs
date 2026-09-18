@@ -3,7 +3,7 @@
 use std::any::Any;
 use super::cubes::ElemCube;
 use super::cubes::BufferedElemCube;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 
 /// Кросс‑энтропия с логитами.
 ///

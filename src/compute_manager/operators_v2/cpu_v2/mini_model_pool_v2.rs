@@ -18,7 +18,7 @@
 // тип-алиас, фиксирующий, что под «пулом mini-model» в v2 понимается
 // ровно `Vec<ForwardTimePredictor>` из `Scheduler`.
 
-use crate::compute_manager::cpu::mini_model::ForwardTimePredictor;
+use crate::compute_manager::operators_v2::cpu_v2::mini_model::ForwardTimePredictor;
 
 /// Тип-алиас, отражающий содержимое `Scheduler::predictors`.
 pub type MiniModelPoolV2 = Vec<ForwardTimePredictor>;

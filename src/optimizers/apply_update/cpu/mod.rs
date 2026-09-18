@@ -2,7 +2,7 @@
 
 use std::any::Any;
 
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::plans::optimizer_plan::cube::OptimizerCube;
 
 use super::super::apply_update::ApplyUpdate;

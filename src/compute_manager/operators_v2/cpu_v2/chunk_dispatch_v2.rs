@@ -17,17 +17,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::compute_manager::cpu::parallel::{
+use super::parallel::{
     backward_universal_parallel, can_parallelize, forward_universal_parallel,
 };
-use crate::compute_manager::dim_change;
-use crate::compute_manager::executor::Executor;
-use crate::compute_manager::graph::types::{ChunkedContexts, DynamicContext};
+use crate::compute_manager::core::dim_change;
+use crate::compute_manager::core::executor::Executor;
+use crate::compute_manager::core::dynamic_context::{ChunkedContexts, DynamicContext};
 use crate::compute_manager::jobs_v2::{
     BackwardSegmentJob, ConnectorDirection, ConnectorOpJob, ConnectorOpKind,
     DimOpJob, DimOpKind, ForwardContextsV2, ForwardSegmentJob, JobResult,
 };
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::layers::{
     BufferedContext, UniversalLayer, UniversalLayerBuffered,
     Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,

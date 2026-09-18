@@ -1,6 +1,6 @@
 // src/layers/buffered_context.rs
 
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 
 #[derive(Clone)]
 pub struct CpuLinearAttentionHead {

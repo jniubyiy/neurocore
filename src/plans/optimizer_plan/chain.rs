@@ -1,7 +1,7 @@
 // src/plans/optimizer_plan/chain.rs
 
 use super::cube::OptimizerCube;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 
 /// Цепочка кубиков оптимизации.
 ///

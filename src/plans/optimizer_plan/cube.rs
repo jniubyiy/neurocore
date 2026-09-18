@@ -1,7 +1,7 @@
 // src/plans/optimizer_plan/cube.rs
 
 use std::any::Any;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 
 /// Атомарный блок оптимизации.
 ///

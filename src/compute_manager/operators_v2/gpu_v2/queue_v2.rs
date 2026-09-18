@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 
-use crate::compute_manager::gpu::GpuCompute;
+use crate::compute_manager::operators_v2::gpu_v2::GpuCompute;
 use crate::compute_manager::jobs_v2::{Job, JobResult};
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::operators_v2::memory_v2::MemoryExecutor;
 
 const GPU_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 
@@ -122,7 +122,7 @@ fn execute_gpu_job(
     gpu: &Arc<GpuCompute>,
     job: Job,
 ) -> JobResult {
-    use crate::compute_manager::gpu::processor::{
+    use crate::compute_manager::operators_v2::gpu_v2::processor::{
         process_backward_gpu_buffered, process_forward_gpu_buffered,
     };
     use crate::compute_manager::jobs_v2::ForwardContextsV2;

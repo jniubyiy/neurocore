@@ -2,10 +2,10 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::compute_manager::memory_executor::executor::MemoryExecutor;
-use crate::compute_manager::memory_executor::policy::BufferPriority;
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::executor::MemoryExecutor;
+use crate::compute_manager::operators_v2::memory_v2::policy::BufferPriority;
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 
 use super::param_buffer::ParamBuffer;
 use super::slice::ParamSlice;

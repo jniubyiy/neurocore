@@ -15,8 +15,8 @@
 //   * индексирован по сегментам (в графе v2 сегмент = единица размещения).
 
 use crate::compute_manager::jobs_v2::OperatorKind;
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 
 use super::strategy;
 use super::topology::TopologySnapshot;

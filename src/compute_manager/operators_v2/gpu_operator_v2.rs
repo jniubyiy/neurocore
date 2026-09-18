@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use crate::compute_manager::gpu::GpuCompute;
+use crate::compute_manager::operators_v2::gpu_v2::GpuCompute;
 use crate::compute_manager::jobs_v2::{
     Job, JobHandle, JobResult, OperatorKind,
 };
-use crate::compute_manager::memory_executor::MemoryExecutor;
+use crate::compute_manager::operators_v2::memory_v2::MemoryExecutor;
 
 use super::capacity_v2::OperatorCapacity;
 use super::gpu_v2::queue_v2::{GpuQueueV2, GpuTaskMessage};

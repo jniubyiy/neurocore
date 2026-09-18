@@ -39,15 +39,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::compute_manager::dim_change::DynamicTensor;
+use crate::compute_manager::core::dim_change::DynamicTensor;
 use crate::compute_manager::distributor_v2::{
     SegmentTopologyInfo, SmartDistributor,
 };
 use crate::compute_manager::jobs_v2::{
     Job, JobResult, LossJob, OptimizerStepJob, ParamInitJob,
 };
-use crate::compute_manager::matrix_buffer::{MatrixBufferHandle, TempMatrixPool};
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use crate::device_plan::DevicePlan;
 use crate::loss_plan::desc::LossDesc;
 use crate::model_plan::layer_desc::LayerDesc;

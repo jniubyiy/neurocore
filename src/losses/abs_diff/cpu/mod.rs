@@ -1,6 +1,6 @@
 // src/losses/abs_diff/cpu/mod.rs
 
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::losses::BufferedElemCube;
 use crate::losses::abs_diff::AbsDiff;
 

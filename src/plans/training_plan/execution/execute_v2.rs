@@ -32,9 +32,9 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 
-use crate::compute_manager::dim_change::DynamicTensor;
+use crate::compute_manager::core::dim_change::DynamicTensor;
 use crate::compute_manager::graph_v2::{bridge_v2, GraphV2};
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use crate::device_plan::DevicePlan;
 use crate::logging::training_monitor::TrainingMonitor;
 use crate::tensor::Tensor2D;

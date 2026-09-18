@@ -1,7 +1,7 @@
 // src/plans/model_plan/param_store/param_buffer.rs
 
-use crate::compute_manager::matrix_buffer::MatrixBufferHandle;
-use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
+use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
+use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use std::fmt;
 
 /// Контейнер параметров одного сегмента модели.

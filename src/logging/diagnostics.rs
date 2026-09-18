@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
-use crate::compute_manager::device_spec::DeviceId;
-use crate::compute_manager::memory_executor::MatrixBufferId;
-use crate::compute_manager::graph::types::Model;
+use crate::compute_manager::core::device_spec::DeviceId;
+use crate::compute_manager::operators_v2::memory_v2::MatrixBufferId;
+use crate::compute_manager::core::dynamic_context::Model;
 
 /// Статистика по параметрам модели или градиентам
 #[derive(Debug, Clone)]

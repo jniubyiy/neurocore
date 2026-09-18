@@ -9,13 +9,12 @@
 //   * forward_v2.rs  — forward через SmartDistributor;
 //   * backward_v2.rs — backward через SmartDistributor;
 //   * observer_v2.rs — GraphObserverV2, EpochReportV2, MonitorConfigV2;
-//   * bridge_v2.rs   — канонические per-layer инициализации (адаптер
-//                      к v1-логике `build_layer_aware_overrides`).
+//   * bridge_v2.rs   — канонические per-layer инициализации.
 //
-// Модуль изолирован фичей `v2` (см. `src/compute_manager/mod.rs`) и
-// подключается к основному пути только на финальном этапе миграции.
+// После этапа B модуль подключается к crate безусловно и является
+// основным путём исполнения обучения.
 
-#![cfg_attr(feature = "v2", allow(dead_code, unused_imports))]
+#![allow(dead_code, unused_imports)]
 
 pub mod types_v2;
 pub mod builder_v2;

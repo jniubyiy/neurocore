@@ -30,8 +30,8 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
 ///   forward_step × seq_len  (две фазы: h_t, y_t)
 ///
 /// Backward (Rust-цикл по t в обратную сторону):
-///   bwd_dh_t → bwd_grad_A_bar (если t > 0) → bwd_grad_B_bar
-///            → bwd_grad_C → bwd_grad_D → bwd_grad_input
+///   bwd_dh_t → bwd_grad_a_bar (если t > 0) → bwd_grad_b_bar
+///            → bwd_grad_c → bwd_grad_d → bwd_grad_input
 ///
 /// Convert (один вызов):
 ///   convert_grads
@@ -47,10 +47,10 @@ pub struct MambaPipelines {
 
     // Backward
     pub bwd_dh_t: Arc<ComputePipeline>,
-    pub bwd_grad_A_bar: Arc<ComputePipeline>,
-    pub bwd_grad_B_bar: Arc<ComputePipeline>,
-    pub bwd_grad_C: Arc<ComputePipeline>,
-    pub bwd_grad_D: Arc<ComputePipeline>,
+    pub bwd_grad_a_bar: Arc<ComputePipeline>,
+    pub bwd_grad_b_bar: Arc<ComputePipeline>,
+    pub bwd_grad_c: Arc<ComputePipeline>,
+    pub bwd_grad_d: Arc<ComputePipeline>,
     pub bwd_grad_input: Arc<ComputePipeline>,
 
     // Convert
@@ -65,10 +65,10 @@ impl MambaPipelines {
         let disc_scale_bytes = include_bytes!("vulkan/shaders/mamba_discretize_scale_b.spv");
         let fwd_step_bytes   = include_bytes!("vulkan/shaders/mamba_fwd_step.spv");
         let bwd_dh_t_bytes   = include_bytes!("vulkan/shaders/mamba_bwd_dh_t.spv");
-        let bwd_gA_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_A_bar.spv");
-        let bwd_gB_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_B_bar.spv");
-        let bwd_gC_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_C.spv");
-        let bwd_gD_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_D.spv");
+        let bwd_ga_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_A_bar.spv");
+        let bwd_gb_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_B_bar.spv");
+        let bwd_gc_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_C.spv");
+        let bwd_gd_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_D.spv");
         let bwd_gi_bytes     = include_bytes!("vulkan/shaders/mamba_bwd_grad_input.spv");
         let conv_bytes       = include_bytes!("vulkan/shaders/mamba_convert_grads.spv");
 
@@ -78,10 +78,10 @@ impl MambaPipelines {
         let disc_scale_spv = as_u32_slice(disc_scale_bytes);
         let fwd_step_spv   = as_u32_slice(fwd_step_bytes);
         let bwd_dh_t_spv   = as_u32_slice(bwd_dh_t_bytes);
-        let bwd_gA_spv     = as_u32_slice(bwd_gA_bytes);
-        let bwd_gB_spv     = as_u32_slice(bwd_gB_bytes);
-        let bwd_gC_spv     = as_u32_slice(bwd_gC_bytes);
-        let bwd_gD_spv     = as_u32_slice(bwd_gD_bytes);
+        let bwd_ga_spv     = as_u32_slice(bwd_ga_bytes);
+        let bwd_gb_spv     = as_u32_slice(bwd_gb_bytes);
+        let bwd_gc_spv     = as_u32_slice(bwd_gc_bytes);
+        let bwd_gd_spv     = as_u32_slice(bwd_gd_bytes);
         let bwd_gi_spv     = as_u32_slice(bwd_gi_bytes);
         let conv_spv       = as_u32_slice(conv_bytes);
 
@@ -169,14 +169,14 @@ impl MambaPipelines {
         // push = [batch,d,n,seq,t] (20 байт)
         let bwd_dh_t =
             build(device.clone(), bwd_dh_t_spv, 5, 20, "Mamba bwd_dh_t");
-        let bwd_grad_A_bar =
-            build(device.clone(), bwd_gA_spv, 3, 20, "Mamba bwd_grad_A_bar");
-        let bwd_grad_B_bar =
-            build(device.clone(), bwd_gB_spv, 3, 20, "Mamba bwd_grad_B_bar");
-        let bwd_grad_C =
-            build(device.clone(), bwd_gC_spv, 3, 20, "Mamba bwd_grad_C");
-        let bwd_grad_D =
-            build(device.clone(), bwd_gD_spv, 3, 20, "Mamba bwd_grad_D");
+        let bwd_grad_a_bar =
+            build(device.clone(), bwd_ga_spv, 3, 20, "Mamba bwd_grad_a_bar");
+        let bwd_grad_b_bar =
+            build(device.clone(), bwd_gb_spv, 3, 20, "Mamba bwd_grad_b_bar");
+        let bwd_grad_c =
+            build(device.clone(), bwd_gc_spv, 3, 20, "Mamba bwd_grad_c");
+        let bwd_grad_d =
+            build(device.clone(), bwd_gd_spv, 3, 20, "Mamba bwd_grad_d");
         let bwd_grad_input =
             build(device.clone(), bwd_gi_spv, 5, 20, "Mamba bwd_grad_input");
 
@@ -191,10 +191,10 @@ impl MambaPipelines {
             discretize_scale_b,
             forward_step,
             bwd_dh_t,
-            bwd_grad_A_bar,
-            bwd_grad_B_bar,
-            bwd_grad_C,
-            bwd_grad_D,
+            bwd_grad_a_bar,
+            bwd_grad_b_bar,
+            bwd_grad_c,
+            bwd_grad_d,
             bwd_grad_input,
             convert_grads,
         }

@@ -380,7 +380,7 @@ impl GpuCompute {
             // 2. grad_A_bar (только t > 0).
             if t > 0 {
                 self.run_compute_shader(
-                    &pipelines.bwd_grad_A_bar,
+                    &pipelines.bwd_grad_a_bar,
                     &[
                         (0, current_delta_out.clone()),
                         (1, h_buf.clone()),
@@ -393,7 +393,7 @@ impl GpuCompute {
 
             // 3. grad_B_bar.
             self.run_compute_shader(
-                &pipelines.bwd_grad_B_bar,
+                &pipelines.bwd_grad_b_bar,
                 &[
                     (0, current_delta_out.clone()),
                     (1, in_buf.clone()),
@@ -405,7 +405,7 @@ impl GpuCompute {
 
             // 4. grad_C.
             self.run_compute_shader(
-                &pipelines.bwd_grad_C,
+                &pipelines.bwd_grad_c,
                 &[
                     (0, go_buf.clone()),
                     (1, h_buf.clone()),
@@ -417,7 +417,7 @@ impl GpuCompute {
 
             // 5. grad_D.
             self.run_compute_shader(
-                &pipelines.bwd_grad_D,
+                &pipelines.bwd_grad_d,
                 &[
                     (0, go_buf.clone()),
                     (1, in_buf.clone()),

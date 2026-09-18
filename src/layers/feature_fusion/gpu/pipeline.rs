@@ -28,7 +28,7 @@ fn as_u32_slice(bytes: &[u8]) -> &[u32] {
 /// Конвейер обратного прохода:
 ///   backward: softmax  →  grad_input
 ///                      →  grad_params (логиты + накопление dot_ldz)
-///                      →  grad_T (финализация градиента по температуре)
+///                      →  grad_t (финализация градиента по температуре)
 ///
 /// `softmax` переиспользуется в forward и backward — softmax логитов
 /// одинаков в обе стороны.
@@ -41,8 +41,8 @@ pub struct FeatureFusionPipelines {
     pub grad_input: Arc<ComputePipeline>,
     /// Обратный проход: grad_logits + накопление dot_ldz.
     pub grad_params: Arc<ComputePipeline>,
-    /// Обратный проход: финализация grad_T_raw.
-    pub grad_T: Arc<ComputePipeline>,
+    /// Обратный проход: финализация grad_t_raw.
+    pub grad_t: Arc<ComputePipeline>,
 }
 
 impl FeatureFusionPipelines {
@@ -51,13 +51,13 @@ impl FeatureFusionPipelines {
         let output_bytes       = include_bytes!("vulkan/shaders/feature_fusion_output.spv");
         let grad_in_bytes      = include_bytes!("vulkan/shaders/feature_fusion_grad_input.spv");
         let grad_params_bytes  = include_bytes!("vulkan/shaders/feature_fusion_grad_params.spv");
-        let grad_T_bytes       = include_bytes!("vulkan/shaders/feature_fusion_grad_T.spv");
+        let grad_t_bytes       = include_bytes!("vulkan/shaders/feature_fusion_grad_T.spv");
 
         let softmax_spv     = as_u32_slice(softmax_bytes);
         let output_spv      = as_u32_slice(output_bytes);
         let grad_in_spv     = as_u32_slice(grad_in_bytes);
         let grad_params_spv = as_u32_slice(grad_params_bytes);
-        let grad_T_spv      = as_u32_slice(grad_T_bytes);
+        let grad_t_spv      = as_u32_slice(grad_t_bytes);
 
         fn create_ds_layout(device: Arc<Device>, n: u32) -> Arc<DescriptorSetLayout> {
             let mut bindings = std::collections::BTreeMap::new();
@@ -135,15 +135,15 @@ impl FeatureFusionPipelines {
         //              push = [batch, in, out] (12 байт).
         let grad_params = build(device.clone(), grad_params_spv, 6, 12, "FeatureFusion grad_params");
 
-        // grad_T: 3 буфера (params, dot_ldz, grad_params), push = [out, in] (8 байт).
-        let grad_T = build(device.clone(), grad_T_spv, 3, 8, "FeatureFusion grad_T");
+        // grad_t: 3 буфера (params, dot_ldz, grad_params), push = [out, in] (8 байт).
+        let grad_t = build(device.clone(), grad_t_spv, 3, 8, "FeatureFusion grad_t");
 
         Self {
             softmax,
             output,
             grad_input,
             grad_params,
-            grad_T,
+            grad_t,
         }
     }
 }

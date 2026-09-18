@@ -13,7 +13,7 @@
 // `CpuOperatorV2`, а функции подмодулей получают нужные дескрипторы
 // аргументами.
 
-#![cfg_attr(feature = "v2", allow(dead_code, unused_imports))]
+#![allow(dead_code, unused_imports)]
 
 pub mod scheduler_v2;
 pub mod mini_model_pool_v2;

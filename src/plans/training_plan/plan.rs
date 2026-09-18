@@ -1,11 +1,10 @@
-// src/training_plan/plan.rs
+// src/plans/training_plan/plan.rs
 
 use crate::loss_plan::desc::LossDesc;
 use crate::model_plan::layer_desc::LayerDesc;
 use crate::optimizer_plan::OptimizerDesc;
 use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 use crate::logging::training_monitor::MonitorConfig;
-use crate::device_plan::DevicePlan;
 use super::profiling::ProfileMode;
 
 #[derive(Debug, Clone)]
@@ -195,17 +194,6 @@ impl TrainingPlan {
         self.monitoring = true;
         self.monitor_config = config;
         self
-    }
-
-    /// Строит модель по текущему плану, используя переданный план устройств.
-    /// Это единственный публичный способ получить модель.
-    pub fn build_model(&self, device_plan: DevicePlan) -> crate::compute_manager::graph::model::MixedModel {
-        let model_desc = (self.model_fn)();
-        crate::compute_manager::graph::model::MixedModel::from_plan_with_device_plan(
-            model_desc,
-            device_plan,
-        )
-        .expect("Failed to build model from training plan")
     }
 
     // ── Методы для множественных потоков (задел на будущее) ──

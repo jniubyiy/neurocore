@@ -2,9 +2,6 @@
 
 use super::layer_desc::LayerDesc;
 use super::blueprint::LayerKind;
-use crate::compute_manager::device::Device;
-use crate::device_plan::DevicePlan;
-use crate::compute_manager::graph::model::MixedModel;
 
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -173,29 +170,6 @@ impl Plan {
         }
 
         Ok(Plan { layers: descs })
-    }
-
-    /// Собрать модель с указанным количеством потоков CPU (обратная совместимость).
-    pub fn build_with_threads(&self, threads: usize) -> MixedModel {
-        MixedModel::from_plan(self.layers.clone(), threads)
-            .expect("Plan уже проверен")
-    }
-
-    /// Собрать модель на CPU с одним потоком (по умолчанию).
-    pub fn build(&self) -> MixedModel {
-        self.build_with_device(Device::Cpu { threads: 1 })
-    }
-
-    /// Собрать модель, явно указав целевое устройство.
-    pub fn build_with_device(&self, device: Device) -> MixedModel {
-        MixedModel::from_plan_with_device(self.layers.clone(), 1, device)
-            .expect("Plan уже проверен")
-    }
-
-    /// Собрать модель с детализированным планом устройств (разделение Compute/Storage).
-    pub fn build_with_device_plan(&self, device_plan: DevicePlan) -> MixedModel {
-        MixedModel::from_plan_with_device_plan(self.layers.clone(), device_plan)
-            .expect("Plan уже проверен")
     }
 
     /// Размерность входа (первый поток первого слоя).

@@ -17,7 +17,6 @@ impl UniversalLayerBuffered for LearnableMish {
         slice: &ParamSlice,
         _pool: &mut TempMatrixPool,
     ) -> BufferedContext {
-        let rows = input.rows();
         let cols = input.cols();
         debug_assert_eq!(cols, self.features);
         debug_assert!(

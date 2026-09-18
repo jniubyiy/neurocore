@@ -14,10 +14,9 @@
 //   * gpu_operator_v2.rs      — GpuOperatorV2 (асинхронный, свой GPU-тред)
 //   * gpu_v2/                 — gpu-подмодули (queue)
 //
-// Модуль изолирован фичей `v2` (см. `src/compute_manager/mod.rs`) и
-// подключается к основному пути только на финальном этапе миграции.
+// После этапа B модуль подключается к crate безусловно.
 
-#![cfg_attr(feature = "v2", allow(dead_code, unused_imports))]
+#![allow(dead_code, unused_imports)]
 
 pub mod operator_v2;
 pub mod capacity_v2;

@@ -14,10 +14,9 @@
 //   * executor.rs — SmartDistributor: dispatch / dispatch_batch /
 //                   ensure_local / on_epoch_boundary.
 //
-// Модуль изолирован фичей `v2` (см. `src/compute_manager/mod.rs`) и
-// подключается к основному пути только на финальном этапе миграции.
+// После этапа B модуль подключается к crate безусловно.
 
-#![cfg_attr(feature = "v2", allow(dead_code, unused_imports))]
+#![allow(dead_code, unused_imports)]
 
 pub mod topology;
 pub mod strategy;

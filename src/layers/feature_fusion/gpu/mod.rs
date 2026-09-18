@@ -86,7 +86,7 @@ impl GpuCompute {
     ///   1. softmax логитов (тот же шейдер, что и в forward);
     ///   2. gi = go · weights;
     ///   3. grad_logits и накопление dot_ldz (атомарное);
-    ///   4. финализация grad_T_raw через dot_ldz.
+    ///   4. финализация grad_t_raw через dot_ldz.
     ///
     /// `dot_ldz` — временный буфер длины `out_features`, обнуляется
     /// перед запуском.
@@ -184,17 +184,17 @@ impl GpuCompute {
             out_features * in_features,
         );
 
-        // 4. Финализация grad_T_raw через dot_ldz.
-        let grad_T_pipeline = &self.feature_fusion_pipelines().grad_T;
-        let push_T = [out_features as u32, in_features as u32];
+        // 4. Финализация grad_t_raw через dot_ldz.
+        let grad_t_pipeline = &self.feature_fusion_pipelines().grad_t;
+        let push_t = [out_features as u32, in_features as u32];
         self.run_compute_shader(
-            grad_T_pipeline,
+            grad_t_pipeline,
             &[
                 (0, params_buf),
                 (1, dot_ldz_buf.clone()),
                 (2, grad_params_buf),
             ],
-            &push_T,
+            &push_t,
             out_features,
         );
 

@@ -25,15 +25,25 @@
 // Не знает:
 //   * про потоки, scheduler, mini-model;
 //   * про граф, слои, лоссы, оптимизаторы.
+//
+// # История
+//
+// До этапа A в `new` использовался `ComputeExecutor` (v1-модуль) — только
+// чтобы получить `GpuCompute` и посчитать `cpu_threads`. Это была
+// единственная v2→v1 зависимость. Теперь `GpuCompute` строится
+// напрямую из `GpuContext`, зарегистрированного в `MemoryExecutor`
+// (регистрация — внутри `DevicePlan::build_memory_executor`), а число
+// CPU-потоков считается здесь же, суммируя `threads` у `ComputeDevice::Cpu`.
 
 use std::sync::{Arc, Mutex};
 
-use crate::compute_manager::compute_executor::ComputeExecutor;
 use crate::compute_manager::cpu::cost::CostModel;
 use crate::compute_manager::cpu::hardware::CPU_INFO;
 use crate::compute_manager::cpu::scheduler::Scheduler;
 use crate::compute_manager::cpu::{ComputeThreadPool, ControlThreadPool};
-use crate::compute_manager::gpu::GpuCompute;
+use crate::compute_manager::device_spec::DeviceId;
+use crate::compute_manager::gpu::compute::GpuCompute;
+use crate::compute_manager::gpu::pipeline::PipelineCache;
 use crate::compute_manager::jobs_v2::{
     Job, JobHandle, JobResult, MigrateJob, OperatorKind,
 };
@@ -42,7 +52,7 @@ use crate::compute_manager::memory_executor::types::MemoryDeviceKind;
 use crate::compute_manager::operators_v2::{
     CpuOperatorV2, GpuOperatorV2, MemoryOperatorV2, OperatorV2,
 };
-use crate::device_plan::DevicePlan;
+use crate::device_plan::{ComputeDevice, DevicePlan};
 
 use super::plan::{DistributionPlan, SegmentTopologyInfo};
 use super::strategy;
@@ -75,21 +85,68 @@ pub struct SmartDistributor {
 impl SmartDistributor {
     /// Создаёт распределитель на основе `DevicePlan`.
     pub fn new(device_plan: &DevicePlan) -> Result<Self, String> {
-        // 1. MemoryExecutor
-        let (memory_executor, _gpu_ctx) = device_plan.build_memory_executor();
+        // 1. MemoryExecutor.
+        //
+        //    build_memory_executor регистрирует в нём все RAM/SSD/VRAM и,
+        //    если в плане есть GPU, кладёт готовый `GpuContext` в
+        //    `memory_executor.gpu_contexts[DeviceId(id)]`.
+        let (memory_executor, _gpu_ctx_from_plan) =
+            device_plan.build_memory_executor();
 
-        // 2. ComputeExecutor — только чтобы получить GpuCompute
-        let compute_executor = Arc::new(
-            ComputeExecutor::new(device_plan.clone(), memory_executor.clone())
-                .map_err(|e| format!("SmartDistributor::new: ComputeExecutor: {}", e))?,
-        );
-        let gpu_compute: Option<Arc<GpuCompute>> = compute_executor.gpu_compute();
+        // 2. GpuCompute — напрямую, без ComputeExecutor.
+        //
+        //    Берём GpuContext из MemoryExecutor по тому же DeviceId,
+        //    под которым он был зарегистрирован. PipelineCache и
+        //    сам GpuCompute строятся здесь же. Если в плане GPU нет —
+        //    gpu_compute остаётся None, gpu_op будет None.
+        let gpu_compute: Option<Arc<GpuCompute>> = {
+            let mut found: Option<Arc<GpuCompute>> = None;
+            for d in &device_plan.compute_devices {
+                if let ComputeDevice::Gpu { id } = d {
+                    let ctx = {
+                        let mem = memory_executor.read().unwrap();
+                        mem.gpu_context(DeviceId(*id)).cloned()
+                    };
+                    let ctx = ctx.ok_or_else(|| {
+                        format!(
+                            "SmartDistributor::new: GPU context for id {} \
+                             not registered in MemoryExecutor. \
+                             This means DevicePlan::build_memory_executor \
+                             did not register it.",
+                            id
+                        )
+                    })?;
+                    let pipeline_cache =
+                        Arc::new(PipelineCache::new(ctx.device.clone()));
+                    found = Some(Arc::new(GpuCompute::new(
+                        ctx,
+                        pipeline_cache,
+                        memory_executor.clone(),
+                        DeviceId(*id),
+                    )));
+                    break;
+                }
+            }
+            found
+        };
 
         let has_gpu = gpu_compute.is_some();
         let gpu_device_id = gpu_compute.as_ref().map(|gc| gc.gpu_device_id.0);
 
-        // 3. Потоки
-        let total_cpu_threads = compute_executor.cpu_threads();
+        // 3. Число CPU-потоков — прямая сумма `threads` у CPU-устройств.
+        //
+        //    Раньше это делал ComputeExecutor::cpu_threads; в v2 он не
+        //    нужен ни для чего другого, поэтому инлайним.
+        let total_cpu_threads: usize = device_plan
+            .compute_devices
+            .iter()
+            .filter_map(|d| match d {
+                ComputeDevice::Cpu { threads, .. } => Some(*threads),
+                _ => None,
+            })
+            .sum::<usize>()
+            .max(1);
+
         let (control_threads, compute_threads) =
             split_cpu_threads(total_cpu_threads, has_gpu);
 
@@ -105,13 +162,15 @@ impl SmartDistributor {
             .unwrap()
             .set_num_workers(compute_threads);
 
-        let compute_pool = ComputeThreadPool::new(compute_threads, scheduler.clone());
+        let compute_pool =
+            ComputeThreadPool::new(compute_threads, scheduler.clone());
         let control_pool = ControlThreadPool::new(control_threads);
 
-        // 4. TempMatrixPool
-        let temp_pool = Arc::new(Mutex::new(TempMatrixPool::new(memory_executor.clone())));
+        // 4. TempMatrixPool.
+        let temp_pool =
+            Arc::new(Mutex::new(TempMatrixPool::new(memory_executor.clone())));
 
-        // 5. Операторы
+        // 5. Операторы.
         let memory_op = Arc::new(MemoryOperatorV2::new(memory_executor.clone()));
         let cpu_op = Arc::new(CpuOperatorV2::new(
             scheduler,
@@ -124,7 +183,7 @@ impl SmartDistributor {
             .as_ref()
             .map(|gc| Arc::new(GpuOperatorV2::new(gc.clone(), memory_executor.clone())));
 
-        // 6. Снимок и пустой план
+        // 6. Снимок топологии и пустой план.
         let snapshot = TopologySnapshot {
             has_gpu,
             gpu_device_id,

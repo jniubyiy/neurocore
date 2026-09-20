@@ -6,7 +6,7 @@ use crate::losses::{
     ElemCube, Sub, Square, SumColumns, Log, Neg, Mul, Abs, AddScalar, Log1p, AbsDiff,
     CrossEntropyWithLogits,
 };
-use super::expr::{Aggregation, LossExpr};
+use super::expr::LossExpr;
 
 /// Вычисляет значение функции потерь и градиент по pred на GPU.
 /// Все промежуточные операции выполняются на GPU, без CPU‑fallback.
@@ -75,10 +75,24 @@ pub fn compute_loss_gpu_buffered_handle(
     let loss = expr.aggregate_loss(&loss_vec);
 
     // ---------------- Обратный проход ----------------
-    let grad_scale = match expr.aggregation() {
-        Aggregation::Sum => 1.0f32,
-        Aggregation::Mean => 1.0f32 / batch as f32,
-    };
+    // ========================================================================
+    // ФАЗА 0 (MIGRATION_PLAN.md §7): Loss больше не масштабирует градиент.
+    //
+    // Инвариант I-2: Loss отдаёт Σ_r g_r (сырой Sum) без каких-либо
+    // множителей. Aggregation::Mean влияет ТОЛЬКО на отображаемое значение
+    // loss (см. LossExpr::aggregate_loss), но не на градиент.
+    //
+    // Ранее здесь было:
+    //     Aggregation::Sum  => grad_scale = 1.0
+    //     Aggregation::Mean => grad_scale = 1.0 / batch
+    // Это давало разный эффективный шаг SGD для разных батчей и ослабляло
+    // обучение в B раз при Mean. Теперь grad_scale всегда 1.0, независимо
+    // от агрегации.
+    //
+    // Пользовательские lr в примерах с Aggregation::Mean и batch > 1
+    // могут требовать пересчёта — это отдельная задача ФАЗА 0.1.
+    // ========================================================================
+    let grad_scale = 1.0f32;
     let mut grad = gpu.allocate_gpu_matrix_handle(batch, 1);
     gpu.fill_gpu_handle(&grad, grad_scale);
 

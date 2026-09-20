@@ -89,7 +89,27 @@ pub enum SegmentForwardStateV2 {
 ///
 /// Хранит:
 ///   * для каждого сегмента — его собственные state'ы (для backward);
-///   * финальный выходной handle (для сверки / отладки).
+///   * финальный выходной handle (для сверки / отладки);
+///   * размер батча текущего forward-прохода.
+///
+/// # Время жизни (MIGRATION_PLAN.md §7, Фаза 4)
+///
+/// Начиная с Фазы 4 кэш живёт **до конца шага оптимизатора**, а не
+/// до конца backward:
+///
+/// ```text
+/// forward                     → cache создан
+/// loss                        → cache жив
+/// backward                    → cache жив (использован)
+/// optimizer_modify_grads      → cache жив
+/// adapter_pass                → cache читается (для forward_ctx адаптеров)
+/// optimizer_apply_update      → cache очищается
+/// ```
+///
+/// Это позволяет `adapter_pass` передавать в адаптеры forward-state
+/// слоёв (`AdapterContext::forward_ctx`), не сохраняя его отдельно.
+/// Кэш очищается в конце `optimizer_apply_update` — то есть один
+/// шаг обучения = один cache.
 #[derive(Clone)]
 pub struct ForwardCacheV2 {
     /// Состояния сегментов (индекс = index сегмента в графе).
@@ -97,6 +117,14 @@ pub struct ForwardCacheV2 {
 
     /// Буфер выхода (последний результат forward).
     pub output: MatrixBufferHandle,
+
+    /// Размер батча текущего forward-прохода.
+    ///
+    /// Нужен `adapter_pass`: `AdapterContext::batch` заполняется этим
+    /// значением. Раньше (до Фазы 4) batch не сохранялся — он брался
+    /// прямо из `input.rows()` в момент forward. Теперь его надо
+    /// «пронести» через весь шаг обучения, поэтому он кладётся в кэш.
+    pub batch: usize,
 }
 
 impl ForwardCacheV2 {

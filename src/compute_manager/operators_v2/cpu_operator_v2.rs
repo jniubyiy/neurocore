@@ -19,6 +19,13 @@
 //   * что за граф его дёргает.
 //
 // Про синхронность submit: см. комментарий ниже.
+//
+// # Фазы оптимизатора (MIGRATION_PLAN.md §7, инвариант I-1)
+//
+// Шаг оптимизатора разделён на два job'а:
+//   * `OptimizerModifyGrads` — модификация градиента;
+//   * `OptimizerApplyUpdate` — обновление параметров.
+// Между ними в графе вклинивается `adapter_pass` (Фаза 4 плана).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,7 +87,13 @@ impl CpuOperatorInner {
                 chunk_dispatch_v2::execute_connector(c, Arc::clone(&self.pool))
             }
             Job::Loss(l) => loss_dispatch_v2::execute_loss(l, Arc::clone(&self.pool)),
-            Job::OptimizerStep(o) => opt_dispatch_v2::execute_optimizer_step(
+            Job::OptimizerModifyGrads(o) => opt_dispatch_v2::execute_optimizer_modify_grads(
+                o,
+                Arc::clone(&self.memory_executor),
+                Arc::clone(&self.pool),
+                Arc::clone(&self.optimizers),
+            ),
+            Job::OptimizerApplyUpdate(o) => opt_dispatch_v2::execute_optimizer_apply_update(
                 o,
                 Arc::clone(&self.memory_executor),
                 Arc::clone(&self.pool),

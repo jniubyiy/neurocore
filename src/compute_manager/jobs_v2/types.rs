@@ -56,8 +56,15 @@ pub enum JobKind {
     BackwardSegment,
     /// Вычисление функции потерь и градиента по pred.
     Loss,
-    /// Шаг оптимизатора по одному ParamBuffer.
-    OptimizerStep,
+    /// Фаза 1 оптимизации: модификация градиента (lr, momentum, adam, clip,
+    /// weight_decay). Не обновляет параметры.
+    ///
+    /// Инвариант I-1 (MIGRATION_PLAN.md §2): обязательно предшествует
+    /// `OptimizerApplyUpdate` и `AdapterPass`.
+    OptimizerModifyGrads,
+    /// Фаза 2 оптимизации: обновление параметров (`params -= grads`).
+    /// Не модифицирует градиент.
+    OptimizerApplyUpdate,
     /// Изменение размерности (Unsqueeze / ReduceMean).
     DimOp,
     /// Операция коннектора (Splitter / Combiner).
@@ -186,11 +193,46 @@ pub struct LossJob {
     pub target: MatrixBufferHandle,
 }
 
-/// Один шаг оптимизатора по буферу параметров одного сегмента.
-pub struct OptimizerStepJob {
+/// Фаза 1 оптимизации: модификация градиента.
+///
+/// Применяет все кубики цепочки, кроме `ApplyUpdate`:
+/// `ScaleGradient`, `AddWeightDecay`, `GradientClip`, `Momentum`,
+/// `NesterovMomentum`, `Adam`.
+///
+/// # Инвариант I-1 (MIGRATION_PLAN.md §2)
+///
+/// Эта фаза НЕ обновляет параметры. `params` здесь — только для чтения
+/// (например, `AddWeightDecay` читает их для расчёта вклада в градиент).
+/// Обновление параметров — исключительная ответственность
+/// `OptimizerApplyUpdate`.
+pub struct OptimizerModifyGradsJob {
     /// Индекс буфера в `ParamStore`.
     pub buffer_idx: usize,
     /// Буфер параметров.
+    pub params: MatrixBufferHandle,
+    /// Буфер градиентов (in-place модифицируется этой фазой).
+    pub grads: MatrixBufferHandle,
+    /// Описание оптимизатора.
+    pub optimizer: OptimizerDesc,
+    /// Ссылка на `GpuCompute` — заполняется распределителем только если
+    /// `params.is_gpu()` или `grads.is_gpu()`. Иначе `None`.
+    pub gpu_compute: Option<Arc<GpuCompute>>,
+}
+
+/// Фаза 2 оптимизации: обновление параметров.
+///
+/// Применяет только `ApplyUpdate` (`params -= grads`). Все модификации
+/// градиента должны быть выполнены фазой `OptimizerModifyGrads` до этого.
+///
+/// # Инвариант I-1 (MIGRATION_PLAN.md §2)
+///
+/// Эта фаза НЕ модифицирует градиент. `grads` здесь — только для чтения.
+/// После этой фазы `optimizer_step` завершён, следующий шаг начинается
+/// снова с `forward`.
+pub struct OptimizerApplyUpdateJob {
+    /// Индекс буфера в `ParamStore`.
+    pub buffer_idx: usize,
+    /// Буфер параметров (in-place обновляется этой фазой).
     pub params: MatrixBufferHandle,
     /// Буфер градиентов.
     pub grads: MatrixBufferHandle,
@@ -198,10 +240,6 @@ pub struct OptimizerStepJob {
     pub optimizer: OptimizerDesc,
     /// Ссылка на `GpuCompute` — заполняется распределителем только если
     /// `params.is_gpu()` или `grads.is_gpu()`. Иначе `None`.
-    ///
-    /// Нужна для `OptimizerExpr::step_buffered_handle_hybrid`, который
-    /// скачивает буферы на CPU, шагает CPU-кубиками, и заливает обратно.
-    /// Сам `CpuOperatorV2` не хранит ссылку на GPU — она приходит в job'е.
     pub gpu_compute: Option<Arc<GpuCompute>>,
 }
 
@@ -335,7 +373,8 @@ pub enum Job {
     ForwardSegment(ForwardSegmentJob),
     BackwardSegment(BackwardSegmentJob),
     Loss(LossJob),
-    OptimizerStep(OptimizerStepJob),
+    OptimizerModifyGrads(OptimizerModifyGradsJob),
+    OptimizerApplyUpdate(OptimizerApplyUpdateJob),
     DimOp(DimOpJob),
     ConnectorOp(ConnectorOpJob),
     ParamInit(ParamInitJob),
@@ -350,7 +389,8 @@ impl Job {
             Job::ForwardSegment(_) => JobKind::ForwardSegment,
             Job::BackwardSegment(_) => JobKind::BackwardSegment,
             Job::Loss(_) => JobKind::Loss,
-            Job::OptimizerStep(_) => JobKind::OptimizerStep,
+            Job::OptimizerModifyGrads(_) => JobKind::OptimizerModifyGrads,
+            Job::OptimizerApplyUpdate(_) => JobKind::OptimizerApplyUpdate,
             Job::DimOp(_) => JobKind::DimOp,
             Job::ConnectorOp(_) => JobKind::ConnectorOp,
             Job::ParamInit(_) => JobKind::ParamInit,
@@ -365,7 +405,7 @@ impl Job {
 /// Результат исполнения задания. Выбирается по `Job::kind()`.
 pub enum JobResult {
     /// Задание без возвращаемого значения
-    /// (`Migrate`, `OptimizerStep`, `ParamInit`).
+    /// (`Migrate`, `OptimizerModifyGrads`, `OptimizerApplyUpdate`, `ParamInit`).
     Unit,
 
     /// Прямой проход сегмента: выходной буфер + контексты слоёв.

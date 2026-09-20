@@ -8,19 +8,20 @@
 //
 // Таблица решений:
 //
-//   JobKind           | Operator | Условие
-//   ------------------|----------|-------------------------------------
-//   Migrate           | Memory   | всегда
-//   ForwardSegment    | GPU      | has_gpu && segment_param_count > HEAVY_THRESHOLD
-//   ForwardSegment    | CPU      | иначе
-//   BackwardSegment   | GPU      | как ForwardSegment
-//   BackwardSegment   | CPU      | иначе
-//   Loss              | GPU      | has_gpu && pred на GPU && target на GPU
-//   Loss              | CPU      | иначе
-//   OptimizerStep     | CPU      | всегда (CPU-кубики; hybrid через gpu_compute)
-//   DimOp             | CPU      | всегда (этап 6 может пересмотреть)
-//   ConnectorOp       | CPU      | всегда
-//   ParamInit         | CPU      | всегда
+//   JobKind                      | Operator | Условие
+//   -----------------------------|----------|-------------------------------------
+//   Migrate                      | Memory   | всегда
+//   ForwardSegment               | GPU      | has_gpu && segment_param_count > HEAVY_THRESHOLD
+//   ForwardSegment               | CPU      | иначе
+//   BackwardSegment              | GPU      | как ForwardSegment
+//   BackwardSegment              | CPU      | иначе
+//   Loss                         | GPU      | has_gpu && pred на GPU && target на GPU
+//   Loss                         | CPU      | иначе
+//   OptimizerModifyGrads         | CPU      | всегда (hybrid через gpu_compute)
+//   OptimizerApplyUpdate         | CPU      | всегда (hybrid через gpu_compute)
+//   DimOp                        | CPU      | всегда
+//   ConnectorOp                  | CPU      | всегда
+//   ParamInit                    | CPU      | всегда
 //
 // Порог «тяжести» сегмента согласован со старым
 // `compute_manager::compute_executor::placement` (HEAVY_THRESHOLD = 1000):
@@ -49,15 +50,17 @@ pub fn select_operator(job: &Job, snapshot: &TopologySnapshot) -> OperatorKind {
 
         JobKind::Loss => select_loss(job, snapshot),
 
-        // Оптимизатор — CPU-код (кубики из plans::optimizer_plan::cube).
+        // Обе фазы оптимизатора — CPU-код (кубики из plans::optimizer_plan::cube).
         // Если буферы физически лежат на GPU, `CpuOperatorV2` внутри
-        // `step_buffered_handle_hybrid` скачает их, шагнёт и зальёт обратно.
+        // `OptimizerExpr::*_hybrid` скачает их, шагнёт и зальёт обратно.
         // Ссылка на `GpuCompute` вкладывается в job заранее (prepare_job).
-        JobKind::OptimizerStep => OperatorKind::Cpu,
+        //
+        // Фаза 1 и фаза 2 — независимые job'ы, каждый выбирается CPU-оператором
+        // отдельно. Между ними в графе вызывается `adapter_pass` (Фаза 4 плана).
+        JobKind::OptimizerModifyGrads => OperatorKind::Cpu,
+        JobKind::OptimizerApplyUpdate => OperatorKind::Cpu,
 
-        // DimOp и ConnectorOp — memory-bound операции, пока не реализованы
-        // в операторах. Этап 6 (граф) либо добавит их реализацию в
-        // `CpuOperatorV2`, либо обработает напрямую без оператора.
+        // DimOp и ConnectorOp — memory-bound операции.
         JobKind::DimOp => OperatorKind::Cpu,
         JobKind::ConnectorOp => OperatorKind::Cpu,
 

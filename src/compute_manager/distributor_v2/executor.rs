@@ -13,18 +13,30 @@
 //   * dispatch(job) -> JobResult;
 //   * dispatch_batch(jobs) -> Vec<JobResult>;
 //   * ensure_local(handle, target);
-//   * ensure_inputs_local(job, op, snapshot) — приватный pre-flight:
-//     приводит входные буферы job'а (а для ConnectorOp — и saved) к
-//     тому месту памяти, где будет работать выбранный оператор.
-//     Реализуется через ensure_local (то есть через MemoryOperatorV2),
-//     потому что распределитель — единственное место, которое знает
-//     про всех трёх операторов.
+//   * ensure_inputs_local(job, op, snapshot) — приватный pre-flight;
 //   * on_epoch_boundary(segments);
-//   * prepare_job (вкладывает gpu_compute в OptimizerStep).
+//   * prepare_job (вкладывает gpu_compute в оба optimizer-job'а).
 //
 // Не знает:
 //   * про потоки, scheduler, mini-model;
 //   * про граф, слои, лоссы, оптимизаторы.
+//
+// # Фазы оптимизатора (MIGRATION_PLAN.md §7, инвариант I-1)
+//
+// Шаг оптимизатора разделён на два независимых job'а:
+//   * `OptimizerModifyGrads` — модификация градиента;
+//   * `OptimizerApplyUpdate` — обновление параметров.
+// Оба выбираются CPU-оператором (см. `strategy.rs`); `prepare_job`
+// вкладывает в них `gpu_compute` при необходимости (hybrid-путь).
+// Миграции pre-flight для них не выполняются: CPU-кубики оптимизатора
+// сами решают, как достать буферы (см. `OptimizerExpr::*_hybrid`).
+//
+// # Adapter state (MIGRATION_PLAN.md §7, Фаза 2)
+//
+// `on_epoch_boundary` мигрирует буфер `adapter_state_handle` сегмента
+// **синхронно** с `param_handle` (инвариант I-5: устройство адаптера =
+// устройство слоя). Если у сегмента нет адаптеров с состоянием —
+// `adapter_state_handle = None`, миграция для него не выполняется.
 //
 // # История
 //
@@ -134,9 +146,6 @@ impl SmartDistributor {
         let gpu_device_id = gpu_compute.as_ref().map(|gc| gc.gpu_device_id.0);
 
         // 3. Число CPU-потоков — прямая сумма `threads` у CPU-устройств.
-        //
-        //    Раньше это делал ComputeExecutor::cpu_threads; в v2 он не
-        //    нужен ни для чего другого, поэтому инлайним.
         let total_cpu_threads: usize = device_plan
             .compute_devices
             .iter()
@@ -223,8 +232,6 @@ impl SmartDistributor {
         let job = self.prepare_job(job, &snapshot);
         let op = strategy::select_operator(&job, &snapshot);
 
-        // Pre-flight: приводим входные буферы job'а к месту памяти
-        // выбранного оператора.
         let job = match self.ensure_inputs_local(job, op, &snapshot) {
             Ok(j) => j,
             Err(msg) => return JobResult::Failed(msg),
@@ -348,10 +355,15 @@ impl SmartDistributor {
 
     /// Пересчитывает план размещения и выполняет миграции.
     ///
-    /// Мигрируются **все три** буфера сегмента: `params`, `grads`,
-    /// `opt_state` (если он есть). Раньше мигрировались только `params`,
-    /// из-за чего при работе на GPU `grads` оставались на CPU и следующий
-    /// backward падал на assert `grad_params_handle.is_gpu()`.
+    /// Мигрируются **все четыре** буфера сегмента (если они есть):
+    /// `params`, `grads`, `opt_state`, `adapter_state`.
+    ///
+    /// `adapter_state` мигрирует синхронно с `params` — инвариант I-5
+    /// (устройство адаптера = устройство слоя).
+    ///
+    /// Раньше мигрировались только `params`, из-за чего при работе на GPU
+    /// `grads` оставались на CPU и следующий backward падал на assert
+    /// `grad_params_handle.is_gpu()`.
     pub fn on_epoch_boundary(
         &self,
         segments: &[SegmentTopologyInfo],
@@ -368,11 +380,11 @@ impl SmartDistributor {
                 .map(|p| p.storage)
                 .unwrap_or(MemoryDeviceKind::HostRam);
 
-            // Мигрируем каждый из трёх буферов сегмента (если он есть).
-            let buf_list: [(&str, &Option<MatrixBufferHandle>); 3] = [
+            let buf_list: [(&str, &Option<MatrixBufferHandle>); 4] = [
                 ("params", &seg.param_handle),
                 ("grads", &seg.grad_handle),
                 ("opt_state", &seg.opt_state_handle),
+                ("adapter_state", &seg.adapter_state_handle),
             ];
 
             for (label, handle_opt) in buf_list {
@@ -430,47 +442,43 @@ impl SmartDistributor {
     // Внутреннее
     // -----------------------------------------------------------------------
 
+    /// Вкладывает `gpu_compute` в optimizer-job'ы (обеих фаз), если
+    /// буферы лежат на GPU.
     fn prepare_job(&self, mut job: Job, snapshot: &TopologySnapshot) -> Job {
-        if let Job::OptimizerStep(ref mut o) = job {
-            if (o.params.is_gpu() || o.grads.is_gpu()) && o.gpu_compute.is_none() {
-                o.gpu_compute = snapshot.gpu_compute.clone();
+        match &mut job {
+            Job::OptimizerModifyGrads(o) => {
+                if (o.params.is_gpu() || o.grads.is_gpu()) && o.gpu_compute.is_none() {
+                    o.gpu_compute = snapshot.gpu_compute.clone();
+                }
             }
+            Job::OptimizerApplyUpdate(o) => {
+                if (o.params.is_gpu() || o.grads.is_gpu()) && o.gpu_compute.is_none() {
+                    o.gpu_compute = snapshot.gpu_compute.clone();
+                }
+            }
+            _ => {}
         }
         job
     }
 
     /// Pre-flight миграция входных буферов job'а.
-    ///
-    /// Для ForwardSegment / BackwardSegment / Loss / ConnectorOp —
-    /// целевое место памяти определяется выбранным оператором
-    /// (HostRam для CPU, VRAM для GPU). Для ConnectorOp мигрируются
-    /// также буферы `saved` (forward-состояние).
-    ///
-    /// Для DimOp — всегда HostRam, потому что реализация DimOp
-    /// в `CpuOperatorV2` работает только с CPU-буферами.
-    ///
-    /// Для OptimizerStep миграции не выполняются: гибридный шаг
-    /// (`OptimizerExpr::step_buffered_handle_hybrid`) сам решает, как
-    /// достать буферы.
-    ///
-    /// Для Migrate и ParamInit миграции не нужны.
     fn ensure_inputs_local(
         &self,
         mut job: Job,
         op: OperatorKind,
         snapshot: &TopologySnapshot,
     ) -> Result<Job, String> {
-        // Migrate — это уже миграция; ParamInit — CPU-only.
         if matches!(job, Job::Migrate(_) | Job::ParamInit(_)) {
             return Ok(job);
         }
 
-        // OptimizerStep сам решает, как достать свои буферы.
-        if matches!(job, Job::OptimizerStep(_)) {
+        if matches!(
+            job,
+            Job::OptimizerModifyGrads(_) | Job::OptimizerApplyUpdate(_)
+        ) {
             return Ok(job);
         }
 
-        // Для DimOp цель всегда HostRam.
         if let Job::DimOp(ref mut d) = job {
             if d.input.device_kind() != MemoryDeviceKind::HostRam {
                 d.input = self
@@ -547,9 +555,9 @@ impl SmartDistributor {
                     }
                 }
             }
-            // Уже обработаны выше или не требуют миграции.
             Job::DimOp(_)
-            | Job::OptimizerStep(_)
+            | Job::OptimizerModifyGrads(_)
+            | Job::OptimizerApplyUpdate(_)
             | Job::Migrate(_)
             | Job::ParamInit(_) => {}
         }

@@ -2,46 +2,59 @@
 //
 // Оркестратор обучения v2.
 //
-// Отличия от старого execute.rs:
-//   * использует GraphV2 + SmartDistributor + три оператора;
-//   * главный поток не касается ни графа напрямую (кроме публичных
-//     методов GraphV2), ни памяти, ни устройств, ни операторов;
-//   * наблюдатель v2 работает через GraphObserverV2 внутри графа;
-//   * канонические per-layer инициализации (BatchRenorm1d,
-//     PerFeatureAttention) применяются через bridge_v2 после
-//     generic-инициализации.
+// # Фазы шага обучения (MIGRATION_PLAN.md §7, Фаза 4)
 //
-// Функционально полноценная замена v1 `execute.rs`:
-//   * профилирование (`plan.profile`) → `Profiler` из
-//     `plans::training_plan::profiling`;
-//   * мониторинг (`plan.monitoring`) → `TrainingMonitor` из
-//     `logging::training_monitor`;
-//   * валидационный проход (`plan.validation`) — как в v1;
-//   * `output_tensors` с тегом `"loss"` — как в v1;
-//   * проверка многопоточных DataSource (`train_data_streams` и т.п.) —
-//     как в v1;
-//   * инициализация параметров одной RNG-последовательностью —
-//     как в v1 (см. `GraphV2::init_params`).
+// Внутренний цикл обучения использует три явные фазы шага оптимизатора:
 //
-// API симметричен старому execute:
-//     pub fn execute(plan: &TrainingPlan, device_plan: &DevicePlan)
-//         -> Result<TrainingResult, String>
+//   forward → loss → backward
+//     → optimizer_modify_grads
+//     → adapter_pass
+//     → optimizer_apply_update
+//
+// Между `modify_grads` и `apply_update` встаёт `adapter_pass` — он обходит
+// слои, у которых есть `GradientAdapter`, и вызывает `apply(&ctx)`.
+//
+// # Диагностика адаптеров (MIGRATION_PLAN.md §7, Фаза 6)
+//
+// `adapter_pass` возвращает `AdapterPassStats` — статистику работы
+// адаптеров за шаг. `execute_inner_v2` аккумулирует её в `AdapterSummary`
+// и по завершении обучения кладёт в `TrainingResult::adapter_summary`.
+//
+// L2-метрики (mean_scale и т. п.) заполняются только при
+// `NEUROCORE_DEBUG_ADAPTER=1`. При `NEUROCORE_DISABLE_ADAPTERS=1`
+// `adapter_pass` возвращает пустую статистику (baseline-режим).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
 
+use once_cell::sync::Lazy;
+
 use crate::compute_manager::core::dim_change::DynamicTensor;
 use crate::compute_manager::graph_v2::{bridge_v2, GraphV2};
 use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use crate::device_plan::DevicePlan;
+use crate::layers::adapter::AdapterSummary;
 use crate::logging::training_monitor::TrainingMonitor;
 use crate::tensor::Tensor2D;
 use crate::training_plan::plan::TrainingPlan;
 use crate::training_plan::profiling::{ProfileMode, Profiler};
 
 use super::types::TrainingResult;
+
+// ============================================================================
+// Env-флаги диагностики (MIGRATION_PLAN.md §7, Фаза 6)
+// ============================================================================
+
+/// `NEUROCORE_DEBUG_ADAPTER=1` — печатать сводку адаптеров после обучения.
+///
+/// Сама диагностика (замер L2, лог `[ADAPTER ...]`) управляется внутри
+/// `GraphV2::adapter_pass` (см. `graph_v2::model_v2`). Здесь флаг нужен
+/// только для того, чтобы не сорить в консоль `AdapterSummary::report()`
+/// без запроса.
+static DEBUG_ADAPTER: Lazy<bool> =
+    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_ADAPTER").is_ok());
 
 // ============================================================================
 // Публичный API
@@ -87,10 +100,6 @@ fn execute_inner_v2(
     // ---------------------------------------------------------------------
     // 0. Проверка многопоточных DataSource
     // ---------------------------------------------------------------------
-    //
-    // Как в v1: многопоточные данные через `train_data_streams` и т.п.
-    // пока не поддерживаются в автоматическом цикле. Пользователь должен
-    // использовать ручной цикл с forward_multi/backward_multi.
     if plan.train_data_streams.is_some()
         || plan.target_data_streams.is_some()
         || plan.test_input_streams.is_some()
@@ -108,15 +117,7 @@ fn execute_inner_v2(
     // ---------------------------------------------------------------------
     // 1. Инициализация параметров
     // ---------------------------------------------------------------------
-    //
-    // Сначала — generic Initializer по всем буферам.
-    // `GraphV2::init_params` генерирует всю последовательность одним RNG
-    // (как v1 `execute.rs`) и раздаёт буферам её куски через `precomputed`.
     graph.init_params(plan.initializer.clone())?;
-
-    // Затем — канонические per-layer overrides. Без этого BatchRenorm1d
-    // и PerFeatureAttention стартуют в режиме, из которого не выходят
-    // (см. подробное обоснование в bridge_v2.rs и v1-файле overrides.rs).
     apply_layer_aware_overrides_v2(graph)?;
 
     // ---------------------------------------------------------------------
@@ -150,6 +151,10 @@ fn execute_inner_v2(
     } else {
         None
     };
+
+    // Аккумулятор статистики адаптеров (Фаза 6 плана).
+    // Заполняется после каждого adapter_pass.
+    let mut adapter_summary_acc = AdapterSummary::default();
 
     // ---------------------------------------------------------------------
     // 3. Подготовка данных
@@ -212,22 +217,31 @@ fn execute_inner_v2(
             let _grad_input = graph.backward(delta)?;
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
-            // --- Сбор градиентов ДО optimizer_step (как в v1) ---
-            //
-            // На этом этапе градиенты уже посчитаны backward'ом, но ещё не
-            // применены. Собранный плоский вектор идёт в монитор для
-            // проверки нормы градиента. На GPU-буферах скачивается через
-            // `GpuCompute`.
+            // --- Сбор градиентов ДО optimizer_modify_grads (как в v1) ---
             let grads_flat: Option<Vec<f32>> = if monitor.is_some() {
                 collect_grads_flat(graph)
             } else {
                 None
             };
 
-            // --- Профилирование: optimizer step ---
+            // --- Три фазы шага оптимизатора ---
             let t3 = Instant::now();
-            graph.optimizer_step(plan.optimizer_desc.clone())?;
-            let update_dt = t3.elapsed().as_nanos() as u64;
+
+            graph.optimizer_modify_grads(plan.optimizer_desc.clone())?;
+            let modify_dt = t3.elapsed().as_nanos() as u64;
+
+            let t_ad = Instant::now();
+            let adapter_stats = graph.adapter_pass()?;
+            let adapter_dt = t_ad.elapsed().as_nanos() as u64;
+
+            // Аккумулируем статистику адаптеров (Фаза 6 плана).
+            adapter_summary_acc.absorb(&adapter_stats);
+
+            let t_ap = Instant::now();
+            graph.optimizer_apply_update(plan.optimizer_desc.clone())?;
+            let apply_dt = t_ap.elapsed().as_nanos() as u64;
+
+            let update_dt = modify_dt + adapter_dt + apply_dt;
 
             graph.observe_step(loss, None);
 
@@ -252,7 +266,6 @@ fn execute_inner_v2(
                 }
             }
 
-            // --- Мониторинг: записать шаг с градиентами ---
             if let Some(ref mut mon) = monitor {
                 mon.record_step(loss, grads_flat.as_deref(), None);
             }
@@ -267,8 +280,6 @@ fn execute_inner_v2(
             0.0
         };
 
-        // Совпадает с v1: `if avg_loss < best_loss` — для NaN условие
-        // само false, поэтому дополнительная проверка не нужна.
         if avg_loss < best_loss {
             best_loss = avg_loss;
             best_epoch = epoch;
@@ -279,7 +290,6 @@ fn execute_inner_v2(
 
         let report = graph.end_epoch();
 
-        // Логируем: warnings приоритетнее рутинного вывода.
         if !report.warnings.is_empty() {
             println!(
                 "Epoch {}: avg_loss = {:.6}  ({} warnings)",
@@ -297,7 +307,6 @@ fn execute_inner_v2(
             println!("Epoch {}: avg_loss = {:.6}", epoch, avg_loss);
         }
 
-        // --- Мониторинг: конец эпохи ---
         if let Some(ref mut mon) = monitor {
             let summary = mon.end_epoch();
             if !summary.warnings.is_empty() {
@@ -384,9 +393,9 @@ fn execute_inner_v2(
         zero_loss_epoch,
         profile: None,
         monitor_summary: None,
+        adapter_summary: None,
     };
 
-    // --- Тэг "loss" в tensors ---
     if plan.output_tensors.contains(&"loss".to_string()) {
         result.tensors.insert(
             "loss".into(),
@@ -394,12 +403,10 @@ fn execute_inner_v2(
         );
     }
 
-    // --- Профилирование: финализация ---
     if let Some(prof) = profiler {
         result.profile = Some(prof.finish());
     }
 
-    // --- Мониторинг: итоговая сводка ---
     if let Some(mon) = monitor {
         let summary = mon.summary();
         println!("=== Training Monitor Summary ===");
@@ -415,6 +422,21 @@ fn execute_inner_v2(
         result.monitor_summary = Some(summary);
     }
 
+    // ---------------------------------------------------------------------
+    // 6. Сводка адаптеров (Фаза 6 плана)
+    // ---------------------------------------------------------------------
+    //
+    // `Some`, если за обучение был хотя бы один вызов адаптера.
+    // При `NEUROCORE_DISABLE_ADAPTERS=1` — всегда `None` (adapter_pass
+    // возвращал пустые stats).
+    if adapter_summary_acc.total_calls > 0 {
+        if *DEBUG_ADAPTER {
+            println!("=== Adapter Summary ===");
+            print!("{}", adapter_summary_acc.report());
+        }
+        result.adapter_summary = Some(adapter_summary_acc);
+    }
+
     Ok(result)
 }
 
@@ -424,12 +446,6 @@ fn execute_inner_v2(
 
 /// Применяет `bridge_v2::build_layer_aware_overrides_v2` поверх
 /// generic-инициализации.
-///
-/// Записывает значения напрямую в буферы параметров через
-/// `MatrixBufferHandle::write_range`. На момент вызова все параметры
-/// находятся в `HostRam` (миграции делаются только на границе эпохи,
-/// см. `GraphV2::observe_epoch`), поэтому `write_range` работает
-/// без паник.
 fn apply_layer_aware_overrides_v2(graph: &GraphV2) -> Result<(), String> {
     let overrides = bridge_v2::build_layer_aware_overrides_v2(graph);
     if overrides.is_empty() {
@@ -454,17 +470,6 @@ fn apply_layer_aware_overrides_v2(graph: &GraphV2) -> Result<(), String> {
 // ============================================================================
 
 /// Собирает плоский вектор градиентов из всех буферов `ParamStore`.
-///
-/// Поведение идентично v1 `ParamGradients::to_flat_vec`:
-///   * CPU-буферы копируются напрямую через `as_slice()`;
-///   * GPU-буферы скачиваются через `GpuCompute::download_gpu_handle_to_vec`.
-///
-/// Порядок градиентов согласован с `total_params()`: индексация по
-/// `buffer_idx` в порядке `ParamStore::buffers`.
-///
-/// Возвращает `None` только если GPU-буфер обнаружен, но `GpuCompute`
-/// недоступен (не должно случаться в корректной сборке — если буфер
-/// на GPU, значит GPU доступен).
 fn collect_grads_flat(graph: &GraphV2) -> Option<Vec<f32>> {
     let ps = graph.param_store().lock().ok()?;
     let total = ps.total_params();
@@ -472,19 +477,16 @@ fn collect_grads_flat(graph: &GraphV2) -> Option<Vec<f32>> {
         return Some(Vec::new());
     }
 
-    // GpuCompute нужен только если есть GPU-буферы. Запрашиваем один раз.
     let gpu_opt = graph.distributor().gpu_compute();
 
     let mut out: Vec<f32> = Vec::with_capacity(total);
     for i in 0..ps.num_buffers() {
         let b = ps.get_param_buffer_by_idx(i);
         if b.grads.is_gpu() {
-            // GPU-градиенты скачиваем через GpuCompute — как v1.
             let gpu = gpu_opt.as_ref()?;
             let vec = gpu.download_gpu_handle_to_vec(&b.grads);
             out.extend_from_slice(&vec);
         } else {
-            // CPU-градиенты — прямая копия.
             let guard = b.grads.read();
             let slice = guard.as_slice().expect("CPU buffer");
             out.extend_from_slice(slice);

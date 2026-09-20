@@ -33,6 +33,7 @@ pub use types::{
     ForwardSegmentJob,
     LossJob,
     MigrateJob,
-    OptimizerStepJob,
+    OptimizerModifyGradsJob,
+    OptimizerApplyUpdateJob,
     ParamInitJob,
 };

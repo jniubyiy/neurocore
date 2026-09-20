@@ -20,6 +20,12 @@
 //
 //   * Combiner принимает ровно 2 потока (`streams[0], streams[1]`) и
 //     заменяет весь вектор на `[out]`.
+//
+// # Кэш (MIGRATION_PLAN.md §7, Фаза 4)
+//
+// `run_forward` сохраняет `batch` (число строк входного буфера) в
+// `ForwardCacheV2`. Это значение переживёт backward и будет использовано
+// `adapter_pass` для заполнения `AdapterContext::batch`.
 
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +51,10 @@ pub(super) fn run_forward(
     segments: &[SegmentV2],
     input: MatrixBufferHandle,
 ) -> Result<(MatrixBufferHandle, ForwardCacheV2), String> {
+    // Запоминаем batch до move `input` в `streams`.
+    // (MIGRATION_PLAN.md §7, Фаза 4: batch сохраняется в ForwardCacheV2.)
+    let batch = input.rows();
+
     let mut streams: Vec<MatrixBufferHandle> = vec![input];
     let mut states: Vec<SegmentForwardStateV2> = Vec::with_capacity(segments.len());
 
@@ -66,6 +76,7 @@ pub(super) fn run_forward(
     let cache = ForwardCacheV2 {
         segment_states: states,
         output: output.clone(),
+        batch,
     };
 
     Ok((output, cache))

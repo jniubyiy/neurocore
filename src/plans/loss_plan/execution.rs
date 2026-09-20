@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
-use super::expr::{Aggregation, LossExpr};
+use super::expr::LossExpr;
 
 /// Вычисляет значение функции потерь и градиент по предсказанию на CPU с использованием
 /// управляемых буферов `MatrixBufferHandle` и пула `TempMatrixPool`.
@@ -70,27 +70,23 @@ pub fn compute_loss_mat_buffered(
     pool.release(full_input);
 
     // ========================================================================
-    // Масштаб градиента согласован с агрегацией loss.
+    // ФАЗА 0 (MIGRATION_PLAN.md §7): Loss больше не масштабирует градиент.
     //
-    //   aggregate_loss(loss_vec):
-    //     Sum  -> Σ_r loss_vec[r]              => ∂loss/∂loss_vec[r] = 1
-    //     Mean -> Σ_r loss_vec[r] / n          => ∂loss/∂loss_vec[r] = 1 / n
+    // Инвариант I-2: Loss отдаёт Σ_r g_r (сырой Sum) без каких-либо
+    // множителей. Aggregation::Mean влияет ТОЛЬКО на отображаемое значение
+    // loss (см. LossExpr::aggregate_loss), но не на градиент.
     //
-    // Ранее в CPU-ветке grad_loss всегда был [1.0; batch]. Для Mean это
-    // давало градиент в B раз больше ожидаемого. GPU-ветка
-    // (`compute_loss_gpu_buffered_handle` в gpu_exec.rs) этот множитель
-    // применяет корректно. Приводим CPU к тому же поведению.
+    // Ранее здесь было:
+    //     Aggregation::Sum  => grad_scale = 1.0
+    //     Aggregation::Mean => grad_scale = 1.0 / batch
+    // Это давало разный эффективный шаг SGD для разных батчей и ослабляло
+    // обучение в B раз при Mean. Теперь grad_scale всегда 1.0, независимо
+    // от агрегации.
     //
-    // ВНИМАНИЕ (побочный эффект):
-    //   После этой правки эффективный шаг SGD на CPU для всех примеров
-    //   с batch_size > 1 уменьшается в B раз. Это математически корректно,
-    //   но меняет скорость обучения. Если где-то требуется сохранить
-    //   прежнюю скорость — увеличьте lr в соответствующем примере в B раз.
+    // Пользовательские lr в примерах с Aggregation::Mean и batch > 1
+    // могут требовать пересчёта — это отдельная задача ФАЗА 0.1.
     // ========================================================================
-    let grad_scale = match expr.aggregation() {
-        Aggregation::Sum => 1.0f32,
-        Aggregation::Mean => 1.0f32 / batch as f32,
-    };
+    let grad_scale = 1.0f32;
     let grad_loss = vec![grad_scale; batch];
     let grad_full = expr.backward_chunk_buffered(&intermediates, &grad_loss, pool);
 

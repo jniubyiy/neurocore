@@ -41,6 +41,9 @@ pub mod per_feature_attention;
 pub mod layers_special;
 pub mod buffered_context;
 
+// Инфраструктура градиентных адаптеров (MIGRATION_PLAN.md §7, Фаза 3).
+pub mod adapter;
+
 use crate::compute_manager::core::dynamic_context::DynamicContext;
 use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::compute_manager::operators_v2::memory_v2::buffer::TempMatrixPool;
@@ -86,6 +89,27 @@ pub trait UniversalLayer: Send + Sync + 'static {
 
     // PerFeatureAttention
     fn as_per_feature_attention(&self) -> Option<&PerFeatureAttention> { None }
+
+    // -----------------------------------------------------------------------
+    // Градиентный адаптер (MIGRATION_PLAN.md §7, Фаза 3)
+    // -----------------------------------------------------------------------
+    //
+    // Возвращает адаптер этого слоя, если он есть. Вызывается в
+    // `GraphV2::adapter_pass` (Фаза 4) между `optimizer_modify_grads`
+    // и `optimizer_apply_update`.
+    //
+    // Дефолт `None` означает «у слоя нет адаптера» — поведение полностью
+    // совпадает с архитектурой без адаптеров. Все существующие слои
+    // используют дефолт; переопределение появится в Фазе 5+.
+    //
+    // Инварианты:
+    //   * I-4: адаптер живёт в папке слоя (`src/layers/<layer>/adapter/`);
+    //   * I-5: устройство адаптера = устройство слоя;
+    //   * I-9: каждый слой имеет право на свою формулу.
+    #[inline]
+    fn adapter(&self) -> Option<&dyn GradientAdapter> {
+        None
+    }
 
     // Общая информация о слое, используемая планировщиком.
     fn param_len(&self) -> usize { 0 }
@@ -179,3 +203,11 @@ pub use per_feature_attention::PerFeatureAttention;
 
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 pub use buffered_context::BufferedContext;
+
+// Инфраструктура адаптеров (Фаза 3).
+//
+// `GradientAdapter` здесь и вводит имя в текущий модуль (для сигнатуры
+// `UniversalLayer::adapter()` выше), и реэкспортирует его наружу.
+// Отдельный `use crate::layers::adapter::GradientAdapter;` избыточен
+// и вызывает E0252.
+pub use adapter::{AdapterContext, AdapterRegistry, AdapterTypeInfo, GradientAdapter};

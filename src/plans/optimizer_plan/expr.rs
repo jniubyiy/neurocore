@@ -13,11 +13,26 @@ use super::chain::OptimizerChain;
 /// Работает с дескрипторами `MatrixBufferHandle`. Поддерживает выполнение
 /// шага как для CPU-буферов, так и для GPU-буферов (с автоматическим
 /// копированием на CPU, выполнением шага и возвратом на GPU).
+///
+/// # Фазы (MIGRATION_PLAN.md §7, инвариант I-1)
+///
+/// Шаг оптимизатора разделён на две независимые операции:
+///
+/// * `modify_grads_step_*` — модификация градиента (lr, momentum, adam,
+///   clip, weight_decay). Не обновляет параметры.
+///
+/// * `apply_update_step_*` — обновление параметров (`params -= grads`).
+///   Не модифицирует градиент.
+///
+/// Между этими двумя фазами в общий цикл обучения встраивается `adapter_pass`
+/// (per-layer коррекция градиента).
 pub struct OptimizerExpr {
     chain: OptimizerChain,
     /// Состояния для каждого кубика в буферизованном пути.
     /// Всегда хранятся на CPU для простоты.
     states: Vec<MatrixBufferHandle>,
+    /// Счётчик шагов. Инкрементируется один раз за полный шаг обучения,
+    /// то есть в фазе `modify_grads`.
     step_counter: usize,
 }
 
@@ -59,43 +74,85 @@ impl OptimizerExpr {
         }
     }
 
-    /// Выполняет один шаг оптимизации, работая полностью с `MatrixBufferHandle`.
+    // ------------------------------------------------------------------------
+    // Фаза 1: модификация градиента (CPU-only)
+    // ------------------------------------------------------------------------
+
+    /// Модифицирует градиент (CPU-only).
     ///
-    /// Параметры и градиенты изменяются in‑place через `write()`/`read()`.
-    /// Поддерживаются только CPU-буферы.
+    /// Применяет все кубики цепочки, кроме `ApplyUpdate`. Обновляет
+    /// `step_counter`.
     ///
     /// # Паника
-    /// Паникует, если `params` или `grads` являются GPU‑буферами, или если
-    /// буферизованный путь не был инициализирован (состояния отсутствуют).
-    pub fn step_buffered_handle(
+    /// Паникует, если `params` или `grads` являются GPU-буферами.
+    /// Используйте `modify_grads_step_buffered_handle_hybrid` для GPU.
+    pub fn modify_grads_step_buffered_handle(
         &mut self,
         params: &MatrixBufferHandle,
         grads: &MatrixBufferHandle,
     ) {
-        assert!(!params.is_gpu() && !grads.is_gpu(),
-            "step_buffered_handle supports only CPU handles. Use step_buffered_handle_hybrid for GPU.");
-        assert_eq!(self.states.len(), self.chain.cubes().len(),
-            "OptimizerExpr was not initialized with new_buffered_handle");
+        assert!(
+            !params.is_gpu() && !grads.is_gpu(),
+            "modify_grads_step_buffered_handle supports only CPU handles. \
+             Use modify_grads_step_buffered_handle_hybrid for GPU."
+        );
+        assert_eq!(
+            self.states.len(),
+            self.chain.cubes().len(),
+            "OptimizerExpr was not initialized with new_buffered_handle"
+        );
 
-        self.chain.apply_all_buffered_handle(params, grads, &self.states);
+        self.chain.modify_grads_buffered_handle(params, grads, &self.states);
         self.step_counter += 1;
     }
 
-    /// Выполняет один шаг оптимизации для возможно GPU-буферов.
+    // ------------------------------------------------------------------------
+    // Фаза 2: обновление параметров (CPU-only)
+    // ------------------------------------------------------------------------
+
+    /// Обновляет параметры (CPU-only).
     ///
-    /// Если параметры и градиенты находятся на GPU, они временно копируются
-    /// на CPU, шаг выполняется на CPU, затем обновлённые параметры копируются
-    /// обратно на GPU. Состояния оптимизатора всегда находятся на CPU.
-    ///
-    /// # Аргументы
-    /// * `params` – дескриптор параметров (CPU или GPU).
-    /// * `grads` – дескриптор градиентов (CPU или GPU).
-    /// * `gpu_compute` – ссылка на `GpuCompute`, необходимая если буферы GPU.
+    /// Применяет только `ApplyUpdate`. Не модифицирует градиент и не
+    /// инкрементирует `step_counter`.
     ///
     /// # Паника
-    /// Паникует, если один из буферов GPU, а другой CPU, или если `gpu_compute`
-    /// не предоставлен для GPU-буферов.
-    pub fn step_buffered_handle_hybrid(
+    /// Паникует, если `params` или `grads` являются GPU-буферами.
+    /// Используйте `apply_update_step_buffered_handle_hybrid` для GPU.
+    pub fn apply_update_step_buffered_handle(
+        &mut self,
+        params: &MatrixBufferHandle,
+        grads: &MatrixBufferHandle,
+    ) {
+        assert!(
+            !params.is_gpu() && !grads.is_gpu(),
+            "apply_update_step_buffered_handle supports only CPU handles. \
+             Use apply_update_step_buffered_handle_hybrid for GPU."
+        );
+        assert_eq!(
+            self.states.len(),
+            self.chain.cubes().len(),
+            "OptimizerExpr was not initialized with new_buffered_handle"
+        );
+
+        self.chain.apply_update_buffered_handle(params, grads, &self.states);
+    }
+
+    // ------------------------------------------------------------------------
+    // Фаза 1: модификация градиента (hybrid)
+    // ------------------------------------------------------------------------
+
+    /// Модифицирует градиент для возможно GPU-буферов.
+    ///
+    /// Если `params`/`grads` на GPU — они временно копируются на CPU, шаг
+    /// выполняется на CPU. Обратно на GPU заливаются **только `grads`**:
+    /// по инварианту I-1 фаза `modify_grads` не изменяет `params`.
+    ///
+    /// Состояния оптимизатора всегда находятся на CPU.
+    ///
+    /// # Паника
+    /// Паникует, если один из буферов GPU, а другой CPU, или если
+    /// `gpu_compute` не предоставлен для GPU-буферов.
+    pub fn modify_grads_step_buffered_handle_hybrid(
         &mut self,
         params: &MatrixBufferHandle,
         grads: &MatrixBufferHandle,
@@ -105,29 +162,78 @@ impl OptimizerExpr {
         let grads_is_gpu = grads.is_gpu();
 
         if params_is_gpu || grads_is_gpu {
-            // Оба должны быть GPU
-            assert!(params_is_gpu && grads_is_gpu,
-                "Mixed CPU/GPU buffers not supported. params_is_gpu={}, grads_is_gpu={}",
-                params_is_gpu, grads_is_gpu);
-
+            assert!(
+                params_is_gpu && grads_is_gpu,
+                "Mixed CPU/GPU buffers not supported. \
+                 params_is_gpu={}, grads_is_gpu={}",
+                params_is_gpu,
+                grads_is_gpu
+            );
             let gpu = gpu_compute.expect("GPU buffers require GpuCompute reference");
 
-            // Скачиваем параметры и градиенты в управляемые CPU-буферы.
             let cpu_params = gpu.download_gpu_handle_to_cpu_handle(params);
             let cpu_grads = gpu.download_gpu_handle_to_cpu_handle(grads);
 
-            // Выполняем шаг на CPU.
-            self.step_buffered_handle(&cpu_params, &cpu_grads);
+            self.modify_grads_step_buffered_handle(&cpu_params, &cpu_grads);
 
-            // Загружаем обновлённые параметры обратно на GPU.
-            gpu.copy_cpu_to_gpu_handle(&cpu_params, params);
+            // ФАЗА 1 (MIGRATION_PLAN.md §7, инвариант I-1):
+            // modify_grads не модифицирует params, поэтому заливаем
+            // обратно только grads. Это экономит одну GPU↔CPU копию.
+            gpu.copy_cpu_to_gpu_handle(&cpu_grads, grads);
         } else {
-            // Оба CPU — обычный шаг.
-            self.step_buffered_handle(params, grads);
+            self.modify_grads_step_buffered_handle(params, grads);
         }
     }
 
-    /// Возвращает номер текущего шага (начиная с 1 после первого вызова шага).
+    // ------------------------------------------------------------------------
+    // Фаза 2: обновление параметров (hybrid)
+    // ------------------------------------------------------------------------
+
+    /// Обновляет параметры для возможно GPU-буферов.
+    ///
+    /// Если `params`/`grads` на GPU — они временно копируются на CPU, шаг
+    /// выполняется на CPU. Обратно на GPU заливаются **только `params`**:
+    /// по инварианту I-1 фаза `apply_update` не изменяет `grads`, а после
+    /// неё градиенты уже не используются до следующего forward.
+    ///
+    /// # Паника
+    /// Паникует, если один из буферов GPU, а другой CPU, или если
+    /// `gpu_compute` не предоставлен для GPU-буферов.
+    pub fn apply_update_step_buffered_handle_hybrid(
+        &mut self,
+        params: &MatrixBufferHandle,
+        grads: &MatrixBufferHandle,
+        gpu_compute: Option<&GpuCompute>,
+    ) {
+        let params_is_gpu = params.is_gpu();
+        let grads_is_gpu = grads.is_gpu();
+
+        if params_is_gpu || grads_is_gpu {
+            assert!(
+                params_is_gpu && grads_is_gpu,
+                "Mixed CPU/GPU buffers not supported. \
+                 params_is_gpu={}, grads_is_gpu={}",
+                params_is_gpu,
+                grads_is_gpu
+            );
+            let gpu = gpu_compute.expect("GPU buffers require GpuCompute reference");
+
+            let cpu_params = gpu.download_gpu_handle_to_cpu_handle(params);
+            let cpu_grads = gpu.download_gpu_handle_to_cpu_handle(grads);
+
+            self.apply_update_step_buffered_handle(&cpu_params, &cpu_grads);
+
+            // ФАЗА 1 (MIGRATION_PLAN.md §7, инвариант I-1):
+            // apply_update модифицирует params, grads остаются как есть.
+            // Заливаем обратно только params.
+            gpu.copy_cpu_to_gpu_handle(&cpu_params, params);
+        } else {
+            self.apply_update_step_buffered_handle(params, grads);
+        }
+    }
+
+    /// Возвращает номер текущего шага (начиная с 1 после первого вызова
+    /// `modify_grads_step_*`).
     pub fn current_step(&self) -> usize {
         self.step_counter
     }

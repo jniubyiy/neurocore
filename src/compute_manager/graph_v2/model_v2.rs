@@ -7,49 +7,79 @@
 //   * Arc<SmartDistributor>;
 //   * GraphObserverV2;
 //   * Arc<Mutex<ParamStore>>;
+//   * Arc<Mutex<AdapterStateStore>>;
 //   * Arc<Mutex<TempMatrixPool>> (тот же, что у распределителя);
 //   * input_shapes / output_shapes;
-//   * forward_cache (перезаписывается между forward и backward).
+//   * forward_cache (живёт от forward до optimizer_apply_update).
 //
 // Делает:
 //   * forward(DynamicTensor) -> DynamicTensor;
 //   * loss(LossDesc, &pred, &target) -> (f32, DynamicTensor);
 //   * backward(delta: DynamicTensor) -> DynamicTensor;
-//   * optimizer_step(OptimizerDesc);
+//   * optimizer_modify_grads(OptimizerDesc);
+//   * adapter_pass() -> AdapterPassStats;
+//   * optimizer_apply_update(OptimizerDesc);
+//   * optimizer_step(OptimizerDesc) — обёртка над тремя фазами;
 //   * observe_step(loss), observe_epoch(epoch), end_epoch() -> EpochReportV2.
 //
 // Не делает:
 //   * не выбирает CPU/GPU (это делает distributor);
-//   * не мигрирует буферы вручную (это делает distributor::ensure_inputs_local);
+//   * не мигрирует буферы вручную;
 //   * не знает про потоки, scheduler, mini-model.
 //
-// ВАЖНО (правка): контракт «наружу из GraphV2 хендл уходит в HostRam»
+// ВАЖНО: контракт «наружу из GraphV2 хендл уходит в HostRam»
 // реализуется через КОПИРОВАНИЕ в отдельный CPU-буфер, а не через
 // in-place миграцию оригинального хендла.
 //
-// Причина: `BufferedContext` ряда слоёв (Sigmoid, Tanh, Softmax) хранит
-// клон `output`-хендла сегмента. `MemoryExecutor::move_matrix_handle`
-// меняет storage в `MatrixEntry` in-place, поэтому все клоны одного и
-// того же id видят новое устройство. Если мигрировать `cache.output`
-// в HostRam, контекст последнего слоя тоже «переедет» на CPU, и
-// `assert!(output.is_gpu())` в GPU-backward упадёт.
+// # Фазы шага обучения (MIGRATION_PLAN.md §2, инвариант I-1)
 //
-// Копирование в новый буфер оставляет оригинал (и все его клоны в
-// контекстах) на том устройстве, где он был создан.
+// Шаг обучения проходит в порядке:
+//
+//   forward
+//     → loss
+//     → backward (raw)
+//     → optimizer_modify_grads
+//     → adapter_pass
+//     → optimizer_apply_update
+//
+// `forward_cache` живёт **от forward до optimizer_apply_update** — то
+// есть весь шаг обучения. Это позволяет `adapter_pass` передавать
+// forward-контексты слоёв в адаптеры через `AdapterContext::forward_ctx`.
+// Кэш очищается в `optimizer_apply_update` (последняя фаза шага).
+//
+// # Диагностика адаптеров (MIGRATION_PLAN.md §7, Фаза 6)
+//
+// `adapter_pass` возвращает `AdapterPassStats` — срез статистики
+// работы адаптеров за один pass. Метрики L2 замеряются **только** при
+// `NEUROCORE_DEBUG_ADAPTER=1` (замер на GPU стоит скачивания).
+//
+// При `NEUROCORE_DISABLE_ADAPTERS=1` `adapter_pass` возвращает пустую
+// статистику без обхода слоёв — это baseline-режим.
 
 use std::sync::{Arc, Mutex};
 
+use once_cell::sync::Lazy;
+
 use crate::compute_manager::core::dim_change::DynamicTensor;
+use crate::compute_manager::core::dynamic_context::DynamicContext;
 use crate::compute_manager::distributor_v2::{
     SegmentTopologyInfo, SmartDistributor,
 };
 use crate::compute_manager::jobs_v2::{
-    Job, JobResult, LossJob, OptimizerStepJob, ParamInitJob,
+    ForwardContextsV2,
+    Job, JobResult, LossJob,
+    OptimizerApplyUpdateJob, OptimizerModifyGradsJob,
+    ParamInitJob,
 };
+use crate::compute_manager::operators_v2::gpu_v2::compute::GpuCompute;
 use crate::compute_manager::operators_v2::memory_v2::buffer::{MatrixBufferHandle, TempMatrixPool};
 use crate::compute_manager::operators_v2::memory_v2::types::MemoryDeviceKind;
 use crate::device_plan::DevicePlan;
+use crate::layers::adapter::{
+    AdapterCallStats, AdapterContext, AdapterPassStats,
+};
 use crate::loss_plan::desc::LossDesc;
+use crate::model_plan::adapter_store::AdapterStateStore;
 use crate::model_plan::layer_desc::LayerDesc;
 use crate::model_plan::param_store::ParamStore;
 use crate::optimizer_plan::OptimizerDesc;
@@ -61,7 +91,25 @@ use super::backward_v2::run_backward;
 use super::observer_v2::{
     EpochReportV2, GraphObserverV2, MonitorConfigV2, WarningV2,
 };
-use super::types_v2::{ForwardCacheV2, SegmentV2};
+use super::types_v2::{
+    ForwardCacheV2, SegmentForwardStateV2, SegmentKindV2, SegmentV2,
+};
+
+// ============================================================================
+// Env-флаги диагностики (MIGRATION_PLAN.md §7, Фаза 6)
+// ============================================================================
+
+/// `NEUROCORE_DEBUG_ADAPTER=1` — замер L2-норм градиента до/после
+/// `adapter.apply` и вывод в stderr. Замер требует скачивания GPU-буфера
+/// на CPU, поэтому отключён по умолчанию.
+static DEBUG_ADAPTER: Lazy<bool> =
+    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_ADAPTER").is_ok());
+
+/// `NEUROCORE_DISABLE_ADAPTERS=1` — baseline-режим: `adapter_pass`
+/// возвращает пустую статистику без обхода слоёв. Градиент идёт в
+/// `apply_update` ровно так, как его оставил `modify_grads`.
+static DISABLE_ADAPTERS: Lazy<bool> =
+    Lazy::new(|| std::env::var("NEUROCORE_DISABLE_ADAPTERS").is_ok());
 
 // ============================================================================
 // GraphV2
@@ -81,6 +129,9 @@ pub struct GraphV2 {
     /// Хранилище параметров.
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
 
+    /// Хранилище персистентного состояния градиентных адаптеров.
+    pub(crate) adapter_store: Arc<Mutex<AdapterStateStore>>,
+
     /// Temp-pool (тот же, что у распределителя).
     pub(crate) temp_pool: Arc<Mutex<TempMatrixPool>>,
 
@@ -90,7 +141,7 @@ pub struct GraphV2 {
     /// Форма выхода (без batch).
     pub(crate) output_shape: Vec<usize>,
 
-    /// Кэш forward-прохода. Заполняется в `forward`, потребляется в `backward`.
+    /// Кэш forward-прохода.
     pub(crate) forward_cache: Option<ForwardCacheV2>,
 
     /// Seed для детерминированной инициализации.
@@ -103,11 +154,6 @@ impl GraphV2 {
     // -----------------------------------------------------------------------
 
     /// Создаёт граф из описания слоёв.
-    ///
-    /// За кулисами:
-    ///   1. Создаётся `SmartDistributor` на основе `DevicePlan`.
-    ///   2. Строятся сегменты через `builder_v2::build_segments`.
-    ///   3. Создаётся наблюдатель с конфигурацией по умолчанию.
     pub fn build(
         layers_desc: Vec<LayerDesc>,
         device_plan: &DevicePlan,
@@ -118,12 +164,11 @@ impl GraphV2 {
 
         let distributor = Arc::new(SmartDistributor::new(device_plan)?);
 
-        // Пустой ParamStore (аллокация буферов будет в build_segments).
-        let param_store = Arc::new(Mutex::new(ParamStore::new(
-            distributor.snapshot().memory_executor.clone(),
-        )));
+        let memory = distributor.snapshot().memory_executor.clone();
 
-        // Пока все параметры в HostRam; миграция — на этапе on_epoch_boundary.
+        let param_store = Arc::new(Mutex::new(ParamStore::new(memory.clone())));
+        let adapter_store = Arc::new(Mutex::new(AdapterStateStore::new(memory)));
+
         let segments = build_segments(
             &layers_desc,
             &param_store,
@@ -146,6 +191,7 @@ impl GraphV2 {
             distributor,
             observer: GraphObserverV2::new(),
             param_store,
+            adapter_store,
             temp_pool,
             input_shape,
             output_shape,
@@ -154,13 +200,11 @@ impl GraphV2 {
         })
     }
 
-    /// Настраивает наблюдателя.
     pub fn with_monitor_config(mut self, cfg: MonitorConfigV2) -> Self {
         self.observer = GraphObserverV2::with_config(cfg);
         self
     }
 
-    /// Устанавливает seed для детерминированной инициализации.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -170,12 +214,7 @@ impl GraphV2 {
     // Forward
     // -----------------------------------------------------------------------
 
-    /// Прямой проход.
-    ///
-    /// Вход и выход — `DynamicTensor` с формой
-    /// `(batch, product(input_shape))`.
     pub fn forward(&mut self, input: DynamicTensor) -> Result<DynamicTensor, String> {
-        // Кэш предыдущего forward больше не нужен — перезаписываем.
         self.forward_cache = None;
 
         let input_handle = {
@@ -190,17 +229,6 @@ impl GraphV2 {
             input_handle,
         )?;
 
-        // Контракт: наружу из GraphV2 хендл уходит в HostRam, потому что
-        // пользователь получает DynamicTensor (то есть CPU-вектор).
-        //
-        // ВАЖНО: НЕ мигрируем `cache.output` in-place. Оригинальный
-        // хендл может быть процитирован в `BufferedContext` последнего
-        // слоя (Sigmoid/Tanh/Softmax хранят в контексте именно output).
-        // In-place миграция изменила бы storage у всех клонов, включая
-        // контекстный, и GPU-backward этого слоя упал бы на
-        // assert!(output.is_gpu()).
-        //
-        // Вместо миграции — копируем данные в отдельный CPU-буфер.
         let out_handle_cpu = self.copy_handle_to_host_ram(&cache.output)?;
 
         self.forward_cache = Some(cache);
@@ -214,16 +242,12 @@ impl GraphV2 {
     // Loss
     // -----------------------------------------------------------------------
 
-    /// Вычисляет loss и градиент по предсказанию.
     pub fn loss(
         &self,
         loss_desc: LossDesc,
         pred: &DynamicTensor,
         target: &DynamicTensor,
     ) -> Result<(f32, DynamicTensor), String> {
-        // Конвертируем pred и target в handle'ы (в HostRam).
-        // Миграцию в VRAM (если strategy выберет GPU-loss) сделает
-        // distributor::ensure_inputs_local внутри dispatch.
         let (pred_handle, target_handle) = {
             let mut pool = self.temp_pool.lock().unwrap();
             let p = dynamic_tensor_to_handle(&mut *pool, pred.clone())?;
@@ -241,12 +265,6 @@ impl GraphV2 {
         let result = self.distributor.dispatch(job);
         match result {
             JobResult::Loss { value, grad_pred } => {
-                // Контракт: grad_pred отдаётся наружу в HostRam.
-                //
-                // Здесь grad_pred — «свежий» буфер, созданный внутри loss
-                // и нигде в контекстах не закэшированный. in-place миграция
-                // безопасна, но для единообразия политики (см. forward)
-                // копируем в отдельный CPU-буфер.
                 let grad_pred_cpu = self.copy_handle_to_host_ram(&grad_pred)?;
 
                 let grad_tensor =
@@ -262,10 +280,6 @@ impl GraphV2 {
     // Backward
     // -----------------------------------------------------------------------
 
-    /// Обратный проход.
-    ///
-    /// `delta` — градиент по выходу (обычно из `loss`).
-    /// Возвращает градиент по входу первого сегмента.
     pub fn backward(&mut self, delta: DynamicTensor) -> Result<DynamicTensor, String> {
         let cache = self
             .forward_cache
@@ -281,12 +295,13 @@ impl GraphV2 {
             &self.distributor,
             &self.param_store,
             &self.segments,
-            cache,
+            &cache,
             delta_handle,
         )?;
 
-        // Контракт: наружу grad_input отдаётся в HostRam.
-        // Копирование, а не миграция — см. комментарий в `forward`.
+        // Возвращаем cache обратно: он нужен adapter_pass.
+        self.forward_cache = Some(cache);
+
         let grad_input_cpu = self.copy_handle_to_host_ram(&grad_input)?;
 
         let grad_tensor =
@@ -295,11 +310,11 @@ impl GraphV2 {
     }
 
     // -----------------------------------------------------------------------
-    // Optimizer step
+    // Optimizer step (три фазы, MIGRATION_PLAN.md §2, инвариант I-1)
     // -----------------------------------------------------------------------
 
-    /// Один шаг оптимизатора по каждому буферу параметров.
-    pub fn optimizer_step(&self, optimizer: OptimizerDesc) -> Result<(), String> {
+    /// Фаза 1: модификация градиента.
+    pub fn optimizer_modify_grads(&self, optimizer: OptimizerDesc) -> Result<(), String> {
         let num_buffers = {
             let ps = self.param_store.lock().unwrap();
             ps.num_buffers()
@@ -312,25 +327,25 @@ impl GraphV2 {
                 (buffer.params.clone(), buffer.grads.clone())
             };
 
-            let job = Job::OptimizerStep(OptimizerStepJob {
+            let job = Job::OptimizerModifyGrads(OptimizerModifyGradsJob {
                 buffer_idx,
                 params,
                 grads,
                 optimizer: optimizer.clone(),
-                gpu_compute: None, // будет вложен в SmartDistributor::prepare_job
+                gpu_compute: None,
             });
 
             match self.distributor.dispatch(job) {
                 JobResult::Unit => {}
                 JobResult::Failed(msg) => {
                     return Err(format!(
-                        "GraphV2::optimizer_step: buffer {}: {}",
+                        "GraphV2::optimizer_modify_grads: buffer {}: {}",
                         buffer_idx, msg
                     ));
                 }
                 _ => {
                     return Err(format!(
-                        "GraphV2::optimizer_step: buffer {} unexpected JobResult",
+                        "GraphV2::optimizer_modify_grads: buffer {} unexpected JobResult",
                         buffer_idx
                     ));
                 }
@@ -339,24 +354,229 @@ impl GraphV2 {
         Ok(())
     }
 
+    /// Фаза 2: per-layer коррекция градиента адаптерами.
+    ///
+    /// # Диагностика (MIGRATION_PLAN.md §7, Фаза 6)
+    ///
+    ///   * `NEUROCORE_DISABLE_ADAPTERS=1` — возвращает пустую статистику,
+    ///     не обходит слои (baseline-режим).
+    ///   * `NEUROCORE_DEBUG_ADAPTER=1` — замеряет L2-норму собственного
+    ///     среза `grads` до и после `apply`, пишет в stderr
+    ///     `[ADAPTER <name>] before_l2=<x> after_l2=<y> scale=<y/x>`,
+    ///     включает замеры в `AdapterPassStats`.
+    ///
+    /// Без этих флагов адаптеры всё равно вызываются (если они есть у
+    /// слоёв) — но L2 не замеряется (дорого на GPU), в лог ничего не
+    /// пишется, `AdapterPassStats` содержит только имена и счётчики.
+    ///
+    /// # Контекст (I-3, I-10)
+    ///
+    /// `grad_input` в `AdapterContext` не передаётся: адаптер не может
+    /// его исказить (I-3).
+    pub fn adapter_pass(&self) -> Result<AdapterPassStats, String> {
+        // Baseline-режим: полностью пропускаем обход.
+        if *DISABLE_ADAPTERS {
+            return Ok(AdapterPassStats::default());
+        }
+
+        let cache = match self.forward_cache.as_ref() {
+            Some(c) => c,
+            None => {
+                return Err(
+                    "GraphV2::adapter_pass: forward_cache is empty. \
+                     adapter_pass must be called after forward/loss/backward \
+                     and before optimizer_apply_update (MIGRATION_PLAN.md §2, I-1)."
+                        .to_string(),
+                );
+            }
+        };
+
+        let batch = cache.batch;
+        let debug = *DEBUG_ADAPTER;
+        // GpuCompute нужен только для замеров GPU-градиентов; в baseline
+        // он не требуется.
+        let gpu_opt = self.distributor.gpu_compute();
+
+        if cache.segment_states.len() != self.segments.len() {
+            return Err(format!(
+                "GraphV2::adapter_pass: cache size ({}) != segments count ({})",
+                cache.segment_states.len(),
+                self.segments.len()
+            ));
+        }
+
+        let mut pass_stats = AdapterPassStats::default();
+
+        for (seg, state) in self.segments.iter().zip(cache.segment_states.iter()) {
+            let SegmentKindV2::Universal { layers, slices } = &seg.kind else {
+                continue;
+            };
+            let SegmentForwardStateV2::Universal { contexts } = state else {
+                continue;
+            };
+
+            let contexts_local: Vec<DynamicContext> = match contexts {
+                ForwardContextsV2::Sequential(v) => v.clone(),
+                ForwardContextsV2::Chunked { contexts, .. } => {
+                    contexts.first().cloned().unwrap_or_default()
+                }
+            };
+
+            let (params_handle, grads_handle) = {
+                let ps = self.param_store.lock().unwrap();
+                let first_slice = slices.first().ok_or_else(|| {
+                    format!(
+                        "GraphV2::adapter_pass: segment {} has no slices",
+                        seg.index
+                    )
+                })?;
+                (
+                    ps.params_handle(first_slice).clone(),
+                    ps.grads_handle(first_slice).clone(),
+                )
+            };
+
+            for (i, layer) in layers.iter().enumerate() {
+                let Some(adapter) = layer.adapter() else {
+                    continue;
+                };
+
+                let own_slice = slices[i];
+                let forward_ctx_ref: Option<&DynamicContext> = contexts_local.get(i);
+
+                // Замер «до» (только при активной диагностике).
+                let before_l2 = if debug {
+                    compute_grads_l2(&grads_handle, own_slice, gpu_opt.as_deref())
+                } else {
+                    f32::NAN
+                };
+
+                let ctx = AdapterContext {
+                    segment_params: &params_handle,
+                    segment_grads: &grads_handle,
+                    own_slice,
+                    all_slices: slices,
+                    batch,
+                    optimizer_applied: true,
+                    own_state_slice: None,
+                    adapter_store: Some(self.adapter_store.clone()),
+                    forward_ctx: forward_ctx_ref,
+                };
+
+                adapter.apply(&ctx);
+
+                // Замер «после» (только при активной диагностике).
+                let after_l2 = if debug {
+                    compute_grads_l2(&grads_handle, own_slice, gpu_opt.as_deref())
+                } else {
+                    f32::NAN
+                };
+
+                if debug {
+                    let scale = if before_l2.abs() > 1e-30 && before_l2.is_finite()
+                        && after_l2.is_finite()
+                    {
+                        after_l2 / before_l2
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "[ADAPTER {}] seg={} layer={} before_l2={:.6e} \
+                         after_l2={:.6e} scale={:.6}",
+                        adapter.name(),
+                        seg.index,
+                        i,
+                        before_l2,
+                        after_l2,
+                        scale
+                    );
+                }
+
+                pass_stats.calls.push(AdapterCallStats {
+                    name: adapter.name(),
+                    before_l2,
+                    after_l2,
+                });
+            }
+        }
+
+        Ok(pass_stats)
+    }
+
+    /// Фаза 3: обновление параметров (`params -= grads`).
+    ///
+    /// В конце очищает `forward_cache` — шаг обучения завершён.
+    pub fn optimizer_apply_update(&mut self, optimizer: OptimizerDesc) -> Result<(), String> {
+        let num_buffers = {
+            let ps = self.param_store.lock().unwrap();
+            ps.num_buffers()
+        };
+
+        for buffer_idx in 0..num_buffers {
+            let (params, grads) = {
+                let ps = self.param_store.lock().unwrap();
+                let buffer = ps.get_param_buffer_by_idx(buffer_idx);
+                (buffer.params.clone(), buffer.grads.clone())
+            };
+
+            let job = Job::OptimizerApplyUpdate(OptimizerApplyUpdateJob {
+                buffer_idx,
+                params,
+                grads,
+                optimizer: optimizer.clone(),
+                gpu_compute: None,
+            });
+
+            match self.distributor.dispatch(job) {
+                JobResult::Unit => {}
+                JobResult::Failed(msg) => {
+                    return Err(format!(
+                        "GraphV2::optimizer_apply_update: buffer {}: {}",
+                        buffer_idx, msg
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "GraphV2::optimizer_apply_update: buffer {} unexpected JobResult",
+                        buffer_idx
+                    ));
+                }
+            }
+        }
+
+        self.forward_cache = None;
+        Ok(())
+    }
+
+    /// Обёртка над тремя фазами шага оптимизатора.
+    ///
+    /// Эквивалентна последовательному вызову:
+    ///
+    /// ```ignore
+    /// graph.optimizer_modify_grads(optimizer.clone())?;
+    /// let _stats = graph.adapter_pass()?;
+    /// graph.optimizer_apply_update(optimizer)?;
+    /// ```
+    ///
+    /// Статистика `adapter_pass` здесь игнорируется (в отличие от
+    /// `execute_v2.rs`, который её аккумулирует в `AdapterSummary`).
+    /// Если нужна диагностика — вызывайте три фазы явно.
+    pub fn optimizer_step(&mut self, optimizer: OptimizerDesc) -> Result<(), String> {
+        self.optimizer_modify_grads(optimizer.clone())?;
+        let _stats = self.adapter_pass()?;
+        self.optimizer_apply_update(optimizer)?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Наблюдение
     // -----------------------------------------------------------------------
 
-    /// Зафиксировать шаг наблюдения.
-    ///
-    /// `grad_norm` вычислять не обязательно — можно передать `None`.
     pub fn observe_step(&mut self, loss: f32, grad_norm: Option<f32>) {
         self.observer.record_step(loss, grad_norm);
     }
 
-    /// Отметить начало эпохи.
-    ///
-    /// Проверяет `observer.should_reassign()` и, при необходимости,
-    /// запрашивает перераспределение у распределителя.
     pub fn observe_epoch(&mut self, epoch: usize) -> Result<(), String> {
-        // Регулярный reassign: первая эпоха всегда, плюс при срабатывании
-        // эвристик наблюдателя.
         let should = epoch == 0 || self.observer.should_reassign();
         if should {
             let infos = self.collect_segment_infos();
@@ -366,12 +586,10 @@ impl GraphV2 {
         Ok(())
     }
 
-    /// Завершить эпоху, получить отчёт.
     pub fn end_epoch(&mut self) -> EpochReportV2 {
         self.observer.end_epoch()
     }
 
-    /// Вернуть сводку предупреждений за всё время.
     pub fn all_warnings(&self) -> &[WarningV2] {
         self.observer.all_warnings()
     }
@@ -380,26 +598,7 @@ impl GraphV2 {
     // Инициализация параметров
     // -----------------------------------------------------------------------
 
-    /// Инициализирует параметры по правилу `initializer`.
-    ///
-    /// # Порядок применения (совпадает с v1 `execute.rs`)
-    ///
-    /// 1. **Одна последовательность RNG на всю модель.** `GraphV2` сам
-    ///    создаёт `StdRng::seed_from_u64(self.seed)` и генерирует
-    ///    `total_params()` значений подряд. Это даёт **точное совпадение**
-    ///    начальных весов с v1 `execute.rs` при одинаковом `plan.seed` —
-    ///    критично для критерия ТЗ «loss-кривая v2 совпадает со старым
-    ///    execute на тех же данных».
-    ///
-    /// 2. **Раскладка по буферам.** Сгенерированный вектор нарезается по
-    ///    `param_len` каждого буфера и передаётся в `ParamInitJob` как
-    ///    `precomputed`. Диспетчер и `CpuOperatorV2` просто записывают
-    ///    эти значения — никакой собственной генерации не происходит.
-    ///
-    /// 3. **Zero-size buffers.** Если у сегмента нет параметров, `ParamInitJob`
-    ///    для него не создаётся — как в v1.
     pub fn init_params(&self, initializer: Initializer) -> Result<(), String> {
-        // ---- Шаг 1: одна последовательность RNG на всю модель. ----
         let all_data: Vec<f32> = {
             let ps = self.param_store.lock().unwrap();
             let total = ps.total_params();
@@ -423,7 +622,6 @@ impl GraphV2 {
             }
         };
 
-        // ---- Шаг 2: раскладка по буферам через ParamInitJob. ----
         let num_buffers = {
             let ps = self.param_store.lock().unwrap();
             ps.num_buffers()
@@ -437,7 +635,6 @@ impl GraphV2 {
                 (b.params.clone(), b.params.rows() * b.params.cols())
             };
 
-            // Zero-size buffer — ничего не инициализируем, как в v1.
             if len == 0 {
                 continue;
             }
@@ -476,27 +673,26 @@ impl GraphV2 {
     // Доступ
     // -----------------------------------------------------------------------
 
-    /// Ссылка на распределитель.
     pub fn distributor(&self) -> &Arc<SmartDistributor> {
         &self.distributor
     }
 
-    /// Ссылка на хранилище параметров.
     pub fn param_store(&self) -> &Arc<Mutex<ParamStore>> {
         &self.param_store
     }
 
-    /// Количество сегментов.
+    pub fn adapter_store(&self) -> &Arc<Mutex<AdapterStateStore>> {
+        &self.adapter_store
+    }
+
     pub fn num_segments(&self) -> usize {
         self.segments.len()
     }
 
-    /// Форма входа (без batch).
     pub fn input_shape(&self) -> &[usize] {
         &self.input_shape
     }
 
-    /// Форма выхода (без batch).
     pub fn output_shape(&self) -> &[usize] {
         &self.output_shape
     }
@@ -505,26 +701,16 @@ impl GraphV2 {
     // Внутреннее
     // -----------------------------------------------------------------------
 
-    /// Копирует данные из произвольного handle (GPU или CPU) в свежий
-    /// HostRam-handle, НЕ трогая оригинал.
-    ///
-    /// Это ключевое отличие от `SmartDistributor::ensure_local`: тот
-    /// мигрирует оригинал in-place (меняет storage в `MatrixEntry`),
-    /// из-за чего все клоны хендла «переезжают» на новое устройство.
-    /// Здесь же создаётся отдельный буфер в HostRam, в него копируются
-    /// данные, а оригинал остаётся там, где был.
     fn copy_handle_to_host_ram(
         &self,
         handle: &MatrixBufferHandle,
     ) -> Result<MatrixBufferHandle, String> {
-        // Создаём свежий CPU-буфер через общий temp-pool.
         let cpu_buf = {
             let mut pool = self.temp_pool.lock().unwrap();
             pool.acquire(handle.rows(), handle.cols())
         };
 
         if handle.is_gpu() {
-            // GPU → CPU: используем GpuCompute.
             let gpu = self
                 .distributor
                 .gpu_compute()
@@ -534,7 +720,6 @@ impl GraphV2 {
                 })?;
             gpu.copy_gpu_to_cpu_handle(handle, &cpu_buf);
         } else {
-            // Уже CPU: просто копируем содержимое.
             let src = handle.read();
             let src_slice = src
                 .as_slice()
@@ -545,16 +730,14 @@ impl GraphV2 {
         Ok(cpu_buf)
     }
 
-    /// Собирает `SegmentTopologyInfo` для передачи в `on_epoch_boundary`.
-    ///
-    /// Заполняет `param_handle`, `grad_handle` и `opt_state_handle`, чтобы
-    /// распределитель мог мигрировать все три буфера одним проходом.
     fn collect_segment_infos(&self) -> Vec<SegmentTopologyInfo> {
         let ps = self.param_store.lock().unwrap();
+        let _as = self.adapter_store.lock().unwrap();
+
         let mut infos = Vec::with_capacity(self.segments.len());
         for seg in &self.segments {
             match &seg.kind {
-                super::types_v2::SegmentKindV2::Universal { layers, slices } => {
+                SegmentKindV2::Universal { layers, slices } => {
                     let param_count: usize = layers.iter().map(|l| l.param_len()).sum();
                     let (param_handle, grad_handle, opt_state_handle, current_loc) =
                         match slices.first() {
@@ -575,6 +758,7 @@ impl GraphV2 {
                         param_handle,
                         grad_handle,
                         opt_state_handle,
+                        adapter_state_handle: None,
                         current_param_location: current_loc,
                     });
                 }
@@ -585,6 +769,7 @@ impl GraphV2 {
                         param_handle: None,
                         grad_handle: None,
                         opt_state_handle: None,
+                        adapter_state_handle: None,
                         current_param_location: MemoryDeviceKind::HostRam,
                     });
                 }
@@ -595,14 +780,58 @@ impl GraphV2 {
 }
 
 // ============================================================================
+// Вспомогательные функции
+// ============================================================================
+
+/// Вычисляет L2-норму среза градиента `[slice.start, slice.end)`.
+///
+/// Работает с CPU и GPU буферами. Для GPU использует `download_gpu_handle_to_vec`
+/// (полное скачивание буфера), потому что в текущей реализации
+/// `MatrixBufferHandle::read_range` не поддерживает частичное чтение с GPU.
+///
+/// # Стоимость
+///
+/// Для GPU это дорого (PCIe transfer). Функция вызывается только при
+/// `NEUROCORE_DEBUG_ADAPTER=1` — в горячем пути без диагностики её нет.
+fn compute_grads_l2(
+    grads: &MatrixBufferHandle,
+    slice: crate::model_plan::param_store::ParamSlice,
+    gpu: Option<&GpuCompute>,
+) -> f32 {
+    if slice.len == 0 {
+        return 0.0;
+    }
+
+    let values: Vec<f32> = if grads.is_gpu() {
+        match gpu {
+            Some(g) => {
+                // Скачиваем весь буфер, потом берём нужный срез.
+                // (Частичное чтение с GPU пока не поддерживается.)
+                let full = g.download_gpu_handle_to_vec(grads);
+                if slice.end() <= full.len() {
+                    full[slice.start..slice.end()].to_vec()
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        }
+    } else {
+        grads.read_range(slice.start, slice.len)
+    };
+
+    let mut sum_sq = 0.0f64;
+    for &v in &values {
+        let d = v as f64;
+        sum_sq += d * d;
+    }
+    (sum_sq.sqrt()) as f32
+}
+
+// ============================================================================
 // Конвертации DynamicTensor ↔ MatrixBufferHandle
 // ============================================================================
 
-/// `DynamicTensor` → `MatrixBufferHandle` (col-major).
-///
-/// Всегда создаёт буфер в HostRam. Если стратегия решит, что job
-/// должен идти на GPU, `SmartDistributor::ensure_inputs_local`
-/// мигрирует буфер в VRAM перед отправкой оператору.
 pub(crate) fn dynamic_tensor_to_handle(
     pool: &mut TempMatrixPool,
     tensor: DynamicTensor,
@@ -631,11 +860,6 @@ pub(crate) fn dynamic_tensor_to_handle(
     Ok(buf)
 }
 
-/// `MatrixBufferHandle` → `DynamicTensor` (row-major).
-///
-/// Требует, чтобы handle был в HostRam. Вызывающая сторона обязана
-/// предварительно убедиться, что данные лежат в HostRam (например,
-/// через `GraphV2::copy_handle_to_host_ram`).
 pub(crate) fn handle_to_dynamic_tensor(
     handle: &MatrixBufferHandle,
     shape: &[usize],

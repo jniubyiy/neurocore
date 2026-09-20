@@ -13,6 +13,17 @@
 //     `grad_input`, т.е. заменяет весь вектор на `[dx]`.
 //
 //   * Combiner (backward) — разворачивает `[delta]` в `[da, db]`.
+//
+// # Кэш (MIGRATION_PLAN.md §7, Фаза 4)
+//
+// `run_backward` теперь принимает `&ForwardCacheV2` (не owned).
+// Раньше кэш «съедался» на входе, и после backward его нельзя было
+// использовать. Теперь `GraphV2` сохраняет `forward_cache` живым до
+// конца шага оптимизатора — это позволяет `adapter_pass` читать
+// forward-контексты слоёв (`AdapterContext::forward_ctx`).
+//
+// Кэш очищается в `GraphV2::optimizer_apply_update` (последняя фаза
+// шага). Один шаг обучения = один forward_cache.
 
 use std::sync::{Arc, Mutex};
 
@@ -31,12 +42,14 @@ use super::types_v2::{
 /// Выполняет backward-проход через граф.
 ///
 /// `grad_output` — градиент по выходу последнего сегмента.
+/// `cache` — forward-кэш (по ссылке, не консумируется: нужен для
+/// `adapter_pass` после backward).
 /// Возвращает градиент по входу первого сегмента.
 pub(super) fn run_backward(
     distributor: &SmartDistributor,
     param_store: &Arc<Mutex<ParamStore>>,
     segments: &[SegmentV2],
-    cache: ForwardCacheV2,
+    cache: &ForwardCacheV2,
     grad_output: MatrixBufferHandle,
 ) -> Result<MatrixBufferHandle, String> {
     if cache.segment_states.len() != segments.len() {

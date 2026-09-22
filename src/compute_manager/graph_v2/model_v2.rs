@@ -55,7 +55,19 @@
 //
 // При `NEUROCORE_DISABLE_ADAPTERS=1` `adapter_pass` возвращает пустую
 // статистику без обхода слоёв — это baseline-режим.
+//
+// # Уровни печати диагностики `[ADAPTER ...]`
+//
+// По умолчанию (`NEUROCORE_DEBUG_ADAPTER=1`) печать per-call сжата:
+//   * первые 5 вызовов — детально;
+//   * каждый 50-й — компактно;
+//   * остальные — молча (L2 всё равно считается и уходит в stats).
+//
+// При дополнительном `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1` печатается
+// **каждый** вызов (старое поведение — для отладки, если нужно
+// протрассировать конкретный шаг).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use once_cell::sync::Lazy;
@@ -99,17 +111,36 @@ use super::types_v2::{
 // Env-флаги диагностики (MIGRATION_PLAN.md §7, Фаза 6)
 // ============================================================================
 
-/// `NEUROCORE_DEBUG_ADAPTER=1` — замер L2-норм градиента до/после
-/// `adapter.apply` и вывод в stderr. Замер требует скачивания GPU-буфера
-/// на CPU, поэтому отключён по умолчанию.
+/// `NEUROCORE_DEBUG_ADAPTER=1` — печатать диагностику адаптеров.
+///
+/// По умолчанию печать per-call сжата (первые 5 + каждый 50-й), чтобы
+/// не засорять консоль при длинных прогонах. Для полного трейса см.
+/// `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1`.
 static DEBUG_ADAPTER: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_ADAPTER").is_ok());
 
+/// `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1` — печатать **каждый** вызов
+/// `[ADAPTER ...]` (старое поведение).
+///
+/// Имеет смысл только вместе с `NEUROCORE_DEBUG_ADAPTER=1`. Иначе
+/// игнорируется (никакой диагностики не будет вообще).
+static DEBUG_ADAPTER_VERBOSE: Lazy<bool> =
+    Lazy::new(|| std::env::var("NEUROCORE_DEBUG_ADAPTER_VERBOSE").is_ok());
+
 /// `NEUROCORE_DISABLE_ADAPTERS=1` — baseline-режим: `adapter_pass`
-/// возвращает пустую статистику без обхода слоёв. Градиент идёт в
-/// `apply_update` ровно так, как его оставил `modify_grads`.
+/// возвращает пустую статистику без обхода слоёв.
 static DISABLE_ADAPTERS: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DISABLE_ADAPTERS").is_ok());
+
+/// Сквозной счётчик вызовов `adapter_pass` **за сессию**. Нужен для
+/// сжатия per-call трейса `[ADAPTER ...]` (первые 5 + каждый 50-й).
+///
+/// Статика, потому что `adapter_pass(&self)` — без `mut`.
+static ADAPTER_PASS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Пороговые константы для сжатия трейса.
+const ADAPTER_TRACE_FIRST_N: usize = 5;
+const ADAPTER_TRACE_EVERY_N: usize = 50;
 
 // ============================================================================
 // GraphV2
@@ -361,13 +392,12 @@ impl GraphV2 {
     ///   * `NEUROCORE_DISABLE_ADAPTERS=1` — возвращает пустую статистику,
     ///     не обходит слои (baseline-режим).
     ///   * `NEUROCORE_DEBUG_ADAPTER=1` — замеряет L2-норму собственного
-    ///     среза `grads` до и после `apply`, пишет в stderr
-    ///     `[ADAPTER <name>] before_l2=<x> after_l2=<y> scale=<y/x>`,
-    ///     включает замеры в `AdapterPassStats`.
+    ///     среза `grads` до и после `apply`. По умолчанию печатает
+    ///     **первые 5** вызовов и **каждый 50-й** (сжатый трейс).
+    ///     Для полного трейса — `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1`.
     ///
-    /// Без этих флагов адаптеры всё равно вызываются (если они есть у
-    /// слоёв) — но L2 не замеряется (дорого на GPU), в лог ничего не
-    /// пишется, `AdapterPassStats` содержит только имена и счётчики.
+    /// L2-замеры идут в `AdapterPassStats` **всегда**, когда активен
+    /// `NEUROCORE_DEBUG_ADAPTER` — сжатие касается только печати.
     ///
     /// # Контекст (I-3, I-10)
     ///
@@ -393,6 +423,7 @@ impl GraphV2 {
 
         let batch = cache.batch;
         let debug = *DEBUG_ADAPTER;
+        let verbose = debug && *DEBUG_ADAPTER_VERBOSE;
         // GpuCompute нужен только для замеров GPU-градиентов; в baseline
         // он не требуется.
         let gpu_opt = self.distributor.gpu_compute();
@@ -472,6 +503,8 @@ impl GraphV2 {
                     f32::NAN
                 };
 
+                // Диагностическая печать. Сжатая по умолчанию,
+                // полная при NEUROCORE_DEBUG_ADAPTER_VERBOSE=1.
                 if debug {
                     let scale = if before_l2.abs() > 1e-30 && before_l2.is_finite()
                         && after_l2.is_finite()
@@ -480,16 +513,40 @@ impl GraphV2 {
                     } else {
                         0.0
                     };
-                    eprintln!(
-                        "[ADAPTER {}] seg={} layer={} before_l2={:.6e} \
-                         after_l2={:.6e} scale={:.6}",
-                        adapter.name(),
-                        seg.index,
-                        i,
-                        before_l2,
-                        after_l2,
-                        scale
-                    );
+
+                    let call_idx = ADAPTER_PASS_CALLS.fetch_add(1, Ordering::Relaxed);
+                    let should_print = verbose
+                        || call_idx < ADAPTER_TRACE_FIRST_N
+                        || call_idx % ADAPTER_TRACE_EVERY_N == 0;
+
+                    if should_print {
+                        if verbose {
+                            eprintln!(
+                                "[ADAPTER {}] #{} seg={} layer={} \
+                                 before_l2={:.6e} after_l2={:.6e} scale={:.6}",
+                                adapter.name(),
+                                call_idx,
+                                seg.index,
+                                i,
+                                before_l2,
+                                after_l2,
+                                scale
+                            );
+                        } else {
+                            // Компактный формат для сжатого режима.
+                            eprintln!(
+                                "[ADAPTER {}] #{} seg={} layer={} \
+                                 before_l2={:.3e} after_l2={:.3e} scale={:.4}",
+                                adapter.name(),
+                                call_idx,
+                                seg.index,
+                                i,
+                                before_l2,
+                                after_l2,
+                                scale
+                            );
+                        }
+                    }
                 }
 
                 pass_stats.calls.push(AdapterCallStats {

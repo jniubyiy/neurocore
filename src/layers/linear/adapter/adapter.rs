@@ -1,54 +1,100 @@
 // src/layers/linear/adapter/adapter.rs
 
-use std::sync::atomic::{AtomicBool, Ordering};
+//! Градиентный адаптер слоя `Linear` (MIGRATION_PLAN.md §7, финальная версия).
+//!
+//! # Формула (per-row)
+//!
+//! Для каждого выходного нейрона `c` слоя `Linear`:
+//!
+//! ```text
+//!   ‖W_c‖              = L2-норма строки весов [c · in, (c+1) · in)
+//!   ‖∇W_c‖_sum         = L2-норма СЫРОГО Sum-градиента (I-2, ∝ √B)
+//!   ‖∇W_c‖_per_sample  = ‖∇W_c‖_sum / √B        ← batch-инвариантность
+//!
+//!   r                  = ‖∇W_c‖_ps / (‖W_c‖ + ε)
+//!   β_eff              = β · (1 + α · r)         ← адаптивный damping
+//!   scale_raw          = ‖W_c‖ / (‖∇W_c‖_ps + β_eff · ‖W_c‖ + ε)
+//!   scale              = clamp(scale_raw, min_scale, max_scale)
+//!   ∇W_c              *= scale
+//! ```
+//!
+//! Bias (хвост `out_features` элементов `own_slice`) не модифицируется.
+//!
+//! # Batch-инвариантность
+//!
+//! Целевое свойство: **`loss(M шагов, B=1) == loss(1 шаг, B=M)`**.
+//!
+//! Достигается за счёт оценки `‖g_per_sample‖ = ‖g_sum‖ / √B`: при
+//! i.i.d.-шумовом режиме `‖Σ g_i‖ ≈ √B · G`, поэтому деление на `√B`
+//! даёт корректную оценку нормы per-sample градиента. Деление на `B`
+//! занижает оценку в `√B` раз и приводит к неинвариантности.
+//!
+//! # Адаптивность
+//!
+//! `β_eff = β · (1 + α · r)`:
+//!   * `r → 0` (малый градиент) → `β_eff ≈ β` → сильный boost;
+//!   * `r ≫ 1` (большой градиент) → `β_eff ≫ β` → damping.
+//!
+//! # Параметры (зафиксированы, эмпирически подтверждены)
+//!
+//! | Параметр | Значение |
+//! |----------|----------|
+//! | β (базовый damping) | 0.3 |
+//! | α (адаптивность)    | 1.0 |
+//! | min_scale           | 0.01 |
+//! | max_scale           | 3.0 |
+//! | ε                   | 1e-12 |
+//!
+//! # GPU
+//!
+//! Заморожена (I-5). Если `ctx.segment_grads.is_gpu()` — адаптер
+//! пропускает модификацию.
+//!
+//! # Инварианты (MIGRATION_PLAN.md §2)
+//!
+//!   * I-1: `optimizer_applied == true`.
+//!   * I-2: Loss отдаёт сырой Sum-градиент.
+//!   * I-3: адаптер трогает только `grad_params`.
+//!   * I-4: адаптер в папке слоя.
+//!   * I-5: GPU↔GPU / CPU↔CPU.
+//!   * I-8: `&self`, без внутреннего состояния.
+//!   * I-10: `own_slice` — легитимный член `all_slices`.
 
+use crate::compute_manager::core::dynamic_context::DynamicContext;
 use crate::layers::adapter::{AdapterContext, GradientAdapter};
+use crate::layers::buffered_context::BufferedContext;
 
-/// No-op градиентный адаптер слоя `Linear`.
+// ============================================================================
+// Константы формулы
+// ============================================================================
+
+/// Базовый β в знаменателе LARS-adaptive scale.
+const LARS_BETA: f32 = 0.3;
+
+/// α — коэффициент адаптивности β: `β_eff = β · (1 + α · r)`.
+const LARS_ADAPT: f32 = 1.0;
+
+/// Нижний clip `scale`.
+const LARS_MIN_SCALE: f32 = 0.01;
+
+/// Верхний clip `scale`.
+const LARS_MAX_SCALE: f32 = 3.0;
+
+/// ε в знаменателе (защита от деления на ноль).
+const LARS_EPS: f32 = 1e-12;
+
+// ============================================================================
+// LinearAdapter
+// ============================================================================
+
+/// Градиентный адаптер слоя `Linear`.
 ///
-/// # Назначение (MIGRATION_PLAN.md §7, Фаза 5 — пилот)
-///
-/// Пилотный адаптер для проверки **среды адаптеров**. Он не модифицирует
-/// градиент — только валидирует контракт [`AdapterContext`] через
-/// `debug_assert`. Любое нарушение инвариантов (неверный срез, отсутствие
-/// forward-контекста, отсутствие adapter_store, `optimizer_applied == false`)
-/// обнаруживается сразу — в debug-сборке через панику, а не где-то позже
-/// в процессе обучения.
-///
-/// # Инварианты, которые валидирует адаптер (MIGRATION_PLAN.md §2)
-///
-///   * **I-1** (фазовый порядок): `optimizer_applied == true`.
-///   * **I-10** (сегмент-local): `own_slice` — легитимный член `all_slices`,
-///     его конец не выходит за пределы `segment_params` / `segment_grads`.
-///   * **Фаза 4** (жизненный цикл cache): `forward_ctx.is_some()`.
-///   * **Интеграция со Фазой 2**: `adapter_store.is_some()`.
-///
-/// # Модификация градиента
-///
-/// Отсутствует. Числовые результаты примеров **идентичны** baseline
-/// (конец Фазы 4). Это точка валидации §7 Фазы 5.
-///
-/// # Потокобезопасность
-///
-/// `LinearAdapter` содержит только `AtomicBool` для однократного
-/// диагностического сообщения. Никакого персистентного состояния
-/// между шагами нет (адаптер stateless).
-pub struct LinearAdapter {
-    /// Флаг «первый вызов уже был». Используется только для однократного
-    /// диагностического сообщения в debug-сборке.
-    ///
-    /// В release-сборке всегда `false`, к нему нет обращений по горячему
-    /// пути. Поле сохранено, чтобы структура была одинаковой в debug и
-    /// release (никаких `#[cfg]` на уровне полей).
-    reported: AtomicBool,
-}
+/// Stateless. Работает через `&self`.
+pub struct LinearAdapter;
 
 impl LinearAdapter {
-    /// Создаёт no-op адаптер.
     pub fn new() -> Self {
-        Self {
-            reported: AtomicBool::new(false),
-        }
+        Self
     }
 }
 
@@ -62,14 +108,8 @@ impl GradientAdapter for LinearAdapter {
     fn apply(&self, ctx: &AdapterContext<'_>) {
         // ====================================================================
         // Валидация контракта AdapterContext (MIGRATION_PLAN.md §2).
-        //
-        // Все проверки — `debug_assert`: срабатывают только в debug-сборке,
-        // в release вырезаются компилятором. Это суть пилота: убедиться,
-        // что среда адаптеров полностью прокинута и передаёт корректные
-        // данные, до появления первого настоящего адаптера с формулой.
+        // 7 групп debug_assert из пилотной версии сохранены.
         // ====================================================================
-
-        // ---- I-10: own_slice лежит внутри segment_params и segment_grads ----
         let params_len = ctx.segment_params.rows() * ctx.segment_params.cols();
         let grads_len = ctx.segment_grads.rows() * ctx.segment_grads.cols();
         debug_assert!(
@@ -93,9 +133,6 @@ impl GradientAdapter for LinearAdapter {
             ctx.own_slice.len
         );
 
-        // ---- Форма params и grads должна совпадать ----
-        // Иначе backprop в принципе не сходится: градиенты разной формы
-        // не смогут быть вычтены из параметров в apply_update.
         debug_assert_eq!(
             ctx.segment_params.rows(),
             ctx.segment_grads.rows(),
@@ -111,19 +148,12 @@ impl GradientAdapter for LinearAdapter {
             ctx.segment_grads.cols()
         );
 
-        // ---- batch > 0 ----
-        // cache.batch сохраняется из input.rows() при forward;
-        // нулевой batch означал бы, что forward не выполнялся.
         debug_assert!(
             ctx.batch > 0,
             "LinearAdapter: batch must be positive, got {}",
             ctx.batch
         );
 
-        // ---- I-1: adapter_pass вызывается после optimizer_modify_grads ----
-        // Фазовый порядок (MIGRATION_PLAN.md §2): forward → loss → backward
-        // → optimizer_modify_grads → adapter_pass → optimizer_apply_update.
-        // Если флаг `false`, значит кто-то нарушил порядок фаз.
         debug_assert!(
             ctx.optimizer_applied,
             "LinearAdapter: optimizer_applied must be true. \
@@ -131,9 +161,6 @@ impl GradientAdapter for LinearAdapter {
              adapter_pass must be called after optimizer_modify_grads."
         );
 
-        // ---- I-10: own_slice — легитимный член all_slices ----
-        // `all_slices` содержит срезы слоёв сегмента. `own_slice` адаптера
-        // должен быть одним из них — иначе это чужой срез или ошибка индексации.
         debug_assert!(
             ctx.all_slices.iter().any(|s| *s == ctx.own_slice),
             "LinearAdapter: own_slice {:?} is not present in all_slices {:?}",
@@ -141,10 +168,6 @@ impl GradientAdapter for LinearAdapter {
             ctx.all_slices
         );
 
-        // ---- Фаза 4: forward_ctx присутствует ----
-        // MIGRATION_PLAN.md §7, Фаза 4: forward_cache живёт до
-        // optimizer_apply_update. К моменту adapter_pass он обязан
-        // быть заполнен.
         debug_assert!(
             ctx.forward_ctx.is_some(),
             "LinearAdapter: forward_ctx is missing. \
@@ -152,7 +175,6 @@ impl GradientAdapter for LinearAdapter {
              (MIGRATION_PLAN.md §7, Фаза 4: cache must survive until apply_update)."
         );
 
-        // ---- Фаза 2: adapter_store доступен ----
         debug_assert!(
             ctx.adapter_store.is_some(),
             "LinearAdapter: adapter_store is missing. \
@@ -161,37 +183,137 @@ impl GradientAdapter for LinearAdapter {
         );
 
         // ====================================================================
-        // No-op: адаптер не модифицирует градиент.
+        // GPU-ветка заморожена (I-5).
         // ====================================================================
-        //
-        // По решению администратора пилотный адаптер только проверяет
-        // среду, не меняет числа. Никакого `ctx.modify_own_grads(...)`
-        // здесь нет и не должно быть до следующей фазы.
-
-        // ---- Однократное диагностическое сообщение (только debug) ----
-        #[cfg(debug_assertions)]
-        {
-            if !self.reported.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "[adapter] LinearAdapter no-op activated \
-                     (pilot phase: validating adapter environment, \
-                     grads are NOT modified)"
-                );
-            }
+        if ctx.segment_grads.is_gpu() {
+            debug_assert!(
+                ctx.segment_params.is_gpu(),
+                "LinearAdapter: I-5 violation — grads on GPU but params on CPU. \
+                 Adapter device must match layer device."
+            );
+            return;
         }
 
-        // В release-сборке `reported` не читается по горячему пути.
-        // Заглушка ниже — только чтобы поле не считалось dead_code.
-        #[cfg(not(debug_assertions))]
-        {
-            let _ = self.reported.load(Ordering::Relaxed);
+        // ====================================================================
+        // Режим per_row. Если из forward_ctx не удаётся извлечь in_features
+        // или slice_len не согласован — тихо откатываемся на per_tensor.
+        // ====================================================================
+        match extract_in_features(ctx.forward_ctx) {
+            Some(in_features)
+                if in_features > 0
+                    && ctx.own_slice.len % (in_features + 1) == 0 =>
+            {
+                apply_per_row(ctx, in_features);
+            }
+            _ => {
+                apply_per_tensor(ctx);
+            }
         }
     }
 
     fn name(&self) -> &'static str {
         "linear"
     }
+}
 
-    // `has_state` / `state_size_per_param` — дефолт (false / 0):
-    // пилотный адаптер stateless.
+// ============================================================================
+// Реализация формул
+// ============================================================================
+
+/// Адаптивный β_eff = β · (1 + α · r), где r = ‖g_ps‖ / ‖W‖.
+#[inline]
+fn adaptive_beta(beta: f32, alpha: f32, w_norm: f32, g_norm_ps: f32) -> f32 {
+    if alpha == 0.0 || w_norm < 1e-30 {
+        return beta;
+    }
+    let r = g_norm_ps / w_norm;
+    beta * (1.0 + alpha * r)
+}
+
+/// Per-tensor LARS. Fallback, если per_row неприменим.
+fn apply_per_tensor(ctx: &AdapterContext<'_>) {
+    let w = ctx.read_own_params();
+    let mut g = ctx.read_own_grads();
+
+    let w_norm = l2_norm(&w);
+    let g_norm_sum = l2_norm(&g);
+
+    let b = ctx.batch.max(1) as f32;
+    let g_norm_per_sample = g_norm_sum / b.sqrt();
+
+    let beta_eff = adaptive_beta(LARS_BETA, LARS_ADAPT, w_norm, g_norm_per_sample);
+
+    let denom = g_norm_per_sample + beta_eff * w_norm + LARS_EPS;
+    let scale_raw = if denom > 0.0 { w_norm / denom } else { 1.0 };
+    let scale = scale_raw.clamp(LARS_MIN_SCALE, LARS_MAX_SCALE);
+
+    for v in g.iter_mut() {
+        *v *= scale;
+    }
+    ctx.write_own_grads(&g);
+}
+
+/// Per-row LARS. Свой scale на каждую строку W.
+fn apply_per_row(ctx: &AdapterContext<'_>, in_features: usize) {
+    let slice_len = ctx.own_slice.len;
+    let out_features = slice_len / (in_features + 1);
+
+    if out_features == 0 {
+        return;
+    }
+
+    let w = ctx.read_own_params();
+    let mut g = ctx.read_own_grads();
+
+    let b = ctx.batch.max(1) as f32;
+    let sqrt_b = b.sqrt();
+
+    for c in 0..out_features {
+        let start = c * in_features;
+        let end = start + in_features;
+
+        let w_c = &w[start..end];
+        let g_c = &mut g[start..end];
+
+        let w_norm = l2_norm(w_c);
+        let g_norm_sum = l2_norm(g_c);
+        let g_norm_per_sample = g_norm_sum / sqrt_b;
+
+        let beta_eff = adaptive_beta(LARS_BETA, LARS_ADAPT, w_norm, g_norm_per_sample);
+
+        let denom = g_norm_per_sample + beta_eff * w_norm + LARS_EPS;
+        let scale_raw = if denom > 0.0 { w_norm / denom } else { 1.0 };
+        let scale = scale_raw.clamp(LARS_MIN_SCALE, LARS_MAX_SCALE);
+
+        for v in g_c.iter_mut() {
+            *v *= scale;
+        }
+    }
+
+    ctx.write_own_grads(&g);
+}
+
+// ============================================================================
+// Вспомогательные функции
+// ============================================================================
+
+#[inline]
+fn l2_norm(v: &[f32]) -> f32 {
+    let mut sum_sq: f64 = 0.0;
+    for &x in v {
+        let d = x as f64;
+        sum_sq += d * d;
+    }
+    sum_sq.sqrt() as f32
+}
+
+fn extract_in_features(forward_ctx: Option<&DynamicContext>) -> Option<usize> {
+    let fctx = forward_ctx?;
+    match fctx {
+        DynamicContext::Buffered(BufferedContext::Linear { input }) => {
+            let cols = input.cols();
+            if cols > 0 { Some(cols) } else { None }
+        }
+        DynamicContext::Buffered(_) => None,
+    }
 }

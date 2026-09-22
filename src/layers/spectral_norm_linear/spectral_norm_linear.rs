@@ -1,6 +1,9 @@
 // src/layers/spectral_norm_linear/spectral_norm_linear.rs
 
 use crate::layers::UniversalLayer;
+use crate::layers::adapter::GradientAdapter;
+
+use super::adapter::SpectralNormLinearAdapter;
 
 /// Линейный слой со спектральной нормализацией весов.
 ///
@@ -43,11 +46,22 @@ use crate::layers::UniversalLayer;
 /// старта). Если требуется **точная** эмуляция исходной динамики с
 /// персистентными `u`/`v` между эпохами — эту пару нужно вынести в
 /// отдельное персистентное поле слоя (аналогично `BatchRenorm1d::state`).
+///
+/// # Градиентный адаптер
+///
+/// Слой владеет [`SpectralNormLinearAdapter`], который реализует
+/// LARS-adaptive нормировку градиента по `W` с использованием
+/// эффективной спектральной нормы `|scale|` в качестве числителя.
+/// Вызывается в `GraphV2::adapter_pass` между
+/// `optimizer_modify_grads` и `optimizer_apply_update`.
 pub struct SpectrallyNormalizedLinear {
     /// Размерность входа.
     pub in_features: usize,
     /// Размерность выхода.
     pub out_features: usize,
+
+    /// Градиентный адаптер (MIGRATION_PLAN.md §7, Фаза 5+).
+    pub(crate) adapter: SpectralNormLinearAdapter,
 }
 
 impl SpectrallyNormalizedLinear {
@@ -63,6 +77,7 @@ impl SpectrallyNormalizedLinear {
         Self {
             in_features,
             out_features,
+            adapter: SpectralNormLinearAdapter::new(),
         }
     }
 }
@@ -70,6 +85,15 @@ impl SpectrallyNormalizedLinear {
 impl UniversalLayer for SpectrallyNormalizedLinear {
     fn as_spectral_norm_linear(&self) -> Option<&SpectrallyNormalizedLinear> {
         Some(self)
+    }
+
+    /// Возвращает LARS-adaptive адаптер слоя (MIGRATION_PLAN.md §7, Фаза 5+).
+    ///
+    /// Вызывается в `GraphV2::adapter_pass` строго между
+    /// `optimizer_modify_grads` и `optimizer_apply_update` (инвариант I-1).
+    #[inline]
+    fn adapter(&self) -> Option<&dyn GradientAdapter> {
+        Some(&self.adapter)
     }
 
     fn param_len(&self) -> usize {

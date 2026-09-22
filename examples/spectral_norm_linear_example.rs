@@ -53,7 +53,7 @@ mod optimizers {
 
     pub fn sgd() -> OptimizerDesc {
         OptimizerDesc::new()
-            .add(OptCubeDesc::ScaleGradient(0.01))
+            .add(OptCubeDesc::ScaleGradient(0.015))
             .add(OptCubeDesc::ApplyUpdate)
     }
 }

@@ -1,6 +1,9 @@
 // src/layers/multi_resolution_kan_linear/multi_resolution_kan_linear.rs
 
+use crate::layers::adapter::GradientAdapter;
 use crate::layers::UniversalLayer;
+
+use super::adapter::MultiResolutionKANLinearAdapter;
 
 /// Адаптивный KAN-слой с multi-resolution spline (NeuroCore v2).
 ///
@@ -28,6 +31,14 @@ use crate::layers::UniversalLayer;
 pub struct MultiResolutionKANLinear {
     pub in_features: usize,
     pub out_features: usize,
+
+    /// Градиентный адаптер (MIGRATION_PLAN.md §7, Фаза 5+).
+    ///
+    /// Вызывается в `GraphV2::adapter_pass` между
+    /// `optimizer_modify_grads` и `optimizer_apply_update` (инвариант I-1).
+    /// Stateless: `&self`, конфигурация — через env-переменные. См.
+    /// документацию модуля [`super::adapter`].
+    pub(crate) adapter: MultiResolutionKANLinearAdapter,
 }
 
 impl MultiResolutionKANLinear {
@@ -40,13 +51,31 @@ impl MultiResolutionKANLinear {
             out_features > 0,
             "MultiResolutionKANLinear: out_features must be positive"
         );
-        Self { in_features, out_features }
+        Self {
+            in_features,
+            out_features,
+            adapter: MultiResolutionKANLinearAdapter::new(),
+        }
     }
 }
 
 impl UniversalLayer for MultiResolutionKANLinear {
     fn as_multi_resolution_kan_linear(&self) -> Option<&MultiResolutionKANLinear> {
         Some(self)
+    }
+
+    /// Градиентный адаптер (MIGRATION_PLAN.md §7, Фаза 5+).
+    ///
+    /// `Some` всегда: слой KAN по умолчанию использует режим 5
+    /// (`group_rms_equalize`). Режим 0 (env `NEUROCORE_KAN_MODE=0`)
+    /// делает адаптер no-op, что эквивалентно базлайну; либо можно
+    /// полностью отключить адаптеры через `NEUROCORE_DISABLE_ADAPTERS=1`.
+    ///
+    /// Вызывается в `GraphV2::adapter_pass` строго между
+    /// `optimizer_modify_grads` и `optimizer_apply_update` (инвариант I-1).
+    #[inline]
+    fn adapter(&self) -> Option<&dyn GradientAdapter> {
+        Some(&self.adapter)
     }
 
     fn param_len(&self) -> usize {

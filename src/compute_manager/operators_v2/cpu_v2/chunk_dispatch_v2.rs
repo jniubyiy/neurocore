@@ -2,18 +2,6 @@
 //
 // Диспетчер forward/backward UniversalProcessor-сегмента на CPU + DimOp
 // + ConnectorOp.
-//
-// Universal:
-//   * Параллельный режим — через существующие
-//     `forward_universal_parallel` / `backward_universal_parallel`.
-//   * Последовательный режим — проход по слоям в вызывающем потоке.
-//
-// DimOp:
-//   * вызов `dim_change::unsqueeze_mat_buffered_handle` /
-//     `reduce_mat_buffered_handle` (CPU-only).
-//
-// Connector:
-//   * Splitter / Combiner — CPU-реализация по формулам из старого пути.
 
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +25,7 @@ use crate::layers::{
     AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
     SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
     PerFeatureAttention,
+    AdaptiveSpaceCompress,
 };
 use crate::model_plan::param_store::ParamSlice;
 
@@ -53,6 +42,7 @@ pub fn execute_forward(
     let slices = job.slices.clone();
     let params = job.params.clone();
     let input = job.input.clone();
+    let sample_lens = job.sample_lens.clone();
 
     let batch = input.rows();
 
@@ -80,6 +70,7 @@ pub fn execute_forward(
             params,
             input,
             output.clone(),
+            sample_lens,
         );
 
         JobResult::Forward {
@@ -100,9 +91,10 @@ pub fn execute_forward(
                 p.acquire(batch, out_feat)
             };
 
-            let ctx = dispatch_forward_one_layer(
+            let ctx = dispatch_forward_one_layer_ragged(
                 layer,
                 &current_input,
+                sample_lens.as_deref(),
                 &out,
                 &params,
                 slice,
@@ -194,7 +186,19 @@ pub fn execute_backward(
             let slice = &slices[i];
             let ctx = &ctxs[i];
 
-            let layer_in_feat = layer.input_features_for(current_grad.cols());
+            // Размерность входа слоя. Оркестратор не знает про конкретный
+            // слой: он спрашивает слой через `input_features_from_ctx`.
+            // Слои с фиксированным входом используют дефолтную реализацию
+            // (возвращает `self.input_features()` либо `fallback`); слои
+            // с динамическим входом (например, `AdaptiveSpaceCompress`)
+            // переопределяют метод и читают размер из своего варианта
+            // `BufferedContext`.
+            let layer_ref: &dyn UniversalLayer = layer.as_ref();
+            let layer_in_feat = {
+                let layer_buffered = layer_ref_as_buffered(layer_ref);
+                layer_buffered.input_features_from_ctx(ctx, current_grad.cols())
+            };
+
             let next_grad = {
                 let mut p = pool.lock().unwrap();
                 p.acquire(current_grad.rows(), layer_in_feat)
@@ -217,7 +221,6 @@ pub fn execute_backward(
             current_grad = next_grad;
         }
 
-        // Копируем финальный градиент в выделенный grad_input.
         {
             let src_guard = current_grad.read();
             let src = src_guard.as_slice().expect("CPU buffer");
@@ -236,7 +239,6 @@ pub fn execute_backward(
 // DimOp
 // ============================================================================
 
-/// Изменение формы буфера без потери элементов.
 pub fn execute_dimop(job: DimOpJob, pool: Arc<Mutex<TempMatrixPool>>) -> JobResult {
     let mut p = pool.lock().unwrap();
     let result = match job.kind {
@@ -251,10 +253,9 @@ pub fn execute_dimop(job: DimOpJob, pool: Arc<Mutex<TempMatrixPool>>) -> JobResu
 }
 
 // ============================================================================
-// ConnectorOp
+// ConnectorOp — оставлен как был
 // ============================================================================
 
-/// Диспетчер forward/backward коннекторов.
 pub fn execute_connector(
     job: ConnectorOpJob,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -265,11 +266,6 @@ pub fn execute_connector(
     }
 }
 
-/// Forward-диспетчер коннекторов.
-///
-/// ВАЖНО: match по **клонированному** `kind`, а не по `&job.kind`.
-/// Иначе borrow `job.kind` остаётся живым, пока `job` move-ится в одну
-/// из вызываемых функций ниже (ошибка E0505).
 fn execute_connector_forward(
     job: ConnectorOpJob,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -445,10 +441,6 @@ fn execute_combiner_forward(
     JobResult::Buffers(vec![out, pre])
 }
 
-/// Backward-диспетчер коннекторов.
-///
-/// ВАЖНО: match по **клонированному** `kind` — см. комментарий к
-/// `execute_connector_forward`.
 fn execute_connector_backward(
     job: ConnectorOpJob,
     pool: Arc<Mutex<TempMatrixPool>>,
@@ -514,7 +506,6 @@ fn execute_splitter_backward(
     let bias_a_start = wb_start + q_dim * n;
     let bias_b_start = bias_a_start + p_dim;
 
-    // dx[c, r] = Σ_j d_pre_a[j, r] * wa[j, c] + Σ_j d_pre_b[j, r] * wb[j, c]
     let mut dx_data = vec![0.0f32; batch * n];
     for c in 0..n {
         for r in 0..batch {
@@ -522,24 +513,19 @@ fn execute_splitter_backward(
             for j in 0..p_dim {
                 let d_pre = if pre_a_data[j * batch + r] > 0.0 {
                     delta_a_data[j * batch + r]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 sum += d_pre * params_data[wa_start + j * n + c];
             }
             for j in 0..q_dim {
                 let d_pre = if pre_b_data[j * batch + r] > 0.0 {
                     delta_b_data[j * batch + r]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 sum += d_pre * params_data[wb_start + j * n + c];
             }
             dx_data[c * batch + r] = sum;
         }
     }
 
-    // grad_wa[j, k] = Σ_r d_pre_a[j, r] * x[k, r]
     let mut grad_wa = vec![0.0f32; p_dim * n];
     for j in 0..p_dim {
         for k in 0..n {
@@ -547,16 +533,13 @@ fn execute_splitter_backward(
             for r in 0..batch {
                 let d_pre = if pre_a_data[j * batch + r] > 0.0 {
                     delta_a_data[j * batch + r]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 sum += d_pre * x_data[k * batch + r];
             }
             grad_wa[j * n + k] = sum;
         }
     }
 
-    // grad_wb[j, k] = Σ_r d_pre_b[j, r] * x[k, r]
     let mut grad_wb = vec![0.0f32; q_dim * n];
     for j in 0..q_dim {
         for k in 0..n {
@@ -564,46 +547,37 @@ fn execute_splitter_backward(
             for r in 0..batch {
                 let d_pre = if pre_b_data[j * batch + r] > 0.0 {
                     delta_b_data[j * batch + r]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 sum += d_pre * x_data[k * batch + r];
             }
             grad_wb[j * n + k] = sum;
         }
     }
 
-    // grad_bias_a[j] = Σ_r d_pre_a[j, r]
     let mut grad_bias_a = vec![0.0f32; p_dim];
     for j in 0..p_dim {
         let mut sum = 0.0f32;
         for r in 0..batch {
             let d_pre = if pre_a_data[j * batch + r] > 0.0 {
                 delta_a_data[j * batch + r]
-            } else {
-                0.0
-            };
+            } else { 0.0 };
             sum += d_pre;
         }
         grad_bias_a[j] = sum;
     }
 
-    // grad_bias_b[j] = Σ_r d_pre_b[j, r]
     let mut grad_bias_b = vec![0.0f32; q_dim];
     for j in 0..q_dim {
         let mut sum = 0.0f32;
         for r in 0..batch {
             let d_pre = if pre_b_data[j * batch + r] > 0.0 {
                 delta_b_data[j * batch + r]
-            } else {
-                0.0
-            };
+            } else { 0.0 };
             sum += d_pre;
         }
         grad_bias_b[j] = sum;
     }
 
-    // Собираем все градиенты в один блок и пишем одним write_range.
     let mut grad_params_local = vec![0.0f32; param_len];
     grad_params_local[wa_start..wa_start + p_dim * n].copy_from_slice(&grad_wa);
     grad_params_local[wb_start..wb_start + q_dim * n].copy_from_slice(&grad_wb);
@@ -663,9 +637,6 @@ fn execute_combiner_backward(
     let wb_start = wa_start + m * n;
     let bias_start = wb_start + m * n;
 
-    // d_pre[j, r] = (pre[j, r] > 0) ? delta[j, r] : 0
-    // da[c, r] = Σ_j d_pre[j, r] * wa[j, c]
-    // db[c, r] = Σ_j d_pre[j, r] * wb[j, c]
     let mut da_data = vec![0.0f32; batch * n];
     let mut db_data = vec![0.0f32; batch * n];
     for c in 0..n {
@@ -675,9 +646,7 @@ fn execute_combiner_backward(
             for j in 0..m {
                 let d_pre = if pre_data[j * batch + r] > 0.0 {
                     delta_data[j * batch + r]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 sum_a += d_pre * params_data[wa_start + j * n + c];
                 sum_b += d_pre * params_data[wb_start + j * n + c];
             }
@@ -686,7 +655,6 @@ fn execute_combiner_backward(
         }
     }
 
-    // grad_wa[j, k] = Σ_r d_pre[j, r] * a[k, r]
     let mut grad_wa = vec![0.0f32; m * n];
     for j in 0..m {
         for k in 0..n {
@@ -694,16 +662,13 @@ fn execute_combiner_backward(
             for r in 0..batch {
                 let d_pre = if pre_data[j * batch + r] > 0.0 {
                     delta_data[j * batch + r]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 sum += d_pre * a_data[k * batch + r];
             }
             grad_wa[j * n + k] = sum;
         }
     }
 
-    // grad_wb[j, k] = Σ_r d_pre[j, r] * b[k, r]
     let mut grad_wb = vec![0.0f32; m * n];
     for j in 0..m {
         for k in 0..n {
@@ -711,25 +676,20 @@ fn execute_combiner_backward(
             for r in 0..batch {
                 let d_pre = if pre_data[j * batch + r] > 0.0 {
                     delta_data[j * batch + r]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 sum += d_pre * b_data[k * batch + r];
             }
             grad_wb[j * n + k] = sum;
         }
     }
 
-    // grad_bias[j] = Σ_r d_pre[j, r]
     let mut grad_bias = vec![0.0f32; m];
     for j in 0..m {
         let mut sum = 0.0f32;
         for r in 0..batch {
             let d_pre = if pre_data[j * batch + r] > 0.0 {
                 delta_data[j * batch + r]
-            } else {
-                0.0
-            };
+            } else { 0.0 };
             sum += d_pre;
         }
         grad_bias[j] = sum;
@@ -759,6 +719,61 @@ fn execute_combiner_backward(
 // ============================================================================
 // Внутренние диспетчеры одного слоя
 // ============================================================================
+
+/// Возвращает `&dyn UniversalLayerBuffered` для любого конкретного слоя.
+///
+/// В проекте нет универсального моста `UniversalLayer → UniversalLayerBuffered`
+/// (это два независимых трейта, оба реализуются в одном impl-блоке). Здесь
+/// используется самый простой способ: downcast к конкретным типам.
+///
+/// Единственное, зачем это нужно — чтобы оркестратор мог вызвать
+/// `input_features_from_ctx(ctx, fallback)` **до** `dispatch_backward_one_layer`,
+/// не зная про конкретный слой.
+fn layer_ref_as_buffered(layer: &dyn UniversalLayer) -> &dyn UniversalLayerBuffered {
+    macro_rules! as_buf {
+        ($ty:ty, $getter:ident) => {
+            if let Some(x) = layer.$getter() {
+                return x as &dyn UniversalLayerBuffered;
+            }
+        };
+    }
+
+    as_buf!(Linear, as_linear);
+    as_buf!(ReLU, as_relu);
+    as_buf!(Sigmoid, as_sigmoid);
+    as_buf!(Tanh, as_tanh);
+    as_buf!(LeakyReLU, as_leaky_relu);
+    as_buf!(Identity, as_identity);
+    as_buf!(Softmax, as_softmax);
+    as_buf!(Memory, as_memory);
+    as_buf!(SoftSparseGate, as_soft_sparse_gate);
+    as_buf!(SoftKeepGate, as_soft_keep_gate);
+    as_buf!(DualAnchor, as_dual_anchor);
+    as_buf!(AdaptivePerFeatureActivation, as_adaptive_activation);
+    as_buf!(DualSlopeReLU, as_dual_slope_relu);
+    as_buf!(LearnableMish, as_learnable_mish);
+    as_buf!(LearnableSoftplus, as_learnable_softplus);
+    as_buf!(RMSNormWithLearnableEpsilon, as_rms_norm_learnable_eps);
+    as_buf!(AdaptiveDropout, as_adaptive_dropout);
+    as_buf!(FeatureFusion, as_feature_fusion);
+    as_buf!(SparseFeatureSelectionGate, as_sparse_feature_selection_gate);
+    as_buf!(MultiResolutionKANLinear, as_multi_resolution_kan_linear);
+    as_buf!(AdaptiveNormalization, as_adaptive_normalization);
+    as_buf!(BatchRenorm1d, as_batch_renorm);
+    as_buf!(ConcreteDropout, as_concrete_dropout);
+    as_buf!(IndRNN, as_ind_rnn);
+    as_buf!(Mamba, as_mamba);
+    as_buf!(SpectrallyNormalizedLinear, as_spectral_norm_linear);
+    as_buf!(LinearAttention, as_linear_attention);
+    as_buf!(RelativePositionAttention, as_relative_position_attention);
+    as_buf!(PerFeatureAttention, as_per_feature_attention);
+    as_buf!(AdaptiveSpaceCompress, as_adaptive_space_compress);
+
+    unreachable!(
+        "layer_ref_as_buffered: unsupported layer {:?}",
+        std::any::type_name_of_val(layer)
+    );
+}
 
 fn dispatch_forward_one_layer(
     layer: &Box<dyn UniversalLayer>,
@@ -810,9 +825,73 @@ fn dispatch_forward_one_layer(
     fwd!(LinearAttention, as_linear_attention);
     fwd!(RelativePositionAttention, as_relative_position_attention);
     fwd!(PerFeatureAttention, as_per_feature_attention);
+    fwd!(AdaptiveSpaceCompress, as_adaptive_space_compress);
 
     unreachable!(
         "CpuOperatorV2::forward: layer {:?} has no buffered forward",
+        std::any::type_name_of_val(l)
+    );
+}
+
+fn dispatch_forward_one_layer_ragged(
+    layer: &Box<dyn UniversalLayer>,
+    input: &MatrixBufferHandle,
+    sample_lens: Option<&[usize]>,
+    output: &MatrixBufferHandle,
+    params: &MatrixBufferHandle,
+    slice: &ParamSlice,
+    pool: &Arc<Mutex<TempMatrixPool>>,
+) -> BufferedContext {
+    let Some(lens) = sample_lens else {
+        return dispatch_forward_one_layer(layer, input, output, params, slice, pool);
+    };
+
+    let mut pool_guard = pool.lock().unwrap();
+    let l: &dyn UniversalLayer = layer.as_ref();
+
+    macro_rules! fwd_ragged {
+        ($ty:ty, $getter:ident) => {
+            if let Some(x) = l.$getter() {
+                return <$ty as UniversalLayerBuffered>::forward_buffered_ragged(
+                    x, input, lens, output, params, slice, &mut *pool_guard,
+                );
+            }
+        };
+    }
+
+    fwd_ragged!(Linear, as_linear);
+    fwd_ragged!(ReLU, as_relu);
+    fwd_ragged!(Sigmoid, as_sigmoid);
+    fwd_ragged!(Tanh, as_tanh);
+    fwd_ragged!(LeakyReLU, as_leaky_relu);
+    fwd_ragged!(Identity, as_identity);
+    fwd_ragged!(Softmax, as_softmax);
+    fwd_ragged!(Memory, as_memory);
+    fwd_ragged!(SoftSparseGate, as_soft_sparse_gate);
+    fwd_ragged!(SoftKeepGate, as_soft_keep_gate);
+    fwd_ragged!(DualAnchor, as_dual_anchor);
+    fwd_ragged!(AdaptivePerFeatureActivation, as_adaptive_activation);
+    fwd_ragged!(DualSlopeReLU, as_dual_slope_relu);
+    fwd_ragged!(LearnableMish, as_learnable_mish);
+    fwd_ragged!(LearnableSoftplus, as_learnable_softplus);
+    fwd_ragged!(RMSNormWithLearnableEpsilon, as_rms_norm_learnable_eps);
+    fwd_ragged!(AdaptiveDropout, as_adaptive_dropout);
+    fwd_ragged!(FeatureFusion, as_feature_fusion);
+    fwd_ragged!(SparseFeatureSelectionGate, as_sparse_feature_selection_gate);
+    fwd_ragged!(MultiResolutionKANLinear, as_multi_resolution_kan_linear);
+    fwd_ragged!(AdaptiveNormalization, as_adaptive_normalization);
+    fwd_ragged!(BatchRenorm1d, as_batch_renorm);
+    fwd_ragged!(ConcreteDropout, as_concrete_dropout);
+    fwd_ragged!(IndRNN, as_ind_rnn);
+    fwd_ragged!(Mamba, as_mamba);
+    fwd_ragged!(SpectrallyNormalizedLinear, as_spectral_norm_linear);
+    fwd_ragged!(LinearAttention, as_linear_attention);
+    fwd_ragged!(RelativePositionAttention, as_relative_position_attention);
+    fwd_ragged!(PerFeatureAttention, as_per_feature_attention);
+    fwd_ragged!(AdaptiveSpaceCompress, as_adaptive_space_compress);
+
+    unreachable!(
+        "CpuOperatorV2::forward (ragged): layer {:?} has no buffered forward",
         std::any::type_name_of_val(l)
     );
 }
@@ -868,6 +947,7 @@ fn dispatch_backward_one_layer(
     bwd!(LinearAttention, as_linear_attention);
     bwd!(RelativePositionAttention, as_relative_position_attention);
     bwd!(PerFeatureAttention, as_per_feature_attention);
+    bwd!(AdaptiveSpaceCompress, as_adaptive_space_compress);
 
     unreachable!(
         "CpuOperatorV2::backward: layer {:?} has no buffered backward",

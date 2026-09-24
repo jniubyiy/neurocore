@@ -17,6 +17,10 @@ pub(super) struct ForwardTaskShared {
     pub layers: Arc<Vec<Box<dyn UniversalLayer>>>,
     pub slices: Arc<Vec<ParamSlice>>,
     pub pool: Arc<Mutex<TempMatrixPool>>,
+    /// Длины реальных данных каждого примера **всего** батча. `None` —
+    /// вход dense. `Some(lens)` — ragged; для каждого чанка берётся
+    /// срез `lens[in_start..in_end]` из `chunk_ops`-плана.
+    pub sample_lens: Option<Vec<usize>>,
 }
 
 /// Общие данные для всех backward-задач одного вызова.

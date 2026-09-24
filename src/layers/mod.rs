@@ -25,7 +25,6 @@ pub mod relative_position_attention;
 pub mod ind_rnn;
 pub mod spectral_norm_linear;
 
-// Новые слои (полные внутренние реализации)
 pub mod dual_slope_relu;
 pub mod learnable_mish;
 pub mod learnable_softplus;
@@ -35,23 +34,19 @@ pub mod feature_fusion;
 pub mod sparse_feature_selection_gate;
 pub mod multi_resolution_kan_linear;
 
-// PerFeatureAttention (CPU-only)
+pub mod adaptive_space_compress;
+
 pub mod per_feature_attention;
 
 pub mod layers_special;
 pub mod buffered_context;
 
-// Инфраструктура градиентных адаптеров (MIGRATION_PLAN.md §7, Фаза 3).
 pub mod adapter;
 
 use crate::compute_manager::core::dynamic_context::DynamicContext;
 use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
 use crate::compute_manager::operators_v2::memory_v2::buffer::TempMatrixPool;
 use crate::model_plan::param_store::ParamSlice;
-
-// ---------------------------------------------------------------------------
-// Маркерный трейт UniversalLayer (для downcasting и общей информации)
-// ---------------------------------------------------------------------------
 
 pub trait UniversalLayer: Send + Sync + 'static {
     fn as_linear(&self) -> Option<&Linear> { None }
@@ -77,7 +72,6 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_reduce_mean(&self) -> Option<&ReduceMean> { None }
     fn as_unsqueeze(&self) -> Option<&Unsqueeze> { None }
 
-    // Новые слои
     fn as_dual_slope_relu(&self) -> Option<&DualSlopeReLU> { None }
     fn as_learnable_mish(&self) -> Option<&LearnableMish> { None }
     fn as_learnable_softplus(&self) -> Option<&LearnableSoftplus> { None }
@@ -87,31 +81,15 @@ pub trait UniversalLayer: Send + Sync + 'static {
     fn as_sparse_feature_selection_gate(&self) -> Option<&SparseFeatureSelectionGate> { None }
     fn as_multi_resolution_kan_linear(&self) -> Option<&MultiResolutionKANLinear> { None }
 
-    // PerFeatureAttention
+    fn as_adaptive_space_compress(&self) -> Option<&AdaptiveSpaceCompress> { None }
+
     fn as_per_feature_attention(&self) -> Option<&PerFeatureAttention> { None }
 
-    // -----------------------------------------------------------------------
-    // Градиентный адаптер (MIGRATION_PLAN.md §7, Фаза 3)
-    // -----------------------------------------------------------------------
-    //
-    // Возвращает адаптер этого слоя, если он есть. Вызывается в
-    // `GraphV2::adapter_pass` (Фаза 4) между `optimizer_modify_grads`
-    // и `optimizer_apply_update`.
-    //
-    // Дефолт `None` означает «у слоя нет адаптера» — поведение полностью
-    // совпадает с архитектурой без адаптеров. Все существующие слои
-    // используют дефолт; переопределение появится в Фазе 5+.
-    //
-    // Инварианты:
-    //   * I-4: адаптер живёт в папке слоя (`src/layers/<layer>/adapter/`);
-    //   * I-5: устройство адаптера = устройство слоя;
-    //   * I-9: каждый слой имеет право на свою формулу.
     #[inline]
     fn adapter(&self) -> Option<&dyn GradientAdapter> {
         None
     }
 
-    // Общая информация о слое, используемая планировщиком.
     fn param_len(&self) -> usize { 0 }
     fn input_features(&self) -> usize { 0 }
     fn output_features(&self) -> usize { 0 }
@@ -128,10 +106,6 @@ pub trait UniversalLayer: Send + Sync + 'static {
         if inf == 0 { fallback } else { inf }
     }
 }
-
-// ---------------------------------------------------------------------------
-// UniversalLayerBuffered — единый контракт forward/backward
-// ---------------------------------------------------------------------------
 
 pub trait UniversalLayerBuffered: Send + Sync + 'static {
     fn forward_buffered(
@@ -153,16 +127,65 @@ pub trait UniversalLayerBuffered: Send + Sync + 'static {
         grad_params: &MatrixBufferHandle,
     );
 
+    /// Ragged-версия forward. По умолчанию игнорирует `sample_lens` и
+    /// вызывает `forward_buffered`. Слои, поддерживающие ragged-вход,
+    /// переопределяют этот метод.
+    fn forward_buffered_ragged(
+        &self,
+        input: &MatrixBufferHandle,
+        _sample_lens: &[usize],
+        output: &MatrixBufferHandle,
+        params: &MatrixBufferHandle,
+        slice: &ParamSlice,
+        pool: &mut TempMatrixPool,
+    ) -> BufferedContext {
+        self.forward_buffered(input, output, params, slice, pool)
+    }
+
+    /// Ragged-версия backward. По умолчанию игнорирует `sample_lens`
+    /// и вызывает `backward_buffered`.
+    fn backward_buffered_ragged(
+        &self,
+        ctx: &DynamicContext,
+        _sample_lens: &[usize],
+        grad_output: &MatrixBufferHandle,
+        grad_input: &MatrixBufferHandle,
+        params: &MatrixBufferHandle,
+        slice: &ParamSlice,
+        grad_params: &MatrixBufferHandle,
+    ) {
+        self.backward_buffered(ctx, grad_output, grad_input, params, slice, grad_params)
+    }
+
+    /// Возвращает размерность **входа** слоя, используя контекст backward.
+    ///
+    /// Это позволяет слоям с **динамическим** входным размером (например,
+    /// `AdaptiveSpaceCompress`) сообщить оркестратору реальную длину
+    /// входа, взятую из forward-контекста, — не заставляя оркестратор
+    /// знать про конкретный слой.
+    ///
+    /// Дефолтная реализация игнорирует `ctx` и возвращает
+    /// `self.input_features()`, подставляя `fallback`, если слой
+    /// возвращает 0 (то есть для слоёв с фиксированным входом или
+    /// для слоёв, не переопределивших `input_features`).
+    ///
+    /// Слои с фиксированным входом ничего не переопределяют.
+    /// Слои с динамическим входом переопределяют, читая фактический
+    /// размер из своего варианта `BufferedContext`.
+    #[inline]
+    fn input_features_from_ctx(
+        &self,
+        _ctx: &DynamicContext,
+        fallback: usize,
+    ) -> usize {
+        let inf = self.input_features();
+        if inf == 0 { fallback } else { inf }
+    }
+
     fn param_len(&self) -> usize;
-
     fn input_features(&self) -> usize;
-
     fn output_features(&self) -> usize;
 }
-
-// ---------------------------------------------------------------------------
-// Публичные реэкспорты
-// ---------------------------------------------------------------------------
 
 pub use linear::Linear;
 pub use relu::ReLU;
@@ -189,7 +212,6 @@ pub use relative_position_attention::RelativePositionAttention;
 pub use ind_rnn::IndRNN;
 pub use spectral_norm_linear::SpectrallyNormalizedLinear;
 
-// Новые реэкспорты
 pub use dual_slope_relu::DualSlopeReLU;
 pub use learnable_mish::LearnableMish;
 pub use learnable_softplus::LearnableSoftplus;
@@ -199,15 +221,11 @@ pub use feature_fusion::FeatureFusion;
 pub use sparse_feature_selection_gate::SparseFeatureSelectionGate;
 pub use multi_resolution_kan_linear::MultiResolutionKANLinear;
 
+pub use adaptive_space_compress::AdaptiveSpaceCompress;
+
 pub use per_feature_attention::PerFeatureAttention;
 
 pub use layers_special::{DimReduce, DimExpand, ReduceMean, Unsqueeze};
 pub use buffered_context::BufferedContext;
 
-// Инфраструктура адаптеров (Фаза 3).
-//
-// `GradientAdapter` здесь и вводит имя в текущий модуль (для сигнатуры
-// `UniversalLayer::adapter()` выше), и реэкспортирует его наружу.
-// Отдельный `use crate::layers::adapter::GradientAdapter;` избыточен
-// и вызывает E0252.
 pub use adapter::{AdapterContext, AdapterRegistry, AdapterTypeInfo, GradientAdapter};

@@ -1,28 +1,4 @@
 // src/plans/training_plan/execution/execute_v2.rs
-//
-// Оркестратор обучения v2.
-//
-// # Фазы шага обучения (MIGRATION_PLAN.md §7, Фаза 4)
-//
-// Внутренний цикл обучения использует три явные фазы шага оптимизатора:
-//
-//   forward → loss → backward
-//     → optimizer_modify_grads
-//     → adapter_pass
-//     → optimizer_apply_update
-//
-// Между `modify_grads` и `apply_update` встаёт `adapter_pass` — он обходит
-// слои, у которых есть `GradientAdapter`, и вызывает `apply(&ctx)`.
-//
-// # Диагностика адаптеров (MIGRATION_PLAN.md §7, Фаза 6)
-//
-// `adapter_pass` возвращает `AdapterPassStats` — статистику работы
-// адаптеров за шаг. `execute_inner_v2` аккумулирует её в `AdapterSummary`
-// и по завершении обучения кладёт в `TrainingResult::adapter_summary`.
-//
-// L2-метрики (mean_scale и т. п.) заполняются только при
-// `NEUROCORE_DEBUG_ADAPTER=1`. При `NEUROCORE_DISABLE_ADAPTERS=1`
-// `adapter_pass` возвращает пустую статистику (baseline-режим).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -43,24 +19,9 @@ use crate::training_plan::profiling::{ProfileMode, Profiler};
 
 use super::types::TrainingResult;
 
-// ============================================================================
-// Env-флаги диагностики (MIGRATION_PLAN.md §7, Фаза 6)
-// ============================================================================
-
-/// `NEUROCORE_DEBUG_ADAPTER=1` — печатать сводку адаптеров после обучения.
-///
-/// Сама диагностика (замер L2, лог `[ADAPTER ...]`) управляется внутри
-/// `GraphV2::adapter_pass` (см. `graph_v2::model_v2`). Здесь флаг нужен
-/// только для того, чтобы не сорить в консоль `AdapterSummary::report()`
-/// без запроса.
 static DEBUG_ADAPTER: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_ADAPTER").is_ok());
 
-// ============================================================================
-// Публичный API
-// ============================================================================
-
-/// Запускает обучение v2 в отдельном потоке с увеличенным стеком.
 pub fn execute(
     plan: &TrainingPlan,
     device_plan: &DevicePlan,
@@ -87,19 +48,12 @@ pub fn execute(
     }
 }
 
-// ============================================================================
-// Внутренний цикл
-// ============================================================================
-
 fn execute_inner_v2(
     plan: &TrainingPlan,
     graph: &mut GraphV2,
 ) -> Result<TrainingResult, String> {
     let start_time = Instant::now();
 
-    // ---------------------------------------------------------------------
-    // 0. Проверка многопоточных DataSource
-    // ---------------------------------------------------------------------
     if plan.train_data_streams.is_some()
         || plan.target_data_streams.is_some()
         || plan.test_input_streams.is_some()
@@ -114,15 +68,9 @@ fn execute_inner_v2(
         );
     }
 
-    // ---------------------------------------------------------------------
-    // 1. Инициализация параметров
-    // ---------------------------------------------------------------------
     graph.init_params(plan.initializer.clone())?;
     apply_layer_aware_overrides_v2(graph)?;
 
-    // ---------------------------------------------------------------------
-    // 2. Создание монитора и профайлера
-    // ---------------------------------------------------------------------
     let opt_chain = plan.optimizer_desc.build_chain();
     let learning_rate = opt_chain
         .cubes()
@@ -152,13 +100,8 @@ fn execute_inner_v2(
         None
     };
 
-    // Аккумулятор статистики адаптеров (Фаза 6 плана).
-    // Заполняется после каждого adapter_pass.
     let mut adapter_summary_acc = AdapterSummary::default();
 
-    // ---------------------------------------------------------------------
-    // 3. Подготовка данных
-    // ---------------------------------------------------------------------
     let train_data = plan
         .train_data
         .clone()
@@ -177,11 +120,16 @@ fn execute_inner_v2(
     }
 
     let num_samples = train_data.num_samples();
-    let batch_size = plan.batch_size.max(1);
 
-    // ---------------------------------------------------------------------
-    // 4. Цикл эпох
-    // ---------------------------------------------------------------------
+    // Ragged-данные: примеры разной длины. Батчить их произвольно нельзя
+    // (padding «съедает» ёмкость), поэтому при ragged обучение идёт
+    // по одному примеру за шаг.
+    let batch_size = if train_data.is_ragged() {
+        1
+    } else {
+        plan.batch_size.max(1)
+    };
+
     let mut best_loss = f32::MAX;
     let mut best_epoch: usize = 0;
     let mut zero_loss_epoch: Option<usize> = None;
@@ -202,31 +150,25 @@ fn execute_inner_v2(
             let x = train_data.batch(start, end);
             let y = target_data.batch(start, end);
 
-            // --- Профилирование: forward ---
             let t0 = Instant::now();
             let pred = graph.forward(x)?;
             let forward_dt = t0.elapsed().as_nanos() as u64;
 
-            // --- Профилирование: loss ---
             let t1 = Instant::now();
             let (loss, delta) = graph.loss(plan.loss_desc.clone(), &pred, &y)?;
             let loss_dt = t1.elapsed().as_nanos() as u64;
 
-            // --- Профилирование: backward ---
             let t2 = Instant::now();
             let _grad_input = graph.backward(delta)?;
             let backward_dt = t2.elapsed().as_nanos() as u64;
 
-            // --- Сбор градиентов ДО optimizer_modify_grads (как в v1) ---
             let grads_flat: Option<Vec<f32>> = if monitor.is_some() {
                 collect_grads_flat(graph)
             } else {
                 None
             };
 
-            // --- Три фазы шага оптимизатора ---
             let t3 = Instant::now();
-
             graph.optimizer_modify_grads(plan.optimizer_desc.clone())?;
             let modify_dt = t3.elapsed().as_nanos() as u64;
 
@@ -234,7 +176,6 @@ fn execute_inner_v2(
             let adapter_stats = graph.adapter_pass()?;
             let adapter_dt = t_ad.elapsed().as_nanos() as u64;
 
-            // Аккумулируем статистику адаптеров (Фаза 6 плана).
             adapter_summary_acc.absorb(&adapter_stats);
 
             let t_ap = Instant::now();
@@ -317,7 +258,6 @@ fn execute_inner_v2(
             }
         }
 
-        // --- Валидация ---
         if let Some(ref val_cfg) = plan.validation {
             if (epoch + 1) % val_cfg.frequency == 0 {
                 let val_data = &val_cfg.data;
@@ -352,9 +292,6 @@ fn execute_inner_v2(
         }
     }
 
-    // ---------------------------------------------------------------------
-    // 5. Тестовый прогон
-    // ---------------------------------------------------------------------
     let mut final_loss = 0.0f32;
     let mut tensors: HashMap<String, DynamicTensor> = HashMap::new();
 
@@ -422,13 +359,6 @@ fn execute_inner_v2(
         result.monitor_summary = Some(summary);
     }
 
-    // ---------------------------------------------------------------------
-    // 6. Сводка адаптеров (Фаза 6 плана)
-    // ---------------------------------------------------------------------
-    //
-    // `Some`, если за обучение был хотя бы один вызов адаптера.
-    // При `NEUROCORE_DISABLE_ADAPTERS=1` — всегда `None` (adapter_pass
-    // возвращал пустые stats).
     if adapter_summary_acc.total_calls > 0 {
         if *DEBUG_ADAPTER {
             println!("=== Adapter Summary ===");
@@ -440,12 +370,6 @@ fn execute_inner_v2(
     Ok(result)
 }
 
-// ============================================================================
-// Применение канонических per-layer инициализаций
-// ============================================================================
-
-/// Применяет `bridge_v2::build_layer_aware_overrides_v2` поверх
-/// generic-инициализации.
 fn apply_layer_aware_overrides_v2(graph: &GraphV2) -> Result<(), String> {
     let overrides = bridge_v2::build_layer_aware_overrides_v2(graph);
     if overrides.is_empty() {
@@ -465,11 +389,6 @@ fn apply_layer_aware_overrides_v2(graph: &GraphV2) -> Result<(), String> {
     Ok(())
 }
 
-// ============================================================================
-// Вспомогательные функции
-// ============================================================================
-
-/// Собирает плоский вектор градиентов из всех буферов `ParamStore`.
 fn collect_grads_flat(graph: &GraphV2) -> Option<Vec<f32>> {
     let ps = graph.param_store().lock().ok()?;
     let total = ps.total_params();

@@ -5,7 +5,6 @@ use crate::tensor::{Tensor2D, Tensor3D, Tensor4D, Tensor5D};
 use super::plan::DataSource;
 
 impl DataSource {
-    /// Количество примеров (размер по первому измерению).
     pub fn num_samples(&self) -> usize {
         match self {
             DataSource::Tensor2D(t) => t.dim1,
@@ -15,7 +14,6 @@ impl DataSource {
         }
     }
 
-    /// Возвращает полные размерности тензора, включая batch.
     pub fn dimensions(&self) -> Vec<usize> {
         match self {
             DataSource::Tensor2D(t) => vec![t.dim1, t.dim2],
@@ -25,7 +23,15 @@ impl DataSource {
         }
     }
 
-    /// Преобразует весь датасет в DynamicTensor нужной размерности.
+    /// `true`, если примеры имеют разную длину признаков.
+    /// Сейчас поддерживается только для `Tensor2D`.
+    pub fn is_ragged(&self) -> bool {
+        match self {
+            DataSource::Tensor2D(t) => t.is_ragged(),
+            _ => false,
+        }
+    }
+
     pub fn to_dynamic_tensor(&self) -> DynamicTensor {
         match self {
             DataSource::Tensor2D(t) => DynamicTensor::Dim1(t.clone()),
@@ -35,12 +41,14 @@ impl DataSource {
         }
     }
 
-    /// Извлекает подтензор по индексам `[start, end)` вдоль первого измерения (batch).
+    /// Извлекает подтензор по строкам `[start, end)`.
+    ///
+    /// Для `Tensor2D` использует `slice_rows`, сохраняя `sample_lens`
+    /// (ragged-тензоры). Для остальных вариантов поведение как раньше.
     pub fn batch(&self, start: usize, end: usize) -> DynamicTensor {
         match self {
             DataSource::Tensor2D(t) => {
-                let rows: Vec<Vec<f32>> = t.data[start..end].to_vec();
-                DynamicTensor::Dim1(Tensor2D::new(rows))
+                DynamicTensor::Dim1(t.slice_rows(start, end))
             }
             DataSource::Tensor3D(t) => {
                 let slice = t.data[start..end].to_vec();

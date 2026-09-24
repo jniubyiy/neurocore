@@ -7,9 +7,9 @@ use std::time::Instant;
 
 use crate::compute_manager::operators_v2::cpu_v2::WorkerPool;
 use crate::compute_manager::core::executor::Executor;
-use crate::compute_manager::core::dynamic_context::ChunkedContexts;
+use crate::compute_manager::core::dynamic_context::{ChunkedContexts, DynamicContext};
 use crate::compute_manager::operators_v2::memory_v2::buffer::MatrixBufferHandle;
-use crate::layers::UniversalLayer;
+use crate::layers::{UniversalLayer, UniversalLayerBuffered};
 use crate::model_plan::param_store::ParamSlice;
 
 use super::chunk_ops::{extract_chunk, write_chunk};
@@ -17,6 +17,64 @@ use super::dims::get_input_features;
 use super::dispatch::call_backward_buffered;
 use super::shared::BackwardTaskShared;
 use super::tracker::ChunkTracker;
+
+/// Возвращает `&dyn UniversalLayerBuffered` для конкретного слоя.
+/// См. комментарий в `chunk_dispatch_v2::layer_ref_as_buffered`.
+fn layer_ref_as_buffered(layer: &dyn UniversalLayer) -> &dyn UniversalLayerBuffered {
+    macro_rules! as_buf {
+        ($ty:ty, $getter:ident) => {
+            if let Some(x) = layer.$getter() {
+                return x as &dyn UniversalLayerBuffered;
+            }
+        };
+    }
+
+    use crate::layers::{
+        Linear, ReLU, Sigmoid, Tanh, LeakyReLU, Identity, Softmax,
+        Memory, SoftSparseGate, SoftKeepGate, DualAnchor, AdaptivePerFeatureActivation,
+        DualSlopeReLU, LearnableMish, LearnableSoftplus, RMSNormWithLearnableEpsilon,
+        AdaptiveDropout, FeatureFusion, SparseFeatureSelectionGate, MultiResolutionKANLinear,
+        AdaptiveNormalization, BatchRenorm1d, ConcreteDropout, IndRNN, Mamba,
+        SpectrallyNormalizedLinear, LinearAttention, RelativePositionAttention,
+        PerFeatureAttention, AdaptiveSpaceCompress,
+    };
+
+    as_buf!(Linear, as_linear);
+    as_buf!(ReLU, as_relu);
+    as_buf!(Sigmoid, as_sigmoid);
+    as_buf!(Tanh, as_tanh);
+    as_buf!(LeakyReLU, as_leaky_relu);
+    as_buf!(Identity, as_identity);
+    as_buf!(Softmax, as_softmax);
+    as_buf!(Memory, as_memory);
+    as_buf!(SoftSparseGate, as_soft_sparse_gate);
+    as_buf!(SoftKeepGate, as_soft_keep_gate);
+    as_buf!(DualAnchor, as_dual_anchor);
+    as_buf!(AdaptivePerFeatureActivation, as_adaptive_activation);
+    as_buf!(DualSlopeReLU, as_dual_slope_relu);
+    as_buf!(LearnableMish, as_learnable_mish);
+    as_buf!(LearnableSoftplus, as_learnable_softplus);
+    as_buf!(RMSNormWithLearnableEpsilon, as_rms_norm_learnable_eps);
+    as_buf!(AdaptiveDropout, as_adaptive_dropout);
+    as_buf!(FeatureFusion, as_feature_fusion);
+    as_buf!(SparseFeatureSelectionGate, as_sparse_feature_selection_gate);
+    as_buf!(MultiResolutionKANLinear, as_multi_resolution_kan_linear);
+    as_buf!(AdaptiveNormalization, as_adaptive_normalization);
+    as_buf!(BatchRenorm1d, as_batch_renorm);
+    as_buf!(ConcreteDropout, as_concrete_dropout);
+    as_buf!(IndRNN, as_ind_rnn);
+    as_buf!(Mamba, as_mamba);
+    as_buf!(SpectrallyNormalizedLinear, as_spectral_norm_linear);
+    as_buf!(LinearAttention, as_linear_attention);
+    as_buf!(RelativePositionAttention, as_relative_position_attention);
+    as_buf!(PerFeatureAttention, as_per_feature_attention);
+    as_buf!(AdaptiveSpaceCompress, as_adaptive_space_compress);
+
+    unreachable!(
+        "layer_ref_as_buffered: unsupported layer {:?}",
+        std::any::type_name_of_val(layer)
+    );
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn backward_universal_parallel(
@@ -125,7 +183,14 @@ pub(crate) fn backward_universal_parallel(
                     let slice = &shared.slices[i];
                     let ctx = &contexts_chunk[i];
 
-                    let in_features = get_input_features(layer, &current_grad);
+                    // Размерность входа: спрашиваем слой через
+                    // `input_features_from_ctx`. Оркестратор не знает
+                    // про конкретный слой.
+                    let layer_ref: &dyn UniversalLayer = layer.as_ref();
+                    let layer_buffered = layer_ref_as_buffered(layer_ref);
+                    let in_features = layer_buffered
+                        .input_features_from_ctx(ctx, get_input_features(layer, &current_grad));
+
                     let grad_input_chunk =
                         pool_guard.acquire(current_grad.rows(), in_features);
 

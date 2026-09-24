@@ -39,4 +39,6 @@ pub enum LayerKind {
     MultiResolutionKANLinear,
     // PerFeatureAttention (CPU-only)
     PerFeatureAttention,
+    // AdaptiveSpaceCompress (CPU-only на первой итерации)
+    AdaptiveSpaceCompress,
 }

@@ -14,7 +14,7 @@ use crate::model_plan::param_store::ParamSlice;
 
 use super::chunk_ops::{extract_chunk, write_chunk_to_range};
 use super::dims::get_output_features;
-use super::dispatch::call_forward_buffered;
+use super::dispatch::call_forward_buffered_ragged;
 use super::plan::{default_layer_chunk_plan, ChunkSlice};
 use super::shared::ForwardTaskShared;
 use super::tracker::ChunkTracker;
@@ -27,6 +27,7 @@ pub(crate) fn forward_universal_parallel(
     params: MatrixBufferHandle,
     input: MatrixBufferHandle,
     output: MatrixBufferHandle,
+    sample_lens: Option<Vec<usize>>,
 ) -> (ChunkedContexts, Vec<(usize, usize, usize)>) {
     let batch_size = input.rows();
     let num_workers = executor.num_workers();
@@ -80,6 +81,7 @@ pub(crate) fn forward_universal_parallel(
         layers,
         slices: slices_arc,
         pool,
+        sample_lens,
     });
 
     let ctx_storage: Arc<Mutex<Vec<Vec<DynamicContext>>>> =
@@ -118,15 +120,22 @@ pub(crate) fn forward_universal_parallel(
                 let mut current = input_chunk;
                 let mut chunk_ctxs = Vec::with_capacity(shared.layers.len());
 
+                // Срез sample_lens для этого чанка: длины реальных данных
+                // строк [m.in_start..m.in_end) всего батча.
+                let chunk_lens: Option<Vec<usize>> = shared
+                    .sample_lens
+                    .as_ref()
+                    .map(|lens| lens[m.in_start..m.in_end].to_vec());
+                let chunk_lens_ref: Option<&[usize]> = chunk_lens.as_deref();
+
                 for (layer, slice) in shared.layers.iter().zip(shared.slices.iter()) {
                     let out_cols = get_output_features(layer, &current);
                     let out = pool_guard.acquire(current.rows(), out_cols);
 
-                    // Слой сам строит свой BufferedContext — включая
-                    // per-chunk state, если он есть.
-                    let buffered_ctx = call_forward_buffered(
+                    let buffered_ctx = call_forward_buffered_ragged(
                         layer,
                         &current,
+                        chunk_lens_ref,
                         &out,
                         &shared.params,
                         slice,

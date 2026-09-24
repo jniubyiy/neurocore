@@ -40,6 +40,23 @@ impl DynamicTensor {
         }
     }
 
+    /// Возвращает длины реальных данных каждого примера, если тензор
+    /// ragged. Сейчас ragged поддерживается только для `Dim1`.
+    #[inline]
+    pub fn sample_lens(&self) -> Option<&[usize]> {
+        match self {
+            DynamicTensor::Dim1(t) => t.sample_lens(),
+            _ => None,
+        }
+    }
+
+    /// `true`, если тензор ragged (хотя бы для текущего варианта
+    /// поддерживаемого ragged — `Dim1`).
+    #[inline]
+    pub fn is_ragged(&self) -> bool {
+        self.sample_lens().is_some()
+    }
+
     pub fn to_flat(&self) -> Vec<f32> {
         let mut buf = Vec::new();
         self.write_to_flat(&mut buf);

@@ -115,7 +115,6 @@ pub enum BufferedContext {
         pre_act: MatrixBufferHandle,
     },
 
-    // ================= Новые слои =================
     DualSlopeReLU { input: MatrixBufferHandle },
     LearnableMish { input: MatrixBufferHandle },
     LearnableSoftplus { input: MatrixBufferHandle },
@@ -129,8 +128,6 @@ pub enum BufferedContext {
     SparseFeatureSelectionGate { input: MatrixBufferHandle },
     MultiResolutionKANLinear { input: MatrixBufferHandle },
 
-    // ================= PerFeatureAttention =================
-    /// CPU-путь. Все state-буферы живут внутри `cpu_heads`.
     PerFeatureAttention {
         input: MatrixBufferHandle,
         cpu_heads: Vec<CpuPerFeatureAttentionHead>,
@@ -139,8 +136,6 @@ pub enum BufferedContext {
         d_model: usize,
         d_head: usize,
     },
-
-    /// GPU-путь. Все state-буферы — отдельные GPU-дескрипторы.
     PerFeatureAttentionGpu {
         input: MatrixBufferHandle,
         q_raw: MatrixBufferHandle,
@@ -156,5 +151,16 @@ pub enum BufferedContext {
         seq_len: usize,
         d_model: usize,
         d_head: usize,
+    },
+
+    /// Контекст forward для `AdaptiveSpaceCompress`.
+    ///
+    /// `sample_lens[r]` — реальная длина входа примера `r`. При dense-входе
+    /// все длины равны `input.cols()`. Backward пересчитывает `assign`
+    /// per-example из `input`, `center`, `b_L` и `sample_lens`.
+    AdaptiveSpaceCompress {
+        input: MatrixBufferHandle,
+        p_soft: f32,
+        sample_lens: Vec<usize>,
     },
 }

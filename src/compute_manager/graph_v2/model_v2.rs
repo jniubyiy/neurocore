@@ -1,71 +1,4 @@
 // src/compute_manager/graph_v2/model_v2.rs
-//
-// GraphV2 — публичный фасад графа.
-//
-// Знает:
-//   * Vec<SegmentV2>;
-//   * Arc<SmartDistributor>;
-//   * GraphObserverV2;
-//   * Arc<Mutex<ParamStore>>;
-//   * Arc<Mutex<AdapterStateStore>>;
-//   * Arc<Mutex<TempMatrixPool>> (тот же, что у распределителя);
-//   * input_shapes / output_shapes;
-//   * forward_cache (живёт от forward до optimizer_apply_update).
-//
-// Делает:
-//   * forward(DynamicTensor) -> DynamicTensor;
-//   * loss(LossDesc, &pred, &target) -> (f32, DynamicTensor);
-//   * backward(delta: DynamicTensor) -> DynamicTensor;
-//   * optimizer_modify_grads(OptimizerDesc);
-//   * adapter_pass() -> AdapterPassStats;
-//   * optimizer_apply_update(OptimizerDesc);
-//   * optimizer_step(OptimizerDesc) — обёртка над тремя фазами;
-//   * observe_step(loss), observe_epoch(epoch), end_epoch() -> EpochReportV2.
-//
-// Не делает:
-//   * не выбирает CPU/GPU (это делает distributor);
-//   * не мигрирует буферы вручную;
-//   * не знает про потоки, scheduler, mini-model.
-//
-// ВАЖНО: контракт «наружу из GraphV2 хендл уходит в HostRam»
-// реализуется через КОПИРОВАНИЕ в отдельный CPU-буфер, а не через
-// in-place миграцию оригинального хендла.
-//
-// # Фазы шага обучения (MIGRATION_PLAN.md §2, инвариант I-1)
-//
-// Шаг обучения проходит в порядке:
-//
-//   forward
-//     → loss
-//     → backward (raw)
-//     → optimizer_modify_grads
-//     → adapter_pass
-//     → optimizer_apply_update
-//
-// `forward_cache` живёт **от forward до optimizer_apply_update** — то
-// есть весь шаг обучения. Это позволяет `adapter_pass` передавать
-// forward-контексты слоёв в адаптеры через `AdapterContext::forward_ctx`.
-// Кэш очищается в `optimizer_apply_update` (последняя фаза шага).
-//
-// # Диагностика адаптеров (MIGRATION_PLAN.md §7, Фаза 6)
-//
-// `adapter_pass` возвращает `AdapterPassStats` — срез статистики
-// работы адаптеров за один pass. Метрики L2 замеряются **только** при
-// `NEUROCORE_DEBUG_ADAPTER=1` (замер на GPU стоит скачивания).
-//
-// При `NEUROCORE_DISABLE_ADAPTERS=1` `adapter_pass` возвращает пустую
-// статистику без обхода слоёв — это baseline-режим.
-//
-// # Уровни печати диагностики `[ADAPTER ...]`
-//
-// По умолчанию (`NEUROCORE_DEBUG_ADAPTER=1`) печать per-call сжата:
-//   * первые 5 вызовов — детально;
-//   * каждый 50-й — компактно;
-//   * остальные — молча (L2 всё равно считается и уходит в stats).
-//
-// При дополнительном `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1` печатается
-// **каждый** вызов (старое поведение — для отладки, если нужно
-// протрассировать конкретный шаг).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -107,84 +40,34 @@ use super::types_v2::{
     ForwardCacheV2, SegmentForwardStateV2, SegmentKindV2, SegmentV2,
 };
 
-// ============================================================================
-// Env-флаги диагностики (MIGRATION_PLAN.md §7, Фаза 6)
-// ============================================================================
-
-/// `NEUROCORE_DEBUG_ADAPTER=1` — печатать диагностику адаптеров.
-///
-/// По умолчанию печать per-call сжата (первые 5 + каждый 50-й), чтобы
-/// не засорять консоль при длинных прогонах. Для полного трейса см.
-/// `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1`.
 static DEBUG_ADAPTER: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_ADAPTER").is_ok());
 
-/// `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1` — печатать **каждый** вызов
-/// `[ADAPTER ...]` (старое поведение).
-///
-/// Имеет смысл только вместе с `NEUROCORE_DEBUG_ADAPTER=1`. Иначе
-/// игнорируется (никакой диагностики не будет вообще).
 static DEBUG_ADAPTER_VERBOSE: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DEBUG_ADAPTER_VERBOSE").is_ok());
 
-/// `NEUROCORE_DISABLE_ADAPTERS=1` — baseline-режим: `adapter_pass`
-/// возвращает пустую статистику без обхода слоёв.
 static DISABLE_ADAPTERS: Lazy<bool> =
     Lazy::new(|| std::env::var("NEUROCORE_DISABLE_ADAPTERS").is_ok());
 
-/// Сквозной счётчик вызовов `adapter_pass` **за сессию**. Нужен для
-/// сжатия per-call трейса `[ADAPTER ...]` (первые 5 + каждый 50-й).
-///
-/// Статика, потому что `adapter_pass(&self)` — без `mut`.
 static ADAPTER_PASS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// Пороговые константы для сжатия трейса.
 const ADAPTER_TRACE_FIRST_N: usize = 5;
 const ADAPTER_TRACE_EVERY_N: usize = 50;
 
-// ============================================================================
-// GraphV2
-// ============================================================================
-
-/// Граф v2.
 pub struct GraphV2 {
-    /// Сегменты.
     pub(crate) segments: Vec<SegmentV2>,
-
-    /// Распределитель заданий.
     pub(crate) distributor: Arc<SmartDistributor>,
-
-    /// Наблюдатель.
     pub(crate) observer: GraphObserverV2,
-
-    /// Хранилище параметров.
     pub(crate) param_store: Arc<Mutex<ParamStore>>,
-
-    /// Хранилище персистентного состояния градиентных адаптеров.
     pub(crate) adapter_store: Arc<Mutex<AdapterStateStore>>,
-
-    /// Temp-pool (тот же, что у распределителя).
     pub(crate) temp_pool: Arc<Mutex<TempMatrixPool>>,
-
-    /// Форма входа (без batch).
     pub(crate) input_shape: Vec<usize>,
-
-    /// Форма выхода (без batch).
     pub(crate) output_shape: Vec<usize>,
-
-    /// Кэш forward-прохода.
     pub(crate) forward_cache: Option<ForwardCacheV2>,
-
-    /// Seed для детерминированной инициализации.
     pub(crate) seed: Option<u64>,
 }
 
 impl GraphV2 {
-    // -----------------------------------------------------------------------
-    // Построение
-    // -----------------------------------------------------------------------
-
-    /// Создаёт граф из описания слоёв.
     pub fn build(
         layers_desc: Vec<LayerDesc>,
         device_plan: &DevicePlan,
@@ -241,12 +124,11 @@ impl GraphV2 {
         self
     }
 
-    // -----------------------------------------------------------------------
-    // Forward
-    // -----------------------------------------------------------------------
-
     pub fn forward(&mut self, input: DynamicTensor) -> Result<DynamicTensor, String> {
         self.forward_cache = None;
+
+        // Извлекаем sample_lens ДО конвертации в handle.
+        let sample_lens: Option<Vec<usize>> = input.sample_lens().map(|s| s.to_vec());
 
         let input_handle = {
             let mut pool = self.temp_pool.lock().unwrap();
@@ -258,6 +140,7 @@ impl GraphV2 {
             &self.param_store,
             &self.segments,
             input_handle,
+            sample_lens.clone(),
         )?;
 
         let out_handle_cpu = self.copy_handle_to_host_ram(&cache.output)?;
@@ -268,10 +151,6 @@ impl GraphV2 {
             handle_to_dynamic_tensor(&out_handle_cpu, &self.output_shape)?;
         Ok(out_tensor)
     }
-
-    // -----------------------------------------------------------------------
-    // Loss
-    // -----------------------------------------------------------------------
 
     pub fn loss(
         &self,
@@ -307,10 +186,6 @@ impl GraphV2 {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Backward
-    // -----------------------------------------------------------------------
-
     pub fn backward(&mut self, delta: DynamicTensor) -> Result<DynamicTensor, String> {
         let cache = self
             .forward_cache
@@ -330,7 +205,6 @@ impl GraphV2 {
             delta_handle,
         )?;
 
-        // Возвращаем cache обратно: он нужен adapter_pass.
         self.forward_cache = Some(cache);
 
         let grad_input_cpu = self.copy_handle_to_host_ram(&grad_input)?;
@@ -340,11 +214,6 @@ impl GraphV2 {
         Ok(grad_tensor)
     }
 
-    // -----------------------------------------------------------------------
-    // Optimizer step (три фазы, MIGRATION_PLAN.md §2, инвариант I-1)
-    // -----------------------------------------------------------------------
-
-    /// Фаза 1: модификация градиента.
     pub fn optimizer_modify_grads(&self, optimizer: OptimizerDesc) -> Result<(), String> {
         let num_buffers = {
             let ps = self.param_store.lock().unwrap();
@@ -385,26 +254,7 @@ impl GraphV2 {
         Ok(())
     }
 
-    /// Фаза 2: per-layer коррекция градиента адаптерами.
-    ///
-    /// # Диагностика (MIGRATION_PLAN.md §7, Фаза 6)
-    ///
-    ///   * `NEUROCORE_DISABLE_ADAPTERS=1` — возвращает пустую статистику,
-    ///     не обходит слои (baseline-режим).
-    ///   * `NEUROCORE_DEBUG_ADAPTER=1` — замеряет L2-норму собственного
-    ///     среза `grads` до и после `apply`. По умолчанию печатает
-    ///     **первые 5** вызовов и **каждый 50-й** (сжатый трейс).
-    ///     Для полного трейса — `NEUROCORE_DEBUG_ADAPTER_VERBOSE=1`.
-    ///
-    /// L2-замеры идут в `AdapterPassStats` **всегда**, когда активен
-    /// `NEUROCORE_DEBUG_ADAPTER` — сжатие касается только печати.
-    ///
-    /// # Контекст (I-3, I-10)
-    ///
-    /// `grad_input` в `AdapterContext` не передаётся: адаптер не может
-    /// его исказить (I-3).
     pub fn adapter_pass(&self) -> Result<AdapterPassStats, String> {
-        // Baseline-режим: полностью пропускаем обход.
         if *DISABLE_ADAPTERS {
             return Ok(AdapterPassStats::default());
         }
@@ -424,8 +274,6 @@ impl GraphV2 {
         let batch = cache.batch;
         let debug = *DEBUG_ADAPTER;
         let verbose = debug && *DEBUG_ADAPTER_VERBOSE;
-        // GpuCompute нужен только для замеров GPU-градиентов; в baseline
-        // он не требуется.
         let gpu_opt = self.distributor.gpu_compute();
 
         if cache.segment_states.len() != self.segments.len() {
@@ -475,7 +323,6 @@ impl GraphV2 {
                 let own_slice = slices[i];
                 let forward_ctx_ref: Option<&DynamicContext> = contexts_local.get(i);
 
-                // Замер «до» (только при активной диагностике).
                 let before_l2 = if debug {
                     compute_grads_l2(&grads_handle, own_slice, gpu_opt.as_deref())
                 } else {
@@ -496,15 +343,12 @@ impl GraphV2 {
 
                 adapter.apply(&ctx);
 
-                // Замер «после» (только при активной диагностике).
                 let after_l2 = if debug {
                     compute_grads_l2(&grads_handle, own_slice, gpu_opt.as_deref())
                 } else {
                     f32::NAN
                 };
 
-                // Диагностическая печать. Сжатая по умолчанию,
-                // полная при NEUROCORE_DEBUG_ADAPTER_VERBOSE=1.
                 if debug {
                     let scale = if before_l2.abs() > 1e-30 && before_l2.is_finite()
                         && after_l2.is_finite()
@@ -533,7 +377,6 @@ impl GraphV2 {
                                 scale
                             );
                         } else {
-                            // Компактный формат для сжатого режима.
                             eprintln!(
                                 "[ADAPTER {}] #{} seg={} layer={} \
                                  before_l2={:.3e} after_l2={:.3e} scale={:.4}",
@@ -560,9 +403,6 @@ impl GraphV2 {
         Ok(pass_stats)
     }
 
-    /// Фаза 3: обновление параметров (`params -= grads`).
-    ///
-    /// В конце очищает `forward_cache` — шаг обучения завершён.
     pub fn optimizer_apply_update(&mut self, optimizer: OptimizerDesc) -> Result<(), String> {
         let num_buffers = {
             let ps = self.param_store.lock().unwrap();
@@ -605,29 +445,12 @@ impl GraphV2 {
         Ok(())
     }
 
-    /// Обёртка над тремя фазами шага оптимизатора.
-    ///
-    /// Эквивалентна последовательному вызову:
-    ///
-    /// ```ignore
-    /// graph.optimizer_modify_grads(optimizer.clone())?;
-    /// let _stats = graph.adapter_pass()?;
-    /// graph.optimizer_apply_update(optimizer)?;
-    /// ```
-    ///
-    /// Статистика `adapter_pass` здесь игнорируется (в отличие от
-    /// `execute_v2.rs`, который её аккумулирует в `AdapterSummary`).
-    /// Если нужна диагностика — вызывайте три фазы явно.
     pub fn optimizer_step(&mut self, optimizer: OptimizerDesc) -> Result<(), String> {
         self.optimizer_modify_grads(optimizer.clone())?;
         let _stats = self.adapter_pass()?;
         self.optimizer_apply_update(optimizer)?;
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Наблюдение
-    // -----------------------------------------------------------------------
 
     pub fn observe_step(&mut self, loss: f32, grad_norm: Option<f32>) {
         self.observer.record_step(loss, grad_norm);
@@ -650,10 +473,6 @@ impl GraphV2 {
     pub fn all_warnings(&self) -> &[WarningV2] {
         self.observer.all_warnings()
     }
-
-    // -----------------------------------------------------------------------
-    // Инициализация параметров
-    // -----------------------------------------------------------------------
 
     pub fn init_params(&self, initializer: Initializer) -> Result<(), String> {
         let all_data: Vec<f32> = {
@@ -726,10 +545,6 @@ impl GraphV2 {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Доступ
-    // -----------------------------------------------------------------------
-
     pub fn distributor(&self) -> &Arc<SmartDistributor> {
         &self.distributor
     }
@@ -753,10 +568,6 @@ impl GraphV2 {
     pub fn output_shape(&self) -> &[usize] {
         &self.output_shape
     }
-
-    // -----------------------------------------------------------------------
-    // Внутреннее
-    // -----------------------------------------------------------------------
 
     fn copy_handle_to_host_ram(
         &self,
@@ -840,16 +651,6 @@ impl GraphV2 {
 // Вспомогательные функции
 // ============================================================================
 
-/// Вычисляет L2-норму среза градиента `[slice.start, slice.end)`.
-///
-/// Работает с CPU и GPU буферами. Для GPU использует `download_gpu_handle_to_vec`
-/// (полное скачивание буфера), потому что в текущей реализации
-/// `MatrixBufferHandle::read_range` не поддерживает частичное чтение с GPU.
-///
-/// # Стоимость
-///
-/// Для GPU это дорого (PCIe transfer). Функция вызывается только при
-/// `NEUROCORE_DEBUG_ADAPTER=1` — в горячем пути без диагностики её нет.
 fn compute_grads_l2(
     grads: &MatrixBufferHandle,
     slice: crate::model_plan::param_store::ParamSlice,
@@ -862,8 +663,6 @@ fn compute_grads_l2(
     let values: Vec<f32> = if grads.is_gpu() {
         match gpu {
             Some(g) => {
-                // Скачиваем весь буфер, потом берём нужный срез.
-                // (Частичное чтение с GPU пока не поддерживается.)
                 let full = g.download_gpu_handle_to_vec(grads);
                 if slice.end() <= full.len() {
                     full[slice.start..slice.end()].to_vec()

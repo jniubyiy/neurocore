@@ -209,10 +209,26 @@ impl LayerDesc {
                 out_features + in_features * out_features * (4 + (G_C + K) + (G_F + K))
             }
             LayerKind::PerFeatureAttention => {
-                // extra = [seq_len, d_model]; d_head фиксирован в слое.
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 let d_head = crate::layers::PerFeatureAttention::DEFAULT_D_HEAD;
                 d_model * (10 * d_head + 2)
+            }
+            LayerKind::AdaptiveSpaceCompress => {
+                assert_eq!(
+                    self.output_shape.streams.len(),
+                    1,
+                    "AdaptiveSpaceCompress expects exactly one output stream"
+                );
+                let out_features = self.output_shape.streams[0];
+                let p_max = self.extra.get(0).copied().unwrap_or(4.0) as usize;
+                assert!(
+                    p_max > 0,
+                    "AdaptiveSpaceCompress: p_max must be positive (extra[0])"
+                );
+                // param_len НЕ зависит от in_features:
+                // [center (p_max), b_L (p_max), compress (p_max),
+                //  W (p_max·out), b (out), p_raw (1)]
+                p_max * (3 + out_features) + out_features + 1
             }
             _ => 0,
         }
@@ -347,6 +363,18 @@ impl LayerDesc {
                 let seq_len = self.extra.get(0).copied().unwrap_or(1.0) as usize;
                 let d_model = self.extra.get(1).copied().unwrap_or(1.0) as usize;
                 Box::new(crate::layers::PerFeatureAttention::new(seq_len, d_model))
+            }
+            LayerKind::AdaptiveSpaceCompress => {
+                // in_features НЕ передаётся: слой работает с любым входным
+                // размером, а фактический берётся из `input.cols()` в
+                // forward. `input_shape.streams[0]` остаётся только для
+                // валидации согласованности форм в `Plan::from_descs`.
+                let out_features = self.output_shape.streams[0];
+                let p_max = self.extra.get(0).copied().unwrap_or(4.0) as usize;
+                Box::new(crate::layers::AdaptiveSpaceCompress::new(
+                    out_features,
+                    p_max,
+                ))
             }
             _ => panic!("Unsupported layer kind for UniversalLayer: {:?}", self.kind),
         }

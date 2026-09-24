@@ -138,6 +138,10 @@ fn forward_impl(
         let center = &p[center_off..center_off + p_max];
         let b_l    = &p[b_l_off..b_l_off + p_max];
 
+        // Общий буфер под assign на весь батч — размер под максимальную
+        // длину `in_f`. Для ragged-примеров реальная длина `len_r` может
+        // быть меньше `in_f`, поэтому в `compute_assign_one` передаём
+        // срез ровно нужного размера: `p_max * len_r`.
         let mut assign = vec![0.0f32; p_max * in_f];
         for r in 0..batch {
             let len_r = sample_lens[r];
@@ -145,7 +149,13 @@ fn forward_impl(
                 for k in 0..out_f { y[k * batch + r] = 0.0; }
                 continue;
             }
-            compute_assign_one(len_r, p_max, center, b_l, &mut assign);
+            compute_assign_one(
+                len_r,
+                p_max,
+                center,
+                b_l,
+                &mut assign[..p_max * len_r],
+            );
 
             let mut value = vec![0.0f32; p_max];
             for pi in 0..p_max {
@@ -260,11 +270,21 @@ fn backward_impl(
             gp[b_off + k] = s;
         }
 
+        // Общий буфер под assign на весь батч — размер под максимальную
+        // длину `in_f`. Для ragged-примеров реальная длина `len_r` может
+        // быть меньше `in_f`, поэтому в `compute_assign_one` передаём
+        // срез ровно нужного размера: `p_max * len_r`.
         let mut assign = vec![0.0f32; p_max * in_f];
         for r in 0..batch {
             let len_r = sample_lens[r];
             if len_r == 0 || len_r > in_f { continue; }
-            compute_assign_one(len_r, p_max, center, b_l, &mut assign);
+            compute_assign_one(
+                len_r,
+                p_max,
+                center,
+                b_l,
+                &mut assign[..p_max * len_r],
+            );
 
             let mut value = vec![0.0f32; p_max];
             for pi in 0..p_max {

@@ -129,9 +129,44 @@ pub fn execute_backward(
 
     let batch = grad_output.rows();
 
-    let in_features = match layers.first() {
-        Some(first) => first.input_features_for(grad_output.cols()),
-        None => grad_output.cols(),
+    // ========================================================================
+    // Число столбцов буфера grad_input (градиент по входу сегмента).
+    //
+    // Раньше здесь стояло:
+    //     let in_features = match layers.first() {
+    //         Some(first) => first.input_features_for(grad_output.cols()),
+    //         None => grad_output.cols(),
+    //     };
+    //
+    // Для слоёв с фиксированным входом это корректно: `input_features()`
+    // возвращает ненулевое значение, и `input_features_for` его использует.
+    //
+    // Но у `AdaptiveSpaceCompress` входной размер **динамический**:
+    // `input_features()` возвращает 0, и `input_features_for` подставляет
+    // fallback = `grad_output.cols()` = `out_features` этого слоя. Это
+    // НЕ размер входа — буфер `grad_input` получался размером 1×10 вместо
+    // 1×512, и последующая запись `grad_input.write_range(0, current_grad)`
+    // в конце backward падала на проверке границ.
+    //
+    // Правильный размер входа можно узнать только из forward-контекста
+    // первого слоя сегмента — через `input_features_from_ctx`. Для слоёв
+    // с фиксированным входом дефолтная реализация этого метода возвращает
+    // ровно то же значение, что и раньше (`self.input_features()` либо
+    // fallback), поэтому поведение для всех остальных слоёв не меняется.
+    //
+    // Контексты в этот момент уже доступны в `job.contexts` — они были
+    // сохранены forward-проходом и пришли вместе с job'ом.
+    // ========================================================================
+    let in_features = {
+        let first_chunk = job.contexts.first_chunk();
+        match (layers.first(), first_chunk.first()) {
+            (Some(first), Some(ctx)) => {
+                let first_ref: &dyn UniversalLayer = first.as_ref();
+                layer_ref_as_buffered(first_ref)
+                    .input_features_from_ctx(ctx, grad_output.cols())
+            }
+            _ => grad_output.cols(),
+        }
     };
 
     let can_parallel = can_parallelize(layers.as_slice())
@@ -772,7 +807,7 @@ fn layer_ref_as_buffered(layer: &dyn UniversalLayer) -> &dyn UniversalLayerBuffe
     unreachable!(
         "layer_ref_as_buffered: unsupported layer {:?}",
         std::any::type_name_of_val(layer)
-    );
+    )
 }
 
 fn dispatch_forward_one_layer(
@@ -830,7 +865,7 @@ fn dispatch_forward_one_layer(
     unreachable!(
         "CpuOperatorV2::forward: layer {:?} has no buffered forward",
         std::any::type_name_of_val(l)
-    );
+    )
 }
 
 fn dispatch_forward_one_layer_ragged(
@@ -893,7 +928,7 @@ fn dispatch_forward_one_layer_ragged(
     unreachable!(
         "CpuOperatorV2::forward (ragged): layer {:?} has no buffered forward",
         std::any::type_name_of_val(l)
-    );
+    )
 }
 
 fn dispatch_backward_one_layer(
@@ -952,5 +987,5 @@ fn dispatch_backward_one_layer(
     unreachable!(
         "CpuOperatorV2::backward: layer {:?} has no buffered backward",
         std::any::type_name_of_val(l)
-    );
+    )
 }

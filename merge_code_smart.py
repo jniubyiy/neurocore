@@ -1,6 +1,5 @@
 # merge_code_smart.py
 import os
-import math
 from pathlib import Path
 
 # ============================================================
@@ -11,8 +10,13 @@ SOURCE_DIR = SCRIPT_DIR   # скрипт лежит в корне проекта
 
 # ============================================================
 # 2. Папки, которые ПОЛНОСТЬЮ ПРОПУСКАЕМ (не сканируются)
+# ------------------------------------------------------------
+# Правила сопоставления:
+#   - "target"          -> любая папка с таким именем на любом уровне
+#   - "src/layers/mamba"-> точное совпадение ИЛИ суффикс на границе сегмента
+# При пропуске папки её подпапки тоже не сканируются.
 # ============================================================
-EXCLUDE_DIR_NAMES = [
+EXCLUDE_DIR_PATTERNS = [
     "target",
     ".git",
     ".vscode",
@@ -21,15 +25,40 @@ EXCLUDE_DIR_NAMES = [
 
 # ============================================================
 # 3. Папки, которые НЕ СКАНИРУЮТСЯ, но УПОМИНАЮТСЯ в отчёте
+# ------------------------------------------------------------
+# Те же правила сопоставления, что и выше.
 # ============================================================
-MENTIONED_EXCLUDE_DIRS = [
+MENTIONED_EXCLUDE_DIR_PATTERNS = [
     "debug",
     "release",
+    "layers/adaptive_activation",
+    "layers/adaptive_dropout",
+    "layers/adaptive_normalization",
+    "layers/batch_renorm",
+    "layers/combiner",
+    "layers/combiner_connector",
+    "layers/concrete_dropout",
+    "layers/dual_anchor",
+    "layers/dual_slope_relu",
+    "layers/feature_fusion",
+    "layers/identity",
+    "layers/ind_rnn",
+    "layers/layers_special",
+    "layers/learnable_mish",
+    "layers/learnable_softplus",
+    "layers/linear_attention",
+    "layers/mamba",
+    "layers/memory",
+    "layers/multi_resolution_kan_linear",
+    "layers/per_feature_attention",
+    "layers/relative_position_attention",
+    "layers/rms_norm_learnable_eps",
+    "layers/sparse_feature_selection_gate",
+    "layers/spectral_norm_linear",
 ]
 
 # ============================================================
 # 4. Количество частей, на которые нужно разбить итоговый файл
-#    (если PARTS = 1, разбивка не производится)
 # ============================================================
 PARTS = 15
 
@@ -40,37 +69,92 @@ BASE_OUTPUT_NAME = "merged_project_code"
 SEPARATOR = "=" * 80
 SUB_SEPARATOR = "-" * 80
 
+# Сколько ПОСЛЕДНИХ логов показывать в консольной диагностике
+LOG_TAIL = 32
+
 # Файлы, исключаемые из сборки (автоматически: сам скрипт и выходные файлы)
 EXCLUDE_FILES = set()
 
 
-def collect_files(root_dir, exclude_dirs, mentioned_dirs):
+def matches_dir_pattern(rel_dir: Path, pattern: str) -> bool:
+    """
+    Сопоставление папки с шаблоном.
+
+      * шаблон без '/' — совпадение по имени сегмента на любой глубине;
+      * шаблон с '/' — совпадение пути ЦЕЛИКОМ либо по суффиксу на границе
+        сегмента: "layers/mamba" матчит "layers/mamba", "src/layers/mamba",
+        "a/b/layers/mamba", но не "my_layers/mamba_x".
+    """
+    rel_posix = rel_dir.as_posix().replace("\\", "/").strip("/")
+    pat = pattern.replace("\\", "/").strip("/")
+
+    if "/" not in pat:
+        return rel_dir.name.lower() == pat.lower()
+
+    rp = rel_posix.lower()
+    pp = pat.lower()
+    return rp == pp or rp.endswith("/" + pp)
+
+
+def collect_files(root_dir, exclude_patterns, mentioned_patterns):
     """
     Собирает файлы проекта: Cargo.toml, .rs, .html, .js, .css, .comp, .bat.
-    Возвращает список (тип, отн.путь, полный путь) и множество найденных упомянутых каталогов.
+    Возвращает:
+      * список (тип, отн.путь, полный путь);
+      * множество найденных упомянутых каталогов (для шапки отчёта);
+      * список ВСЕХ путей, попавших под EXCLUDE (для консольного лога);
+      * список ВСЕХ путей, попавших под MENTIONED (для консольного лога).
     """
     root = Path(root_dir).resolve()
     collected = []
     found_mentioned = set()
+    excluded_hits = []   # копим все срабатывания, потом покажем хвост
+    mentioned_hits = []
 
     for current_dir, dirs, filenames in os.walk(root):
-        # Исключаем каталоги из списка dirs, чтобы не заходить в них
-        dirs[:] = [
-            d for d in dirs
-            if d not in exclude_dirs and d not in mentioned_dirs
-        ]
+        current_path = Path(current_dir).resolve()
+        try:
+            rel_current = current_path.relative_to(root)
+        except ValueError:
+            rel_current = Path(".")
 
-        # Проверяем наличие упомянутых каталогов (не сканируются, но будут упомянуты)
-        for d in os.listdir(current_dir):
-            if d in mentioned_dirs and (Path(current_dir) / d).is_dir():
-                found_mentioned.add(d)
+        new_dirs = []
+        for d in dirs:
+            rel_sub = (rel_current / d) if rel_current != Path(".") else Path(d)
+
+            hit_exclude = next(
+                (p for p in exclude_patterns
+                 if matches_dir_pattern(rel_sub, p)),
+                None,
+            )
+            hit_mention = next(
+                (p for p in mentioned_patterns
+                 if matches_dir_pattern(rel_sub, p)),
+                None,
+            )
+
+            if hit_exclude is not None:
+                # Только в консольный лог, в файлы это не попадает.
+                excluded_hits.append(
+                    f"{rel_sub.as_posix()}  <- правило: {hit_exclude!r}"
+                )
+                continue
+
+            if hit_mention is not None:
+                found_mentioned.add(rel_sub.as_posix())
+                mentioned_hits.append(
+                    f"{rel_sub.as_posix()}  <- правило: {hit_mention!r}"
+                )
+                continue
+
+            new_dirs.append(d)
+        dirs[:] = new_dirs
 
         for fname in filenames:
             full_path = (Path(current_dir) / fname).resolve()
             if full_path in EXCLUDE_FILES:
                 continue
 
-            # Определяем тип файла по расширению
             fname_lower = fname.lower()
             if fname_lower == "cargo.toml":
                 ftype = "toml"
@@ -82,13 +166,12 @@ def collect_files(root_dir, exclude_dirs, mentioned_dirs):
                 ftype = "js"
             elif fname_lower.endswith(".css"):
                 ftype = "css"
-            # +++ Добавлены новые расширения
             elif fname_lower.endswith(".comp"):
                 ftype = "comp"
             elif fname_lower.endswith(".bat"):
                 ftype = "bat"
             else:
-                continue  # пропускаем остальные
+                continue
 
             try:
                 rel_path = full_path.relative_to(root)
@@ -97,10 +180,11 @@ def collect_files(root_dir, exclude_dirs, mentioned_dirs):
 
             collected.append((ftype, str(rel_path), full_path))
 
-    # Сортировка: сначала Cargo.toml, потом .rs, потом .html, .js, .css, .comp, .bat
-    type_order = {"toml": 0, "rs": 1, "html": 2, "js": 3, "css": 4, "comp": 5, "bat": 6}
+    type_order = {"toml": 0, "rs": 1, "html": 2, "js": 3,
+                  "css": 4, "comp": 5, "bat": 6}
     collected.sort(key=lambda x: (type_order.get(x[0], 99), x[1]))
-    return collected, found_mentioned
+
+    return collected, found_mentioned, excluded_hits, mentioned_hits
 
 
 def count_lines_of_file(full_path):
@@ -109,15 +193,15 @@ def count_lines_of_file(full_path):
         with open(full_path, "r", encoding="utf-8") as f:
             return sum(1 for _ in f)
     except Exception as e:
-        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось прочитать {full_path} для подсчёта строк: {e}")
+        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось прочитать {full_path} "
+              f"для подсчёта строк: {e}")
         return 0
 
 
 def distribute_files_by_lines(file_infos, num_parts):
     """
-    Жадно распределяет файлы по num_parts корзинам так, чтобы суммарное число строк
-    в каждой корзине было как можно более равномерным.
-    Возвращает список корзин, каждая корзина — список элементов file_info.
+    Жадно распределяет файлы по num_parts корзинам так, чтобы суммарное число
+    строк в каждой корзине было как можно более равномерным.
     """
     sorted_infos = sorted(file_infos, key=lambda x: x[3], reverse=True)
 
@@ -132,7 +216,8 @@ def distribute_files_by_lines(file_infos, num_parts):
     return parts
 
 
-def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total_parts=None, total_lines=None):
+def merge_files(entries, output_path, mentioned_dirs_found,
+                part_num=None, total_parts=None, total_lines=None):
     """Записывает содержимое файлов в выходной текстовый файл."""
     processed = 0
     skipped = 0
@@ -186,14 +271,14 @@ def merge_files(entries, output_path, mentioned_dirs_found, part_num=None, total
             print(f"[OK] Добавлен: {rel_path}")
             processed += 1
 
-    print(f"Часть {part_num}: обработано {processed} файлов, пропущено {skipped} -> {output_path}")
+    print(f"Часть {part_num}: обработано {processed} файлов, "
+          f"пропущено {skipped} -> {output_path}")
 
 
 def write_partition_message(file_obj, part_num, total_parts, is_start):
     """Вставляет сообщение о переходе между частями."""
-    msg = ""
     if is_start:
-        if part_num == 2:
+        if part_num == 2 and total_parts == 2:
             msg = "Это начало второй половины."
         else:
             msg = f"Это начало части {part_num}."
@@ -204,6 +289,45 @@ def write_partition_message(file_obj, part_num, total_parts, is_start):
     file_obj.write(SEPARATOR + "\n\n")
 
 
+# ============================================================
+# Консольная диагностика: последние N срабатываний
+# ============================================================
+
+def print_exclude_log(hits, patterns, tail=LOG_TAIL):
+    print()
+    print(SEPARATOR)
+    print(f"EXCLUDE_DIR_NAMES — последние {tail} срабатываний")
+    print(f"Задано шаблонов: {len(patterns)} "
+          f"-> {', '.join(repr(p) for p in patterns)}")
+    print(SEPARATOR)
+    if not hits:
+        print("  (срабатываний не было)")
+        return
+    shown = hits[-tail:]
+    print(f"  Всего срабатываний: {len(hits)}. "
+          f"Показаны последние {len(shown)}:")
+    for line in shown:
+        print(f"  [X] {line}")
+
+
+def print_mentioned_log(hits, patterns, tail=LOG_TAIL):
+    print()
+    print(SEPARATOR)
+    print(f"MENTIONED_EXCLUDE_DIRS — последние {tail} срабатываний")
+    print(f"Задано шаблонов: {len(patterns)}")
+    print(SEPARATOR)
+    if not hits:
+        print("  (срабатываний не было)")
+        return
+    shown = hits[-tail:]
+    print(f"  Всего срабатываний: {len(hits)}. "
+          f"Показаны последние {len(shown)}:")
+    for line in shown:
+        print(f"  [M] {line}")
+
+
+# ============================================================
+
 if __name__ == "__main__":
     this_script = Path(__file__).resolve()
     EXCLUDE_FILES = {this_script}
@@ -212,15 +336,20 @@ if __name__ == "__main__":
         EXCLUDE_FILES.add(output_file)
     EXCLUDE_FILES.add(Path(f"{BASE_OUTPUT_NAME}.txt").resolve())
 
-    entries, mentioned_found = collect_files(
+    entries, mentioned_found, excluded_hits, mentioned_hits = collect_files(
         SOURCE_DIR,
-        EXCLUDE_DIR_NAMES,
-        MENTIONED_EXCLUDE_DIRS
+        EXCLUDE_DIR_PATTERNS,
+        MENTIONED_EXCLUDE_DIR_PATTERNS,
     )
 
+    # --- Логи только в консоль, в файлы не пишутся ---
+    print_exclude_log(excluded_hits, EXCLUDE_DIR_PATTERNS, LOG_TAIL)
+    print_mentioned_log(mentioned_hits, MENTIONED_EXCLUDE_DIR_PATTERNS, LOG_TAIL)
+
     if not entries:
-        # +++ Обновлено сообщение – добавлены .comp и .bat
-        print("Не найдено ни одного подходящего файла (Cargo.toml, .rs, .html, .js, .css, .comp, .bat) с учётом исключений.")
+        print("Не найдено ни одного подходящего файла "
+              "(Cargo.toml, .rs, .html, .js, .css, .comp, .bat) "
+              "с учётом исключений.")
         exit(1)
 
     file_infos = []
@@ -229,8 +358,6 @@ if __name__ == "__main__":
         file_infos.append((ftype, rel_path, full_path, line_cnt))
         print(f"[INFO] {rel_path}: {line_cnt} строк(и)")
 
-    total_files = len(file_infos)
-
     if PARTS <= 1:
         output_path = f"{BASE_OUTPUT_NAME}.txt"
         total_lines_all = sum(info[3] for info in file_infos)
@@ -238,7 +365,7 @@ if __name__ == "__main__":
             [(info[0], info[1], info[2]) for info in file_infos],
             output_path,
             mentioned_found,
-            total_lines=total_lines_all
+            total_lines=total_lines_all,
         )
     else:
         distributed_parts = distribute_files_by_lines(file_infos, PARTS)
